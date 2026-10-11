@@ -3503,6 +3503,11 @@ extern "C" long
 amp_gdn_chunk_ws_floats(int S, int Hv);
 
 extern "C" int
+amp_comm_allreduce_fp16(const void *x, void *out, void *const *bufs,
+                       int *const *ctls, int rank, int N, long n, long cap,
+                       int mode, int blocks, cudaStream_t stream);
+
+extern "C" int
 amp_gdn_chunk_f32(const void *q, const void *k, const void *v, const void *beta,
                  const void *gexp, void *state, void *out, void *ws, int S,
                  int Hk, int Hv, int dk, int dv, float scale,
@@ -4664,6 +4669,198 @@ torch_device_count(uc_vm_t *vm, size_t nargs)
  */
 #define AMP_COMM_MAXN 8
 #define AMP_COMM_MAXB 16
+
+struct comm_state {
+	int N, mode;
+	long cap;
+	std::vector<int> dev;
+	std::vector<at::Tensor> buf, ctl;
+	void *bufp[AMP_COMM_MAXN];
+	int *ctlp[AMP_COMM_MAXN];
+};
+
+static void
+comm_free(void *data)
+{
+	delete static_cast<comm_state *>(data);
+}
+
+static uc_value_t *
+torch_p2p_comm(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *devs = uc_fn_arg(0);
+	int64_t cap;
+	int mode = -1;
+
+	if (ucv_type(devs) != UC_ARRAY || !arg_int(vm, uc_fn_arg(1), &cap) || cap <= 0 || cap % 8) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (devices array, cap (multiple of 8), mode?)");
+		return NULL;
+	}
+
+	uc_value_t *mv = uc_fn_arg(2);
+
+	if (nargs > 2 && ucv_type(mv) == UC_STRING) {
+		const char *m = ucv_string_get(mv);
+
+		mode = !strcmp(m, "oneshot") ? 0 : !strcmp(m, "twophase") ? 1 :
+			!strcmp(m, "auto") ? -1 : -2;
+
+		if (mode == -2) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"mode must be auto, oneshot or twophase");
+			return NULL;
+		}
+	}
+
+	size_t N = ucv_array_length(devs);
+
+	if (N < 2 || N > AMP_COMM_MAXN) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "2..8 devices supported");
+		return NULL;
+	}
+
+	auto *c = new comm_state();
+
+	c->N = (int)N;
+	c->cap = cap;
+	c->mode = (mode >= 0) ? mode : (N <= 3 ? 0 : 1);
+
+	try {
+		for (size_t i = 0; i < N; i++) {
+			uc_value_t *v = ucv_array_get(devs, i);
+
+			if (ucv_type(v) != UC_INTEGER || ucv_int64_get(v) < 0 ||
+			    ucv_int64_get(v) >= at::cuda::device_count())
+				throw std::runtime_error("bad device index");
+
+			c->dev.push_back((int)ucv_int64_get(v));
+		}
+
+		for (int a : c->dev)
+			for (int b : c->dev) {
+				if (a == b)
+					continue;
+
+				c10::cuda::CUDAGuard g((c10::DeviceIndex)a);
+				cudaError_t rc = cudaDeviceEnablePeerAccess(b, 0);
+
+				if (rc != cudaSuccess && rc != cudaErrorPeerAccessAlreadyEnabled)
+					throw std::runtime_error(cudaGetErrorString(rc));
+
+				(void)cudaGetLastError();
+			}
+
+		/* The buffers below are written by the peers. With the allocator's
+		 * expandable segments, memory is only mapped to the peers whose
+		 * access ATen has already enabled — which it does lazily, on the
+		 * first cross-device copy of a pair. Make that copy now. */
+		for (int a : c->dev)
+			for (int b : c->dev)
+				if (a != b)
+					(void)at::zeros({ 8 }, at::TensorOptions().device(at::kCUDA, a))
+						.to(at::Device(at::kCUDA, b));
+
+		at::cuda::device_synchronize();
+
+		for (size_t i = 0; i < N; i++) {
+			auto o = at::TensorOptions().device(at::kCUDA, c->dev[i]);
+
+			c->buf.push_back(at::zeros({ (int64_t)(2 * N + 2) * cap }, o.dtype(at::kHalf)));
+			c->ctl.push_back(at::zeros({ (2 * AMP_COMM_MAXN + 1) * AMP_COMM_MAXB }, o.dtype(at::kInt)));
+			c->bufp[i] = c->buf[i].data_ptr();
+			c->ctlp[i] = (int *)c->ctl[i].data_ptr();
+		}
+
+		/* the zero fills must have landed on EVERY rank's device before
+		 * the first all-reduce writes flags into a peer's buffers (a plain
+		 * device_synchronize only covers the current device) */
+		for (int d : c->dev) {
+			c10::cuda::CUDAGuard g((c10::DeviceIndex)d);
+
+			at::cuda::device_synchronize();
+		}
+	}
+	catch (const std::exception &e) {
+		delete c;
+		RAISE(e.what());
+	}
+
+	return uc_resource_new(ucv_resource_type_lookup(vm, COMM_TYPE), c);
+}
+
+static uc_value_t *
+comm_allreduce(uc_vm_t *vm, size_t nargs)
+{
+	auto *c = static_cast<comm_state *>(uc_fn_thisval(COMM_TYPE));
+	int64_t rank;
+
+	if (!c) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "called on non-comm value");
+		return NULL;
+	}
+
+	at::Tensor *x = tensor_arg(vm, uc_fn_arg(0));
+
+	if (!x || !arg_int(vm, uc_fn_arg(1), &rank) || rank < 0 || rank >= c->N) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (x, rank)");
+		return NULL;
+	}
+
+	if (!x->is_cuda() || x->get_device() != c->dev[rank] ||
+	    x->scalar_type() != at::kHalf || !x->is_contiguous() ||
+	    x->numel() % 8 || x->numel() > c->cap) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"comm.allreduce: x must be contiguous fp16 on the rank's device, "
+			"n %% 8 == 0, n <= cap");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		long n = (long)x->numel();
+		/* blocks: one per ~16k values per chunk, as all ranks compute it */
+		static const long blk_div = getenv("AMP_COMM_BLOCK_DIV") ?
+			atol(getenv("AMP_COMM_BLOCK_DIV")) : 16384;
+		int blocks = (int)std::min<long>(AMP_COMM_MAXB,
+			std::max<long>(1, n / c->N / blk_div));
+		at::Tensor out = at::empty_like(*x);
+		int rc = amp_comm_allreduce_fp16(x->data_ptr(), out.data_ptr(),
+			c->bufp, c->ctlp, (int)rank, c->N, n, c->cap, c->mode, blocks,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "comm.allreduce"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+static uc_value_t *
+comm_info(uc_vm_t *vm, size_t nargs)
+{
+	auto *c = static_cast<comm_state *>(uc_fn_thisval(COMM_TYPE));
+	uc_value_t *o;
+
+	if (!c)
+		return NULL;
+
+	o = ucv_object_new(vm);
+	ucv_object_add(o, "ranks", ucv_int64_new(c->N));
+	ucv_object_add(o, "cap", ucv_int64_new(c->cap));
+	ucv_object_add(o, "mode", ucv_string_new(c->mode ? "twophase" : "oneshot"));
+
+	return o;
+}
+
+static const uc_function_list_t comm_methods[] = {
+	{ "allreduce",	comm_allreduce },
+	{ "info",	comm_info },
+};
 
 /* --- stream fork / join (intra-graph concurrency) ------------------------ */
 
@@ -6224,6 +6421,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "silu_mul",	torch_silu_mul },
 	{ "gdn_scan",	torch_gdn_scan },
 	{ "flash_attn_kvcache",	torch_flash_attn_kvcache },
+	{ "p2p_comm",	torch_p2p_comm },
 	{ "device_count",	torch_device_count },
 	{ "common_prefix",	torch_common_prefix },
 	{ "copy_many",	torch_copy_many },
@@ -6279,6 +6477,7 @@ uc_module_init(uc_vm_t *vm, uc_value_t *scope)
 	uc_type_declare(vm, TENSOR_TYPE, tensor_methods, tensor_free);
 	uc_type_declare(vm, STFILE_TYPE, stfile_methods, stfile_free);
 	uc_type_declare(vm, GRAPH_TYPE, graph_methods, graph_free);
+	uc_type_declare(vm, COMM_TYPE, comm_methods, comm_free);
 	uc_type_declare(vm, NOTIFIER_TYPE, notifier_methods, notifier_free);
 	uc_function_list_register(scope, torch_fns);
 	amp_tokenizer_init(vm, scope);

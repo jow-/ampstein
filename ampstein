@@ -37,6 +37,8 @@ function usage() {
 	printf("  --split N             layers per GPU (layer split)\n");
 	printf("  --chunk N             prefill chunk size (default 1024)\n");
 	printf("  --mtp N               speculative MTP window (default 3)\n");
+	printf("  --tp                  tensor parallel\n");
+	printf("  --tp-share F          tensor-parallel share (two GPUs, default 0.5)\n");
 	printf("  --name NAME           served model name (default: basename of --model)\n");
 	printf("  --version             print version and exit\n");
 	printf("  --help                print this help and exit\n");
@@ -106,6 +108,8 @@ function parse_args() {
 		case '--name': a.name = v; i++; break;
 		case '--mtp': a.mtp = int(v); a.mtp_set = true; i++; break;
 		case '--draft-vocab': a.draft_vocab = int(v); i++; break;
+		case '--tp': a.tp = true; break;
+		case '--tp-share': a.tp_share = +v; i++; break;
 		default:
 			warn(`unknown argument '${k}'\n`);
 			exit(1);

@@ -16,3 +16,5 @@ ucode -L build/lib -L src/ucode -ltorch=ampstein.torch examples/<script>.uc [-- 
 | `bench_qwen35.uc` | Qwen3.5 / 3.8 benchmark over a multi-GPU layer split |
 | `bench_prefill.uc` | sequential versus pipelined prefill |
 | `bench_decode.uc` | plain greedy versus MTP speculative decoding |
+| `perf_server.uc` | the server's decode path outside the server (layer split or `--tp`) |
+| `bench_allreduce.uc` | latency of the P2P all-reduce inside a CUDA graph |

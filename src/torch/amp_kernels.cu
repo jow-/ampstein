@@ -1788,6 +1788,221 @@ amp_attn_gate_fp16(const void *a, long ast, long ash, const void *g, long gst,
 #define AMP_COMM_MAXN 8
 #define AMP_COMM_MAXB 16
 
+struct amp_comm_peers {
+	__half *buf[AMP_COMM_MAXN];   /* per rank: A [2][N][cap] then G [2][cap] */
+	int *ctl[AMP_COMM_MAXN];
+};
+
+/* [u0, u1) of a [0, units) range cut into parts pieces, piece i */
+__device__ __forceinline__ void
+amp_comm_part(long units, int parts, int i, long *u0, long *u1)
+{
+	*u0 = units * i / parts;
+	*u1 = units * (i + 1) / parts;
+}
+
+__device__ __forceinline__ void
+amp_comm_acc(float *acc, uint4 v)
+{
+	const __half2 *h = (const __half2 *)&v;
+
+	for (int k = 0; k < 4; k++) {
+		float2 f = __half22float2(h[k]);
+
+		acc[2 * k] += f.x;
+		acc[2 * k + 1] += f.y;
+	}
+}
+
+__device__ __forceinline__ uint4
+amp_comm_pack(const float *acc)
+{
+	uint4 o;
+	__half2 *h = (__half2 *)&o;
+
+	for (int k = 0; k < 4; k++)
+		h[k] = __floats2half2_rn(acc[2 * k], acc[2 * k + 1]);
+
+	return o;
+}
+
+/* Post this block's flag to every peer and wait for every peer's, in
+ * parallel: warp 0, lane p handles peer p (posted atomics, acquire polls
+ * of the LOCAL flag array). One block-wide barrier before (all stores of
+ * the block are issued) and after; one system fence each way by lane 0.
+ * post: offset (in ints) into a peer's ctl at which this rank's flag
+ * lives; wait: offset into the local ctl where peer p's flag is. */
+__device__ __forceinline__ void
+amp_comm_sync(const amp_comm_peers &P, int rank, int N, int post, int wait, int seq)
+{
+	/* every thread releases ITS OWN remote stores (a fence by one thread
+	 * does not flush other warps' stores in hardware), then the block
+	 * meets, then warp 0 posts and waits in parallel */
+	__threadfence_system();
+	__syncthreads();
+
+	if (threadIdx.x < 32) {
+		int p = threadIdx.x;
+		bool peer = (p < N && p != rank);
+
+		if (peer)
+			atomicMax_system(&P.ctl[p][post + rank], seq);
+
+		if (peer) {
+			const volatile int *f = (const volatile int *)&P.ctl[rank][wait + p];
+			long long t0 = clock64();
+
+			while (*f < seq)
+				if (clock64() - t0 > (1LL << 33))
+					__trap();
+		}
+
+		__syncwarp();
+
+		if (p == 0)
+			__threadfence_system();      // acquire: peers' data is visible
+	}
+
+	__syncthreads();
+}
+
+__global__ void
+amp_comm_allreduce_kernel(const __half *__restrict__ x, __half *__restrict__ out,
+                         amp_comm_peers P, int rank, int N, long n, long cap, int mode)
+{
+	__shared__ int s_seq;
+	int b = blockIdx.x, nb = gridDim.x;
+	int *ctl = P.ctl[rank];
+	int *f1 = ctl, *f2 = ctl + AMP_COMM_MAXB * AMP_COMM_MAXN;
+	int *ctr = ctl + 2 * AMP_COMM_MAXB * AMP_COMM_MAXN;
+
+	if (threadIdx.x == 0)
+		s_seq = *(volatile int *)&ctr[b] + 1;
+
+	__syncthreads();
+
+	int seq = s_seq, sl = seq & 1;
+	long units = n / 8;
+	const uint4 *xv = (const uint4 *)x;
+	uint4 *ov = (uint4 *)out;
+
+	/* A slot of rank p's buffer for sender s, G slot of rank p */
+	#define A_OF(p, s) ((uint4 *)(P.buf[p] + ((long)sl * N + (s)) * cap))
+	#define G_OF(p) ((uint4 *)(P.buf[p] + (2L * N + sl) * cap))
+
+	if (mode == 0) {
+		long u0, u1;
+
+		amp_comm_part(units, nb, b, &u0, &u1);
+
+		for (int p = 0; p < N; p++) {
+			if (p == rank)
+				continue;
+
+			uint4 *dst = A_OF(p, rank);
+
+			for (long i = u0 + threadIdx.x; i < u1; i += blockDim.x)
+				dst[i] = xv[i];
+		}
+
+		amp_comm_sync(P, rank, N, b * AMP_COMM_MAXN, b * AMP_COMM_MAXN, seq);
+
+		for (long i = u0 + threadIdx.x; i < u1; i += blockDim.x) {
+			float acc[8] = { 0 };
+
+			for (int p = 0; p < N; p++)
+				amp_comm_acc(acc, (p == rank) ? xv[i] : __ldcg(&A_OF(rank, p)[i]));
+
+			ov[i] = amp_comm_pack(acc);
+		}
+	}
+	else {
+		/* phase 1: my slice of chunk c goes to its owner c */
+		for (int c = 0; c < N; c++) {
+			if (c == rank)
+				continue;
+
+			long c0, c1, u0, u1;
+
+			amp_comm_part(units, N, c, &c0, &c1);
+			amp_comm_part(c1 - c0, nb, b, &u0, &u1);
+
+			uint4 *dst = A_OF(c, rank);
+
+			for (long i = c0 + u0 + threadIdx.x; i < c0 + u1; i += blockDim.x)
+				dst[i] = xv[i];
+		}
+
+		amp_comm_sync(P, rank, N, b * AMP_COMM_MAXN, b * AMP_COMM_MAXN, seq);
+
+		/* reduce my chunk slice, store it into every rank's G */
+		long c0, c1, u0, u1;
+
+		amp_comm_part(units, N, rank, &c0, &c1);
+		amp_comm_part(c1 - c0, nb, b, &u0, &u1);
+
+		for (long i = c0 + u0 + threadIdx.x; i < c0 + u1; i += blockDim.x) {
+			float acc[8] = { 0 };
+
+			for (int p = 0; p < N; p++)
+				amp_comm_acc(acc, (p == rank) ? xv[i] : __ldcg(&A_OF(rank, p)[i]));
+
+			uint4 o = amp_comm_pack(acc);
+
+			for (int p = 0; p < N; p++)
+				if (p != rank)
+					G_OF(p)[i] = o;
+
+			ov[i] = o;
+		}
+
+		amp_comm_sync(P, rank, N, (AMP_COMM_MAXB + b) * AMP_COMM_MAXN,
+			(AMP_COMM_MAXB + b) * AMP_COMM_MAXN, seq);
+
+		/* gather: the other owners' chunk slices */
+		for (int c = 0; c < N; c++) {
+			if (c == rank)
+				continue;
+
+			amp_comm_part(units, N, c, &c0, &c1);
+			amp_comm_part(c1 - c0, nb, b, &u0, &u1);
+
+			for (long i = c0 + u0 + threadIdx.x; i < c0 + u1; i += blockDim.x)
+				ov[i] = __ldcg(&G_OF(rank)[i]);
+		}
+	}
+
+	#undef A_OF
+	#undef G_OF
+
+	__syncthreads();
+
+	if (threadIdx.x == 0)
+		*(volatile int *)&ctr[b] = seq;
+}
+
+extern "C" int
+amp_comm_allreduce_fp16(const void *x, void *out, void *const *bufs,
+                       int *const *ctls, int rank, int N, long n, long cap,
+                       int mode, int blocks, cudaStream_t stream)
+{
+	if (N < 2 || N > AMP_COMM_MAXN || n <= 0 || n % 8 || n > cap ||
+	    blocks < 1 || blocks > AMP_COMM_MAXB)
+		return (int)cudaErrorInvalidValue;
+
+	amp_comm_peers P;
+
+	for (int p = 0; p < N; p++) {
+		P.buf[p] = (__half *)bufs[p];
+		P.ctl[p] = ctls[p];
+	}
+
+	amp_comm_allreduce_kernel<<<blocks, 512, 0, stream>>>((const __half *)x,
+		(__half *)out, P, rank, N, n, cap, mode);
+
+	return (int)cudaGetLastError();
+}
+
 /*
  * Batched contiguous copies on one device: up to AMP_CM_MAX (src, dst,
  * bytes) entries in one launch (the speculative-decoding rollback copies

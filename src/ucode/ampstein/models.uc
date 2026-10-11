@@ -434,6 +434,41 @@ export function sub_columns(lin, ranges) {
 	return sub;
 }
 
+/* EXL3 linear from explicit parts (tensor-parallel shards): p = {
+ * trellis, suh, svh, K, mul1, mcg, dev}. Same forward as LinearEXL3Seq
+ * (2-D or 3-D input; reconstruct + cuBLAS above RECON_ROWS rows). */
+export function LinearEXL3Parts(p) {
+	let s = p.trellis.shape();
+
+	return {
+		trellis: p.trellis, suh: p.suh, svh: p.svh, bias: null,
+		K: p.K, mul1: p.mul1, mcg: p.mcg, dev: p.dev,
+		in_features: s[0] * 16,
+		out_features: s[1] * 16,
+
+		forward: function (x) {
+			let sh = x.shape();
+			let flat = (length(sh) == 2) ? x : x.view([-1, this.in_features]);
+			let m = flat.shape()[0];
+			let out;
+
+			if (m > RECON_ROWS && this.out_features <= RECON_MAX_N) {
+				out = torch.exl3_gemm_recon(flat.contiguous(), this.trellis,
+					this.suh, this.svh, this.K, this.mul1, this.mcg);
+			}
+			else {
+				out = torch.empty([m, this.out_features], 'float16',
+					'cuda:' + this.dev);
+				torch.exl3_gemm(flat, this.trellis, out, this.suh, this.svh,
+					this.mul1, this.mcg);
+			}
+
+			return (length(sh) == 2) ? out :
+				out.view([sh[0], sh[1], this.out_features]);
+		}
+	};
+}
+
 /* Tensor-parallel shards of an EXL3 linear, placed on device `dev`:
  *
  *   cols(lin, ranges, dev)  output columns ([start, length] pairs,
@@ -444,6 +479,42 @@ export function sub_columns(lin, ranges) {
  *                           to the full result (the output Hadamard and
  *                           svh are linear in the accumulated sum)
  */
+export function cols(lin, ranges, dev) {
+	let sub = sub_columns(lin, ranges);
+
+	return LinearEXL3Parts({
+		trellis: sub.trellis.cuda(dev), suh: sub.suh.cuda(dev),
+		svh: sub.svh.cuda(dev), K: lin.K, mul1: lin.mul1, mcg: lin.mcg,
+		dev: dev
+	});
+}
+
+export function rows(lin, k0, klen, dev) {
+	if (k0 % 128 || klen % 128 || k0 + klen > lin.in_features)
+		die(`models.rows: range [${k0}, ${klen}] not 128-aligned/in bounds`);
+
+	return LinearEXL3Parts({
+		trellis: lin.trellis.narrow(0, k0 / 16, klen / 16).contiguous().cuda(dev),
+		suh: lin.suh.narrow(0, k0, klen).contiguous().cuda(dev),
+		svh: lin.svh.cuda(dev), K: lin.K, mul1: lin.mul1, mcg: lin.mcg,
+		dev: dev
+	});
+}
 
 /* fp16 linear (y = x W^T) restricted to output rows [n0, n0 + len) of
  * W, on device `dev`. */
+export function fp16_cols(lin, n0, len, dev) {
+	let w = lin.weight.narrow(0, n0, len).contiguous().cuda(dev);
+
+	return {
+		weight: w, bias: null, in_features: w.shape()[1], out_features: len,
+
+		forward: function (x) {
+			let s = x.shape();
+			let flat = (length(s) == 2) ? x : x.view([-1, this.in_features]);
+			let y = torch.matmul(flat, this.weight.t());
+
+			return (length(s) == 2) ? y : y.view([s[0], s[1], this.out_features]);
+		}
+	};
+}

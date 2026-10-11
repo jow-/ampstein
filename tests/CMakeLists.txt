@@ -120,3 +120,11 @@ amp_test(qwen35_mtp)
 amp_test(notifier)
 # engine_async: async sampling reproduces dist() / argmax exactly
 amp_test(engine_async)
+
+# --- Tensor parallelism
+# p2p_comm: N-way P2P all-reduce, 2..visible GPUs, both modes
+amp_test(p2p_comm)
+# attn_decode_tp: TP decode attention scenario, cross-device CUDA graph
+amp_test(attn_decode_tp)
+# qwen35_tp: tensor-parallel qwen35 (eager + multi-GPU graph) vs the layer split
+amp_test(qwen35_tp)

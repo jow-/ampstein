@@ -351,7 +351,7 @@ export function create(model, opts) {
 	// GDN state holders of layer i: the layer's cache entry, or one per
 	// device under tensor parallelism (model.states)
 	function states(i) {
-		return [ cache.layers[i] ];
+		return model.states ? model.states(cache, i) : [ cache.layers[i] ];
 	}
 
 	function snap_bufs(i) {
@@ -1002,6 +1002,10 @@ export function create(model, opts) {
 		let D = last_hidden;
 		let temp = (s.temperature != null) ? s.temperature : 1.0;
 
+		// (a tensor-parallel model scores the draft with its vocabulary-
+		// sharded head: model.draft_argmax)
+		let sharded = model.draft_argmax && !draft_head;
+
 		// Async greedy round: the draft chain runs on the device (each
 		// step's argmax feeds the next step's embedding lookup straight
 		// from the device buffer), the verify replays with device-side
@@ -1011,8 +1015,8 @@ export function create(model, opts) {
 		// verify graph (the eager fallback scores host ids) and the plain
 		// lm_head; the sampled walk and the TP sharded draft head stay
 		// synchronous below.
-		if (temp <= 0 && !draft_head && graph &&
-			graph.has(W) && graph.run_dev) {
+		if (temp <= 0 && !sharded && !draft_head && graph &&
+		    graph.has(W) && graph.run_dev) {
 			c_dev.narrow(0, 0, 1).fill_(j.t_next);
 
 			for (let k = 1; k <= W; k++) {
@@ -1057,11 +1061,15 @@ export function create(model, opts) {
 		}
 
 		for (let k = 1; k <= W; k++) {
-			let r = mtp_run([c[k - 1]], D, p + k, draft_head || model.lm_head);
+			let r = mtp_run([c[k - 1]], D, p + k, sharded ? null : (draft_head || model.lm_head));
 
-			let am = sampler.argmax_last(r.logits);
+			if (sharded)
+				push(c, (r.token != null) ? r.token : model.draft_argmax(r.collapsed || r.hidden));
+			else {
+				let am = sampler.argmax_last(r.logits);
 
-			push(c, draft_head ? draft_head.map(am) : am);
+				push(c, draft_head ? draft_head.map(am) : am);
+			}
 
 			D = r.hidden;
 		}

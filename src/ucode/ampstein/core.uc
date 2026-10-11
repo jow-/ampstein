@@ -21,6 +21,7 @@ import * as utpl from './utpl.uc';
 import * as chat_jinja from './chat_jinja.uc';
 import * as chat_qwen35 from './chat_qwen35.uc';
 import * as qwen35 from './qwen35.uc';
+import * as qwen35_tp from './qwen35_tp.uc';
 
 function now_s() {
 	return time();
@@ -112,6 +113,19 @@ export function serve(args) {
 
 	model = qwen35.load(args.model, {devices: devs, mtp: args.mtp > 0});
 
+	if (args.tp) {
+		if (args.gpus < 2) {
+			warn('ampstein: --tp needs --gpus >= 2\n');
+			exit(1);
+		}
+
+		let ranks = [];
+
+		for (let g = 0; g < args.gpus; g++)
+			push(ranks, g);
+
+		model = qwen35_tp.shard(model, {devices: ranks, f0: args.tp_share});
+	}
 	let eng = engine.create(model, {
 		max_ctx: args.ctx,
 		prefill_chunk: args.chunk,
@@ -120,6 +134,10 @@ export function serve(args) {
 	});
 
 	let banner = `ampstein: model loaded in ${time() - t0}s`;
+
+	if (args.tp)
+		banner += `, tensor parallel over ${model.G} GPUs` +
+			` (${model.comm.info().mode} all-reduce)`;
 
 	if (eng.mtp_window)
 		banner += `, MTP speculative decoding (window ${eng.mtp_window})`;

@@ -206,3 +206,15 @@ Add new lessons at the end of the matching section.
   re-zeroed); compute shared-memory offsets from a constexpr row-byte size, not
   another region's element count; kernel attributes are per device — key the
   one-shot setup by `cudaGetDevice()` and test graph capture on the second GPU.
+
+## Tensor parallelism
+
+- **L67 — Cross-device graph edges are slow** (25-90 µs each, 7.5 ms per token
+  over 128 all-reduces). Use `torch.p2p_allreduce` (peer stores + a monotonic
+  flag); eager work on the side device around a replay needs an explicit barrier.
+- **L69 — All-reduce scheme by rank count.** One-shot sends (N-1)x the payload
+  and loses from N = 4 on PCIe 3.0 x4; reduce-scatter + all-gather wins.
+- **L87 (d, e) — The all-reduce kernel.** Every thread must fence its own remote
+  stores before the block barrier (a single-thread fence gave a deterministic
+  token flip); a kernel that spins on a peer deadlocks if another kernel is
+  lazily module-loaded meanwhile — warm everything up first.
