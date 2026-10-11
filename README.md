@@ -30,6 +30,8 @@ GPUs from ucode scripts, with no Python in the loop.
   runs llama-family models: prefill, KV-cache decode, CUDA-graph decode,
   sampling — numerically matching exllamav3.
 - Native BPE tokenizer for HF `tokenizer.json` files (PCRE2 pre-tokenizer).
+- Jinja → ucode transpiler for chat templates, with taint tracking so user text
+  can never tokenize as a special token.
 
 ## Building and installing
 

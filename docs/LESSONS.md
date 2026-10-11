@@ -115,3 +115,23 @@ Add new lessons at the end of the matching section.
 - **L44, L46 — Profiling.** Isolated per-op timings are inflated 2-6x by clock
   ramp; budget from ablations in one process. The 1B decode step is ~2.9 ms, of
   which the vendored gemm kernels are ~2.0 ms (a shared floor with exllamav3).
+
+## The Jinja transpiler
+
+- **L98t — Scoping and `set`.** ucode template `let` is block-scoped; emit every
+  `{% set %}` as a bare assignment and re-initialise the names in a per-render
+  preamble to get Jinja's one-namespace set-leaking semantics. Raw text inside a
+  macro goes to the macro's own buffer; whitespace control must be applied at
+  text-emit time, not at tag-emit time.
+- **L104, L107 — Tagged values.** Bare ucode operators on MIXED tag objects
+  compare by identity: every ordering / arithmetic operator emits `raw(a) OP
+  raw(b)`, and `tv.idx()` unwraps numeric indices. `tv.eq` is text equality only
+  when both sides are strings.
+- **L105, L120 — A `loadstring`'d program is a separate module instance and
+  cannot import sources.** Per-render state and the `tv` / `utpl` namespaces are
+  injected through the call scope (`__utpl_state`).
+- **L106 — Macros are function expressions** compiled at their definition site;
+  Jinja itself does not hoist macros, and function expressions give scope,
+  single emission and recursion for free.
+- **L109 — `struct.buffer` is the string builder of record** (O(1) appends,
+  zero-copy `pull()`); it is not a script global — import it.

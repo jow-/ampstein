@@ -42,6 +42,7 @@ python3 tests/oracle/make_llama_logits_oracle.py  # llama_*, graphdec*
 python3 tests/oracle/make_kld_oracle.py           # kld
 python3 tests/oracle/make_chat_prompt_oracle.py   # chat_prompt
 python3 tests/oracle/make_tokenizer_oracle.py     # tokenizer
+python3 tests/oracle/make_chat_qwen35_oracle.py   # utpl_template, chat_jinja, chat_qwen35
 ```
 
 Each script documents its arguments (model directory, output) in its docstring.

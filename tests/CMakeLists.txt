@@ -70,3 +70,13 @@ amp_test(loadperf)
 amp_test(decode_attn_hd128)
 # mlp_gpu: 2-layer MLP forward on the GPU (examples/mlp.uc)
 amp_test(mlp_gpu SCRIPT ${CMAKE_SOURCE_DIR}/examples/mlp)
+
+# --- Jinja -> utpl transpiler
+# taint_values: runtime taint values: cells, mixed strings, scope frames
+amp_test(taint_values)
+# tv_sink: template output sink: merging, taint mapping, nested capture
+amp_test(tv_sink)
+# utpl: taint-aware transpilation over an embedded template battery
+amp_test(utpl)
+# utpl_template: real checkpoint chat templates, byte-exact vs the jinja2 oracle
+amp_test(utpl_template)
