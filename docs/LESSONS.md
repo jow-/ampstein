@@ -264,3 +264,17 @@ Add new lessons at the end of the matching section.
   other conversation; parking states in pinned RAM (tiered fp16 / int8 / int4 KV
   by distance from the end) restores a 100k-token prefix in ~1 s against ~100 s
   of prefill. Log *why* a request did not reuse the live state.
+
+## Qwen3.8-Flash-Next
+
+- **L98 — Bring-up.** A partial-model mode (`layers: N`) checks blocks 0-3 in
+  seconds instead of a minute per fix. A shared object links with undefined
+  symbols and binds lazily: after vendoring a TU, load the module. `tensor.index`
+  is `at::embedding` (2-D table), and the module has no relu / masked_fill /
+  permute (`clamp`, `where`, `transpose`).
+- **L99 — TP decode is capped by what every rank replicates** (gated-residual
+  tables, the router chain, two barriers per layer) and by arrival spread at the
+  barriers, not by communication time. Prefill under TP is host-bound.
+- **L100 — Stages beat micro-chunks:** fewer launches per layer, not overlap,
+  cured the host-bound TP prefill (716 → ~2000 tok/s). Time the second repetition
+  of any prefill measurement.

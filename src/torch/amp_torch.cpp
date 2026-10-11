@@ -7774,6 +7774,326 @@ torch_hc_apply(uc_vm_t *vm, size_t nargs)
 	return ucv_get(uc_fn_arg(0));
 }
 
+/* Qwen3.8-Flash-Next kernels (vendor/exl3/exllamav3_ext/ngram.cu, ple.cu) */
+int64_t ngram_hash_cpu
+(
+	const at::Tensor& ids, int64_t seq_len, const at::Tensor& multipliers,
+	const at::Tensor& offsets, const at::Tensor& sizes, int64_t heads_per_ngram,
+	int64_t eos_token, at::Tensor uids, at::Tensor inverse, at::Tensor heads
+);
+
+void ngram_dequant
+(
+	const at::Tensor& packed, int64_t K, const at::Tensor& heads,
+	const at::Tensor& bias, at::Tensor out
+);
+
+void ple_forward_streams
+(
+	const at::Tensor& streams, const at::Tensor& emb, const at::Tensor& key_w,
+	const at::Tensor& value_w, const at::Tensor& norm_key_w,
+	const at::Tensor& norm_query_w, const at::Tensor& norm_conv_w,
+	const at::Tensor& conv_w, const c10::optional<at::Tensor>& conv_state,
+	double rms_eps, double gate_scale, int64_t conv_dilation,
+	at::Tensor delta, at::Tensor conv_stream
+);
+
+/*
+ * ngram_hash(ids, out_len, multipliers, offsets, sizes, heads_per_ngram, eos,
+ *            uids, inverse, heads): int
+ *
+ * Hash a (1, ctx + out_len) int64 CPU token history into the n-gram table
+ * row ids: fills the sorted unique row ids (uids), the inverse map
+ * (out_len * heads entries) and each unique row's hash head, all CPU
+ * tensors (pinned or not), and returns the unique count.
+ */
+static uc_value_t *
+torch_ngram_hash(uc_vm_t *vm, size_t nargs)
+{
+	int64_t out_len, hpn, eos;
+
+	if (nargs != 10 || !arg_int(vm, uc_fn_arg(1), &out_len) ||
+	    !arg_int(vm, uc_fn_arg(5), &hpn) || !arg_int(vm, uc_fn_arg(6), &eos)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (ids, out_len, multipliers, offsets, sizes, heads_per_ngram, eos, uids, inverse, heads)");
+		return NULL;
+	}
+
+	at::Tensor *t[7];
+	static const int idx[7] = { 0, 2, 3, 4, 7, 8, 9 };
+
+	for (int i = 0; i < 7; i++) {
+		t[i] = tensor_arg(vm, uc_fn_arg(idx[i]));
+
+		if (!t[i])
+			return NULL;
+
+		if (t[i]->is_cuda())
+			RAISE("ngram_hash: tensors must be on the CPU");
+	}
+
+	try {
+		int64_t u = ngram_hash_cpu(*t[0], out_len, *t[1], *t[2], *t[3], hpn,
+		                           eos, *t[4], *t[5], *t[6]);
+
+		return ucv_int64_new(u);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * ngram_dequant(packed, K, heads, bias, out): out
+ *
+ * Decode packed n-gram rows (U, 1 + 10*K) int16 on the GPU into out
+ * (U, 160) fp16: mul1 codebook * row scale + the per-hash-head bias row.
+ */
+static uc_value_t *
+torch_ngram_dequant(uc_vm_t *vm, size_t nargs)
+{
+	int64_t K;
+
+	if (nargs != 5 || !arg_int(vm, uc_fn_arg(1), &K)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (packed, K, heads, bias, out)");
+		return NULL;
+	}
+
+	at::Tensor *packed = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *heads = packed ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	at::Tensor *bias = heads ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+	at::Tensor *out = bias ? tensor_arg(vm, uc_fn_arg(4)) : NULL;
+
+	if (!out)
+		return NULL;
+
+	if (!out->is_cuda() || !packed->is_cuda())
+		RAISE("ngram_dequant: packed and out must be CUDA tensors");
+
+	try {
+		TensorDeviceGuard dg(*out);
+
+		ngram_dequant(*packed, K, *heads, *bias, *out);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return ucv_get(uc_fn_arg(4));
+}
+
+/*
+ * ple_forward(streams, emb, key_w, value_w, norm_key, norm_query, norm_conv,
+ *             conv_w, conv_state|null, eps, gate_scale, dilation, delta,
+ *             conv_stream)
+ *
+ * Fused PLE layer for a stream stack (R rows): streams (1, R, 4, D) fp32,
+ * emb (1, R, E) fp16 -> delta (1, R, 4, D) fp32 (to be added to the
+ * streams by the caller) and conv_stream (1, 4D, state + R) fp16 (its
+ * trailing columns are the next conv state).
+ */
+static uc_value_t *
+torch_ple_forward(uc_vm_t *vm, size_t nargs)
+{
+	double eps, gs;
+	int64_t dil;
+
+	if (nargs != 14 || !arg_number(vm, uc_fn_arg(9), &eps) ||
+	    !arg_number(vm, uc_fn_arg(10), &gs) || !arg_int(vm, uc_fn_arg(11), &dil)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (streams, emb, key_w, value_w, norm_key, norm_query, norm_conv, conv_w, conv_state, eps, gate_scale, dilation, delta, conv_stream)");
+		return NULL;
+	}
+
+	at::Tensor *t[8];
+
+	for (int i = 0; i < 8; i++) {
+		t[i] = tensor_arg(vm, uc_fn_arg(i));
+
+		if (!t[i])
+			return NULL;
+	}
+
+	at::Tensor *cs = NULL;
+
+	if (ucv_type(uc_fn_arg(8)) != UC_NULL) {
+		cs = tensor_arg(vm, uc_fn_arg(8));
+
+		if (!cs)
+			return NULL;
+	}
+
+	at::Tensor *delta = tensor_arg(vm, uc_fn_arg(12));
+	at::Tensor *cstream = delta ? tensor_arg(vm, uc_fn_arg(13)) : NULL;
+
+	if (!cstream)
+		return NULL;
+
+	try {
+		TensorDeviceGuard dg(*t[0]);
+		c10::optional<at::Tensor> cso;
+
+		if (cs)
+			cso = *cs;
+
+		ple_forward_streams(*t[0], *t[1], *t[2], *t[3], *t[4], *t[5], *t[6],
+		                    *t[7], cso, eps, gs, dil, *delta, *cstream);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+/* Gated-residual mix, fused decode form (vendor hc_mix.cu gr_mix) */
+void gr_mix
+(
+	const at::Tensor& streams, const at::Tensor& fn, const at::Tensor& upt,
+	const at::Tensor& w, double rms_eps, at::Tensor dots,
+	c10::optional<at::Tensor> post, at::Tensor mixed
+);
+
+/*
+ * gr_mix(streams, fn, upx, w, eps, inject): [post | null, mixed]
+ *
+ * Qwen3.8-Flash-Next gated-residual mix for R <= 8 rows (decode / verify):
+ * streams (R, 4, D) fp32; fn (rank [+ 4], 4*D) fp16 = cat(down, inject) * w
+ * (folded); upx (4, D/4, rank, 4) fp16 = the up projection repacked for the
+ * kernel's rank loop; w (4*D) fp16 = hc_norm + 1. Returns post (R, 4) fp32
+ * (the injection gates, when inject) and the mixed sublayer input (R, D)
+ * fp16. Allocates its outputs (capture-safe: graph pool).
+ */
+static uc_value_t *
+torch_gr_mix(uc_vm_t *vm, size_t nargs)
+{
+	double eps;
+
+	if (nargs != 6 || !arg_number(vm, uc_fn_arg(4), &eps)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (streams, fn, upx, w, eps, inject)");
+		return NULL;
+	}
+
+	at::Tensor *st = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *fn = st ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *upx = fn ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	at::Tensor *w = upx ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+	bool inject = ucv_is_truish(uc_fn_arg(5));
+
+	if (!w)
+		return NULL;
+
+	if (st->dim() != 3 || st->size(1) != 4 || st->scalar_type() != at::kFloat ||
+	    !st->is_contiguous() || st->size(2) % 128 || !st->is_cuda() || st->size(0) > 8)
+		RAISE("gr_mix: streams must be a contiguous fp32 CUDA tensor (R <= 8, 4, D), D % 128 == 0");
+
+	try {
+		TensorDeviceGuard dg(*st);
+
+		int64_t R = st->size(0), D = st->size(2);
+		int64_t M = fn->size(0) + 1;
+		at::Tensor dots = at::empty({ R, M, 4 }, st->options());
+		at::Tensor post = at::empty({ R, 4 }, st->options());
+		at::Tensor mixed = at::empty({ R, D }, st->options().dtype(at::kHalf));
+		c10::optional<at::Tensor> po;
+
+		if (inject)
+			po = post;
+
+		gr_mix(*st, *fn, *upx, *w, eps, dots, po, mixed);
+
+		uc_value_t *r = ucv_array_new(vm);
+
+		ucv_array_push(r, inject ? tensor_wrap(vm, std::move(post), 0) : NULL);
+		ucv_array_push(r, tensor_wrap(vm, std::move(mixed), 0));
+
+		return r;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+extern "C" long
+amp_qsa_attn_ws_floats(int R, int Hq, int Hk, int E, int ns);
+
+extern "C" int
+amp_qsa_attn_fp16(const void *q, const void *kc, const void *vc, const int *idx,
+                 void *ws, void *out, int R, int Hq, int Hk, int E, int Kt,
+                 int ns, float scale, cudaStream_t stream);
+
+/*
+ * qsa_attn(q, k_cache, v_cache, idx, scale, splits?): out
+ *
+ * Gathered GQA attention (Qwen3.8-Flash-Next QSA): q (R, Hq, E) fp16, the K/V
+ * caches (max_seq, Hk, E) fp16, idx (R, Kt) int32 — per query row the cache
+ * rows it attends to, -1 = padding. Returns (R, Hq, E) fp16. splits: KV
+ * splits per (row, kv head); default sized so the launch fills the GPU.
+ */
+static uc_value_t *
+torch_qsa_attn(uc_vm_t *vm, size_t nargs)
+{
+	double scale;
+
+	if (nargs < 5 || nargs > 6 || !arg_number(vm, uc_fn_arg(4), &scale)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q, k_cache, v_cache, idx, scale, splits?)");
+		return NULL;
+	}
+
+	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *kc = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *vc = kc ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	at::Tensor *idx = vc ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+
+	if (!idx)
+		return NULL;
+
+	if (q->dim() != 3 || kc->dim() != 3 || vc->dim() != 3 || idx->dim() != 2 ||
+	    q->scalar_type() != at::kHalf || kc->scalar_type() != at::kHalf ||
+	    vc->scalar_type() != at::kHalf || idx->scalar_type() != at::kInt ||
+	    !q->is_contiguous() || !kc->is_contiguous() || !vc->is_contiguous() ||
+	    !idx->is_contiguous() || !q->is_cuda() || q->size(0) != idx->size(0) ||
+	    kc->size(1) != vc->size(1) || kc->size(2) != q->size(2) ||
+	    vc->size(2) != q->size(2) || q->size(1) % kc->size(1))
+		RAISE("qsa_attn: q (R, Hq, E) fp16, caches (max_seq, Hk, E) fp16, idx (R, Kt) int32, all contiguous CUDA");
+
+	try {
+		TensorDeviceGuard dg(*q);
+
+		int R = (int)q->size(0), Hq = (int)q->size(1), E = (int)q->size(2);
+		int Hk = (int)kc->size(1), Kt = (int)idx->size(1);
+		int64_t sp = 0;
+
+		if (nargs == 6 && !arg_int(vm, uc_fn_arg(5), &sp))
+			return NULL;
+
+		if (sp <= 0) {
+			sp = (R * Hk >= 256) ? 1 : (256 + R * Hk - 1) / (R * Hk);
+
+			if (sp > 16)
+				sp = 16;
+		}
+
+		at::Tensor ws = at::empty({ amp_qsa_attn_ws_floats(R, Hq, Hk, E, (int)sp) },
+			q->options().dtype(at::kFloat));
+		at::Tensor out = at::empty({ R, Hq, E }, q->options());
+
+		if (!launch_ok(vm, amp_qsa_attn_fp16(q->data_ptr(), kc->data_ptr(),
+		    vc->data_ptr(), (const int *)idx->data_ptr(), ws.data_ptr(), out.data_ptr(),
+		    R, Hq, Hk, E, Kt, (int)sp, (float)scale,
+		    c10::cuda::getCurrentCUDAStream().stream()), "qsa_attn"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 /*
  * kda_scan(q, k, v, beta, g, state, scale, states_out?): torch.tensor
  *
@@ -8050,6 +8370,11 @@ static const uc_function_list_t torch_fns[] = {
 	{ "layer_norm",	torch_layer_norm },
 	{ "hc_mix",	torch_hc_mix },
 	{ "hc_apply",	torch_hc_apply },
+	{ "gr_mix",	torch_gr_mix },
+	{ "qsa_attn",	torch_qsa_attn },
+	{ "ngram_hash",	torch_ngram_hash },
+	{ "ngram_dequant",	torch_ngram_dequant },
+	{ "ple_forward",	torch_ple_forward },
 	{ "image_prepare",	torch_image_prepare },
 	{ "gdn_scan",	torch_gdn_scan },
 	{ "kda_scan",	torch_kda_scan },

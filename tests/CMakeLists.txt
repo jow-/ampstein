@@ -184,3 +184,19 @@ amp_test(engine_store_quant)
 amp_test(glm5_tp_stages SCRIPT glm5_tp ENV AMP_GLM5_STAGES=3)
 amp_test(glm5_tp_graph_stages SCRIPT glm5_tp_graph ENV AMP_GLM5_STAGES=3)
 amp_test(glm5_mtp_stages SCRIPT glm5_mtp ENV AMP_GLM5_STAGES=3)
+
+# --- Qwen3.8-Flash-Next
+# qsa_attn: gathered-attention kernel vs reference
+amp_test(qsa_attn)
+# qwen4_full: full model vs the oracle
+amp_test(qwen4_full)
+# qwen4_mtp: MTP head acceptance
+amp_test(qwen4_mtp)
+# qwen4_vision: vision input
+amp_test(qwen4_vision)
+# qwen4_tp: tensor / expert parallel
+amp_test(qwen4_tp)
+# qwen4_depth: quality vs exllamav3 as a function of context depth
+amp_test(qwen4_depth)
+# qwen4_depth_decode: decode at depth: graph vs eager, determinism
+amp_test(qwen4_depth_decode)

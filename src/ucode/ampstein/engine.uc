@@ -392,6 +392,11 @@ export function create(model, opts) {
 				cl.conv_state.fill_(0);
 			}
 
+		// recurrent state outside the layer entries (qwen4: PLE conv tail +
+		// n-gram id context)
+		if (model.aux_reset)
+			model.aux_reset(cache);
+
 		cache.length = 0;
 	}
 
@@ -444,6 +449,16 @@ export function create(model, opts) {
 					push(rollback[a].s, cl.spec_states.narrow(0, a, 1), cl.spec_conv[a]);
 				}
 			}
+
+		// model-owned rollback state (qwen4: the PLE conv tail) next to the GDN states
+		if (model.spec_bufs) {
+			let extra = model.spec_bufs(cache, mtp_planned);
+
+			for (let a = 0; a < length(extra); a++) {
+				push(rollback[a].d, ...extra[a].d);
+				push(rollback[a].s, ...extra[a].s);
+			}
+		}
 	}
 
 	if (opts.graphs != false) {
@@ -539,6 +554,7 @@ export function create(model, opts) {
 
 	let last_hidden = null;  // target post-norm hidden at ids[-1]
 	let snap_hidden = null;  // ... at the snapshot boundary - 1
+	let snap_aux = null;     // model.aux_get() state at the snapshot boundary
 
 	let queue = [];
 	let job = null;
@@ -552,6 +568,9 @@ export function create(model, opts) {
 		cache.length = length(ids);
 		draft_len = length(ids);
 		last_hidden = snap_hidden;
+
+		if (model.aux_set && snap_aux)
+			model.aux_set(cache, snap_aux);
 	}
 
 	function reset_state() {
@@ -614,6 +633,11 @@ export function create(model, opts) {
 	// caches): else the store stays off
 	function store_supported() {
 		let kv = false;
+
+		// models with recurrent state outside the layer entries (qwen4's PLE
+		// layer) are not stored in RAM yet
+		if (model.aux_get)
+			return false;
 
 		for (let i = 0; i < cfg.num_hidden_layers; i++)
 			for (let cl in states(i)) {
@@ -1150,6 +1174,15 @@ export function create(model, opts) {
 
 				save_states(li, snap[li]);
 				j.snap_taken = true;
+			},
+			on_aux: function (chunk_end) {
+				if (snap_at && chunk_end == snap_at && model.aux_get) {
+					j.snap_aux = model.aux_get(cache);
+
+					// models without per-layer recurrent (GDN) state: the aux state IS the snapshot
+					if (!length(gdn_layers))
+						j.snap_taken = true;
+				}
 			}
 		};
 
@@ -1374,6 +1407,9 @@ export function create(model, opts) {
 
 		for (let k = 0; k <= ((a < W) ? a : W - 1); k++)
 			push(ids, c[k]);
+
+		if (model.aux_ids)
+			model.aux_ids(cache, ids);
 
 		dc.length = p_new + 1;
 		draft_len = p_new + 1;
@@ -1651,6 +1687,7 @@ export function create(model, opts) {
 			if (j.snap_taken) {
 				snap_ids = slice(j.ids, 0, j.snap_at);
 				snap_hidden = j.use_mtp ? j.snap_hid : null;
+				snap_aux = j.snap_aux;
 			}
 
 			if (j.use_mtp)
@@ -1957,6 +1994,70 @@ export function create(model, opts) {
 
 		queued: function () {
 			return length(queue);
+		},
+
+		/* ENGINE_PROBE: scan every persistent cache tensor (KV rows, indexer,
+		 * pooled blocks, GDN states, draft cache, PLE conv tail) for non-finite
+		 * values. Returns ["name: first-bad-row N/total", ...] (empty = clean). */
+		scan: function () {
+			let out = [];
+
+			function bad(t) {
+				let x = t.to('float32');
+
+				return x.sub(x).abs().max().item() != 0.0;     // NaN iff any element is inf/NaN
+			}
+
+			function first_bad(t) {
+				let n = t.shape()[0], lo = 0;
+
+				while (n > 1) {
+					let h = int(n / 2);
+
+					if (bad(t.narrow(0, lo, h)))
+						n = h;
+					else {
+						lo += h;
+						n -= h;
+					}
+				}
+
+				return lo;
+			}
+
+			function walk(name, v) {
+				if (v == null)
+					return;
+
+				if (type(v) == 'array') {
+					for (let i = 0; i < length(v); i++)
+						walk(name + `[${i}]`, v[i]);
+
+					return;
+				}
+
+				let sh;
+
+				try {sh = v.shape();} catch (e) {sh = null;}
+
+				if (sh != null) {
+					if (length(sh) && bad(v))
+						push(out, sprintf('%s: first-bad-row %d/%d', name, first_bad(v), sh[0]));
+
+					return;
+				}
+
+				if (type(v) == 'object')
+					for (let k in v)
+						if (k != 'cos' && k != 'sin')
+							walk(name + '.' + k, v[k]);
+			}
+
+			walk('layers', cache.layers);
+			walk('mtp', cache.mtp);
+			walk('ple', cache.ple ? {conv: cache.ple.conv} : null);
+
+			return out;
 		},
 
 		cached: function () {

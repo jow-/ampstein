@@ -44,7 +44,7 @@ function usage() {
 	printf("  --reasoning-nudge N   after N reason tokens append soft close nudge (default 0 off)\n");
 	printf("  --reasoning-limit Y   force-close reasoning after Y tokens (default 0 off)\n");
 	printf("  --no-vision           disable image input\n");
-	printf("  --arch ARCH           force architecture: auto|qwen35|glm5 (default auto)\n");
+	printf("  --arch ARCH           force architecture: auto|qwen35|glm5|qwen4 (default auto)\n");
 	printf("  --version             print version and exit\n");
 	printf("  --help                print this help and exit\n");
 }

@@ -31,6 +31,7 @@ GPUs from ucode scripts, with no Python in the loop.
 | Llama-3 style dense | `llama.uc` | EXL3 weights, CUDA-graph decode, library use (no server path) |
 | Qwen3.5 / Qwen3.8 hybrid (Gated DeltaNet) | `qwen35.uc` | layer split over several GPUs, CUDA-graph decode |
 | GLM-5.3-Flash | `glm5.uc` | MLA + KDA hybrid, MoE, DSA indexer, MTP, tensor / expert parallel stages, vision |
+| Qwen3.8-Flash-Next | `qwen4.uc` | sparse attention (QSA), per-layer embeddings, MoE, MTP, tensor / expert parallel |
 
 Engine features:
 

@@ -1,0 +1,135 @@
+# Qwen3.8-Flash-Next (`Qwen4ExpForConditionalGeneration`)
+
+Checkpoint: `/data/models/Qwen3.8-Flash-Next-exl3-6.05bpw` (~100 GB EXL3 +
+39 GB n-gram table). Reference: exllamav3 `architecture/qwen4_exp.py`
+(installed wheel). Oracle: `tests/oracle/make_qwen4_oracle.py`.
+
+## Architecture (from config.json / exllamav3)
+
+- 48 layers, hidden 2560, every 4th layer full attention (24 q heads, 2 kv heads,
+  head_dim 256, interleaved q gate, q/k RMSNorm +1, partial rotary 0.25, mrope),
+  the rest GDN (16 k heads, 48 v heads, dim 128, conv 4). Block output gate of the
+  GDN norm is **sigmoid** (`output_gate_type`), same math as the KDA out norm.
+- MoE on every layer: 512 experts, top 10, intermediate 640, softmax router
+  ("std": softmax over all logits, top-k), shared expert (640) times
+  `sigmoid(shared_expert_gate(x))`. Expert tensors are per-expert
+  (`mlp.experts.N.{gate,up,down}_proj`), like GLM.
+- **Gated-residual hyper-connections** (`GatedResidual`), 4 fp32 streams, replace
+  the input/post layernorms: per-stream RMSNorm (weight applied as 1+w) ->
+  low-rank sigmoid gate (`input_mix_weight_down/up`, rank 320) selects what each
+  stream contributes to the **mean** that feeds the sublayer; the sublayer output
+  is injected as `x[h] += post[h] * y`, `post = 2*sigmoid(block_inject(flat)/4)`.
+  No Sinkhorn / comb matrix. Reference: `GatedResidual._mix_ref`.
+  Final `hyper_connection_mixer` = same mix without inject (`use_combine=False`),
+  **no final norm**, then lm_head.
+- Streams start as the embedding broadcast to 4 fp32 streams (`ExpandStreams`).
+- **PLE layer** before block idx 1 (`ple_layer_ids = [2]`, 1-based): hashed n-gram
+  embedding (ngram 3, 8 heads per n-gram, 16 rows of 160 -> 2560) -> key_proj (one
+  key per stream), value_proj (shared value); signed-sqrt dot gate against the
+  normed streams; dilated (3) depthwise causal conv (k=4) over the normed gated
+  values; added to all streams. Recurrent state: conv tail
+  ((k-1)*dilation columns) + the last ngram-1 token ids.
+- **n-gram table** (`ngram_embedding.safetensors`, 39 GB, exl3_ngram_trellis
+  rows of 160 values): never resident on a GPU. Per forward the token ids are
+  hashed on the host, the *unique* rows (a few hundred per chunk) are gathered
+  from the mmap'd file (page cache = RAM, else SSD), uploaded, dequantized with
+  `ngram_dequant`. Kernels are already in `vendor/exl3` (`ngram.cu`, `ple.cu`).
+- **QSA** indexer on full-attention layers: block (4 tokens) mean-pooled keys,
+  top 512 blocks + tail block; dense attention is *exact* up to
+  `4*512+3 = 2051` tokens, so the sparse path is only needed beyond that.
+- MTP head (`mtp.*`, 1 full-attention block, own embeddings off) and the Qwen3.5
+  vision tower (no deepstack) follow after the text path.
+
+## Implementation (ucode/qwen4.uc)
+
+- Layer split over all GPUs (`qwen4.load(dir, { devices: N })`, layers spread evenly);
+  one function set serves the oracle test (`forward_chunk`), the engine
+  (`prefill_pipeline` wavefront runner, `graphs`, `aux_get/aux_set/aux_reset`) and
+  the benchmark (`examples/bench_qwen4.uc`).
+- Gated-residual mix: composite ATen ops for prefill rows (the cuBLAS-path
+  reference in exllamav3), the vendored fused `gr_mix` kernels for <= 8 rows
+  (`torch.gr_mix`; folded `cat(down, inject) * w` and repacked `up` tables built at
+  load). The streams are (rows, 4, D) fp32 and `torch.hc_apply` (comb = null)
+  injects the sublayer output.
+- PLE: `ple_prepare` (host: hash + gather the unique table rows from the mmap'd
+  `ngram_embedding.safetensors`, `ngram_dequant` on the GPU) and `ple_apply`
+  (device: `torch.ple_forward`, conv tail updated in place) so the second half is
+  capturable. The table is never loaded: a chunk touches a few hundred rows.
+- MoE: glm5.uc's `moe_begin/moe_finish` (fused decode kernel for <= 8 rows,
+  token-sorted fused kernel for prefill) with `router: 'softmax'` (softmax over 512
+  logits, top 10, renormalised) and the sigmoid-gated shared expert.
+- QSA: per full-attention layer a raw indexer key cache (max_seq, 128) and a pooled
+  block cache (max_seq / 4, 128); the KV cache is (max_seq, kvh, hd) so selected
+  tokens are a row gather. Prefill uses 64-query slabs (host-computed block counts),
+  dense FlashAttention below 2051 tokens. The decode graphs use fixed shapes: the
+  selection scans all pooled capacity masked per query, gathers 2052 tokens, and
+  every position-dependent index comes from one packed int64 buffer rewritten
+  before each replay (`dev_state` / `dev_values`).
+- Engine: `model.aux_*` snapshot / restore / reset the PLE state next to the GDN
+  states (the conv tail is a persistent tensor, so a snapshot copies it). The RAM
+  store and hot reload are off for this model (store layout assumes the (1, kvh, n,
+  hd) cache of the dense Qwen).
+- MTP (`build_mtp`, `mtp_step`/`mtp_core`, model hooks `mtp_chunk`, `spec_bufs`,
+  `aux_ids`): the draft input is the flattened pre-mixer stream stack (4 x 2560 fp16,
+  `model.hidden_width`), per-stream tap as in exllamav3 (27.7% vs 42.8% teacher-forced
+  with averaged streams, `AMP_QWEN4_MTP_TAP=0`). The verify graph (S = window) keeps the GDN
+  states and the PLE conv tail after each row for the rollback; the PLE id context is
+  resynced from the accepted history after every round. The async device-id round is
+  off (the PLE hash needs host ids), the synchronous round is used.
+- Vision: `qwen35_vision` loads this checkpoint unchanged; `cache.mm` feeds the
+  embedding overlay and `rope_rows` (MRoPE) for the main attention of every attention
+  layer, the indexer uses plain positions; decode graphs carry the rope positions
+  (`rpos`) in the packed index buffer.
+
+## Measured (six-GPU host, 6 x RTX A5000/A5500, 6.05 bpw, layer split)
+
+- vs exllamav3 (oracle fixtures): blocks 0-3 rel-rms 2-3e-3; whole model logits
+  4-6e-2 (noise amplification, like GLM), argmax 24/24, greedy continuation 12/12;
+  4523-token prompt through the sparse path: argmax 62/64, continuation 8/8.
+- Decode: eager 44 ms/token (fused mix), graphs 22-25 ms/token (40-45 tok/s), also
+  at 4.5k context (23.7 ms; the eager attention was 56 ms there). Profile of a
+  graph step: 8-bit projections (exl3 gemm, bandwidth bound) 8 ms, MoE kernels
+  5 ms, gated-residual mixes 3.6 ms, router/top-k/elementwise the rest.
+- Prefill: 1590 tok/s on a 4.5k prompt (wavefront, chunk 1024); 2.0k tok/s at 29k
+  depth; the sparse attention is the fused `torch.qsa_attn` kernel (the composite ATen
+  version gave 1.2k at the same depth). Model load 53 s, 57 s to serve.
+- Long context (server, ctx 131072, needle-in-a-haystack, 17-20 GiB per GPU): 37k
+  tokens and 102k tokens (needle at 15% and at 50%) answered exactly; 102k prefill
+  968 tok/s on the first (cold) request, 2.7k tok/s for the 87k new tokens of the
+  second; decode 37-43 tok/s at 102k depth.
+
+- MTP head accuracy on the model's own greedy output (depth 1): prose 70%, explanation
+  88%, code 98%, list 84%. Server decode, 200 tokens greedy: plain 37-42 tok/s; MTP
+  window 2: 46-59; window 3: 51-75 (default); window 4: no better. Greedy output
+  differs from plain decode at floating-point near-ties (also between two plain
+  kernel configurations), the code prompt is byte-identical.
+- Vision: the tower's embeddings vs exllamav3 cosine 0.9998 (rel-rms 1.9e-2); with
+  exllamav3's own embeddings injected (AMP_VIS_EMB debug override in the server) the
+  description matches in content; short questions ("red", "ucode", "4") are identical.
+
+## Tensor parallel (`--tp`, ucode/qwen4_tp.uc)
+
+Every layer on all ranks: GDN by k-head pairs, MoE expert-parallel (experts split over
+the ranks, shared expert and attention on one owner rank per layer, rotating), the
+streams and the gated-residual tables replicated, PLE on rank 0 (broadcast), the head
+sharded by vocabulary, P2P all-reduces, one multi-GPU CUDA graph per step size and a
+draft-step graph for MTP. Streamed straight from the checkpoint (60-77 s). Measured on
+the 6 GPUs: plain decode 20.8 ms/token vs 23-25 for the layer split; with MTP window 3
+52 / 79 / 93 / 66 tok/s (layer split 51 / 65 / 75 / 53); at 102k depth 57-84 tok/s;
+prefill 457-657 tok/s (host-bound, `--chunk 4096` default) vs 1.6-2.7k. See L99 for the
+analysis of why the decode gain is modest.
+
+`--tp --stages 3` (3 groups of 2 ranks, layers 0-15 / 16-31 / 32-47): the groups hand the
+replicated streams on, decode is one multi-GPU graph through all of them, and prefill
+is a wavefront (one chunk per group in flight; the host launches for 2 ranks per layer).
+Steady-state prefill 2.0-2.1k tok/s at 32-37k tokens (stages 1: 0.7k, stages 2: 1.3k),
+plain decode 23.2 ms/token (stages 2: 21.6, stages 1: 20.8), MTP 52 / 66 / 77 / 56 tok/s,
+17.7-19.3 GiB per GPU at ctx 131072. This is the recommended TP setting; plain
+`--tp` (one group) decodes ~10% faster but prefills at a third of the speed.
+
+## Open
+
+- Balance the TP attention layers (the owner rank runs the QSA chain alone, ~285 us
+  of arrival spread per attention layer) and the expert-parallel MoE.
+- RAM store / hot reload for the PLE state, fused router kernel (`routing.cu` is
+  vendored but not built), the async device-id MTP round (needs a device-side PLE hash).

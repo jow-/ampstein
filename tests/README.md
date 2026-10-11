@@ -28,6 +28,7 @@ Models are found through `AMP_MODEL_*` (the default is a directory under
 | `AMP_MODEL_1B` | llama tests (Llama-3.2-1B-Instruct EXL3) |
 | `AMP_MODEL_QWEN35` | Qwen3.5 / 3.8 tests |
 | `AMP_MODEL_GLM5` | GLM-5.3-Flash tests |
+| `AMP_MODEL_QWEN4` | Qwen3.8-Flash-Next tests |
 
 ## Fixtures
 
@@ -54,6 +55,9 @@ python3 tests/oracle/make_glm5_long_oracle.py     # glm5_long
 python3 tests/oracle/make_glm5_ppl_oracle.py      # glm5_ppl
 python3 tests/oracle/make_glm5_vision_oracle.py   # glm5_vision
 python3 tests/oracle/make_chat_glm5_oracle.py     # glm5_chat, chat_jinja, utpl_template
+python3 tests/oracle/make_qwen4_oracle.py         # qwen4_full, qwen4_mtp, qwen4_tp
+python3 tests/oracle/make_qwen4_depth_oracle.py   # qwen4_depth*
+python3 tests/oracle/make_qwen4_vision_oracle.py  # qwen4_vision
 ```
 
 Each script documents its arguments (model directory, output) in its docstring.

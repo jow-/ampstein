@@ -73,6 +73,12 @@ endforeach()
 # --- mHC mixing (GLM-5.3)
 list(APPEND EXL3_KERNEL_SRCS ${EXL3_DIR}/hc_mix.cu)
 
+# --- Qwen3.8-Flash-Next: n-gram embedding, per-layer embeddings, norms
+list(APPEND EXL3_KERNEL_SRCS
+    ${EXL3_DIR}/ngram.cu
+    ${EXL3_DIR}/ple.cu
+    ${EXL3_DIR}/norm.cu)
+
 add_library(exl3_kernels OBJECT ${EXL3_KERNEL_SRCS})
 
 target_include_directories(exl3_kernels PRIVATE

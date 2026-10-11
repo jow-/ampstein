@@ -19,3 +19,4 @@ ucode -L build/lib -L src/ucode -ltorch=ampstein.torch examples/<script>.uc [-- 
 | `perf_server.uc` | the server's decode path outside the server (layer split or `--tp`) |
 | `bench_allreduce.uc` | latency of the P2P all-reduce inside a CUDA graph |
 | `bench_glm5.uc`, `bench_prefill_glm5.uc`, `mem_glm5.uc` | GLM-5.3-Flash decode latency, prefill throughput, per-GPU memory |
+| `bench_qwen4.uc` | Qwen3.8-Flash-Next decode / prefill timing |

@@ -27,6 +27,8 @@ import * as qwen35_vision from './qwen35_vision.uc';
 import * as glm5 from './glm5.uc';
 import * as glm5_tp from './glm5_tp.uc';
 import * as glm5_vision from './glm5_vision.uc';
+import * as qwen4 from './qwen4.uc';
+import * as qwen4_tp from './qwen4_tp.uc';
 
 // digest.so is optional (not built on every host): images are then keyed
 // by a cheap length+sample fingerprint instead of SHA-256
@@ -102,17 +104,32 @@ export function serve(args) {
 		}
 		catch (e) {}
 
-		args.arch = (index(arch, 'Glm5Next') == 0) ? 'glm5' : 'qwen35';
+		args.arch = (index(arch, 'Glm5Next') == 0) ? 'glm5' :
+			(index(arch, 'Qwen4Exp') == 0) ? 'qwen4' : 'qwen35';
 	}
 
 	const GLM = (args.arch == 'glm5');
+	const Q4 = (args.arch == 'qwen4');       // Qwen3.8-Flash-Next (qwen4.uc)
 
-	// default device count: every GPU for GLM (117 GB), two for the dense Qwen
+	// default device count: every GPU for GLM (117 GB) and Qwen-Flash-Next (100 GB),
+	// two for the dense Qwen
 	if (args.gpus == null)
-		args.gpus = GLM ? torch.device_count() : 2;
+		args.gpus = (GLM || Q4) ? torch.device_count() : 2;
+
+	// Qwen3.8-Flash-Next: the verify window is the draft window, so a window of 1 verifies a
+	// single row and cannot gain anything; 3 measured best (2: 1.25-1.45x, 3: 1.4-1.8x, 4: same)
+	if (Q4 && args.mtp == 1)
+		args.mtp = 2;
+
+	// tensor-parallel prefill is host-bound per chunk (thousands of launches across the ranks per
+	// layer pass): bigger chunks amortise it (37k tokens: 4096 -> 657 tok/s)
+	if (Q4 && args.tp && !args.chunk_set)
+		args.chunk = (args.stages > 1) ? 1024 : 4096;
+
 
 	let chat = GLM ? chat_glm5 : chat_qwen35;
-	let cfg = GLM ? glm5.load_config(args.model) : qwen35.load_config(args.model);
+	let cfg = GLM ? glm5.load_config(args.model) :
+		Q4 ? qwen4.load_config(args.model) : qwen35.load_config(args.model);
 
 	/* The transpiled chat template: chat_template.jinja -> jinja2utpl ->
 	   loadstring, compiled ONCE here; this closure is invoked for every
@@ -157,11 +174,16 @@ export function serve(args) {
 			glm5.load(args.model, {devices: args.gpus, mtp: args.mtp > 0, kv_bits: kv_bits,
 				max_seq: args.ctx});
 	}
+	else if (Q4) {
+		model = args.tp ? qwen4_tp.load(args.model, {devices: args.gpus, mtp: args.mtp > 0,
+			prefill_rows: args.chunk, stages: args.stages}) :
+			qwen4.load(args.model, {devices: args.gpus, mtp: args.mtp > 0});
+	}
 	else {
 		model = qwen35.load(args.model, {devices: devs, mtp: args.mtp > 0});
 	}
 
-	if (args.tp && !GLM) {
+	if (args.tp && !GLM && !Q4) {
 		if (args.gpus < 2) {
 			warn('ampstein: --tp needs --gpus >= 2\n');
 			exit(1);
@@ -182,14 +204,14 @@ export function serve(args) {
 		warmup: args.warmup,
 		cache_ram: args.cache_ram,
 		cache_quant: args.cache_quant,
-		graphs: (GLM && getenv('AMP_GLM5_NO_GRAPHS')) ? false : null
+		graphs: ((GLM || Q4) && getenv('AMP_GLM5_NO_GRAPHS')) ? false : null
 	});
 
 	let banner = `ampstein: model loaded in ${time() - t0}s`;
 
 	if (args.tp)
 		banner += `, tensor parallel over ${model.G} GPUs` +
-			(GLM ? ' (expert parallel MoE)' : ` (${model.comm.info().mode} all-reduce)`);
+			((GLM || Q4) ? ' (expert parallel MoE)' : ` (${model.comm.info().mode} all-reduce)`);
 
 	if (eng.mtp_window)
 		banner += `, MTP speculative decoding (window ${eng.mtp_window})`;
@@ -209,7 +231,7 @@ export function serve(args) {
 	(function restore_cache() {
 		let meta;
 
-		if (GLM)
+		if (GLM || Q4)
 			return;     // the cache-state file format is Qwen-specific for now
 		try {
 			meta = json(readfile(CACHE_META));
@@ -548,6 +570,15 @@ export function serve(args) {
 				why += ', previous state moved to RAM';
 
 			why += ']';
+		}
+
+		if (getenv('AMP_ENGINE_PROBE') != null) {
+			let ta = clock(true);
+			let bad = eng.scan();
+			let tb = clock(true);
+
+			warn(sprintf('scan: %s (%.0f ms)\n', length(bad) ? join('; ', bad) : 'clean',
+				(tb[0] - ta[0]) * 1000 + (tb[1] - ta[1]) / 1e6));
 		}
 
 		warn(sprintf('%s: prompt %d (cached %d via %s%s), prefill %d tok in %.0f ms (%.1f tok/s), ' +
@@ -1107,7 +1138,7 @@ export function serve(args) {
 		shutting_down = true;
 
 		try {
-			if (GLM)
+			if (GLM || Q4)
 				die('not supported for this architecture yet');
 			let n = eng.save_state(CACHE_ST);
 
