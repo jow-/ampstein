@@ -29,6 +29,7 @@ Models are found through `AMP_MODEL_*` (the default is a directory under
 | `AMP_MODEL_QWEN35` | Qwen3.5 / 3.8 tests |
 | `AMP_MODEL_GLM5` | GLM-5.3-Flash tests |
 | `AMP_MODEL_QWEN4` | Qwen3.8-Flash-Next tests |
+| `AMP_MODEL_DSV4` | DeepSeek-V4-Flash tests |
 
 ## Fixtures
 
@@ -58,6 +59,9 @@ python3 tests/oracle/make_chat_glm5_oracle.py     # glm5_chat, chat_jinja, utpl_
 python3 tests/oracle/make_qwen4_oracle.py         # qwen4_full, qwen4_mtp, qwen4_tp
 python3 tests/oracle/make_qwen4_depth_oracle.py   # qwen4_depth*
 python3 tests/oracle/make_qwen4_vision_oracle.py  # qwen4_vision
+python3 tests/oracle/make_dsv4_oracle.py          # dsv4_full, dsv4_tp
+python3 tests/oracle/make_dsv4_vision_oracle.py   # dsv4_vision
+python3 tests/oracle/make_tokenizer_dsv4_oracle.py # tokenizer_dsv4
 ```
 
 Each script documents its arguments (model directory, output) in its docstring.

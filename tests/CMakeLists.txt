@@ -200,3 +200,30 @@ amp_test(qwen4_tp)
 amp_test(qwen4_depth)
 # qwen4_depth_decode: decode at depth: graph vs eager, determinism
 amp_test(qwen4_depth_decode)
+
+# --- DeepSeek-V4
+# tokenizer_dsv4: pre-tokenizer Sequence of splits vs the HF oracle
+amp_test(tokenizer_dsv4)
+# dsv4_full: full model vs the oracle
+amp_test(dsv4_full)
+# dsv4_vision: ViT tower + aligner vs the oracle
+amp_test(dsv4_vision)
+# dsv4_sideho: stage hand-off copies on a side stream
+amp_test(dsv4_sideho)
+# engine_eos: end-of-turn hook: accept / soft bias / forced text
+amp_test(engine_eos)
+# engine_store_dsv4: host-RAM store for compressed pools + aux state
+amp_test(engine_store_dsv4)
+# dsv4_store_state: restored cache == fresh prefill (model level)
+amp_test(dsv4_store_state)
+# engine_slots_dsv4: resident device slots in front of the host store
+amp_test(engine_slots_dsv4)
+# engine_slice: time-sliced co-generation of concurrent sessions
+amp_test(engine_slice)
+# dsv4_tp: 3x2 tensor-parallel pipeline vs the layer split
+amp_test(dsv4_tp)
+# dsv4_verify: multi-row verify graphs
+amp_test(dsv4_verify)
+# engine_dspark: DSpark through the engine
+amp_test(engine_dspark)
+

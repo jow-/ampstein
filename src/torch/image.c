@@ -361,6 +361,17 @@ glm5_canvas(int num_frames, int height, int width, int temporal, int factor,
 }
 
 int
+amp_image_info(const unsigned char *data, size_t len, int *w, int *h)
+{
+	int comp;
+
+	if (len > 0x7fffffffu || !stbi_info_from_memory(data, (int)len, w, h, &comp))
+		return -1;
+
+	return 0;
+}
+
+int
 amp_image_prepare(const unsigned char *data, size_t len,
 	const struct amp_image_params *p, struct amp_image_result *res,
 	char *err, size_t errlen)

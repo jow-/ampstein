@@ -41,10 +41,14 @@ function usage() {
 	printf("  --tp-share F          tensor-parallel share (two GPUs, default 0.5)\n");
 	printf("  --name NAME           served model name (default: basename of --model)\n");
 	printf("  --cache-ram GiB       page-locked host RAM for parked states (default 32, 0 off)\n");
+	printf("  --slots N|auto        resident device slots, DeepSeek-V4 (default auto)\n");
+	printf("  --slice-tokens N      time-slice a generation after N tokens (default 256, 0 off)\n");
+	printf("  --slice-ms N          time-slice by wall-clock ms (default 0 off)\n");
 	printf("  --reasoning-nudge N   after N reason tokens append soft close nudge (default 0 off)\n");
 	printf("  --reasoning-limit Y   force-close reasoning after Y tokens (default 0 off)\n");
+	printf("  --eos-hook SCRIPT     call SCRIPT when the model ends its turn\n");
 	printf("  --no-vision           disable image input\n");
-	printf("  --arch ARCH           force architecture: auto|qwen35|glm5|qwen4 (default auto)\n");
+	printf("  --arch ARCH           force architecture: auto|qwen35|glm5|qwen4|dsv4 (default auto)\n");
 	printf("  --version             print version and exit\n");
 	printf("  --help                print this help and exit\n");
 }
@@ -92,9 +96,15 @@ function parse_args() {
 		reasoning_nudge: 0,
 		reasoning_limit: 0,
 		cache_ram: 32,
+		slots: 'auto',
+		slot_margin: 512,
+		slice_ms: 0,
+		slice_tokens: 256,
 		cache_quant: null,
 		reasoning_nudge_text: null,
 		reasoning_close_text: null,
+		eos_hook: null,
+		eos_hook_max: 4,
 		name: null,
 		arch: 'auto',
 		vision: true,
@@ -126,7 +136,13 @@ function parse_args() {
 		case '--cache-mode': a.cache_mode = uc(v); i++; break;
 		case '--reasoning-nudge': a.reasoning_nudge = int(v); i++; break;
 		case '--reasoning-limit': a.reasoning_limit = int(v); i++; break;
+		case '--eos-hook': a.eos_hook = v; i++; break;
+		case '--eos-hook-max': a.eos_hook_max = int(v); i++; break;
 		case '--cache-ram': a.cache_ram = +v; i++; break;
+		case '--slots': a.slots = (v == 'auto') ? 'auto' : int(v); i++; break;
+		case '--slot-margin': a.slot_margin = +v; i++; break;
+		case '--slice-ms': a.slice_ms = +v; i++; break;
+		case '--slice-tokens': a.slice_tokens = int(v); i++; break;
 		case '--cache-quant': a.cache_quant = (v == 'off') ? 'off' : (a.cache_quant || {}); i++; break;
 		case '--cache-quant-min': a.cache_quant = { ...(a.cache_quant || {}), min: int(v) }; i++; break;
 		case '--cache-quant-tail': a.cache_quant = { ...(a.cache_quant || {}), tail: int(v) }; i++; break;
@@ -143,6 +159,8 @@ function parse_args() {
 		case '--tp': a.tp = true; break;
 		case '--tp-share': a.tp_share = +v; i++; break;
 		case '--stages': a.stages = int(v); i++; break;
+		case '--dspark-window': a.dspark_window = int(v); i++; break;
+		case '--layer-split': a.layer_split = true; break;
 		default:
 			warn(`unknown argument '${k}'\n`);
 			exit(1);

@@ -32,6 +32,13 @@
 //   job.sampling   {temperature, top_k, top_p, min_p, seed,
 //                    presence_penalty, frequency_penalty}
 //   job.stop_ids   token ids that end generation (not emitted)
+//   job.on_eos(n)  optional: a stop id was sampled (n earlier consultations
+//                  of this job); return true to let the generation end, a
+//                  number > 0 to redraw the position with the stop ids' logits
+//                  lowered by that much, or a non-empty array of token ids to
+//                  force them instead (the stop is discarded and the
+//                  generation continues after them). job.eos_max (default 4)
+//                  limits the consultations per job.
 //   job.on_progress(done, total)   prefill progress, return false to abort
 //   job.on_token(id)               return false to stop
 //   job.on_done(info)              {reason, prompt_tokens, cached_tokens,
@@ -461,8 +468,17 @@ export function create(model, opts) {
 		}
 	}
 
+	// DSpark block drafter (DeepSeek-V4, model.dspark): rounds of draft + verify with a
+	// verify window of `dsv` drafts; greedy and sampled requests (one-hot draft rule)
+	let SP = (model.dspark && opts.dspark_window !== 0) ? model.dspark : null;
+	let dsv = SP ? (opts.dspark_window || 4) : 0;
+
 	if (opts.graphs != false) {
 		let sizes = [ 1 ];
+
+		if (SP)
+			for (let k = 2; k <= dsv + 1; k++)
+				push(sizes, k);
 
 		// with per-position states only the verify size replays; the
 		// snapshot path re-runs 2..W-1 accepted tokens as well
@@ -474,6 +490,15 @@ export function create(model, opts) {
 
 		graph = model.graphs ? model.graphs(cache, sizes) :
 			qgraph.create(model, cache, sizes);
+
+		if (SP) {
+			let wins = [ 0 ];
+
+			for (let k = 1; k <= dsv; k++)
+				push(wins, k);
+
+			SP.build(graph, cache, wins);
+		}
 
 		zero_states();
 	}
@@ -558,6 +583,9 @@ export function create(model, opts) {
 
 	let queue = [];
 	let job = null;
+	let parked = [], pick_parked = false;
+	const SLICE_MS = (opts.slice_ms == null) ? 0 : +opts.slice_ms;
+	const SLICE_TOK = (opts.slice_tokens == null) ? 0 : +opts.slice_tokens;
 	let timer = null;
 
 	function restore_snapshot() {
@@ -614,6 +642,12 @@ export function create(model, opts) {
 	let store_bytes = 0;
 	let store_budget = int((opts.cache_ram || 0) * 1073741824);
 
+	// device-resident parked slots in front of the host store (opts.slots: 'auto' = as many as fit
+	// after everything else is allocated | N | 0; opts.slot_margin: MiB kept free on every GPU).
+	// An entry in a slot swaps back device to device (milliseconds, no PCIe).
+	let slots_free = [], slots_total = 0;
+	let slots_cfg = (opts.slots == null) ? 'auto' : opts.slots;
+
 	function elsize(t) {
 		let d = t.dtype();
 
@@ -633,6 +667,11 @@ export function create(model, opts) {
 	// caches): else the store stays off
 	function store_supported() {
 		let kv = false;
+
+		// the model exports / imports its whole cache itself (DeepSeek-V4: compressed
+		// pools + compressor / window aux state + drafter ring)
+		if (model.cache_export)
+			return !!(model.cache_import && model.cache_bytes);
 
 		// models with recurrent state outside the layer entries (qwen4's PLE
 		// layer) are not stored in RAM yet
@@ -654,9 +693,12 @@ export function create(model, opts) {
 		return kv && (!cache.mtp || cache.mtp.k_cache != null);
 	}
 
-	if (store_budget > 0 && !store_supported()) {
-		warn('engine: host-RAM cache store not supported by this model, disabled\n');
+	if ((store_budget > 0 || slots_cfg != 0) && !store_supported()) {
+		if (store_budget > 0)
+			warn('engine: host-RAM cache store not supported by this model, disabled\n');
+
 		store_budget = 0;
+		slots_cfg = 0;
 	}
 
 	function to_host(src, e) {
@@ -770,6 +812,9 @@ export function create(model, opts) {
 	function store_estimate() {
 		let n = length(ids), b = 0;
 
+		if (model.cache_bytes)
+			return model.cache_bytes(cache, n);
+
 		for (let i = 0; i < cfg.num_hidden_layers; i++)
 			for (let cl in states(i)) {
 				if (!is_gdn(i)) {
@@ -801,36 +846,179 @@ export function create(model, opts) {
 	function store_drop(k) {
 		store_bytes -= store[k].bytes;
 
+		if (store[k].slot)
+			push(slots_free, store[k].slot);
+
 		splice(store, k, 1);
+	}
+
+	// index of the oldest entry in the given tier (device: has a slot), -1 when none
+	function oldest(dev) {
+		for (let k = 0; k < length(store); k++)
+			if (!!store[k].slot == dev && (dev || !store[k].owner))     // (a parked job's host entry is not evictable)
+				return k;
+
+		return -1;
+	}
+
+	// a model-specific entry tree (arrays / objects / tensors / numbers) copied to pinned host memory
+	function host_tree(v, e) {
+		if (v == null)
+			return null;
+
+		let t = type(v);
+
+		if (t == 'array')
+			return map(v, (x) => host_tree(x, e));
+
+		if (t == 'object') {
+			let o = {};
+
+			for (let k in v)
+				o[k] = host_tree(v[k], e);
+
+			return o;
+		}
+
+		return (t == 'resource') ? to_host(v, e) : v;
+	}
+
+	function tree_bytes(v) {
+		if (v == null)
+			return 0;
+
+		let t = type(v), b = 0;
+
+		if (t == 'array') {
+			for (let x in v)
+				b += tree_bytes(x);
+		}
+		else if (t == 'object') {
+			for (let k in v)
+				b += tree_bytes(v[k]);
+		}
+		else if (t == 'resource')
+			b = tbytes(v);
+
+		return b;
+	}
+
+	/* Move a device-resident entry to host RAM (frees its slot), or drop it when the host
+	 * budget cannot take it. */
+	function demote(k) {
+		let e = store[k];
+		let b = tree_bytes(e.model);
+
+		if (store_budget <= 0 || b > store_budget) {
+			store_drop(k);
+
+			return;
+		}
+
+		store_bytes -= e.bytes;
+		splice(store, k, 1);
+
+		// make room among the host entries first
+		while (store_bytes + b > store_budget) {
+			let o = oldest(false);
+
+			if (o < 0)
+				break;
+
+			store_drop(o);
+		}
+
+		let h = {bytes: 0};
+
+		try {
+			e.model = host_tree(e.model, h);
+			e.bytes = h.bytes;
+			store_bytes += h.bytes;
+			push(slots_free, e.slot);
+			e.slot = null;
+			unshift(store, e);                     // oldest
+		}
+		catch (err) {
+			warn(`engine: cache store: demotion failed (${err.message}), entry dropped\n`);
+			push(slots_free, e.slot);
+		}
 	}
 
 	/* Move the live state (and its snapshot) to host RAM. Returns true when
 	 * stored; any failure leaves the store as it was. */
-	function store_put() {
+	/* owner: the job whose live state is being parked (time slicing): any length, the entry is
+	 * linked to the job (owner.park) and invisible to prefix lookups; else the plain store. */
+	function store_put(owner) {
 		let n = length(ids);
 		let est = store_estimate();
 
-		if (n < STORE_MIN_TOKENS || cache.length != n)
+		if ((!owner && n < STORE_MIN_TOKENS) || cache.length != n)
 			return false;
 
-		if (store_budget <= 0 || est > store_budget)
+		if (slots_total <= 0 && (store_budget <= 0 || est > store_budget))
 			return false;
 
 		// a stored state that is a prefix of this one is superseded
 		for (let k = length(store) - 1; k >= 0; k--)
-			if (lcp(store[k].ids, ids) == store[k].n)
+			if (!store[k].owner && lcp(store[k].ids, ids) == store[k].n)
 				store_drop(k);
 
-		// make room: evict the oldest entries
-		while (store_bytes + est > store_budget && length(store))
-			store_drop(0);
+		// a free device slot (else demote the oldest device entry), then the host store
+		let slot = null;
+
+		if (slots_total > 0) {
+			if (!length(slots_free) && oldest(true) >= 0)
+				demote(oldest(true));
+
+			if (length(slots_free))
+				slot = pop(slots_free);
+		}
+
+		if (!slot) {
+			if (store_budget <= 0 || est > store_budget)
+				return false;
+
+			while (store_bytes + est > store_budget && oldest(false) >= 0)
+				store_drop(oldest(false));
+		}
 
 		let e = {ids: slice(ids), n: n, bytes: 0, kv: {}, gdn: {}, dl: draft_len,
-			hid: null, snap_ids: null, snap: null, snap_hid: null, draft: null};
+			hid: null, snap_ids: null, snap: null, snap_hid: null, draft: null, slot: null};
 		let t0 = now_ms();
 
 		try {
 			torch.synchronize();
+
+			if (model.cache_export) {
+				// the model's own layout; the snapshot's aux state rides along when the
+				// snapshot is a prefix of the live state
+				let sa = (snap_ids != null && snap_aux != null && lcp(snap_ids, ids) == length(snap_ids)) ?
+					snap_aux : null;
+
+				e.model = slot ? model.cache_export(cache, n, (t) => t.add(0.0), sa, slot) :
+					model.cache_export(cache, n, (t) => to_host(t, e), sa);
+
+				if (slot) {
+					torch.synchronize();
+					e.slot = slot;
+				}
+
+				if (sa)
+					e.snap_ids = slice(snap_ids);
+
+				if (owner) {
+					e.owner = owner;
+					owner.park = e;
+				}
+
+				push(store, e);
+				store_bytes += e.bytes;
+				warn(sprintf('engine: cache store: %d tokens moved to %s in %.0f ms (%d entries, %d/%d slots free, %.2f GiB host)\n',
+					n, slot ? 'a device slot' : 'host RAM', now_ms() - t0, length(store), length(slots_free),
+					slots_total, store_bytes / 1073741824.0));
+
+				return true;
+			}
 
 			for (let i = 0; i < cfg.num_hidden_layers; i++) {
 				let sts = states(i);
@@ -859,7 +1047,15 @@ export function create(model, opts) {
 		catch (err) {
 			warn(`engine: cache store: offload failed (${err.message})\n`);
 
+			if (slot)
+				push(slots_free, slot);
+
 			return false;
+		}
+
+		if (owner) {
+			e.owner = owner;
+			owner.park = e;
 		}
 
 		push(store, e);
@@ -876,6 +1072,44 @@ export function create(model, opts) {
 	function store_restore(e, start) {
 		let t0 = now_ms();
 		let live = (start == e.n);
+
+		if (e.model) {
+			let r = model.cache_import(cache, e.model, start, live);
+
+			if (e.snap_ids) {
+				snap_ids = slice(e.snap_ids);
+				snap_aux = r.snap;
+			}
+			else {
+				snap_ids = null;
+				snap_aux = null;
+			}
+
+			snap_hidden = null;
+			last_hidden = null;
+
+			if (live) {
+				ids = slice(e.ids);
+				cache.length = e.n;
+				draft_len = 0;
+			}
+			else
+				restore_snapshot();
+
+			torch.synchronize();
+
+			let from_slot = !!e.slot;
+
+			if (e.slot) {
+				push(slots_free, e.slot);
+				e.slot = null;
+			}
+
+			warn(sprintf('engine: cache store: %d tokens restored from %s in %.0f ms\n',
+				start, from_slot ? 'a device slot' : 'host RAM', now_ms() - t0));
+
+			return;
+		}
 
 		for (let i = 0; i < cfg.num_hidden_layers; i++) {
 			let sts = states(i);
@@ -953,7 +1187,7 @@ export function create(model, opts) {
 			det.div_new = slice(prompt, max(live - 4, 0), live + 8);
 		}
 
-		if (store_budget <= 0)
+		if (store_budget <= 0 && slots_total <= 0)
 			return plan;
 
 		// best stored state that the prompt extends
@@ -961,6 +1195,9 @@ export function create(model, opts) {
 
 		for (let k = 0; k < length(store); k++) {
 			let e = store[k];
+
+			if (e.owner)
+				continue;            // a parked job's own state
 
 			let l = lcp(e.ids, prompt);
 
@@ -998,6 +1235,7 @@ export function create(model, opts) {
 			return plan;
 
 		det.ram_from = hit_start;
+		det.ram_tier = hit.slot ? 'device' : 'host';
 
 		let tr = now_ms();
 
@@ -1030,6 +1268,7 @@ export function create(model, opts) {
 			reuse: j.reuse_from,
 			reuse_detail: j.reuse_detail,
 			completion_tokens: j.generated,
+			preemptions: j.preempted || 0,
 			mtp: j.rounds ? {rounds: j.rounds, drafted: j.drafted,
 				accepted: j.accepted} : null,
 			timings: {
@@ -1151,6 +1390,13 @@ export function create(model, opts) {
 		// reuse point, and the target hidden state just before it
 		j.use_mtp = mtp_w > 0 && (plan.start == 0 ||
 			(last_hidden != null && draft_len == plan.start));
+		j.use_dspark = !!(SP && graph && graph.has(1) && !j.no_dspark);
+
+		if (j.use_dspark && !j.rounds) {
+			j.rounds = 0;
+			j.drafted = 0;
+			j.accepted = 0;
+		}
 
 		// pipelined prefill of the new tokens (wavefront over the
 		// layer split, see qwen35.prefill_pipeline); the snapshot
@@ -1168,6 +1414,7 @@ export function create(model, opts) {
 			cuts: snap_at ? [ snap_at ] : [],
 			hidden: j.use_mtp,
 			on_hidden: j.use_mtp ? (pos, H) => seed_chunk(j, pos, H) : null,
+			on_taps: SP ? (taps, pos) => SP.prefill_rows(taps, pos) : null,
 			on_layer: function (chunk_end, li) {
 				if (!snap_at || chunk_end != snap_at || !snap[li])
 					return;
@@ -1291,6 +1538,50 @@ export function create(model, opts) {
 	 * position i is (token i, target hidden at i-1); runs the MTP block
 	 * without its head, in chunks. */
 
+	/* A stop id was sampled and the consumer registered job.on_eos: the
+	 * position is redrawn from logits (any shape holding one row) with
+	 * the stop ids lowered by `bias` — exactly sampling the position
+	 * from the biased distribution (penalties, cuts and all). */
+	function biased_token(j, logits, bias) {
+		let l = logits.reshape([-1]).to('float32').add(0.0);   // a copy
+		let s = j.sampling || {};
+		let temp = (s.temperature != null) ? s.temperature : 1.0;
+
+		for (let id in j.stop_ids)
+			l.narrow(0, id, 1).add_(-bias);
+
+		if (temp <= 0)
+			return int(l.argmax().item());
+
+		return draw(dist(l, s, counts_for(j, l)), null);
+	}
+
+	/* Consult job.on_eos for a sampled stop token (logits: the row it was
+	 * drawn from). Returns {tok} with the token to use instead (it may
+	 * still be a stop id: the generation then ends), or {force} with
+	 * token ids to continue with. */
+	function eos_resolve(j, tok, logits) {
+		let max = j.eos_max || 4;
+
+		while (j.on_eos && index(j.stop_ids, tok) >= 0 && (j.eos_n || 0) < max) {
+			let v = j.on_eos(j.eos_n || 0);
+
+			j.eos_n = (j.eos_n || 0) + 1;
+
+			if (type(v) == 'array' && length(v))
+				return {force: v};
+
+			if ((type(v) == 'int' || type(v) == 'double') && v > 0 && logits != null) {
+				tok = biased_token(j, logits, v);
+				continue;
+			}
+
+			break;
+		}
+
+		return {tok: tok};
+	}
+
 	/* Hand control back to the event loop until the device work
 	 * completes: arm the notifier (the AND of the model's streams —
 	 * the wake-up means the forward AND the result copies are done)
@@ -1340,7 +1631,7 @@ export function create(model, opts) {
 			fail('internal error: ' + e.message);
 		}
 
-		if (!waiting && (job || length(queue)))
+		if (!waiting && (job || length(queue) || length(parked)))
 			timer.set(0);
 	}
 
@@ -1428,7 +1719,21 @@ export function create(model, opts) {
 			if (index(j.stop_ids, tok) >= 0) {
 				// (only the bonus can be a stop id here; row a of the verify
 				// output is the distribution it was drawn from)
-				return finish('stop');
+				let r = eos_resolve(j, tok, vrows ? vrows.narrow(0, a, 1) : null);
+
+				if (r.force) {
+					if (inject(j, r.force, true))
+						return;
+
+					return finish('stop');
+				}
+
+				tok = r.tok;
+
+				if (index(j.stop_ids, tok) >= 0)
+					return finish('stop');
+
+				j.t_next = tok;
 			}
 
 			j.generated++;
@@ -1622,12 +1927,149 @@ export function create(model, opts) {
 		mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows);
 	}
 
+	/* One DSpark round: draft + verify through three CUDA graphs (dspark_tp), accept
+	 * by the one-hot-draft rule (exact match at temperature 0, p(x) under the
+	 * sampling distribution otherwise), roll back by resetting the cache length. */
+	function dspark_round(j) {
+		let V = dsv;
+		let p0 = cache.length;
+		let seed = j.t_next;
+		let s = j.sampling || {};
+		let temp = (s.temperature != null) ? s.temperature : 1.0;
+
+		// near the context end or the token budget: plain decode for the rest
+		if (p0 + V + 3 >= max_ctx || j.max_new - j.generated < 2) {
+			j.phase = 'decode';
+			j.use_dspark = false;
+			j.logits = step_fwd([seed]);
+			push(ids, seed);
+
+			return;
+		}
+
+		let r = SP.run(seed, p0, dsv);                  // r.V <= dsv: the confident prefix of the drafts
+		let dr = r.dr;
+		let a = 0, bonus = null;
+
+		V = r.V;
+
+		let vrows = r.logits;   // (V + 1) verify rows, when the drafter hands them out
+
+		if (temp <= 0) {
+			while (a < V && r.am[a] == dr[a])
+				a++;
+
+			bonus = r.am[a];
+		}
+		else {
+			let cnt = counts_for(j, vrows);
+
+			for (let k = 0; k < V; k++) {
+				let x = dr[k];
+				let rr = spec_step(dist(vrows.narrow(0, k, 1), s, cnt), x);
+
+				if (rr.accepted) {
+					a++;
+					count_tok(j, x);
+					continue;
+				}
+
+				bonus = rr.token;
+				break;
+			}
+
+			if (bonus == null)
+				bonus = draw(dist(vrows.narrow(0, V, 1), s, cnt), null);
+		}
+
+		// a stop id among the accepted drafts ends the round there and
+		// becomes its bonus token (see mtp_finish)
+		for (let i = 0; i < a; i++) {
+			if (index(j.stop_ids, dr[i]) >= 0) {
+				a = i;
+				bonus = dr[i];
+				break;
+			}
+		}
+
+		// the cache holds the seed + the a accepted drafts
+		let fed = [ seed, ...slice(dr, 0, a) ];
+		let emit = slice(dr, 0, a);
+
+		push(emit, bonus);
+
+		cache.length = p0 + a + 1;
+		j.rounds++;
+		j.drafted += V;
+		j.accepted += a;
+
+		for (let k = 0; k < length(emit); k++) {
+			let tok = emit[k];
+			let stopped = null;
+
+			if (index(j.stop_ids, tok) >= 0) {
+				let rr = eos_resolve(j, tok, vrows ? vrows.narrow(0, a, 1) : null);
+
+				if (rr.force) {
+					// the seed and the accepted drafts are fed; the stop is dropped
+					push(ids, ...fed);
+
+					if (inject(j, rr.force, true))
+						return;
+
+					return finish('stop');
+				}
+
+				tok = rr.tok;
+				bonus = tok;
+			}
+
+			if (index(j.stop_ids, tok) >= 0) {
+				stopped = 'stop';
+			}
+			else {
+				j.generated++;
+
+				if (k >= a)
+					count_tok(j, tok);
+
+				if (j.on_token(tok) == false)
+					stopped = (j.alive && !j.alive()) ? 'cancelled' : 'stop';
+				else if (j.generated >= j.max_new)
+					stopped = 'length';
+			}
+
+			if (stopped) {
+				// rows kept: the seed and the drafts before this token
+				cache.length = p0 + k + 1;
+				push(ids, ...slice(fed, 0, k + 1));
+
+				return finish(stopped);
+			}
+		}
+
+		push(ids, ...fed);
+		j.t_next = bonus;
+
+		if (cache.length + 1 >= max_ctx)
+			return finish('length');
+	}
+
 	/* Consume one decoded token: emit, bookkeeping, and the next
 	 * forward (or the hand-over to the MTP phase). Runs from the
 	 * notifier callback after the sampling results arrived. */
 	function decode_after(j, tok, logits) {
-		if (index(j.stop_ids, tok) >= 0)
-			return finish('stop');
+		if (index(j.stop_ids, tok) >= 0) {
+			let r = eos_resolve(j, tok, logits);
+
+			if (r.force)
+				return inject(j, r.force, true) ? null : finish('stop');
+
+			tok = r.tok;
+
+			if (index(j.stop_ids, tok) >= 0)
+				return finish('stop');
+		}
 
 		j.generated++;
 		count_tok(j, tok);
@@ -1645,6 +2087,13 @@ export function create(model, opts) {
 		if (j.use_mtp) {
 			j.t_next = tok;
 			j.phase = 'mtp';
+			return;
+		}
+
+		// DSpark: the sampled token seeds the next round (it is not in the cache yet)
+		if (j.use_dspark) {
+			j.t_next = tok;
+			j.phase = 'dspark';
 			return;
 		}
 
@@ -1713,6 +2162,9 @@ export function create(model, opts) {
 		if (j.phase == 'mtp')
 			return mtp_round(j);
 
+		if (j.phase == 'dspark')
+			return dspark_round(j);
+
 		// decode: sample from the pending logits, emit, feed back.
 		// The sampling runs on the GPU; the host only walks the kept
 		// candidates once the notifier delivers the results, so the
@@ -1742,6 +2194,171 @@ export function create(model, opts) {
 		});
 	}
 
+	/* --- time slicing: co-generation ----------------------------------------------------
+	 * With opts.slice_tokens > 0 and / or opts.slice_ms > 0 a job that has generated that many
+	 * tokens (or run that long) since it last got the GPU, while other sessions wait (queued, or
+	 * parked earlier), is PARKED at the step boundary (a speculative round may overshoot the
+	 * token count by a few tokens): its whole live state goes
+	 * through the store (a device slot when there is one, else host RAM) as an entry owned by the
+	 * job, the next session runs, and the parked job resumes later where it stopped (restoring
+	 * the entry exactly; the pending logits of a plain decode are carried by the job). Sessions
+	 * alternate round-robin, a new arrival and a parked job taking turns. Without contention
+	 * nothing changes. Only decode-phase jobs are sliced; a prefill runs to completion. */
+	function should_preempt() {
+		let j = job;
+
+		if ((SLICE_MS <= 0 && SLICE_TOK <= 0) || (slots_total <= 0 && store_budget <= 0))
+			return false;
+
+		if (j.phase != 'decode' && j.phase != 'dspark' && j.phase != 'mtp')
+			return false;
+
+		if (!length(queue) && !length(parked))
+			return false;
+
+		if (!j.t_slice) {
+			j.t_slice = now_ms();
+			j.g_slice = j.generated;
+
+			return false;
+		}
+
+		return (SLICE_TOK > 0 && j.generated - j.g_slice >= SLICE_TOK) ||
+			(SLICE_MS > 0 && now_ms() - j.t_slice >= SLICE_MS);
+	}
+
+	function preempt() {
+		let j = job;
+		let lg = (j.phase == 'decode' && j.logits) ? j.logits.add(0.0) : null;   // out of the graph buffer
+		let saved_ids = slice(ids);
+		let t0 = now_ms();
+
+		j.park = null;
+
+		if (!store_put(j) || !j.park) {
+			j.t_slice = now_ms();       // cannot park (no room): carry on, ask again after another slice
+			j.g_slice = j.generated;
+
+			return false;
+		}
+
+		j.pend_logits = lg;
+		j.park_ids = saved_ids;
+		j.logits = null;
+		j.preempted = (j.preempted || 0) + 1;
+		j.t_slice = null;
+		push(parked, j);
+		job = null;
+
+		// the live state is in the entry now: the engine starts empty (the buffers are overwritten)
+		ids = [];
+		snap_ids = null;
+		snap_aux = null;
+		snap_hidden = null;
+		draft_len = 0;
+		last_hidden = null;
+		cache.length = 0;
+
+		warn(sprintf('engine: job parked after %d tokens (%.0f ms), %d queued, %d parked\n',
+			j.generated, now_ms() - t0, length(queue), length(parked)));
+
+		return true;
+	}
+
+	// a parked job that was cancelled while it waited: free its entry
+	function release_parked(j) {
+		for (let k = 0; k < length(store); k++)
+			if (store[k] == j.park) {
+				store_drop(k);
+				break;
+			}
+
+		j.park = null;
+		j.pend_logits = null;
+		j.on_done({reason: 'cancelled', prompt_tokens: length(j.ids), cached_tokens: j.reuse_start,
+			reuse: j.reuse_from, reuse_detail: j.reuse_detail, completion_tokens: j.generated,
+			preemptions: j.preempted || 0});
+	}
+
+	function unpark(j) {
+		let e = j.park;
+		let k = -1;
+
+		for (let i = 0; i < length(store); i++)
+			if (store[i] == e) {
+				k = i;
+				break;
+			}
+
+		// the engine's live state belongs to whoever ran last: keep it as the plan would
+		if (length(ids) >= STORE_MIN_TOKENS)
+			store_put();
+
+		// (the entry may have moved in the list)
+		k = -1;
+
+		for (let i = 0; i < length(store); i++)
+			if (store[i] == e) {
+				k = i;
+				break;
+			}
+
+		job = j;
+		j.park = null;
+		j.t_slice = now_ms();
+		j.g_slice = j.generated;
+
+		try {
+			let mm = model.mm_build ? model.mm_build(cfg, j.images) : qwen35.mm_build(cfg, j.images);
+
+			cache.mm = mm;
+
+			if (cache.mtp)
+				cache.mtp.mm = mm;
+		}
+		catch (err) {
+			return fail('invalid image input: ' + err.message);
+		}
+
+		if (k >= 0) {
+			splice(store, k, 1);
+			store_bytes -= e.bytes;
+			store_restore(e, e.n);
+
+			j.logits = j.pend_logits;
+			j.pend_logits = null;
+
+			// the MTP chain needs the draft cache and hidden of exactly this position; without
+			// them (a state stored without a draft) the rest of the job decodes plainly
+			if (j.phase == 'mtp' && !(cache.mtp && draft_len == cache.length && last_hidden != null)) {
+				j.use_mtp = false;
+				j.phase = 'decode';
+				j.logits = step_fwd([ j.t_next ]);
+				push(ids, j.t_next);
+			}
+
+			warn(sprintf('engine: job resumed at %d tokens (%d preemptions)\n', length(ids), j.preempted));
+
+			return;
+		}
+
+		// the entry is gone: re-prefill what the cache held (+ the pending seed) and carry on
+		let tail = (j.phase == 'mtp' || j.phase == 'dspark') ? [ j.t_next ] : [];
+		let keep = {rounds: j.rounds, drafted: j.drafted, accepted: j.accepted, t_prefill_done: j.t_prefill_done};
+
+		j.ids = [ ...j.park_ids, ...tail ];
+		j.snap_at = 0;
+		j.phase = 'prefill';
+		j.injected = (j.injected || 0) + 1;
+		j.pend_logits = null;
+		warn(`engine: parked state lost, re-prefilling ${length(j.ids)} tokens\n`);
+		start_prefill(j);
+		j.rounds = keep.rounds;
+		j.drafted = keep.drafted;
+		j.accepted = keep.accepted;
+		j.t_prefill_done = keep.t_prefill_done;
+	}
+
 	function tick() {
 		/* a submit() during a pending GPU continuation re-arms the
 		 * timer; the continuation's tail re-arms after it runs — do
@@ -1749,18 +2366,37 @@ export function create(model, opts) {
 		if (waiting)
 			return;
 
+		// a parked job whose client went away must not hold its slot
+		for (let i = length(parked) - 1; i >= 0; i--)
+			if (parked[i].alive && !parked[i].alive()) {
+				release_parked(parked[i]);
+				splice(parked, i, 1);
+			}
+
+		if (job && should_preempt())
+			preempt();
+
 		if (!job) {
-			while (length(queue) && !job) {
-				let j = shift(queue);
+			while ((length(queue) || length(parked)) && !job) {
+				let from_parked = length(parked) && (!length(queue) || pick_parked);
+				let j = from_parked ? shift(parked) : shift(queue);
+
+				pick_parked = !from_parked;      // alternate while both wait
 
 				if (j.alive && !j.alive()) {
-					j.on_done({reason: 'cancelled', prompt_tokens: length(j.ids),
-						cached_tokens: 0, completion_tokens: 0});
+					if (from_parked)
+						release_parked(j);
+					else
+						j.on_done({reason: 'cancelled', prompt_tokens: length(j.ids),
+							cached_tokens: 0, completion_tokens: 0});
 
 					continue;
 				}
 
-				begin(j);
+				if (from_parked)
+					unpark(j);
+				else
+					begin(j);
 			}
 
 			if (!job)
@@ -1775,7 +2411,7 @@ export function create(model, opts) {
 			fail('internal error: ' + e.message);
 		}
 
-		if (!waiting && (job || length(queue)))
+		if (!waiting && (job || length(queue) || length(parked)))
 			timer.set(0);
 	}
 
@@ -1972,6 +2608,78 @@ export function create(model, opts) {
 
 	warmup();
 
+	/* Resident slots: after everything else is allocated (weights, graphs, the warm-up working
+	 * set), take full-size pool arenas until a GPU is out of memory or has only the margin
+	 * left (opts.slot_margin MiB, default 512). That count is the number of conversations
+	 * that can be parked on the device besides the live one. */
+	function alloc_slots() {
+		if (slots_cfg == 0 || !model.new_slot || !model.devs)
+			return;
+
+		let cap = (slots_cfg == 'auto') ? 256 : int(slots_cfg);   // (auto: as many as fit, 256 at most)
+		let margin = (opts.slot_margin == null ? 512 : +opts.slot_margin) * 1048576;
+		let t0 = now_ms();
+		let why = 'requested count reached';
+
+		function free_of(d) {
+			return torch.mem_info(d)[2];
+		}
+
+		function min_free() {
+			let f = null;
+
+			for (let d in model.devs) {
+				let m = free_of(d);
+
+				if (f == null || m < f)
+					f = m;
+			}
+
+			return f;
+		}
+
+		// per-device cost of the previous slot: the allocator keeps a freed block reserved, so a slot
+		// cannot be given back to the driver; stop BEFORE the allocation that would breach the margin
+		let cost = null;
+
+		while (slots_total < cap) {
+			if (cost) {
+				let short = false;
+
+				for (let i = 0; i < length(model.devs); i++)
+					if (free_of(model.devs[i]) < cost[i] + margin)
+						short = true;
+
+				if (short) {
+					why = sprintf('margin reached (%.0f MiB free, %.0f MiB per slot)', min_free() / 1048576.0,
+						max(...cost) / 1048576.0);
+					break;
+				}
+			}
+
+			let before = map(model.devs, free_of);
+			let s;
+
+			try {
+				s = model.new_slot(max_ctx);
+				torch.synchronize();
+			}
+			catch (e) {
+				why = 'out of memory';
+				break;
+			}
+
+			cost = map(model.devs, (d, i) => max(before[i] - free_of(d), 0));
+			push(slots_free, s);
+			slots_total++;
+		}
+
+		warn(sprintf('engine: %d resident cache slots (%s) allocated in %.1f s, %.0f MiB free on the fullest GPU\n',
+			slots_total, why, (now_ms() - t0) / 1000.0, min_free() / 1048576.0));
+	}
+
+	alloc_slots();
+
 	return {
 		max_ctx: max_ctx,
 
@@ -2066,6 +2774,9 @@ export function create(model, opts) {
 			c.draft = draft_len;
 			c.stored = length(store);
 			c.stored_bytes = store_bytes;
+			c.slots = slots_total;
+			c.slots_free = length(slots_free);
+			c.parked = length(parked);
 
 			return c;
 		},

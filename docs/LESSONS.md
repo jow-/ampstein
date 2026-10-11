@@ -278,3 +278,34 @@ Add new lessons at the end of the matching section.
 - **L100 — Stages beat micro-chunks:** fewer launches per layer, not overlap,
   cured the host-bound TP prefill (716 → ~2000 tok/s). Time the second repetition
   of any prefill measurement.
+
+## DeepSeek-V4
+
+- **L104d — Strided views into EXL3 kernels.** `x.narrow(1, g, 1).reshape(...)`
+  returns a view with the parent's row stride and the kernels read contiguous
+  rows: always `.contiguous()` first.
+- **L105d, L109d — Massive activations.** First-token rows reach 1e5, so the fp16
+  collapse and EXL3 projections overflow to inf / NaN and the NaN spreads through
+  the compressor pools. The reference saturates; so does `hc_collapse`, and tap
+  rows are scaled into range before the projection.
+- **L106d — An HF pre-tokenizer `Sequence` applies every Split, in order.**
+- **L107d — Per-block errors on real text are not a pass criterion** (atomic
+  accumulation, router near-ties): judge logits / argmax / NLL and isolated
+  single-layer tests fed with the oracle's own inputs.
+- **L108d, L112d, L114d — Prefill.** Measure host time per phase before and after
+  a change. A count readback per MoE layer stalled the host (2.5 of 3.9 s); once
+  it was gone the limiters were launch count, then stage hand-off copies and
+  pipeline bubbles. A slice benchmark does not predict the full model.
+- **L110d — Speculative decoding on a sparse MoE** verifies the union of the rows'
+  experts: a 5-row verify costs ~2x a step, so the useful window is 4-5 drafts.
+- **L111d — Engine integration.** A leftover `graphs: false` skipped graph
+  construction *and* the drafter's build with a null deref deep in the first
+  request; a partial-model engine test exercises the plumbing in 90 s.
+- **L113d — Vision.** Image rows route on `gate.bias_vl`, the image proper must be
+  one prefill chunk, and the block layout is tied to the compressor group size.
+- **L115d — 262144-token context.** Raw key rows live in a ring (attention reads
+  128 of them; snapshots copy the window), and the indexer's per-head score
+  matrix is never materialised (`idx_score` handles 64 heads in one kernel).
+- **L116 — A premature end of turn is a model decision.** Intervene at the stop
+  token (`job.on_eos`): redraw with the stop ids lowered, or force text. A stop
+  accepted as a speculative draft must truncate the round and become the bonus.

@@ -47,6 +47,9 @@ int amp_image_prepare(const unsigned char *data, size_t len,
 	const struct amp_image_params *p, struct amp_image_result *res,
 	char *err, size_t errlen);
 
+/* Decoded size of an encoded image without decoding the pixels; 0 or -1. */
+int amp_image_info(const unsigned char *data, size_t len, int *w, int *h);
+
 /* Qwen2-VL smart resize: dims are (height, width); returns 0 or -1. */
 int amp_smart_resize(int height, int width, int factor, long min_pixels,
 	long max_pixels, int *out_h, int *out_w, char *err, size_t errlen);

@@ -3725,6 +3725,34 @@ amp_qk_norm_rope_fp16(const void *x, long st, long sh, const void *w,
                      int hd, int rd, float eps, cudaStream_t stream);
 
 extern "C" int
+amp_dsv4_qkv_fp16(const void *q_raw, const void *kv_raw, const void *kv_w,
+                 const void *inv_freq, const void *pos_f, const void *pos_i,
+                 void *kvcache, void *q_out, int S, int H, int D, int rd, float eps,
+                 float qscale, int fp8, int kvcap, cudaStream_t stream);
+
+extern "C" int
+amp_dsv4_derot_fp16(const void *o, const void *inv_freq, const void *pos_f, void *out,
+                   int R, int H, int D, int rd, cudaStream_t stream);
+
+extern "C" int
+amp_dsv4_mask_fp16(void *out, int R, int nk, int ne, long qpos0, long base, int W, int m, long ncstart,
+                  cudaStream_t stream);
+
+extern "C" int
+amp_dsv4_comp_fp16(const void *kvr, const void *gtr, const void *ape,
+                  void *buf_kv, void *buf_g, void *ovl_kv, void *ovl_g,
+                  void *pool, const void *norm_w, const void *inv_freq,
+                  const void *pos_i, int S, int m, int hd, int W, int rd,
+                  float eps, cudaStream_t stream);
+
+extern "C" int
+amp_dsv4_attn_fp16(const void *q, const void *kvc, const void *pos_i,
+                  const void *pos_f, const void *pool, const void *idx,
+                  const void *sinks, const void *inv_freq, void *out, int S, int H,
+                  int D, int rd, int W, int m, int np_max, float scale, int nc_block, int kvcap,
+                  cudaStream_t stream);
+
+extern "C" int
 amp_attn_gate_fp16(const void *a, long ast, long ash, const void *g, long gst,
                   long gsh, void *out, int S, int H, int hd, cudaStream_t stream);
 
@@ -4641,6 +4669,329 @@ f32_arg(uc_vm_t *vm, uc_value_t *v, const char *what)
 	}
 
 	return t;
+}
+
+/* int64 CUDA tensor argument */
+static at::Tensor *
+i64_arg(uc_vm_t *vm, uc_value_t *v, const char *what)
+{
+	at::Tensor *t = tensor_arg(vm, v);
+
+	if (!t)
+		return NULL;
+
+	if (t->scalar_type() != at::kLong || !t->is_cuda() || !t->is_contiguous()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"%s: must be a contiguous int64 CUDA tensor", what);
+		return NULL;
+	}
+
+	return t;
+}
+
+/*
+ * dsv4_qkv(q_raw, kv_raw, kv_norm_w, inv_freq, pos_f, pos_i, kvcache,
+ *          rope_dim, eps): q_out
+ *
+ * DeepSeek-V4 decode: q_raw (H, D) fp16 -> per-head RMSNorm + GPT-J rope at
+ * the DEVICE position; kv_raw (D) -> weighted RMSNorm + rope, written to
+ * kvcache row pos_i. pos_f float32 (1), pos_i int64 (1), inv_freq float32.
+ */
+static uc_value_t *
+torch_dsv4_qkv(uc_vm_t *vm, size_t nargs)
+{
+	int64_t rd, fp8 = 0;
+	double eps, qscale = 1.0;
+
+	if (nargs < 9 || nargs > 11 || !arg_int(vm, uc_fn_arg(7), &rd) ||
+	    !arg_number(vm, uc_fn_arg(8), &eps) ||
+	    (nargs >= 10 && !arg_number(vm, uc_fn_arg(9), &qscale)) ||
+	    (nargs == 11 && !arg_int(vm, uc_fn_arg(10), &fp8))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q_raw, kv_raw, kv_norm_w, inv_freq, pos_f, pos_i, kvcache, rope_dim, eps, qscale?)");
+		return NULL;
+	}
+
+	at::Tensor *q = fused_arg(vm, uc_fn_arg(0), "dsv4_qkv: q_raw", false);
+	at::Tensor *kv = q ? fused_arg(vm, uc_fn_arg(1), "dsv4_qkv: kv_raw", false) : NULL;
+	at::Tensor *w = kv ? fused_arg(vm, uc_fn_arg(2), "dsv4_qkv: kv_norm_w", false) : NULL;
+	at::Tensor *fr = w ? f32_arg(vm, uc_fn_arg(3), "dsv4_qkv: inv_freq") : NULL;
+	at::Tensor *pf = fr ? f32_arg(vm, uc_fn_arg(4), "dsv4_qkv: pos_f") : NULL;
+	at::Tensor *pi = pf ? i64_arg(vm, uc_fn_arg(5), "dsv4_qkv: pos_i") : NULL;
+	at::Tensor *cache = pi ? fused_arg(vm, uc_fn_arg(6), "dsv4_qkv: kvcache", false) : NULL;
+
+	if (!cache)
+		return NULL;
+
+	/* q_raw (H, D) or (S, H, D); kv_raw (D) or (S, D) */
+	int64_t qS = (q->dim() == 3) ? q->size(0) : 1;
+	int64_t qH = (q->dim() == 3) ? q->size(1) : q->size(0);
+	int64_t qD = q->size(-1);
+
+	if ((q->dim() != 2 && q->dim() != 3) || kv->numel() != qS * qD || w->numel() != qD ||
+	    fr->numel() * 2 != rd || cache->dim() != 2 || cache->size(1) != qD) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "dsv4_qkv: incompatible shapes");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		at::Tensor out = at::empty_like(*q);
+		int rc = amp_dsv4_qkv_fp16(q->data_ptr(), kv->data_ptr(), w->data_ptr(),
+			fr->data_ptr(), pf->data_ptr(), pi->data_ptr(), cache->data_ptr(),
+			out.data_ptr(), (int)qS, (int)qH, (int)qD, (int)rd, (float)eps, (float)qscale, (int)fp8, (int)cache->size(0),
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "dsv4_qkv"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * dsv4_comp(kv_row, gate_row, ape, buf_kv, buf_g, ovl_kv|null, ovl_g|null,
+ *           n, pool, norm_w, inv_freq, pos_f, pos_i, m, rope_dim, eps)
+ *
+ * One token into a V4 compressor (in place): buffers the projected rows
+ * (fp16 (W)) in buf_* (m, W) fp32 at slot pos % m and, when the window is
+ * complete, pools / norms / ropes it and appends it to pool row n (int64
+ * (1), incremented). ovl_* (m, hd) fp32 select the overlapping scheme.
+ */
+static uc_value_t *
+torch_dsv4_comp(uc_vm_t *vm, size_t nargs)
+{
+	int64_t m, rd;
+	double eps;
+
+	if (nargs != 14 || !arg_int(vm, uc_fn_arg(11), &m) || !arg_int(vm, uc_fn_arg(12), &rd) ||
+	    !arg_number(vm, uc_fn_arg(13), &eps)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (kv_rows, gate_rows, ape, buf_kv, buf_g, ovl_kv, ovl_g, pool, norm_w, "
+			"inv_freq, pos_i, m, rope_dim, eps)");
+		return NULL;
+	}
+
+	at::Tensor *kv = fused_arg(vm, uc_fn_arg(0), "dsv4_comp: kv_rows", false);
+	at::Tensor *gt = kv ? fused_arg(vm, uc_fn_arg(1), "dsv4_comp: gate_rows", false) : NULL;
+	at::Tensor *ape = gt ? f32_arg(vm, uc_fn_arg(2), "dsv4_comp: ape") : NULL;
+	at::Tensor *bk = ape ? f32_arg(vm, uc_fn_arg(3), "dsv4_comp: buf_kv") : NULL;
+	at::Tensor *bg = bk ? f32_arg(vm, uc_fn_arg(4), "dsv4_comp: buf_g") : NULL;
+	at::Tensor *ok = NULL, *og = NULL;
+
+	if (bg && ucv_type(uc_fn_arg(5)) != UC_NULL) {
+		ok = f32_arg(vm, uc_fn_arg(5), "dsv4_comp: ovl_kv");
+		og = ok ? f32_arg(vm, uc_fn_arg(6), "dsv4_comp: ovl_g") : NULL;
+
+		if (!og)
+			return NULL;
+	}
+
+	at::Tensor *pool = bg ? fused_arg(vm, uc_fn_arg(7), "dsv4_comp: pool", false) : NULL;
+	at::Tensor *nw = pool ? fused_arg(vm, uc_fn_arg(8), "dsv4_comp: norm_w", false) : NULL;
+	at::Tensor *fr = nw ? f32_arg(vm, uc_fn_arg(9), "dsv4_comp: inv_freq") : NULL;
+	at::Tensor *pi = fr ? i64_arg(vm, uc_fn_arg(10), "dsv4_comp: pos_i") : NULL;
+
+	if (!pi)
+		return NULL;
+
+	int hd = (int)pool->size(1);
+	int64_t W = (ok ? 2 : 1) * (int64_t)hd;
+	int64_t S = kv->numel() / W;
+
+	if (S < 1 || kv->numel() != S * W || gt->numel() != S * W || ape->numel() != (int64_t)m * W ||
+	    bk->numel() != (int64_t)m * W || bg->numel() != (int64_t)m * W || nw->numel() != hd ||
+	    fr->numel() * 2 != rd ||
+	    (ok && (ok->numel() != 3 * (int64_t)m * hd || og->numel() != 3 * (int64_t)m * hd))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "dsv4_comp: incompatible shapes");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*kv);
+
+	int rc = amp_dsv4_comp_fp16(kv->data_ptr(), gt->data_ptr(), ape->data_ptr(),
+		bk->data_ptr(), bg->data_ptr(), ok ? ok->data_ptr() : NULL,
+		og ? og->data_ptr() : NULL, pool->data_ptr(), nw->data_ptr(),
+		fr->data_ptr(), pi->data_ptr(), (int)S, (int)m, hd, (int)W, (int)rd,
+		(float)eps, c10::cuda::getCurrentCUDAStream().stream());
+
+	if (!launch_ok(vm, rc, "dsv4_comp"))
+		return NULL;
+
+	return ucv_boolean_new(true);
+}
+
+/*
+ * dsv4_attn(q, kvcache, pos_i, pos_f, pool|null, idx|null, sinks, inv_freq,
+ *           window, m, rope_dim, np_max, scale): out (H, D) fp16
+ *
+ * One-token V4 attention for all heads: sliding window of `window` rows of
+ * kvcache ending at pos_i, plus the pool (dense: entries j with
+ * (j + 1) * m <= pos + 1, at most np_max; gathered: idx int64 (K) rows,
+ * -1 invalid; np_max = K), attention sinks (H) fp32, V = K, output rope
+ * slice rotated back by the position.
+ */
+static uc_value_t *
+torch_dsv4_attn(uc_vm_t *vm, size_t nargs)
+{
+	int64_t W, m, rd, npm, ncb = 0;
+	double scale;
+
+	if ((nargs != 13 && nargs != 14) || !arg_int(vm, uc_fn_arg(8), &W) || !arg_int(vm, uc_fn_arg(9), &m) ||
+	    !arg_int(vm, uc_fn_arg(10), &rd) || !arg_int(vm, uc_fn_arg(11), &npm) ||
+	    !arg_number(vm, uc_fn_arg(12), &scale) ||
+	    (nargs == 14 && !arg_int(vm, uc_fn_arg(13), &ncb))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q, kvcache, pos_i, pos_f, pool, idx, sinks, inv_freq, window, m, "
+			"rope_dim, np_max, scale, nc_block?)");
+		return NULL;
+	}
+
+	at::Tensor *q = fused_arg(vm, uc_fn_arg(0), "dsv4_attn: q", false);
+	at::Tensor *kc = q ? fused_arg(vm, uc_fn_arg(1), "dsv4_attn: kvcache", false) : NULL;
+	at::Tensor *pi = kc ? i64_arg(vm, uc_fn_arg(2), "dsv4_attn: pos_i") : NULL;
+	at::Tensor *pf = pi ? f32_arg(vm, uc_fn_arg(3), "dsv4_attn: pos_f") : NULL;
+	at::Tensor *pool = NULL, *idx = NULL;
+
+	if (pf && ucv_type(uc_fn_arg(4)) != UC_NULL) {
+		pool = fused_arg(vm, uc_fn_arg(4), "dsv4_attn: pool", false);
+
+		if (!pool)
+			return NULL;
+	}
+
+	if (pf && ucv_type(uc_fn_arg(5)) != UC_NULL) {
+		idx = i64_arg(vm, uc_fn_arg(5), "dsv4_attn: idx");
+
+		if (!idx)
+			return NULL;
+	}
+
+	at::Tensor *sk = pf ? f32_arg(vm, uc_fn_arg(6), "dsv4_attn: sinks") : NULL;
+	at::Tensor *fr = sk ? f32_arg(vm, uc_fn_arg(7), "dsv4_attn: inv_freq") : NULL;
+
+	if (!fr)
+		return NULL;
+
+	int64_t aS = (q->dim() == 3) ? q->size(0) : 1;
+	int64_t aH = (q->dim() == 3) ? q->size(1) : q->size(0);
+	int64_t aD = q->size(-1);
+
+	if ((q->dim() != 2 && q->dim() != 3) || sk->numel() != aH || kc->size(1) != aD ||
+	    fr->numel() * 2 != rd || (idx && !pool) || (idx && idx->numel() != aS * npm)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "dsv4_attn: incompatible shapes");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		at::Tensor out = at::empty_like(*q);
+		int rc = amp_dsv4_attn_fp16(q->data_ptr(), kc->data_ptr(), pi->data_ptr(),
+			pf->data_ptr(), pool ? pool->data_ptr() : NULL, idx ? idx->data_ptr() : NULL,
+			sk->data_ptr(), fr->data_ptr(), out.data_ptr(), (int)aS, (int)aH,
+			(int)aD, (int)rd, (int)W, (int)m, (int)npm, (float)scale, (int)ncb, (int)kc->size(0),
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "dsv4_attn"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * dsv4_derot(o, inv_freq, pos_f): out
+ *
+ * o (R, H, D) fp16: rotate the trailing rope slice back by the position pos_f[0] + r
+ * (GPT-J pairs); returns a new fp16 tensor of the same shape.
+ */
+static uc_value_t *
+torch_dsv4_derot(uc_vm_t *vm, size_t nargs)
+{
+	int64_t rd;
+
+	if (nargs != 4 || !arg_int(vm, uc_fn_arg(3), &rd)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (o, inv_freq, pos_f, rope_dim)");
+		return NULL;
+	}
+
+	at::Tensor *o = fused_arg(vm, uc_fn_arg(0), "dsv4_derot: o", false);
+	at::Tensor *fr = o ? f32_arg(vm, uc_fn_arg(1), "dsv4_derot: inv_freq") : NULL;
+	at::Tensor *pf = fr ? f32_arg(vm, uc_fn_arg(2), "dsv4_derot: pos_f") : NULL;
+
+	if (!pf)
+		return NULL;
+
+	if (o->dim() != 3 || fr->numel() * 2 != rd) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "dsv4_derot: incompatible shapes");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*o);
+
+	try {
+		at::Tensor out = at::empty_like(*o);
+		int rc = amp_dsv4_derot_fp16(o->data_ptr(), fr->data_ptr(), pf->data_ptr(), out.data_ptr(),
+			(int)o->size(0), (int)o->size(1), (int)o->size(2), (int)rd,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "dsv4_derot"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * dsv4_mask(device, R, nk, ne, qpos0, base, window, m): (R, nk + ne) fp16
+ *
+ * Additive prefill mask: window columns c < nk (key row base + c) and pool columns
+ * (entry j visible iff (j + 1) * m <= qpos + 1); query r is at qpos0 + r.
+ */
+static uc_value_t *
+torch_dsv4_mask(uc_vm_t *vm, size_t nargs)
+{
+	int64_t dev, R, nk, ne, qpos0, base, W, m, ncstart = -1;
+
+	if (nargs == 9 && !arg_int(vm, uc_fn_arg(8), &ncstart))
+		return NULL;
+
+	if ((nargs != 8 && nargs != 9) || !arg_int(vm, uc_fn_arg(0), &dev) || !arg_int(vm, uc_fn_arg(1), &R) ||
+	    !arg_int(vm, uc_fn_arg(2), &nk) || !arg_int(vm, uc_fn_arg(3), &ne) ||
+	    !arg_int(vm, uc_fn_arg(4), &qpos0) || !arg_int(vm, uc_fn_arg(5), &base) ||
+	    !arg_int(vm, uc_fn_arg(6), &W) || !arg_int(vm, uc_fn_arg(7), &m)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (device, R, nk, ne, qpos0, base, window, m)");
+		return NULL;
+	}
+
+	c10::cuda::CUDAGuard g((c10::DeviceIndex)dev);
+
+	try {
+		at::Tensor out = at::empty({ R, nk + ne }, at::TensorOptions().dtype(at::kHalf)
+			.device(at::Device(at::kCUDA, (c10::DeviceIndex)dev)));
+		int rc = amp_dsv4_mask_fp16(out.data_ptr(), (int)R, (int)nk, (int)ne, (long)qpos0, (long)base,
+			(int)W, (int)(m > 0 ? m : 1), (long)ncstart, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "dsv4_mask"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
 }
 
 static uc_value_t *
@@ -7519,6 +7870,29 @@ opt_number(uc_vm_t *vm, uc_value_t *opts, const char *key, double *out)
 	return arg_number(vm, v, out);
 }
 
+/* image_info(data): { width, height } of an encoded image */
+static uc_value_t *
+torch_image_info(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *data = uc_fn_arg(0);
+	int w, h;
+
+	if (nargs != 1 || ucv_type(data) != UC_STRING) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (data)");
+		return NULL;
+	}
+
+	if (amp_image_info((const unsigned char *)ucv_string_get(data), ucv_string_length(data), &w, &h))
+		RAISE("image_info: unsupported or corrupt image");
+
+	uc_value_t *res = ucv_object_new(vm);
+
+	ucv_object_add(res, "width", ucv_int64_new(w));
+	ucv_object_add(res, "height", ucv_int64_new(h));
+
+	return res;
+}
+
 static uc_value_t *
 torch_image_prepare(uc_vm_t *vm, size_t nargs)
 {
@@ -8397,6 +8771,12 @@ static const uc_function_list_t torch_fns[] = {
 	{ "notifier",	torch_notifier },
 	{ "attn_decode",	torch_attn_decode },
 	{ "qk_norm_rope",	torch_qk_norm_rope },
+	{ "dsv4_qkv",	torch_dsv4_qkv },
+	{ "dsv4_comp",	torch_dsv4_comp },
+	{ "dsv4_attn",	torch_dsv4_attn },
+	{ "dsv4_derot",	torch_dsv4_derot },
+	{ "dsv4_mask",	torch_dsv4_mask },
+	{ "image_info",	torch_image_info },
 	{ "attn_gate",	torch_attn_gate },
 	{ "gdn_chunk",	torch_gdn_chunk },
 	{ "gdn_prep",	torch_gdn_prep },

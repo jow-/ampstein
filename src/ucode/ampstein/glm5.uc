@@ -928,6 +928,12 @@ export function moe_forward_ref(cfg, M, y) {
  * Temps are shared by all layers of a device. */
 let FUSED_ROWS = 256;
 
+/* Capacity (rows per expert) of the fused prefill kernel; a model that sizes it to its
+ * chunk (a token picks an expert at most once) can use the readback-free path
+ * (M.async_moe). Call before the first prefill: the per-device temps are sized by it. */
+export function set_fused_rows(n) {
+	FUSED_ROWS = n;
+}
 export let HPG = getenv('AMP_DSV4_HOSTPROF') ? {wait: 0, after: 0, n: 0, heavy: 0} : null;
 
 function hp_now() {

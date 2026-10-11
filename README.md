@@ -32,6 +32,7 @@ GPUs from ucode scripts, with no Python in the loop.
 | Qwen3.5 / Qwen3.8 hybrid (Gated DeltaNet) | `qwen35.uc` | layer split over several GPUs, CUDA-graph decode |
 | GLM-5.3-Flash | `glm5.uc` | MLA + KDA hybrid, MoE, DSA indexer, MTP, tensor / expert parallel stages, vision |
 | Qwen3.8-Flash-Next | `qwen4.uc` | sparse attention (QSA), per-layer embeddings, MoE, MTP, tensor / expert parallel |
+| DeepSeek-V4-Flash | `dsv4.uc` | mHC, CSA / HCA attention, sqrtsp + hash MoE, DSpark drafter, vision |
 
 Engine features:
 
@@ -43,6 +44,7 @@ Engine features:
 - Image input (`image_url` data URLs) through the model's vision tower.
 - Host-RAM prompt-cache store with tiered KV precision, reasoning-token budget,
   Q8 latent cache.
+- Resident device slots, time-sliced co-generation, end-of-turn hook (`--eos-hook`).
 
 ## Building and installing
 

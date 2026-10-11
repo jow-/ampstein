@@ -75,7 +75,7 @@ enable_language(CUDA)
 include(cmake/exl3.cmake)
 
 # Project-owned fused kernels (RMSNorm, RoPE) — NOT vendored code.
-add_library(amp_kernels OBJECT src/torch/amp_kernels.cu)
+add_library(amp_kernels OBJECT src/torch/amp_kernels.cu src/torch/amp_dsv4.cu)
 target_compile_options(amp_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 

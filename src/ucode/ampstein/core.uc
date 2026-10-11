@@ -21,6 +21,7 @@ import * as utpl from './utpl.uc';
 import * as chat_jinja from './chat_jinja.uc';
 import * as chat_qwen35 from './chat_qwen35.uc';
 import * as chat_glm5 from './chat_glm5.uc';
+import * as chat_dsv4 from './chat_dsv4.uc';
 import * as qwen35 from './qwen35.uc';
 import * as qwen35_tp from './qwen35_tp.uc';
 import * as qwen35_vision from './qwen35_vision.uc';
@@ -29,6 +30,10 @@ import * as glm5_tp from './glm5_tp.uc';
 import * as glm5_vision from './glm5_vision.uc';
 import * as qwen4 from './qwen4.uc';
 import * as qwen4_tp from './qwen4_tp.uc';
+import * as dsv4 from './dsv4.uc';
+import * as dsv4_tp from './dsv4_tp.uc';
+import * as dsv4_vision from './dsv4_vision.uc';
+import * as dspark_tp from './dspark_tp.uc';
 
 // digest.so is optional (not built on every host): images are then keyed
 // by a cheap length+sample fingerprint instead of SHA-256
@@ -105,16 +110,18 @@ export function serve(args) {
 		catch (e) {}
 
 		args.arch = (index(arch, 'Glm5Next') == 0) ? 'glm5' :
+			(index(arch, 'DeepseekV4') == 0) ? 'dsv4' :
 			(index(arch, 'Qwen4Exp') == 0) ? 'qwen4' : 'qwen35';
 	}
 
 	const GLM = (args.arch == 'glm5');
 	const Q4 = (args.arch == 'qwen4');       // Qwen3.8-Flash-Next (qwen4.uc)
+	const DS = (args.arch == 'dsv4');        // DeepSeek-V4-Flash (dsv4.uc): layer split, no MTP / TP / vision yet
 
 	// default device count: every GPU for GLM (117 GB) and Qwen-Flash-Next (100 GB),
 	// two for the dense Qwen
 	if (args.gpus == null)
-		args.gpus = (GLM || Q4) ? torch.device_count() : 2;
+		args.gpus = (GLM || Q4 || DS) ? torch.device_count() : 2;
 
 	// Qwen3.8-Flash-Next: the verify window is the draft window, so a window of 1 verifies a
 	// single row and cannot gain anything; 3 measured best (2: 1.25-1.45x, 3: 1.4-1.8x, 4: same)
@@ -127,8 +134,25 @@ export function serve(args) {
 		args.chunk = (args.stages > 1) ? 1024 : 4096;
 
 
-	let chat = GLM ? chat_glm5 : chat_qwen35;
-	let cfg = GLM ? glm5.load_config(args.model) :
+	// DeepSeek-V4: pairs of GPUs (tensor-parallel) in a pipeline of stages, with the DSpark block
+	// drafter (--mtp 0 turns it off, --dspark-window N verifies N drafts per round, default 4);
+	// --layer-split runs the plain layer split instead (no drafter)
+	if (DS && !args.layer_split && args.gpus >= 2) {
+		args.tp = true;
+
+		if (!args.stages)
+			args.stages = int(args.gpus / 2);
+	}
+	else if (DS) {
+		args.tp = false;
+		args.mtp = 0;
+	}
+
+	if (DS && !args.dspark_window)
+		args.dspark_window = 4;
+
+	let chat = GLM ? chat_glm5 : DS ? chat_dsv4 : chat_qwen35;
+	let cfg = GLM ? glm5.load_config(args.model) : DS ? dsv4.load_config(args.model) :
 		Q4 ? qwen4.load_config(args.model) : qwen35.load_config(args.model);
 
 	/* The transpiled chat template: chat_template.jinja -> jinja2utpl ->
@@ -174,6 +198,11 @@ export function serve(args) {
 			glm5.load(args.model, {devices: args.gpus, mtp: args.mtp > 0, kv_bits: kv_bits,
 				max_seq: args.ctx});
 	}
+	else if (DS) {
+		model = args.tp ? dsv4_tp.load(args.model, {devices: args.gpus, stages: args.stages,
+			drafter: args.mtp > 0, prefill_rows: args.chunk}) :
+			dsv4.load(args.model, {devices: args.gpus});
+	}
 	else if (Q4) {
 		model = args.tp ? qwen4_tp.load(args.model, {devices: args.gpus, mtp: args.mtp > 0,
 			prefill_rows: args.chunk, stages: args.stages}) :
@@ -183,7 +212,12 @@ export function serve(args) {
 		model = qwen35.load(args.model, {devices: devs, mtp: args.mtp > 0});
 	}
 
-	if (args.tp && !GLM && !Q4) {
+	if (DS && args.tp && args.mtp > 0) {
+		model.dspark = dspark_tp.load(model, {max_seq: args.ctx});
+		warn(`ampstein: DSpark drafter loaded (verify window ${args.dspark_window})\n`);
+	}
+
+	if (args.tp && !GLM && !Q4 && !DS) {
 		if (args.gpus < 2) {
 			warn('ampstein: --tp needs --gpus >= 2\n');
 			exit(1);
@@ -199,11 +233,16 @@ export function serve(args) {
 	let eng = engine.create(model, {
 		max_ctx: args.ctx,
 		prefill_chunk: args.chunk,
-		mtp_window: args.mtp,
+		mtp_window: DS ? 0 : args.mtp,
+		dspark_window: args.dspark_window,
 		draft_vocab: args.draft_vocab,
 		warmup: args.warmup,
 		cache_ram: args.cache_ram,
 		cache_quant: args.cache_quant,
+		slots: args.slots,
+		slot_margin: args.slot_margin,
+		slice_ms: args.slice_ms,
+		slice_tokens: args.slice_tokens,
 		graphs: ((GLM || Q4) && getenv('AMP_GLM5_NO_GRAPHS')) ? false : null
 	});
 
@@ -211,10 +250,13 @@ export function serve(args) {
 
 	if (args.tp)
 		banner += `, tensor parallel over ${model.G} GPUs` +
-			((GLM || Q4) ? ' (expert parallel MoE)' : ` (${model.comm.info().mode} all-reduce)`);
+			(GLM || Q4 || DS ? ' (expert parallel MoE)' : ` (${model.comm.info().mode} all-reduce)`);
 
 	if (eng.mtp_window)
 		banner += `, MTP speculative decoding (window ${eng.mtp_window})`;
+
+	if (model.dspark)
+		banner += ', DSpark speculative decoding';
 
 	warn(banner + '\n');
 
@@ -231,8 +273,9 @@ export function serve(args) {
 	(function restore_cache() {
 		let meta;
 
-		if (GLM || Q4)
+		if (GLM || Q4 || DS)
 			return;     // the cache-state file format is Qwen-specific for now
+
 		try {
 			meta = json(readfile(CACHE_META));
 		}
@@ -309,14 +352,14 @@ export function serve(args) {
 		if (!args.vision)
 			die('image input is disabled (--no-vision)');
 
-		if (GLM ? !cfg.has_vision : !cfg.vision_merge)
+		if ((GLM || DS) ? !cfg.has_vision : !cfg.vision_merge)
 			die('this model has no (supported) vision tower');
 
 		if (!vis) {
 			let t = time();
 
 			warn(`ampstein: loading the vision tower on cuda:${args.vision_device}\n`);
-			vis = GLM ? glm5_vision.load(args.model, {
+			vis = DS ? dsv4_vision.load(args.model, {device: args.vision_device}) : GLM ? glm5_vision.load(args.model, {
 				device: args.vision_device,
 				max_tokens: int(args.image_max_pixels / 784)       // 28 x 28 pixels per row
 			}) : qwen35_vision.load(args.model, {
@@ -397,6 +440,24 @@ export function serve(args) {
 		if (ovr)
 			r.emb = torch.st(ovr).tensor('emb').cuda(args.vision_device).to('float16');
 
+		if (DS) {
+			let ed = {key: key, r: r, ds: true, marker: qwen35.mm_marker(key)};
+
+			warn(`ampstein: image ${r.width}x${r.height} -> ${r.nvw * 14}x${r.nvh * 14}, ` +
+				`${r.nh}x${r.nw} tokens (${sprintf('%.2f', time() - t)}s)\n`);
+
+			img_cache.map[key] = ed;
+			push(img_cache.order, key);
+
+			while (length(img_cache.order) > args.image_cache) {
+				let old = shift(img_cache.order);
+
+				delete img_cache.map[old];
+			}
+
+			return ed;
+		}
+
 		let e = {
 			key: key,
 			emb: r.emb,
@@ -436,6 +497,22 @@ export function serve(args) {
 
 			let e = embs[k];
 
+			if (DS) {
+				// the placeholder becomes the whole image block: lead pads (so IMAGE_START lands on a
+				// compressor group boundary), START, the interleaved rows, newlines, END; every row is
+				// an embedding with a per-image marker id (type in the low bits)
+				let b = vis.block(e.r, length(out));
+				let base = e.marker + (e.marker - qwen35.MARK_BASE) * 7;
+
+				push(images, {start: length(out), nc0: length(out) + b.lead, emb: b.rows, key: e.key});
+
+				for (let t in b.types)
+					push(out, base + t);
+
+				prev = pads[k] + 1;
+				continue;
+			}
+
 			push(images, {start: length(out), grid: e.grid, emb: e.emb});
 
 			for (let r = 0; r < e.n; r++)
@@ -463,6 +540,20 @@ export function serve(args) {
 
 	if (length(im_end) == 1 && index(stop_ids, im_end[0]) < 0)
 		push(stop_ids, im_end[0]);
+
+	// end-of-turn policy (--eos-hook): the compiled script, run per consultation
+	// with the request state as its globals
+	let eos_policy = null;
+
+	if (args.eos_hook) {
+		try {
+			eos_policy = loadfile(args.eos_hook);
+		}
+		catch (e) {
+			warn(`ampstein: cannot load --eos-hook ${args.eos_hook}: ${e.message}\n`);
+			exit(1);
+		}
+	}
 
 	let created_at = now_s();
 
@@ -581,6 +672,12 @@ export function serve(args) {
 				(tb[0] - ta[0]) * 1000 + (tb[1] - ta[1]) / 1e6));
 		}
 
+		if (getenv('AMP_DSV4_PROBE') != null) {
+			let pr = dsv4.probe_report();
+
+			warn(sprintf('probe: stream-peak %g collapse-peak %g%s\n', pr[0], pr[1], pr[2] ? ' NONFINITE-OR-OVERFLOW' : ''));
+		}
+
 		warn(sprintf('%s: prompt %d (cached %d via %s%s), prefill %d tok in %.0f ms (%.1f tok/s), ' +
 			'decode %d tok in %.0f ms (%.1f tok/s)%s, finish %s\n',
 			kind, info.prompt_tokens, info.cached_tokens, info.reuse, why,
@@ -681,7 +778,7 @@ export function serve(args) {
 				reasoning_effort: kw.reasoning_effort || effort,
 				preserve_thinking: kw.preserve_thinking,
 				clear_thinking: kw.clear_thinking,
-				vision: GLM && args.vision && cfg.has_vision
+				vision: (GLM || DS) && args.vision && cfg.has_vision
 			});
 		}
 		catch (e) {
@@ -731,6 +828,12 @@ export function serve(args) {
 		let content = struct.buffer(), reasoning = struct.buffer();
 		let calls = [];
 		let stopped = false;
+
+		// End-of-turn policy state: what the model produced so far (kept apart
+		// from the streamed / final buffers, which a stream does not fill)
+		let htext = eos_policy ? struct.buffer() : null;
+		let hreason = eos_policy ? struct.buffer() : null;
+		let hnum = 0;
 
 		// Reasoning budget. After `nudge_at` reasoning tokens a soft nudge is
 		// appended to the model's thinking (it carries on and usually wraps up);
@@ -785,6 +888,9 @@ export function serve(args) {
 				let ev = events[i];
 
 				if (ev.type == 'reasoning') {
+					if (hreason)
+						hreason.put('*', ev.text);
+
 					if (!stream)
 						reasoning.put('*', ev.text);
 
@@ -792,6 +898,9 @@ export function serve(args) {
 						res.sse(chunk({reasoning_content: ev.text}));
 				}
 				else if (ev.type == 'content') {
+					if (htext)
+						htext.put('*', ev.text);
+
 					if (!stream)
 						content.put('*', ev.text);
 
@@ -848,6 +957,8 @@ export function serve(args) {
 			},
 
 			on_token: function (t) {
+				hnum++;
+
 				if (budgeted && p.mode() == 'reason')
 					rtoks++;
 
@@ -858,6 +969,51 @@ export function serve(args) {
 					return false;
 
 				return stream ? !res.finished() && res.alive() : res.alive();
+			},
+
+			// the model sampled its end token (--eos-hook): see the policy docs
+			eos_max: args.eos_hook_max,
+			on_eos: !eos_policy ? null : function (n) {
+				let v = true;
+
+				try {
+					v = call(eos_policy, null, {
+						text: htext.slice(),
+						reasoning: hreason.slice(),
+						calls: map(calls, (c) => ({name: c.function.name, arguments: c.function.arguments})),
+						tools: map(body.tools || [], (t) => (t.function || t).name),
+						mode: p.mode(),
+						tokens: hnum,
+						overrides: n,
+						finish: 'stop'
+					});
+				}
+				catch (e) {
+					warn(`chat ${id}: eos hook failed: ${e.message}\n`);
+					return true;
+				}
+
+				if (type(v) == 'int' || type(v) == 'double') {
+					if (v > 0)
+						warn(`chat ${id}: eos hook: redraw with the stop ${v} logits down (after ${hnum} tokens)\n`);
+
+					return (v > 0) ? v : true;
+				}
+
+				if (type(v) != 'string' || v == '')
+					return true;
+
+				let f = tok.encode(v, true);
+
+				warn(`chat ${id}: eos hook: forcing ${length(f)} tokens (after ${hnum} tokens)\n`);
+
+				// show the forced text in the stream like generated text
+				for (let i = 0; i < length(f); i++)
+					emit(p.feed(dt.push(f[i])));
+
+				hnum += length(f);
+
+				return f;
 			},
 
 			// the engine polls this at every step boundary
@@ -1138,8 +1294,9 @@ export function serve(args) {
 		shutting_down = true;
 
 		try {
-			if (GLM || Q4)
+			if (GLM || Q4 || DS)
 				die('not supported for this architecture yet');
+
 			let n = eng.save_state(CACHE_ST);
 
 			writefile(CACHE_META, sprintf('%J', {
