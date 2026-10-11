@@ -9,7 +9,7 @@ GPUs from ucode scripts, with no Python in the loop.
 ```
 ┌────────────────────────────────────────────────────┐
 │  ucode scripts                                     │
-│  chat · benchmarks · tests                         │
+│  OpenAI-compatible HTTP server · chat · benchmarks │
 ├────────────────────────────────────────────────────┤
 │  ucode engine layer (src/ucode/ampstein/*.uc)      │
 │  models · KV cache · sampling · generation         │
@@ -24,22 +24,24 @@ GPUs from ucode scripts, with no Python in the loop.
 └────────────────────────────────────────────────────┘
 ```
 
-## Status
+## Models
 
-- Loads EXL3 checkpoints (`exl3_gemm` / `gemv` from the vendored kernels) and
-  runs llama-family models: prefill, KV-cache decode, CUDA-graph decode,
-  sampling — numerically matching exllamav3.
-- Native BPE tokenizer for HF `tokenizer.json` files (PCRE2 pre-tokenizer).
-- Jinja → ucode transpiler for chat templates, with taint tracking so user text
-  can never tokenize as a special token.
-- Qwen3.5 / 3.8 hybrid (Gated DeltaNet + attention): layer split over several
-  GPUs, pipelined prefill, CUDA-graph decode.
+| Family | Module | Notes |
+|---|---|---|
+| Llama-3 style dense | `llama.uc` | EXL3 weights, CUDA-graph decode, library use (no server path) |
+| Qwen3.5 / Qwen3.8 hybrid (Gated DeltaNet) | `qwen35.uc` | layer split over several GPUs, CUDA-graph decode |
+
+Engine features:
+
+- Prompt-cache reuse: live state, plus a snapshot at the end of the previous
+  message (recurrent layers cannot rewind).
 
 ## Building and installing
 
 ```sh
 cmake -B build -DUCODE_INCLUDE_DIR=/path/to/ucode   # a ucode checkout (include/ucode)
 cmake --build build
+cmake --install build --prefix /opt/ampstein         # builds first if needed
 ```
 
 libtorch, CUDA and ucode are hard requirements: a CUDA toolkit ≥ 12.4, the ucode
@@ -55,6 +57,30 @@ build host without a GPU).
 `$AMPSTEIN_CACHE_DIR`), so a second build tree never downloads again. To use an
 existing distribution (e.g. a venv's `site-packages`):
 `-DAMPSTEIN_TORCH_DIST_DIR=<dir containing torch/ and nvidia/>`.
+
+The install prefix is relocatable (loader and `RUNPATH` are `$ORIGIN`-relative):
+
+```
+<prefix>/bin/ampstein                       server entry
+<prefix>/lib/ampstein/torch.so              native module
+<prefix>/lib/ampstein/torch-dist-<ver>/     libtorch distribution (torch/lib, nvidia/*/lib)
+<prefix>/share/ampstein/*.uc                ucode engine layer
+```
+
+For development, `-DAMPSTEIN_INSTALL_TORCH_DIST=OFF` installs a symlink to the
+cache instead of copying the multi-GB distribution.
+
+## Serving
+
+```sh
+/opt/ampstein/bin/ampstein --model /path/to/Qwen3.8-27B-exl3-5.00bpw --ctx 65536
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+     -d '{"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (stream and
+non-stream, tools, reasoning content) and `POST /v1/completions`. `ampstein --help`
+lists the options.
 
 ## Testing
 

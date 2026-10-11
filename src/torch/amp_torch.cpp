@@ -1896,6 +1896,20 @@ tensor_mul(uc_vm_t *vm, size_t nargs)
 		[](const at::Tensor &a, double s) { return at::mul(a, s); });
 }
 
+/*
+ * le(other): torch.tensor
+ *
+ * Elementwise <= (tensor broadcast or number). Returns a bool tensor;
+ * the comparison primitive for data-dependent masks (arange <= pos).
+ */
+static uc_value_t *
+tensor_le(uc_vm_t *vm, size_t nargs)
+{
+	return tensor_binary_out(vm, nargs, "le",
+		[](const at::Tensor &a, const at::Tensor &b) { return at::le(a, b); },
+		[](const at::Tensor &a, double s) { return at::le(a, s); });
+}
+
 static uc_value_t *
 tensor_mul_(uc_vm_t *vm, size_t nargs)
 {
@@ -2056,6 +2070,36 @@ tensor_softmax(uc_vm_t *vm, size_t nargs)
 
 	try {
 		at::Tensor r = at::softmax(*t, dim);
+
+		return tensor_wrap(vm, std::move(r), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * cumsum(dim?: number): torch.tensor
+ *
+ * Inclusive prefix sum over `dim` (default -1), same dtype.
+ */
+static uc_value_t *
+tensor_cumsum(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm);
+	int64_t dim = -1;
+
+	if (!t)
+		return NULL;
+
+	if (nargs > 1 || (nargs == 1 && !arg_int(vm, uc_fn_arg(0), &dim))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected at most one dimension argument");
+		return NULL;
+	}
+
+	try {
+		at::Tensor r = at::cumsum(*t, dim);
 
 		return tensor_wrap(vm, std::move(r), 0);
 	}
@@ -4441,6 +4485,82 @@ torch_attn_decode(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * copy_async(dst, src): null
+ *
+ * Enqueues a device-to-host copy of src into dst WITHOUT synchronizing:
+ * dst must be a contiguous PINNED CPU tensor, src a contiguous CUDA
+ * tensor of the same byte size (no dtype conversion). The transfer
+ * runs on the source device's current stream, so a notifier armed on
+ * that device afterwards fires once the results are visible in dst —
+ * the host never waits for the copy.
+ */
+static uc_value_t *
+torch_copy_async(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *dst, *src;
+
+	if (nargs != 2 || !(dst = tensor_arg(vm, uc_fn_arg(0))) ||
+	    !(src = tensor_arg(vm, uc_fn_arg(1))))
+		return NULL;
+
+	if (!src->is_cuda() || dst->device().type() != at::kCPU ||
+	    !dst->is_pinned() || !dst->is_contiguous() || !src->is_contiguous() ||
+	    dst->numel() * dst->element_size() !=
+	    src->numel() * src->element_size()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"copy_async: contiguous CUDA src, pinned CPU dst, "
+			"equal byte size expected");
+		return NULL;
+	}
+
+	try {
+		c10::cuda::CUDAGuard g((c10::DeviceIndex)src->get_device());
+		cudaError_t e = cudaMemcpyAsync(dst->data_ptr(), src->data_ptr(),
+			src->numel() * src->element_size(), cudaMemcpyDeviceToHost,
+			c10::cuda::getCurrentCUDAStream(
+				(c10::DeviceIndex)src->get_device()).stream());
+
+		if (e != cudaSuccess)
+			RAISE(cudaGetErrorString(e));
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+/*
+ * common_prefix(a, b): int
+ *
+ * Length of the common prefix of two arrays of integers (token ids),
+ * compared natively — the per-request prompt-reuse check walks arrays of
+ * 100k+ ids, ~1 us per element in a ucode loop.
+ */
+static uc_value_t *
+torch_common_prefix(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *a = uc_fn_arg(0), *b = uc_fn_arg(1);
+
+	if (ucv_type(a) != UC_ARRAY || ucv_type(b) != UC_ARRAY) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (array, array)");
+		return NULL;
+	}
+
+	size_t n = std::min(ucv_array_length(a), ucv_array_length(b)), i = 0;
+
+	for (; i < n; i++) {
+		uc_value_t *x = ucv_array_get(a, i), *y = ucv_array_get(b, i);
+
+		if (ucv_type(x) != UC_INTEGER || ucv_type(y) != UC_INTEGER ||
+		    ucv_int64_get(x) != ucv_int64_get(y))
+			break;
+	}
+
+	return ucv_int64_new((int64_t)i);
+}
+
+/*
  * device_count(): int — visible CUDA devices (0 without CUDA).
  */
 static uc_value_t *
@@ -4483,6 +4603,325 @@ torch_device_count(uc_vm_t *vm, size_t nargs)
  * caching allocator knows nothing about the side stream). */
 #define AMP_FORK_MAXD 16
 #define AMP_FORK_MAXK 4
+
+/* --- completion notifier (eventfd + cudaLaunchHostFunc) ------------------- */
+
+/* The shared state behind a notifier: the eventfd and the completion
+ * counter live in a shared_ptr-held core so that an arm() whose
+ * callbacks are still pending keeps them alive even when the notifier
+ * resource is garbage-collected in between — the fd closes only after
+ * the last pending callback ran (on a CUDA driver thread, where closing
+ * it is safe: no CUDA API is touched there).
+ *
+ * Callback concurrency: each arm() launches one callback per device
+ * stream; every callback decrements `remaining` exactly once and the
+ * unique callback observing the 1 -> 0 transition bumps `seq`, writes
+ * the eventfd and frees the arm. `drained` is touched from the VM
+ * thread only. */
+struct notifier_core {
+	int efd;
+	std::atomic<uint64_t> seq;	/* arms completed (all devices) */
+	uint64_t drained;		/* wake-ups consumed by drain() */
+
+	notifier_core() : efd(-1), seq(0), drained(0) {}
+
+	~notifier_core()
+	{
+		if (efd >= 0)
+			close(efd);
+	}
+};
+
+struct notifier_arm {
+	std::shared_ptr<notifier_core> core;
+	std::atomic<int> remaining;
+
+	notifier_arm(std::shared_ptr<notifier_core> c, int n) :
+		core(std::move(c)), remaining(n) {}
+};
+
+/* Runs on a CUDA driver thread: no CUDA calls, no VM access here. */
+static void
+amp_notifier_callback(void *v)
+{
+	auto *a = static_cast<notifier_arm *>(v);
+
+	if (a->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+		a->core->seq.fetch_add(1, std::memory_order_release);
+
+		uint64_t one = 1;
+		ssize_t rc = write(a->core->efd, &one, sizeof(one));
+
+		(void)rc;	/* counter saturation loses one wake-up:
+				 * one is already pending anyway */
+
+		delete a;	/* may drop the last core reference */
+	}
+}
+
+struct notifier_state {
+	std::shared_ptr<notifier_core> core;
+};
+
+static void
+notifier_free(void *data)
+{
+	delete static_cast<notifier_state *>(data);
+}
+
+static notifier_state *
+notifier_this(uc_vm_t *vm)
+{
+	auto *ns = static_cast<notifier_state *>(uc_fn_thisval(NOTIFIER_TYPE));
+
+	if (!ns)
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"called on non-notifier value");
+
+	return ns;
+}
+
+/*
+ * notifier(): torch.notifier
+ *
+ * A wake-up source for the ucode event loop. arm(devices) enqueues a
+ * host-function callback on each device's current stream; when a
+ * stream reaches it (all previously enqueued work on that stream
+ * done), the callback bumps the completion counter and — on the last
+ * device — writes the eventfd, which uloop reports as readable.
+ *
+ *   let n = torch.notifier();
+ *   uloop.handle(n, function() { n.drain(); ...continue... },
+ *                uloop.ULOOP_READ);
+ *   ...enqueue work...
+ *   n.arm([0, 1]);   // one wake-up when BOTH streams drained
+ *
+ * The callback must drain() the eventfd (uloop is level-triggered).
+ * A wake-up can also be consumed without uloop: done() reports whether
+ * an armed completion fired since the last drain(), seq() returns the
+ * raw completion counter.
+ */
+static uc_value_t *
+torch_notifier(uc_vm_t *vm, size_t nargs)
+{
+	auto *ns = new (std::nothrow) notifier_state();
+
+	if (!ns)
+		return NULL;
+
+	ns->core = std::make_shared<notifier_core>();
+	ns->core->efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+	if (ns->core->efd < 0) {
+		int err = errno;
+
+		delete ns;
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, "eventfd: %s",
+			strerror(err));
+		return NULL;
+	}
+
+	return uc_resource_new(ucv_resource_type_lookup(vm, NOTIFIER_TYPE), ns);
+}
+
+/*
+ * fileno(): this — the eventfd number. The name matches what
+ * uloop.handle() probes for, so the notifier registers as a handle
+ * source directly.
+ */
+static uc_value_t *
+notifier_fileno(uc_vm_t *vm, size_t nargs)
+{
+	auto *ns = notifier_this(vm);
+
+	if (!ns)
+		return NULL;
+
+	return ucv_int64_new(ns->core->efd);
+}
+
+/*
+ * arm(devices?): this
+ *
+ * Enqueues one callback per given device on its CURRENT stream — the
+ * wake-up fires when the work enqueued so far on every listed device
+ * has completed. devices: a device index, a "cuda:N" string, an array
+ * of those, or null/absent for the current device. Repeats in the
+ * array count separately (each needs its own callback).
+ *
+ * Raises during an active graph capture (a captured host function
+ * would re-run at every replay with stale callback state).
+ */
+static uc_value_t *
+torch_notifier_arm(uc_vm_t *vm, size_t nargs)
+{
+	auto *ns = notifier_this(vm);
+	uc_value_t *arg = (nargs >= 1) ? uc_fn_arg(0) : NULL;
+	std::vector<at::Device> devs;
+
+	if (!ns)
+		return NULL;
+
+	if (!arg || ucv_type(arg) == UC_NULL) {
+		devs.emplace_back(at::kCUDA,
+			(c10::DeviceIndex)c10::cuda::current_device());
+	}
+	else if (ucv_type(arg) == UC_ARRAY) {
+		for (size_t i = 0; i < ucv_array_length(arg); i++) {
+			at::Device dev(at::kCPU);
+
+			if (!parse_target_device(vm, ucv_array_get(arg, i), &dev))
+				return NULL;
+
+			devs.push_back(dev);
+		}
+	}
+	else {
+		at::Device dev(at::kCPU);
+
+		if (!parse_target_device(vm, arg, &dev))
+			return NULL;
+
+		devs.push_back(dev);
+	}
+
+	if (devs.empty())
+		RAISE("arm: empty device list");
+
+	/* validate everything (and reject capture) BEFORE allocating the
+	 * arm: once the first callback is enqueued it owns its state */
+	std::vector<cudaStream_t> streams;
+
+	for (auto &dev : devs) {
+		if (dev.type() != at::kCUDA || dev.index() < 0 ||
+		    dev.index() >= at::cuda::device_count())
+			RAISE("arm: not a CUDA device");
+
+		cudaStream_t st = c10::cuda::getCurrentCUDAStream(
+			(c10::DeviceIndex)dev.index()).stream();
+		cudaStreamCaptureStatus cs;
+		cudaError_t e = cudaStreamIsCapturing(st, &cs);
+
+		if (e != cudaSuccess)
+			RAISE(cudaGetErrorString(e));
+
+		if (cs != cudaStreamCaptureStatusNone)
+			RAISE("arm: cannot arm during graph capture");
+
+		streams.push_back(st);
+	}
+
+	auto *arm = new notifier_arm(ns->core, (int)streams.size());
+
+	for (size_t si = 0; si < streams.size(); si++) {
+		/* the default (null) stream handle is relative to the CURRENT
+		 * device: enqueue under the stream's own device or the callback
+		 * lands on device 0's queue and fires early */
+		c10::cuda::CUDAGuard sg((c10::DeviceIndex)devs[si].index());
+		cudaStream_t st = streams[si];
+		cudaError_t e = cudaLaunchHostFunc(st, amp_notifier_callback, arm);
+
+		if (e != cudaSuccess) {
+			/* callbacks already enqueued keep the arm (and the fd)
+			 * alive but the countdown can no longer complete */
+			uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+				"arm: cudaLaunchHostFunc failed: %s",
+				cudaGetErrorString(e));
+			return NULL;
+		}
+	}
+
+	return ucv_get(_uc_fn_this_res(vm));
+}
+
+/*
+ * seq(): int — number of arm() completions fired so far (monotonic).
+ * A completion fires only once EVERY device listed in the arm() call
+ * reached its callback.
+ */
+static uc_value_t *
+notifier_seq(uc_vm_t *vm, size_t nargs)
+{
+	auto *ns = notifier_this(vm);
+
+	if (!ns)
+		return NULL;
+
+	return ucv_int64_new((int64_t)ns->core->seq.load(std::memory_order_acquire));
+}
+
+/*
+ * done(): bool — true when at least one armed completion has fired
+ * since the last drain() (or since creation).
+ */
+static uc_value_t *
+notifier_done(uc_vm_t *vm, size_t nargs)
+{
+	auto *ns = notifier_this(vm);
+
+	if (!ns)
+		return NULL;
+
+	return ucv_boolean_new(ns->core->seq.load(std::memory_order_acquire) !=
+		ns->core->drained);
+}
+
+/*
+ * drain(): int — consumes the pending wake-ups (a non-blocking read of
+ * the eventfd) and returns how many there were; 0 when none. Must be
+ * called from the uloop callback: the handle is level-triggered and
+ * keeps firing while the eventfd is readable.
+ */
+static uc_value_t *
+notifier_drain(uc_vm_t *vm, size_t nargs)
+{
+	auto *ns = notifier_this(vm);
+	uint64_t val = 0;
+	ssize_t rc;
+
+	if (!ns)
+		return NULL;
+
+	do {
+		rc = read(ns->core->efd, &val, sizeof(val));
+	} while (rc < 0 && errno == EINTR);
+
+	if (rc < 0) {
+		if (errno == EAGAIN)
+			return ucv_int64_new(0);
+
+		int err = errno;
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, "drain: %s",
+			strerror(err));
+		return NULL;
+	}
+
+	ns->core->drained += val;
+
+	return ucv_int64_new((int64_t)val);
+}
+
+static uc_value_t *
+notifier_free_method(uc_vm_t *vm, size_t nargs)
+{
+	void **slot = ucv_resource_dataptr(_uc_fn_this_res(vm), NOTIFIER_TYPE);
+
+	if (slot && *slot) {
+		notifier_free(static_cast<notifier_state *>(*slot));
+		*slot = NULL;
+	}
+
+	return NULL;
+}
+
+static const uc_function_list_t notifier_methods[] = {
+	{ "fileno",	notifier_fileno },
+	{ "arm",		torch_notifier_arm },
+	{ "seq",		notifier_seq },
+	{ "done",	notifier_done },
+	{ "drain",	notifier_drain },
+	{ "free",	notifier_free_method },
+};
 
 /*
  * flash_attn_kvcache(q, k, v, cu_q, cu_k, seqused_k, max_k, causal):
@@ -5670,6 +6109,7 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "abs",	tensor_abs },
 	{ "rsqrt",	tensor_rsqrt },
 	{ "neg",	tensor_neg },
+	{ "le",	tensor_le },
 	{ "exp",	tensor_exp },
 	{ "log",	tensor_log },
 	{ "cos",	tensor_cos },
@@ -5678,6 +6118,7 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "sigmoid",	tensor_sigmoid },
 	{ "softplus",	tensor_softplus },
 	{ "softmax",	tensor_softmax },
+	{ "cumsum",	tensor_cumsum },
 	{ "mean",	tensor_mean },
 	{ "sum",	tensor_sum },
 	{ "max",	tensor_max },
@@ -5706,6 +6147,9 @@ static const uc_function_list_t torch_fns[] = {
 	{ "gdn_scan",	torch_gdn_scan },
 	{ "flash_attn_kvcache",	torch_flash_attn_kvcache },
 	{ "device_count",	torch_device_count },
+	{ "common_prefix",	torch_common_prefix },
+	{ "copy_async",	torch_copy_async },
+	{ "notifier",	torch_notifier },
 	{ "attn_decode",	torch_attn_decode },
 	{ "qk_norm_rope",	torch_qk_norm_rope },
 	{ "attn_gate",	torch_attn_gate },
@@ -5756,6 +6200,7 @@ uc_module_init(uc_vm_t *vm, uc_value_t *scope)
 	uc_type_declare(vm, TENSOR_TYPE, tensor_methods, tensor_free);
 	uc_type_declare(vm, STFILE_TYPE, stfile_methods, stfile_free);
 	uc_type_declare(vm, GRAPH_TYPE, graph_methods, graph_free);
+	uc_type_declare(vm, NOTIFIER_TYPE, notifier_methods, notifier_free);
 	uc_function_list_register(scope, torch_fns);
 	amp_tokenizer_init(vm, scope);
 }

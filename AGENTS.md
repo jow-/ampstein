@@ -9,7 +9,8 @@ Ampstein runs [EXL3](https://github.com/turboderp-org/exllamav3)-quantized LLMs
 from [ucode](https://github.com/jow-/ucode) scripts, with no Python at run time.
 The native part is one ucode module (`torch.so`) that wraps libtorch and vendored
 EXL3 CUDA kernels; everything else — model loading, architectures, KV cache,
-sampling and generation — is ucode in `src/ucode/ampstein/`.
+sampling, generation and the OpenAI-compatible server — is ucode in
+`src/ucode/ampstein/`.
 
 ucode owns control flow, the module owns compute: long-horizon features stay
 editable without recompiling the module. The EXL3 kernels are vendored, not
@@ -26,6 +27,7 @@ reimplemented (QTIP trellis decoding has bit-exactness requirements).
 | `tests/` | ucode tests run by CTest; `tests/oracle/` generates fixtures (Python, test-only) |
 | `examples/` | small runnable scripts and benchmarks |
 | `docs/` | design notes and `LESSONS.md` |
+| `ampstein` | the server entry script (installed as `bin/ampstein`) |
 
 ## Build, test, run
 
@@ -33,6 +35,8 @@ reimplemented (QTIP trellis decoding has bit-exactness requirements).
 cmake -B build -DUCODE_INCLUDE_DIR=/path/to/ucode     # ucode checkout with include/ucode
 cmake --build build -j
 ctest --test-dir build --output-on-failure             # model tests skip (125) without models
+cmake --install build --prefix /opt/ampstein
+/opt/ampstein/bin/ampstein --model /path/to/exl3-model
 ```
 
 - libtorch and the NVIDIA runtime wheels are downloaded once into

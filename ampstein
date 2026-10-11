@@ -1,0 +1,137 @@
+#!/usr/bin/env ucode
+
+// ampstein — Ampstein OpenAI-compatible HTTP server (application entry).
+//
+// This is the lean application entrypoint. It does NOT contain the engine
+// logic: that lives in the module share/ampstein/core.uc (ampstein.core),
+// which is loaded at runtime with import(). The entry owns only:
+//
+//   * argv parsing (parse_args) and the parsed args object
+//   * --help / --version handling (fast path: returned before any module load)
+//   * the bootstrap: it pushes <prefix>/lib/*.so and <prefix>/share/*.uc
+//     (relative to its own location) onto REQUIRE_SEARCH_PATH, binds
+//     `global.torch = require('ampstein.torch')` (every submodule references
+//     the bare `torch` identifier without importing it) and import()s the engine.
+//
+// Run from an install prefix (see README: `cmake --install`):
+//
+//   <prefix>/bin/ampstein --model DIR
+//
+// Endpoints handled by the engine (see src/ucode/ampstein/core.uc):
+//   GET  /v1/models, /v1/models/<id>
+//   POST /v1/chat/completions   (stream + non-stream, tools, reasoning)
+//   POST /v1/completions        (raw prompt, stream + non-stream)
+//   GET  /health
+
+const VERSION = '0.0.1';    // keep in sync with CMakeLists.txt AMP_VERSION
+
+function usage() {
+	printf("Usage: ampstein --model DIR [options]\n\n");
+
+	printf("Options:\n");
+	printf("  --model DIR           model directory (required)\n");
+	printf("  --host H              bind address (default 127.0.0.1)\n");
+	printf("  --port N              bind port (default 8000)\n");
+	printf("  --ctx N               context length (default 65536)\n");
+	printf("  --gpus N              number of GPUs (default: all)\n");
+	printf("  --split N             layers per GPU (layer split)\n");
+	printf("  --chunk N             prefill chunk size (default 1024)\n");
+	printf("  --name NAME           served model name (default: basename of --model)\n");
+	printf("  --version             print version and exit\n");
+	printf("  --help                print this help and exit\n");
+}
+
+function version() {
+	printf("Ampstein %s\n", VERSION);
+}
+
+// Fast flags, before any heavy module is imported. This keeps --version /
+// --help instant (torch.so and CUDA are not loaded for them).
+function fast_arg_scan() {
+	let argv = ARGV;
+	let start = index(argv, '--');
+
+	if (start >= 0)
+		argv = slice(argv, start + 1);
+
+	for (let i = 0; i < length(argv); i++) {
+		if (argv[i] == '--version' || argv[i] == '-V') {
+			version();
+			exit(0);
+		}
+		if (argv[i] == '--help' || argv[i] == '-h') {
+			usage();
+			exit(0);
+		}
+	}
+}
+
+fast_arg_scan();
+
+// --- argv parsing (the parsed args object handed to serve(args) ---
+
+function parse_args() {
+	let a = {
+		model: null,
+		host: '127.0.0.1',
+		port: 8000,
+		ctx: 65536,
+		gpus: null,
+		split: null,
+		chunk: 1024,
+		name: null,
+	};
+
+	let argv = ARGV;
+	let start = index(argv, '--');
+
+	if (start >= 0)
+		argv = slice(argv, start + 1);
+
+	for (let i = 0; i < length(argv); i++) {
+		let k = argv[i];
+		let v = argv[i + 1];
+
+		switch (k) {
+		case '--model': a.model = v; i++; break;
+		case '--host': a.host = v; i++; break;
+		case '--port': a.port = int(v); i++; break;
+		case '--ctx': a.ctx = int(v); i++; break;
+		case '--gpus': a.gpus = int(v); i++; break;
+		case '--split': a.split = int(v); i++; break;
+		case '--chunk': a.chunk = int(v); a.chunk_set = true; i++; break;
+		case '--name': a.name = v; i++; break;
+		default:
+			warn(`unknown argument '${k}'\n`);
+			exit(1);
+		}
+	}
+
+	return a;
+}
+
+let args = parse_args();
+
+if (args.model == null) {
+	warn('ampstein: --model DIR is required (see --help)\n');
+	exit(1);
+}
+
+// --- runtime bootstrap: installed layout, relocatable ---
+//
+//   <prefix>/bin/ampstein              this loader
+//   <prefix>/lib/ampstein/torch.so     native module (RUNPATH $ORIGIN ->
+//                                      torch-dist-<ver>/ next to it)
+//   <prefix>/share/ampstein/*.uc       the engine (ampstein.core, ...)
+//
+// Everything is located relative to this script, so the prefix can be moved.
+// torch is bound as the global the engine modules reference.
+const root = sourcepath(0, true) + '/..';
+
+push(REQUIRE_SEARCH_PATH, root + '/lib/*.so', root + '/share/*.uc');
+
+global.torch = require('ampstein.torch');
+
+const core = import('ampstein.core');
+
+core.serve(args);

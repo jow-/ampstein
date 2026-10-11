@@ -98,3 +98,13 @@ amp_test(qwen35_graph)
 amp_test(attn_decode_s)
 # qwen35_attn_dev: decode attention wiring selects the mma kernel
 amp_test(qwen35_attn_dev)
+
+# --- Server and engine
+# httpd: HTTP head / body readers driven with sliced input
+amp_test(httpd)
+# chat_qwen35: chat template port vs jinja2 + streaming output parser
+amp_test(chat_qwen35)
+# chat_jinja: transpiled renderer: the server's prompt path, byte-exact vs jinja2
+amp_test(chat_jinja)
+# sampling_dist: engine.dist (tensor-op sampling) vs the reference implementation
+amp_test(sampling_dist)

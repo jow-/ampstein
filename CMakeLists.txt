@@ -141,6 +141,7 @@ install(CODE "
         message(FATAL_ERROR \"ampstein: build failed, nothing installed\")
     endif()")
 
+install(PROGRAMS ampstein DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS ucode_torch LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/ampstein)
 install(DIRECTORY src/ucode/ampstein DESTINATION ${CMAKE_INSTALL_DATADIR}
     FILES_MATCHING PATTERN "*.uc")

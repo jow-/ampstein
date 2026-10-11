@@ -161,3 +161,24 @@ Add new lessons at the end of the matching section.
   state in registers has a ~1.2 µs/token floor; the chunked WY form only pays
   with tiled tensor-core matmuls (naive loops lost 1.5x), and shared-memory
   blocks > 50 KiB run one per SM, so 96 blocks on 82 SMs take two waves.
+
+## Server and engine
+
+- **L72 — Loops on the per-token path cost ~1 µs per element.** Sampling over
+  1000 candidates in ucode took 4.5 ms per call; keep per-candidate work in
+  tensor ops and transfer only the kept prefix. A fp64 cumsum is needed for the
+  top-p cut.
+- **L74 — Per-request host work at 200k tokens** (prefix compare, re-tokenization)
+  adds up to a second per agent turn: use `torch.common_prefix`, re-encode only
+  the new tail, and never `substr()` through UTF-8.
+- **L75 — `uloop.run(timeout)` is one poll round.** Wait with repeated short
+  rounds or an indefinite `run()` ended by `uloop.end()`; `uloop.done()` tears the
+  loop down; handles are level-triggered, so a callback must drain its fd.
+- **L80 — Run a server smoke test after any engine change** when the GPUs are
+  free; multi-device bugs hide behind tests that cannot run.
+- **L86 — Async D2H and the notifier on a non-primary device.** The default stream
+  handle is relative to the current device (guard it), pinned memory must be
+  allocated portable, and the engine synchronises after every wake-up. Never
+  `pkill -f <pattern>` from a command line that contains the pattern.
+- **L118 — The entry is a lean script** (argv, `--help`, bootstrap) that
+  `import()`s the engine module; a script cannot have top-level `export`.

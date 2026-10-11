@@ -337,8 +337,75 @@ export function encode_segments(tok, r) {
  * runs; a render extends an earlier one when the old segments are a
  * structural prefix (taint AND bytes) of the new ones. */
 
+export function seg_equal(a, b) {
+	if (length(a) != length(b))
+		return false;
+
+	for (let i = 0; i < length(a); i++)
+		if (a[i].t != b[i].t || a[i].s != b[i].s)
+			return false;
+
+	return true;
+}
+
 /* Number of bytes of `a` that `b` carries verbatim at the start
  * (taint and bytes), or -1 if `a` is not a structural prefix. */
+export function seg_prefix(b, a) {
+	let alen = 0;
+
+	for (let i = 0; i < length(a); i++)
+		alen += length(a[i].s);
+
+	let ai = 0, bi = 0, aoff = 0, boff = 0, matched = 0;
+
+	while (ai < length(a) && bi < length(b)) {
+		let A = a[ai], B = b[bi];
+		let take = min(length(A.s) - aoff, length(B.s) - boff);
+
+		if (A.t != B.t || substr(A.s, aoff, take) != substr(B.s, boff, take))
+			return -1;
+
+		matched += take;
+		aoff += take;
+		boff += take;
+
+		if (aoff == length(A.s)) {
+			ai++;
+			aoff = 0;
+		}
+
+		if (boff == length(B.s)) {
+			bi++;
+			boff = 0;
+		}
+	}
+
+	return (ai < length(a)) ? -1 : matched;
+}
+
+/* The segments of `b` from byte offset `at` (splitting the segment
+ * the offset falls inside). */
+export function seg_tail(b, at) {
+	let out = [], off = 0;
+
+	for (let i = 0; i < length(b); i++) {
+		let sv = b[i].s;
+
+		if (off + length(sv) <= at) {
+			off += length(sv);
+			continue;
+		}
+
+		let t = substr(sv, max(0, at - off));
+
+		if (t != '')
+			push(out, {t: b[i].t, s: t});
+
+		off += length(sv);
+	}
+
+	return out;
+}
 
 /* A one-entry prompt-tokenization cache (the server's prefix path):
  * agent sessions re-send the whole conversation every turn, so a
@@ -354,3 +421,41 @@ export function encode_segments(tok, r) {
  * encode: (segs) -> ids; scan_pads: (ids, from) -> positions (may be
  * null on the first hit). Returns the prefix ids; the cache's pads
  * follow the same one-entry lifecycle. */
+export function prefix_cache() {
+	let c = {segs: null, text: null, ids: null, pads: null};
+
+	return {
+	run: function(encode, r, scan_pads) {
+		let segs = r.segments, text = r.text;
+		let ids = null, pads = null;
+
+		if (c.segs != null) {
+			let plen = seg_prefix(segs, c.segs);
+
+			if (plen >= 0) {
+				ids = slice(c.ids);
+				let n0 = length(ids);
+
+				push(ids, ...encode(seg_tail(segs, plen)));
+
+				// pad positions carry over; only the new part is scanned
+				if (c.pads != null)
+					pads = [ ...c.pads, ...scan_pads(ids, n0) ];
+			}
+			else if (c.text == text && seg_equal(segs, c.segs)) {
+				ids = slice(c.ids);
+				pads = c.pads;
+			}
+		}
+
+		if (ids == null)
+			ids = encode(segs);
+
+		c = {segs: segs, text: text, ids: slice(ids), pads: pads};
+		return ids;
+		},
+	get: function() {
+		return c;
+	}
+	};
+}
