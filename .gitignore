@@ -1,0 +1,16 @@
+# build artifacts
+build*/
+*.o
+*.so
+*.a
+
+# editor
+*.swp
+.idea/
+.vscode/
+
+# python scratch (oracle tooling only — never a runtime dependency)
+.venv/
+__pycache__/
+# test fixtures are generated deterministically by tests/oracle/make_fixture.py
+tests/fixtures/
