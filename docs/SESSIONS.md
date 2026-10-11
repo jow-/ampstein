@@ -52,8 +52,14 @@ it back (about a second for 100k tokens against ~100 s of prefill).
   never drops below int8. `--cache-quant off`, `--cache-quant-min N`,
   `--cache-quant-tail N`, `--cache-quant-q8 N` control it. The far past
   matters least to the next token, so the loss is placed where it hurts least.
-- Supported for the Qwen3.5-family models and DeepSeek-V4 (through the
-  engine's `cache_export` / `cache_import` hooks). Measured on DeepSeek-V4
+- Supported for the Qwen3.5-family models, GLM-5.3-Flash and DeepSeek-V4
+  (through the engine's `cache_export` / `cache_import` hooks). GLM-5.3 entries
+  hold the MLA latent rows (age-tiered like KV; the Q8 cache form is kept as
+  is), the indexer plane and complete pools (always fp16), the KDA states and
+  the MTP draft cache; under TP the replicated latent cache is stored once.
+  With `--slots` the entries first go to resident device slots (exact, no age
+  tiers; one latent-cache replica per layer) and are demoted to host RAM, tiered,
+  when the slots run out. Measured on DeepSeek-V4
   with ~3k-token states: swap-out 160-280 ms, swap-in 50-80 ms, ~0.1 GiB per
   entry (dominated by fixed-size parts: window rows and drafter rings).
 

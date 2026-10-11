@@ -663,8 +663,21 @@ export function create(model, opts) {
 		return t.numel() * elsize(t);
 	}
 
-	// every layer holds attention KV or GDN states (not e.g. MLA latent
-	// caches): else the store stays off
+	// every layer holds attention KV, an MLA latent cache (GLM) or GDN states:
+	// else the store stays off
+	let mla_store = false;     // MLA latent caches: generic device slots are available
+
+	function is_mla(c) {
+		return c.ckv != null || c.qk != null;
+	}
+
+	// the draft cache holders when the MTP block has an MLA cache (replicas under TP), else null
+	function mtp_mla() {
+		let l = cache.mtp ? cache.mtp.layers : null;
+
+		return (l && length(l) && is_mla(l[0])) ? l : null;
+	}
+
 	function store_supported() {
 		let kv = false;
 
@@ -684,13 +697,17 @@ export function create(model, opts) {
 					if (!cl.rec_state)
 						return false;
 				}
-				else if (cl.k_cache)
+				else if (cl.k_cache || is_mla(cl)) {
 					kv = true;
+
+					if (is_mla(cl))
+						mla_store = true;
+				}
 				else
 					return false;
 			}
 
-		return kv && (!cache.mtp || cache.mtp.k_cache != null);
+		return kv && (!cache.mtp || cache.mtp.k_cache != null || mtp_mla() != null);
 	}
 
 	if ((store_budget > 0 || slots_cfg != 0) && !store_supported()) {
@@ -809,14 +826,179 @@ export function create(model, opts) {
 		}
 	}
 
+	/* MLA latent cache (GLM): the ckv rows (fp16, tiered like KV; the Q8 form is kept as is), the
+	 * indexer plane (per token) and the complete pooled keys, both always fp16 (they feed every
+	 * selection). Under tensor parallelism the replicas of a layer are identical: one is stored. */
+	function mla_pools(n) {
+		return int(n / cfg.index_kpool);
+	}
+
+	function mla_bytes(c, n) {
+		let dc = (c.ckv ? c.ckv : c.qk).shape()[1];
+		let b = n * c.plane.shape()[1] * 2 + mla_pools(n) * c.pools.shape()[1] * 2;
+
+		for (let o = 0; o < n; o += KV_CHUNK) {
+			let m = min(KV_CHUNK, n - o);
+			let t = c.qk ? 8 : tier_of(o, m, n);
+			let vals = m * dc;
+
+			b += (t == 16) ? vals * 2 : (t == 8) ? vals + vals / 16 : vals / 2 + vals / 16;
+		}
+
+		return b;
+	}
+
+	function mla_to_host(c, dev, n, e) {
+		let chunks = [];
+		let dc = (c.ckv ? c.ckv : c.qk).shape()[1];
+
+		for (let o = 0; o < n; o += KV_CHUNK) {
+			let m = min(KV_CHUNK, n - o);
+
+			if (c.qk) {
+				push(chunks, {tier: 8, m: m, x: [ to_host(c.qk.narrow(0, o, m), e), to_host(c.qs.narrow(0, o, m), e) ]});
+				continue;
+			}
+
+			let t = tier_of(o, m, n);
+			let v = c.ckv.narrow(0, o, m);
+
+			if (t == 16) {
+				push(chunks, {tier: 16, m: m, x: [ to_host(v, e) ]});
+				continue;
+			}
+
+			let q = torch.empty([ m, (t == 8) ? dc : dc / 2 ], 'int8', 'cuda:' + dev);
+			let sc = torch.empty([ m, dc / 32 ], 'float16', 'cuda:' + dev);
+
+			if (t == 8)
+				torch.kv_q8_put(v, q, sc, 0);
+			else
+				torch.kv_q4_put(v, q, sc, 0);
+
+			push(chunks, {tier: t, m: m, x: [ to_host(q, e), to_host(sc, e) ]});
+		}
+
+		return {ch: chunks, plane: to_host(c.plane.narrow(0, 0, n), e),
+			pools: to_host(c.pools.narrow(0, 0, mla_pools(n)), e)};
+	}
+
+	function mla_from_host(c, dev, d, n) {
+		for (let k = 0; k * KV_CHUNK < n; k++) {
+			let o = k * KV_CHUNK;
+			let m = min(KV_CHUNK, n - o);
+			let ch = d.ch[k];
+
+			if (c.qk) {
+				c.qk.narrow(0, o, m).copy_(ch.x[0].narrow(0, 0, m));
+				c.qs.narrow(0, o, m).copy_(ch.x[1].narrow(0, 0, m));
+				continue;
+			}
+
+			let src = ch.x[0];
+
+			if (ch.tier != 16) {
+				let q = ch.x[0].cuda(dev), sc = ch.x[1].cuda(dev);
+
+				src = (ch.tier == 8) ? torch.kv_q8_get(q, sc, 0, ch.m) : torch.kv_q4_get(q, sc, 0, ch.m);
+			}
+
+			if (m < ch.m)
+				src = src.narrow(0, 0, m);
+
+			c.ckv.narrow(0, o, m).copy_(src);
+		}
+
+		c.plane.narrow(0, 0, n).copy_(d.plane.narrow(0, 0, n));
+
+		if (mla_pools(n) > 0)
+			c.pools.narrow(0, 0, mla_pools(n)).copy_(d.pools.narrow(0, 0, mla_pools(n)));
+	}
+
+	// rows [0, n) of an MLA cache object to another (slot <-> live, any device)
+	function mla_copy(d, s, n) {
+		for (let k in [ 'ckv', 'qk', 'qs', 'plane' ])
+			if (s[k] != null)
+				d[k].narrow(0, 0, n).copy_(s[k].narrow(0, 0, n).cuda(d.dev));
+
+		if (mla_pools(n) > 0)
+			d.pools.narrow(0, 0, mla_pools(n)).copy_(s.pools.narrow(0, 0, mla_pools(n)).cuda(d.dev));
+	}
+
+	function mla_alloc(c) {
+		let o = {dev: c.dev};
+
+		for (let k in [ 'ckv', 'qk', 'qs', 'plane', 'pools' ])
+			if (c[k] != null)
+				o[k] = torch.zeros(c[k].shape(), c[k].dtype(), 'cuda:' + c.dev);
+
+		return o;
+	}
+
+	/* A resident slot of the generic (MLA) store path: device copies, at the live cache's capacity,
+	 * of the latent cache rows (one replica per layer), the KDA states, the snapshot buffers and the
+	 * draft cache. An entry in a slot is exact (no age tiers) and swaps back device to device. */
+	function new_slot_generic() {
+		let sl = {kv: {}, gdn: {}, snap: {}, draft: null};
+
+		for (let i = 0; i < cfg.num_hidden_layers; i++) {
+			let sts = states(i);
+
+			if (is_gdn(i))
+				sl.gdn[i] = map(sts, (cl) => [
+					torch.zeros(cl.rec_state.shape(), 'float32', 'cuda:' + cl.dev),
+					torch.zeros(cl.conv_state.shape(), 'float16', 'cuda:' + cl.dev)
+				]);
+			else
+				sl.kv[i] = mla_alloc(sts[0]);
+		}
+
+		for (let k in gdn_layers)
+			sl.snap[k] = snap_bufs(k);
+
+		if (mtp_mla())
+			sl.draft = mla_alloc(mtp_mla()[0]);
+
+		return sl;
+	}
+
+	// host bytes a slot entry takes when demoted (at the tiers of its length)
+	function slot_host_bytes(e) {
+		let b = 0;
+
+		for (let i in keys(e.slot.kv))
+			b += mla_bytes(e.slot.kv[i], e.n);
+
+		for (let i in keys(e.slot.gdn))
+			for (let p in e.slot.gdn[i])
+				b += tbytes(p[0]) + tbytes(p[1]);
+
+		if (e.snap)
+			for (let k in keys(e.slot.snap))
+				for (let p in e.slot.snap[k])
+					b += tbytes(p[0]) + tbytes(p[1]);
+
+		if (e.draft && e.slot.draft)
+			b += mla_bytes(e.slot.draft, e.dl);
+
+		return b;
+	}
+
 	function store_estimate() {
 		let n = length(ids), b = 0;
 
 		if (model.cache_bytes)
 			return model.cache_bytes(cache, n);
 
-		for (let i = 0; i < cfg.num_hidden_layers; i++)
-			for (let cl in states(i)) {
+		for (let i = 0; i < cfg.num_hidden_layers; i++) {
+			let sts = states(i);
+
+			if (!is_gdn(i) && is_mla(sts[0])) {
+				b += mla_bytes(sts[0], n);
+				continue;
+			}
+
+			for (let cl in sts) {
 				if (!is_gdn(i)) {
 					let sh = cl.k_cache.shape();
 
@@ -829,8 +1011,11 @@ export function create(model, opts) {
 				else
 					b += 2 * (tbytes(cl.rec_state) + tbytes(cl.conv_state));
 			}
+		}
 
-		if (cache.mtp && draft_len > 0) {
+		if (mtp_mla() && draft_len > 0)
+			b += mla_bytes(mtp_mla()[0], draft_len);
+		else if (cache.mtp && draft_len > 0) {
 			let sh = cache.mtp.k_cache.shape();
 
 			for (let o = 0; o < draft_len; o += KV_CHUNK) {
@@ -907,7 +1092,7 @@ export function create(model, opts) {
 	 * budget cannot take it. */
 	function demote(k) {
 		let e = store[k];
-		let b = tree_bytes(e.model);
+		let b = e.model ? tree_bytes(e.model) : slot_host_bytes(e);
 
 		if (store_budget <= 0 || b > store_budget) {
 			store_drop(k);
@@ -928,10 +1113,37 @@ export function create(model, opts) {
 			store_drop(o);
 		}
 
-		let h = {bytes: 0};
+		let h = {bytes: e.model ? 0 : e.bytes};
 
 		try {
-			e.model = host_tree(e.model, h);
+			if (e.model)
+				e.model = host_tree(e.model, h);
+			else {
+				// generic entry: the slot's rows into the host layout (age tiers apply)
+				let sl = e.slot;
+
+				e.kv = {};
+				e.gdn = {};
+
+				for (let i in keys(sl.kv))
+					e.kv[i] = [ mla_to_host(sl.kv[i], sl.kv[i].dev, e.n, h) ];
+
+				for (let i in keys(sl.gdn))
+					e.gdn[i] = map(sl.gdn[i], (p) => [ to_host(p[0], h), to_host(p[1], h) ]);
+
+				if (e.snap) {
+					e.snap = {};
+
+					for (let q in keys(sl.snap))
+						e.snap[q] = map(sl.snap[q], (p) => [ to_host(p[0], h), to_host(p[1], h) ]);
+				}
+
+				if (e.draft && sl.draft)
+					e.draft = mla_to_host(sl.draft, sl.draft.dev, e.dl, h);
+				else
+					e.draft = null;
+			}
+
 			e.bytes = h.bytes;
 			store_bytes += h.bytes;
 			push(slots_free, e.slot);
@@ -1023,11 +1235,32 @@ export function create(model, opts) {
 			for (let i = 0; i < cfg.num_hidden_layers; i++) {
 				let sts = states(i);
 
-				e[is_gdn(i) ? 'gdn' : 'kv'][i] = map(sts, (cl) => !is_gdn(i) ?
-					kv_to_host(cl, cl.dev, n, e) : [ to_host(cl.rec_state, e), to_host(cl.conv_state, e) ]);
+				if (slot) {
+					if (is_gdn(i))
+						for (let r = 0; r < length(sts); r++) {
+							slot.gdn[i][r][0].copy_(sts[r].rec_state);
+							slot.gdn[i][r][1].copy_(sts[r].conv_state);
+						}
+					else
+						mla_copy(slot.kv[i], sts[0], n);
+				}
+				else if (!is_gdn(i) && is_mla(sts[0]))
+					e.kv[i] = [ mla_to_host(sts[0], sts[0].dev, n, e) ];
+				else
+					e[is_gdn(i) ? 'gdn' : 'kv'][i] = map(sts, (cl) => !is_gdn(i) ?
+						kv_to_host(cl, cl.dev, n, e) : [ to_host(cl.rec_state, e), to_host(cl.conv_state, e) ]);
 			}
 
-			if (cache.mtp && draft_len > 0)
+			if (mtp_mla() && draft_len > 0) {
+				if (slot)
+					mla_copy(slot.draft, mtp_mla()[0], draft_len);
+				else
+					e.draft = mla_to_host(mtp_mla()[0], mtp_mla()[0].dev, draft_len, e);
+
+				if (slot)
+					e.draft = true;
+			}
+			else if (cache.mtp && draft_len > 0)
 				e.draft = kv_to_host(cache.mtp, M.dev, draft_len, e);
 
 			if (last_hidden)
@@ -1037,11 +1270,24 @@ export function create(model, opts) {
 				e.snap_ids = slice(snap_ids);
 				e.snap = {};
 
-				for (let k in gdn_layers)
-					e.snap[k] = map(snap[k], (b) => [ to_host(b[0], e), to_host(b[1], e) ]);
+				for (let k in gdn_layers) {
+					if (slot) {
+						for (let r = 0; r < length(snap[k]); r++) {
+							slot.snap[k][r][0].copy_(snap[k][r][0]);
+							slot.snap[k][r][1].copy_(snap[k][r][1]);
+						}
+					}
+					else
+						e.snap[k] = map(snap[k], (b) => [ to_host(b[0], e), to_host(b[1], e) ]);
+				}
 
 				if (snap_hidden)
 					e.snap_hid = to_host(snap_hidden, e);
+			}
+
+			if (slot) {
+				torch.synchronize();
+				e.slot = slot;
 			}
 		}
 		catch (err) {
@@ -1060,8 +1306,8 @@ export function create(model, opts) {
 
 		push(store, e);
 		store_bytes += e.bytes;
-		warn(sprintf('engine: cache store: %d tokens moved to host RAM in %.0f ms (%d entries, %.1f GiB)\n',
-			n, now_ms() - t0, length(store), store_bytes / 1073741824.0));
+		warn(sprintf('engine: cache store: %d tokens moved to %s in %.0f ms (%d entries, %.1f GiB host)\n',
+			n, slot ? 'a device slot' : 'host RAM', now_ms() - t0, length(store), store_bytes / 1073741824.0));
 
 		return true;
 	}
@@ -1115,20 +1361,30 @@ export function create(model, opts) {
 			let sts = states(i);
 
 			for (let r = 0; r < length(sts); r++) {
-				if (!is_gdn(i))
+				if (!is_gdn(i) && is_mla(sts[r])) {
+					if (e.slot)
+						mla_copy(sts[r], e.slot.kv[i], start);
+					else
+						mla_from_host(sts[r], sts[r].dev, e.kv[i][0], start);
+				}
+				else if (!is_gdn(i))
 					kv_from_host(sts[r], sts[r].dev, e.kv[i][r], start);
 				else if (live) {
-					sts[r].rec_state.copy_(e.gdn[i][r][0]);
-					sts[r].conv_state.copy_(e.gdn[i][r][1]);
+					let g = e.slot ? e.slot.gdn[i][r] : e.gdn[i][r];
+
+					sts[r].rec_state.copy_(g[0]);
+					sts[r].conv_state.copy_(g[1]);
 				}
 			}
 		}
 
 		if (e.snap) {
+			let es = e.slot ? e.slot.snap : e.snap;
+
 			for (let k in gdn_layers)
 				for (let r = 0; r < length(snap[k]); r++) {
-					snap[k][r][0].copy_(e.snap[k][r][0]);
-					snap[k][r][1].copy_(e.snap[k][r][1]);
+					snap[k][r][0].copy_(es[k][r][0]);
+					snap[k][r][1].copy_(es[k][r][1]);
 				}
 
 			snap_ids = slice(e.snap_ids);
@@ -1141,7 +1397,15 @@ export function create(model, opts) {
 
 		let dl = min(e.dl, start);
 
-		if (cache.mtp && e.draft && dl > 0)
+		if (mtp_mla() && e.draft && dl > 0) {
+			for (let h in mtp_mla()) {
+				if (e.slot)
+					mla_copy(h, e.slot.draft, dl);
+				else
+					mla_from_host(h, h.dev, e.draft, dl);
+			}
+		}
+		else if (cache.mtp && e.draft && dl > 0)
 			kv_from_host(cache.mtp, M.dev, e.draft, dl);
 
 		if (live) {
@@ -1159,8 +1423,16 @@ export function create(model, opts) {
 			last_hidden = null;
 
 		torch.synchronize();
-		warn(sprintf('engine: cache store: %d tokens restored from host RAM in %.0f ms\n',
-			start, now_ms() - t0));
+
+		let from_slot = !!e.slot;
+
+		if (e.slot) {
+			push(slots_free, e.slot);
+			e.slot = null;
+		}
+
+		warn(sprintf('engine: cache store: %d tokens restored from %s in %.0f ms\n',
+			start, from_slot ? 'a device slot' : 'host RAM', now_ms() - t0));
 	}
 
 	/* Decide where the job's prompt starts: live state, snapshot, a stored
@@ -2613,7 +2885,7 @@ export function create(model, opts) {
 	 * left (opts.slot_margin MiB, default 512). That count is the number of conversations
 	 * that can be parked on the device besides the live one. */
 	function alloc_slots() {
-		if (slots_cfg == 0 || !model.new_slot || !model.devs)
+		if (slots_cfg == 0 || !(model.new_slot || mla_store) || !model.devs)
 			return;
 
 		let cap = (slots_cfg == 'auto') ? 256 : int(slots_cfg);   // (auto: as many as fit, 256 at most)
@@ -2661,7 +2933,7 @@ export function create(model, opts) {
 			let s;
 
 			try {
-				s = model.new_slot(max_ctx);
+				s = model.new_slot ? model.new_slot(max_ctx) : new_slot_generic();
 				torch.synchronize();
 			}
 			catch (e) {
