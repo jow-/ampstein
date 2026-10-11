@@ -32,6 +32,8 @@ GPUs from ucode scripts, with no Python in the loop.
 - Native BPE tokenizer for HF `tokenizer.json` files (PCRE2 pre-tokenizer).
 - Jinja → ucode transpiler for chat templates, with taint tracking so user text
   can never tokenize as a special token.
+- Qwen3.5 / 3.8 hybrid (Gated DeltaNet + attention): layer split over several
+  GPUs, pipelined prefill, CUDA-graph decode.
 
 ## Building and installing
 

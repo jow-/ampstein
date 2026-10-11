@@ -80,3 +80,21 @@ amp_test(tv_sink)
 amp_test(utpl)
 # utpl_template: real checkpoint chat templates, byte-exact vs the jinja2 oracle
 amp_test(utpl_template)
+
+# --- Qwen3.5 / 3.8 hybrid (Gated DeltaNet + attention)
+# gdn_scan: fused gated delta rule kernel vs the per-token recurrence
+amp_test(gdn_scan)
+# gdn_fused: fused GDN layer kernels vs the composite ATen reference
+amp_test(gdn_fused)
+# qwen35_layers: per-layer oracle (GDN + full attention)
+amp_test(qwen35_layers)
+# qwen35_full: full model, multi-GPU layer split, generation vs the oracle
+amp_test(qwen35_full)
+# qwen35_pipeline: pipelined chunked prefill == sequential prefill (bit-exact)
+amp_test(qwen35_pipeline)
+# qwen35_graph: CUDA-graph decode steps vs eager, two GPUs
+amp_test(qwen35_graph)
+# attn_decode_s: split-KV decode attention, shuffle + tensor-core variants vs SDPA
+amp_test(attn_decode_s)
+# qwen35_attn_dev: decode attention wiring selects the mma kernel
+amp_test(qwen35_attn_dev)

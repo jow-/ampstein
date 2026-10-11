@@ -772,6 +772,41 @@ tensor_ones(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * rand(dims, dtype?, device?): torch.tensor
+ *
+ * As zeros(), filled with uniform [0, 1) values from the device's
+ * default generator. For test/benchmark fixtures that are too big to
+ * build on the host (a 184M-element from_array is minutes; this is
+ * milliseconds — and no pageable H2D, L58).
+ */
+static uc_value_t *
+tensor_rand(uc_vm_t *vm, size_t nargs)
+{
+	std::vector<int64_t> dims;
+	at::ScalarType dt = at::kFloat;
+	at::Device dev = at::Device(at::kCPU);
+
+	if (!parse_factory_args(vm, nargs, &dims, &dt, &dev))
+		return NULL;
+
+	if (dims.empty()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"at least one dimension required");
+		return NULL;
+	}
+
+	try {
+		at::Tensor t = at::rand(dims,
+			at::TensorOptions().dtype(dt).device(dev));
+
+		return tensor_wrap(vm, std::move(t), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
  * full(dims, value, dtype?, device?): torch.tensor
  *
  * As zeros(), filled with `value`.
@@ -1530,6 +1565,20 @@ tensor_contiguous(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * is_contiguous(): boolean
+ */
+static uc_value_t *
+tensor_is_contiguous(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm);
+
+	if (!t)
+		return NULL;
+
+	return ucv_boolean_new(t->is_contiguous());
+}
+
+/*
  * numel(): number
  */
 static uc_value_t *
@@ -1599,6 +1648,34 @@ tensor_unsqueeze(uc_vm_t *vm, size_t nargs)
 
 	try {
 		at::Tensor r = t->unsqueeze(dim);
+
+		return tensor_wrap(vm, std::move(r), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+static uc_value_t *
+tensor_squeeze(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm);
+	int64_t dim = 0;
+
+	if (!t)
+		return NULL;
+
+	if (nargs > 1) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected at most one argument");
+		return NULL;
+	}
+
+	if (nargs == 1 && !arg_int(vm, uc_fn_arg(0), &dim))
+		return NULL;
+
+	try {
+		at::Tensor r = nargs ? t->squeeze(dim) : t->squeeze();
 
 		return tensor_wrap(vm, std::move(r), 0);
 	}
@@ -1740,6 +1817,44 @@ tensor_copy_(uc_vm_t *vm, size_t nargs)
 
 	try {
 		t->copy_(*src);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return ucv_get(_uc_fn_this_res(vm));
+}
+
+/*
+ * index_copy_(dim, index, src): this
+ *
+ * In-place scatter of `src` into this tensor along `dim` at the
+ * positions given by the int64 `index` tensor. The captured-graph KV
+ * write: the slot comes from a persistent position tensor whose VALUE
+ * changes between replays (narrow+copy_ would bake the offset in).
+ */
+static uc_value_t *
+tensor_index_copy_(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm), *idx, *src;
+	int64_t dim;
+
+	if (!t)
+		return NULL;
+
+	if (nargs != 3 || !arg_int(vm, uc_fn_arg(0), &dim) ||
+	    !(idx = tensor_arg(vm, uc_fn_arg(1))) ||
+	    !(src = tensor_arg(vm, uc_fn_arg(2))))
+		return NULL;
+
+	try {
+		if (idx->scalar_type() != at::kLong) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"index must be an int64 tensor");
+			return NULL;
+		}
+
+		t->index_copy_(dim, *idx, *src);
 	}
 	catch (const std::exception &e) {
 		RAISE(e.what());
@@ -1902,6 +2017,23 @@ tensor_silu(uc_vm_t *vm, size_t nargs)
 		[](const at::Tensor &x) { return at::silu(x); });
 }
 
+static uc_value_t *
+tensor_sigmoid(uc_vm_t *vm, size_t nargs)
+{
+	return tensor_unary(vm, nargs, "sigmoid",
+		[](const at::Tensor &x) { return at::sigmoid(x); });
+}
+
+/* softplus with the default threshold 20 (x > 20 passes through
+ * identity) — matches torch.nn.functional.softplus defaults, which is
+ * what the GDN decay chain specifies. */
+static uc_value_t *
+tensor_softplus(uc_vm_t *vm, size_t nargs)
+{
+	return tensor_unary(vm, nargs, "softplus",
+		[](const at::Tensor &x) { return at::softplus(x); });
+}
+
 /*
  * softmax(dim?: number): torch.tensor
  *
@@ -2059,6 +2191,40 @@ tensor_topk(uc_vm_t *vm, size_t nargs)
 			tensor_wrap(vm, std::move(indices), 0));
 
 		return obj;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * argmax(dim?: number): torch.tensor
+ *
+ * at::argmax along `dim` (default -1). Draft/verify path: the winning
+ * token id per position without materializing a top-k heap.
+ */
+static uc_value_t *
+tensor_argmax(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm);
+	int64_t dim = -1;
+	bool has_dim = false;
+
+	if (!t)
+		return NULL;
+
+	if (nargs > 1 || (nargs == 1 && !arg_int(vm, uc_fn_arg(0), &dim))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (dim?)");
+		return NULL;
+	}
+
+	has_dim = nargs >= 1;
+
+	try {
+		at::Tensor r = has_dim ? t->argmax(dim) : t->argmax();
+
+		return tensor_wrap(vm, std::move(r), 0);
 	}
 	catch (const std::exception &e) {
 		RAISE(e.what());
@@ -3256,6 +3422,58 @@ amp_argmax_advance_fp16(const void *logits, int n,
                        void *ids, void *pos, void *log, long long log_cap,
                        void *ws, cudaStream_t stream);
 
+extern "C" int
+amp_gdn_scan_f32(const void *q, const void *k, const void *v, const void *beta,
+                const void *gexp, void *state, void *out, int S, int Hk,
+                int Hv, int dk, int dv, float scale, void *states_out,
+                int n_out, cudaStream_t stream);
+
+extern "C" long
+amp_attn_dec_ws_floats(int S, int Hq, int Hk, int E, int ns);
+
+extern "C" int
+amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
+                 void *ws, void *out, int S, int Hq, int Hk, int E,
+                 int max_seq, int ns, float scale, cudaStream_t stream);
+
+extern "C" int
+amp_attn_dec_mma_fp16(const void *q, const void *k, const void *v,
+                     const int *len, void *ws, void *out, int S, int Hq,
+                     int Hk, int E, int max_seq, int ns, float scale,
+                     cudaStream_t stream);
+
+extern "C" int
+amp_qk_norm_rope_fp16(const void *x, long st, long sh, const void *w,
+                     const void *cos, const void *sin, void *out, int S, int H,
+                     int hd, int rd, float eps, cudaStream_t stream);
+
+extern "C" int
+amp_attn_gate_fp16(const void *a, long ast, long ash, const void *g, long gst,
+                  long gsh, void *out, int S, int H, int hd, cudaStream_t stream);
+
+extern "C" long
+amp_gdn_chunk_ws_floats(int S, int Hv);
+
+extern "C" int
+amp_gdn_chunk_f32(const void *q, const void *k, const void *v, const void *beta,
+                 const void *gexp, void *state, void *out, void *ws, int S,
+                 int Hk, int Hv, int dk, int dv, float scale,
+                 cudaStream_t stream);
+
+extern "C" int
+amp_gdn_prep_fp16(const void *qkv, void *conv_state, const void *conv_w,
+                 void *q, void *k, void *v, int S, int D, int K, int Hk,
+                 int Hv, int hd, cudaStream_t stream);
+
+extern "C" int
+amp_gdn_gates(const void *a, const void *b, const void *dt_bias,
+             const void *nea, void *beta, void *gexp, int S, int Hv,
+             cudaStream_t stream);
+
+extern "C" int
+amp_gdn_out_norm(const void *core, const void *z, const void *w, void *out,
+                long rows, int dv, float eps, cudaStream_t stream);
+
 /* Validate a tensor argument for the fused kernels: fp16 CUDA, and
  * contiguous unless allow_noncontig. Returns NULL after raising on bad
  * input. */
@@ -3677,6 +3895,552 @@ torch_silu_mul(uc_vm_t *vm, size_t nargs)
 	do { uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, __VA_ARGS__); return NULL; } while (0)
 
 /*
+ * gdn_scan(q, k, v, beta, gexp, state, scale): torch.tensor
+ *
+ * Fused gated delta rule over a chunk of S tokens (src/amp_kernels.cu),
+ * one launch for the whole chunk. All fp32 CUDA contiguous on one device:
+ *
+ *   q, k   (S, Hk, dk)   l2-normalized; v head h reads q/k head
+ *                        h / (Hv / Hk) (no head repeat needed)
+ *   v      (S, Hv, dv)
+ *   beta   (S, Hv)
+ *   gexp   (S, Hv)       per-token decay exp(g)
+ *   state  (Hv, dk, dv)  updated in place
+ *
+ * Returns out (S, Hv, dv) fp32. dk must be 64 or 128, dv a multiple of
+ * 64. Same math as ucode/qwen35.uc delta_rule_scan (the reference).
+ */
+static at::Tensor *
+f32_arg(uc_vm_t *vm, uc_value_t *v, const char *what)
+{
+	at::Tensor *t = tensor_arg(vm, v);
+
+	if (!t)
+		return NULL;
+
+	if (t->scalar_type() != at::kFloat || !t->is_cuda() ||
+	    !t->is_contiguous()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"%s: must be a contiguous float32 CUDA tensor", what);
+		return NULL;
+	}
+
+	return t;
+}
+
+static uc_value_t *
+gdn_scan_impl(uc_vm_t *vm, size_t nargs, bool chunked)
+{
+	double scale;
+
+	if ((nargs != 7 && nargs != 8) || !arg_number(vm, uc_fn_arg(6), &scale)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q, k, v, beta, gexp, state, scale, states_out?)");
+		return NULL;
+	}
+
+	at::Tensor *q = f32_arg(vm, uc_fn_arg(0), "gdn_scan: q");
+	at::Tensor *k = q ? f32_arg(vm, uc_fn_arg(1), "gdn_scan: k") : NULL;
+	at::Tensor *v = k ? f32_arg(vm, uc_fn_arg(2), "gdn_scan: v") : NULL;
+	at::Tensor *beta = v ? f32_arg(vm, uc_fn_arg(3), "gdn_scan: beta") : NULL;
+	at::Tensor *gexp = beta ? f32_arg(vm, uc_fn_arg(4), "gdn_scan: gexp") : NULL;
+	at::Tensor *st = gexp ? f32_arg(vm, uc_fn_arg(5), "gdn_scan: state") : NULL;
+
+	if (!st)
+		return NULL;
+
+	/* states_out (n, Hv, dk, dv) fp32: the state after each of the
+	 * first n tokens (speculative verify), sequential kernel only */
+	at::Tensor *so = NULL;
+	uc_value_t *sov = uc_fn_arg(7);
+
+	if (nargs == 8 && ucv_type(sov) != UC_NULL) {
+		if (chunked) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"gdn_chunk: states_out is not supported");
+			return NULL;
+		}
+
+		if (!(so = f32_arg(vm, sov, "gdn_scan: states_out")))
+			return NULL;
+
+		if (so->dim() != 4 || so->size(0) > q->size(0) ||
+		    so->size(1) != st->size(0) || so->size(2) != st->size(1) ||
+		    so->size(3) != st->size(2) || so->get_device() != st->get_device()) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"gdn_scan: states_out must be (n <= S, Hv, dk, dv) on the state's device");
+			return NULL;
+		}
+	}
+
+	if (q->dim() != 3 || k->sizes() != q->sizes() || v->dim() != 3 ||
+	    v->size(0) != q->size(0) || st->dim() != 3 ||
+	    st->size(0) != v->size(1) || st->size(1) != q->size(2) ||
+	    st->size(2) != v->size(2) || beta->numel() != v->size(0) * v->size(1) ||
+	    gexp->numel() != beta->numel()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"gdn_scan: incompatible shapes");
+		return NULL;
+	}
+
+	int dev = q->get_device();
+
+	if (k->get_device() != dev || v->get_device() != dev ||
+	    beta->get_device() != dev || gexp->get_device() != dev ||
+	    st->get_device() != dev) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"gdn_scan: all tensors must be on the same device");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		at::Tensor out = at::empty({ v->size(0), v->size(1), v->size(2) },
+			v->options());
+
+		int rc;
+
+		if (chunked) {
+			at::Tensor ws = at::empty({ (int64_t)amp_gdn_chunk_ws_floats(
+				(int)q->size(0), (int)v->size(1)) }, v->options());
+
+			rc = amp_gdn_chunk_f32(q->data_ptr(), k->data_ptr(),
+				v->data_ptr(), beta->data_ptr(), gexp->data_ptr(),
+				st->data_ptr(), out.data_ptr(), ws.data_ptr(),
+				(int)q->size(0), (int)q->size(1), (int)v->size(1),
+				(int)q->size(2), (int)v->size(2), (float)scale,
+				c10::cuda::getCurrentCUDAStream().stream());
+		}
+		else {
+			rc = amp_gdn_scan_f32(q->data_ptr(), k->data_ptr(),
+				v->data_ptr(), beta->data_ptr(), gexp->data_ptr(),
+				st->data_ptr(), out.data_ptr(), (int)q->size(0),
+				(int)q->size(1), (int)v->size(1), (int)q->size(2),
+				(int)v->size(2), (float)scale,
+				so ? so->data_ptr() : NULL, so ? (int)so->size(0) : 0,
+				c10::cuda::getCurrentCUDAStream().stream());
+		}
+
+		if (!launch_ok(vm, rc, chunked ? "gdn_chunk" : "gdn_scan"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+static uc_value_t *
+torch_gdn_scan(uc_vm_t *vm, size_t nargs)
+{
+	return gdn_scan_impl(vm, nargs, false);
+}
+
+/*
+ * gdn_chunk(q, k, v, beta, gexp, state, scale): torch.tensor
+ *
+ * Same contract as gdn_scan, computed in 64-token blocks (WY/UT form:
+ * block-parallel factorization + a per-block state recurrence; see
+ * src/amp_kernels.cu). Prefill path; dk == dv == 128 only.
+ */
+static uc_value_t *
+torch_gdn_chunk(uc_vm_t *vm, size_t nargs)
+{
+	return gdn_scan_impl(vm, nargs, true);
+}
+
+/*
+ * gdn_prep(qkv, conv_state, conv_w, Hk, Hv, head_dim): [q, k, v]
+ *
+ * Fused GatedDeltaNet input preparation (src/amp_kernels.cu): causal
+ * conv1d over [conv_state | chunk] + SiLU, split into q/k/v heads, fp32,
+ * l2-normalized q/k; updates conv_state (the last K-1 inputs) in place.
+ *
+ *   qkv        (1, S, D) fp16, D = (2 * Hk + Hv) * head_dim
+ *   conv_state (1, D, K-1) fp16
+ *   conv_w     (D, K) fp16
+ *
+ * Returns q, k (S, Hk, head_dim) and v (S, Hv, head_dim), fp32.
+ */
+static uc_value_t *
+torch_gdn_prep(uc_vm_t *vm, size_t nargs)
+{
+	int64_t Hk, Hv, hd;
+
+	if (nargs != 6 || !arg_int(vm, uc_fn_arg(3), &Hk) ||
+	    !arg_int(vm, uc_fn_arg(4), &Hv) || !arg_int(vm, uc_fn_arg(5), &hd)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (qkv, conv_state, conv_w, Hk, Hv, head_dim)");
+		return NULL;
+	}
+
+	at::Tensor *qkv = fused_arg(vm, uc_fn_arg(0), "gdn_prep: qkv", false);
+	at::Tensor *cs = qkv ? fused_arg(vm, uc_fn_arg(1), "gdn_prep: conv_state", false) : NULL;
+	at::Tensor *cw = cs ? fused_arg(vm, uc_fn_arg(2), "gdn_prep: conv_w", false) : NULL;
+
+	if (!cw)
+		return NULL;
+
+	int64_t S = qkv->size(-2), D = qkv->size(-1);
+
+	if (qkv->numel() != S * D || cw->dim() != 2 || cw->size(0) != D ||
+	    cs->numel() != D * (cw->size(1) - 1) || D != (2 * Hk + Hv) * hd) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"gdn_prep: incompatible shapes");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*qkv);
+
+	try {
+		auto f32 = qkv->options().dtype(at::kFloat);
+		at::Tensor q = at::empty({ S, Hk, hd }, f32);
+		at::Tensor k = at::empty({ S, Hk, hd }, f32);
+		at::Tensor v = at::empty({ S, Hv, hd }, f32);
+
+		int rc = amp_gdn_prep_fp16(qkv->data_ptr(), cs->data_ptr(),
+			cw->data_ptr(), q.data_ptr(), k.data_ptr(), v.data_ptr(),
+			(int)S, (int)D, (int)cw->size(1), (int)Hk, (int)Hv, (int)hd,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "gdn_prep"))
+			return NULL;
+
+		uc_value_t *arr = ucv_array_new(vm);
+
+		ucv_array_push(arr, tensor_wrap(vm, std::move(q), 0));
+		ucv_array_push(arr, tensor_wrap(vm, std::move(k), 0));
+		ucv_array_push(arr, tensor_wrap(vm, std::move(v), 0));
+
+		return arr;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * gdn_gates(a, b, dt_bias, neg_exp_a_log): [beta, gexp]
+ *
+ * beta = sigmoid(b), gexp = exp(neg_exp_a_log * softplus(a + dt_bias)).
+ * a, b (…, Hv) fp16 contiguous; dt_bias, neg_exp_a_log (Hv) fp32.
+ * Returns beta, gexp as (S, Hv) fp32.
+ */
+static uc_value_t *
+torch_gdn_gates(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 4) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (a, b, dt_bias, neg_exp_a_log)");
+		return NULL;
+	}
+
+	at::Tensor *a = fused_arg(vm, uc_fn_arg(0), "gdn_gates: a", false);
+	at::Tensor *b = a ? fused_arg(vm, uc_fn_arg(1), "gdn_gates: b", false) : NULL;
+	at::Tensor *dtb = b ? f32_arg(vm, uc_fn_arg(2), "gdn_gates: dt_bias") : NULL;
+	at::Tensor *nea = dtb ? f32_arg(vm, uc_fn_arg(3), "gdn_gates: neg_exp_a_log") : NULL;
+
+	if (!nea)
+		return NULL;
+
+	int64_t Hv = dtb->numel();
+
+	if (b->numel() != a->numel() || nea->numel() != Hv || Hv == 0 ||
+	    a->numel() % Hv != 0) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"gdn_gates: incompatible shapes");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*a);
+
+	try {
+		int64_t S = a->numel() / Hv;
+		auto f32 = a->options().dtype(at::kFloat);
+		at::Tensor beta = at::empty({ S, Hv }, f32);
+		at::Tensor gexp = at::empty({ S, Hv }, f32);
+
+		int rc = amp_gdn_gates(a->data_ptr(), b->data_ptr(), dtb->data_ptr(),
+			nea->data_ptr(), beta.data_ptr(), gexp.data_ptr(), (int)S,
+			(int)Hv, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "gdn_gates"))
+			return NULL;
+
+		uc_value_t *arr = ucv_array_new(vm);
+
+		ucv_array_push(arr, tensor_wrap(vm, std::move(beta), 0));
+		ucv_array_push(arr, tensor_wrap(vm, std::move(gexp), 0));
+
+		return arr;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * gdn_out_norm(core, z, weight, eps): torch.tensor
+ *
+ * GatedDeltaNet output: per (token, head) RMSNorm over the v head dim,
+ * weight multiply, then * silu(z). core (S, Hv, dv) fp32 contiguous;
+ * z (…, Hv * dv) fp16; weight (dv) fp16. Returns (1, S, Hv * dv) fp16.
+ */
+static uc_value_t *
+torch_gdn_out_norm(uc_vm_t *vm, size_t nargs)
+{
+	double eps;
+
+	if (nargs != 4 || !arg_number(vm, uc_fn_arg(3), &eps)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (core, z, weight, eps)");
+		return NULL;
+	}
+
+	at::Tensor *core = f32_arg(vm, uc_fn_arg(0), "gdn_out_norm: core");
+	at::Tensor *z = core ? fused_arg(vm, uc_fn_arg(1), "gdn_out_norm: z", false) : NULL;
+	at::Tensor *w = z ? fused_arg(vm, uc_fn_arg(2), "gdn_out_norm: weight", false) : NULL;
+
+	if (!w)
+		return NULL;
+
+	if (core->dim() != 3 || z->numel() != core->numel() ||
+	    w->numel() != core->size(2)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"gdn_out_norm: incompatible shapes");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*core);
+
+	try {
+		int64_t S = core->size(0), Hv = core->size(1), dv = core->size(2);
+		at::Tensor out = at::empty({ 1, S, Hv * dv }, z->options());
+
+		int rc = amp_gdn_out_norm(core->data_ptr(), z->data_ptr(),
+			w->data_ptr(), out.data_ptr(), (long)(S * Hv), (int)dv,
+			(float)eps, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "gdn_out_norm"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * qk_norm_rope(x, weight, cos, sin, rotary_dim, eps): torch.tensor
+ *
+ * Fused per-head RMSNorm + partial NEOX RoPE (src/amp_kernels.cu). x is
+ * (1, S, H, hd) fp16, may be strided over tokens and heads (e.g. the q
+ * half of the interleaved q/gate projection) but contiguous over hd;
+ * weight (hd) fp16; cos/sin (S, rotary_dim/2) fp32 contiguous. Returns
+ * (1, S, H, hd) fp16 contiguous.
+ */
+static uc_value_t *
+torch_qk_norm_rope(uc_vm_t *vm, size_t nargs)
+{
+	int64_t rd;
+	double eps;
+
+	if (nargs != 6 || !arg_int(vm, uc_fn_arg(4), &rd) ||
+	    !arg_number(vm, uc_fn_arg(5), &eps)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (x, weight, cos, sin, rotary_dim, eps)");
+		return NULL;
+	}
+
+	at::Tensor *x = fused_arg(vm, uc_fn_arg(0), "qk_norm_rope: x", true);
+	at::Tensor *w = x ? fused_arg(vm, uc_fn_arg(1), "qk_norm_rope: weight", false) : NULL;
+	at::Tensor *cs = w ? f32_arg(vm, uc_fn_arg(2), "qk_norm_rope: cos") : NULL;
+	at::Tensor *sn = cs ? f32_arg(vm, uc_fn_arg(3), "qk_norm_rope: sin") : NULL;
+
+	if (!sn)
+		return NULL;
+
+	if (x->dim() != 4 || x->size(0) != 1 || x->stride(3) != 1 ||
+	    w->numel() != x->size(3) || cs->dim() != 2 ||
+	    cs->size(0) != x->size(1) || cs->size(1) * 2 != rd ||
+	    sn->sizes() != cs->sizes()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"qk_norm_rope: incompatible shapes");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		int64_t S = x->size(1), H = x->size(2), hd = x->size(3);
+		at::Tensor out = at::empty({ 1, S, H, hd }, x->options());
+
+		int rc = amp_qk_norm_rope_fp16(x->data_ptr(), (long)x->stride(1),
+			(long)x->stride(2), w->data_ptr(), cs->data_ptr(), sn->data_ptr(),
+			out.data_ptr(), (int)S, (int)H, (int)hd, (int)rd, (float)eps,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "qk_norm_rope"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * attn_gate(attn, g): torch.tensor
+ *
+ * out = attn * fp16(sigmoid(g)), attn (1, H, S, hd) and g (1, S, H, hd)
+ * fp16, both may be strided (contiguous over hd). Returns (1, S, H * hd)
+ * fp16 contiguous — the o_proj input.
+ */
+static uc_value_t *
+torch_attn_gate(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 2) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (attn, g)");
+		return NULL;
+	}
+
+	at::Tensor *a = fused_arg(vm, uc_fn_arg(0), "attn_gate: attn", true);
+	at::Tensor *g = a ? fused_arg(vm, uc_fn_arg(1), "attn_gate: g", true) : NULL;
+
+	if (!g)
+		return NULL;
+
+	if (a->dim() != 4 || g->dim() != 4 || a->size(1) != g->size(2) ||
+	    a->size(2) != g->size(1) || a->size(3) != g->size(3) ||
+	    a->stride(3) != 1 || g->stride(3) != 1) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"attn_gate: incompatible shapes");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*a);
+
+	try {
+		int64_t H = a->size(1), S = a->size(2), hd = a->size(3);
+		at::Tensor out = at::empty({ 1, S, H * hd }, a->options());
+
+		int rc = amp_attn_gate_fp16(a->data_ptr(), (long)a->stride(2),
+			(long)a->stride(1), g->data_ptr(), (long)g->stride(1),
+			(long)g->stride(2), out.data_ptr(), (int)S, (int)H, (int)hd,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "attn_gate"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * attn_decode(q, k_cache, v_cache, len, scale, splits?, mma?):
+ * torch.tensor
+ *
+ * Split-KV decode attention with a DEVICE-side key count (src/
+ * amp_kernels.cu amp_attn_dec_kernel / amp_attn_dec_mma_kernel),
+ * CUDA-graph-safe: q (S, Hq, E) fp16 contiguous (S <= 5,
+ * (Hq/Hk) * S <= 32), k/v caches (Hk, max_seq, E) fp16 contiguous,
+ * len (1) int32 on the device = keys in use (row s attends keys
+ * [0, len - S + s]). splits: key splits per kv head (default:
+ * 2 blocks per SM over the kv heads). mma = 1 selects the
+ * tensor-core (mma.sync) variant, which is ~2.2x faster at long
+ * key counts (E = 64/128/256); default 0 is the shuffle kernel.
+ * Returns (S, Hq, E).
+ */
+static uc_value_t *
+torch_attn_decode(uc_vm_t *vm, size_t nargs)
+{
+	double scale;
+	int64_t splits = 0, use_mma = 0;
+	uc_value_t *scv = uc_fn_arg(4), *spv = uc_fn_arg(5);
+	uc_value_t *mmav = uc_fn_arg(6);
+
+	if ((nargs != 5 && nargs != 6 && nargs != 7) ||
+	    !arg_number(vm, scv, &scale) ||
+	    (nargs >= 6 && ucv_type(spv) != UC_NULL && !arg_int(vm, spv, &splits)) ||
+	    (nargs == 7 && ucv_type(mmav) != UC_NULL && !arg_int(vm, mmav, &use_mma))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q, k_cache, v_cache, len, scale, splits?, mma?)");
+		return NULL;
+	}
+
+	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *k = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *v = k ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	at::Tensor *len = v ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+
+	if (!len)
+		return NULL;
+
+	int dev = q->get_device();
+
+	if (q->dim() != 3 || k->dim() != 3 || v->sizes() != k->sizes() ||
+	    q->scalar_type() != at::kHalf || k->scalar_type() != at::kHalf ||
+	    v->scalar_type() != at::kHalf || len->scalar_type() != at::kInt ||
+	    !q->is_contiguous() || !k->is_contiguous() || !v->is_contiguous() ||
+	    q->size(2) != k->size(2) || k->get_device() != dev ||
+	    v->get_device() != dev || len->get_device() != dev) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"attn_decode: q (S, Hq, E), k/v (Hk, max_seq, E) contiguous fp16, "
+			"len int32, one device");
+		return NULL;
+	}
+
+	int S = (int)q->size(0), Hq = (int)q->size(1), Hk = (int)k->size(0);
+	int E = (int)q->size(2), max_seq = (int)k->size(1);
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		if (splits <= 0) {
+			int sms = 0;
+
+			C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+			/* ~4 blocks per SM over the kv heads: enough unique K/V
+			 * bytes in flight (the block's warps share rows); measured
+			 * best on a 3090 */
+			splits = std::max<int64_t>(1, (4 * (int64_t)sms + Hk - 1) / Hk);
+		}
+
+		at::Tensor ws = at::empty({ (int64_t)amp_attn_dec_ws_floats(S, Hq, Hk, E, (int)splits) },
+			q->options().dtype(at::kFloat));
+		at::Tensor out = at::empty_like(*q);
+		int rc;
+
+		if (use_mma)
+			rc = amp_attn_dec_mma_fp16(q->data_ptr(), k->data_ptr(),
+				v->data_ptr(), (const int *)len->data_ptr(),
+				ws.data_ptr(), out.data_ptr(), S, Hq, Hk, E, max_seq,
+				(int)splits, (float)scale,
+				c10::cuda::getCurrentCUDAStream().stream());
+		else
+			rc = amp_attn_dec_fp16(q->data_ptr(), k->data_ptr(), v->data_ptr(),
+				(const int *)len->data_ptr(), ws.data_ptr(), out.data_ptr(), S, Hq,
+				Hk, E, max_seq, (int)splits, (float)scale,
+				c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "attn_decode"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
  * device_count(): int — visible CUDA devices (0 without CUDA).
  */
 static uc_value_t *
@@ -3719,6 +4483,104 @@ torch_device_count(uc_vm_t *vm, size_t nargs)
  * caching allocator knows nothing about the side stream). */
 #define AMP_FORK_MAXD 16
 #define AMP_FORK_MAXK 4
+
+/*
+ * flash_attn_kvcache(q, k, v, cu_q, cu_k, seqused_k, max_k, causal):
+ * torch.tensor
+ *
+ * FlashAttention-2 variable-length entry (_flash_attention_forward) for
+ * one sequence with a DEVICE-side key length: q (S, Hq, E) fp16, k/v
+ * (max_k, Hk, E) fp16 views of the KV cache (any row/head strides,
+ * contiguous over E); cu_q = [0, S], cu_k = [0, max_k] (int32 device),
+ * seqused_k (1,) int32 device = keys in use. Attends to keys
+ * [0, seqused_k) with the causal mask aligned bottom-right. Shapes are
+ * fixed and the length is read on the device, so the op can live inside
+ * a captured CUDA graph. Returns (S, Hq, E).
+ */
+static uc_value_t *
+torch_flash_attn_kvcache(uc_vm_t *vm, size_t nargs)
+{
+	int64_t max_k;
+	bool causal = true;
+
+	if (nargs != 8 || !arg_int(vm, uc_fn_arg(6), &max_k) ||
+	    !arg_bool(vm, uc_fn_arg(7), &causal)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q, k, v, cu_q, cu_k, seqused_k, max_k, causal)");
+		return NULL;
+	}
+
+	at::Tensor *t[6];
+
+	for (int i = 0; i < 6; i++)
+		if (!(t[i] = tensor_arg(vm, uc_fn_arg(i))))
+			return NULL;
+
+	TensorDeviceGuard dg(*t[0]);
+
+	try {
+		auto r = at::_flash_attention_forward(*t[0], *t[1], *t[2], *t[3],
+			*t[4], t[0]->size(0), max_k, 0.0, causal, false,
+			c10::nullopt, c10::nullopt, c10::nullopt, *t[5], c10::nullopt);
+
+		return tensor_wrap(vm, std::move(std::get<0>(r)), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * flash_attn(q, k, v, causal, scale?): torch.tensor
+ *
+ * FlashAttention-2 via ATen's _scaled_dot_product_flash_attention. q
+ * (B, Hq, L, E), k/v (B, Hk, S, E) fp16 CUDA; returns (B, Hq, L, E).
+ * Unlike the public sdpa(is_causal) — top-left aligned, so unusable for
+ * a chunk on top of history — the flash kernel aligns the causal mask
+ * BOTTOM-RIGHT when L < S: query i sees keys 0 .. S - L + i, exactly a
+ * prefill chunk at position S - L. No mask tensor, no materialized
+ * score matrix. Raises if the flash kernel rejects the configuration.
+ */
+static uc_value_t *
+torch_flash_attn(uc_vm_t *vm, size_t nargs)
+{
+	bool causal = false;
+	double scale = 0;
+	bool has_scale = false;
+
+	if (nargs < 4 || nargs > 5) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q, k, v, causal, scale?)");
+		return NULL;
+	}
+
+	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *k = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *v = k ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+
+	if (!v || !arg_bool(vm, uc_fn_arg(3), &causal))
+		return NULL;
+
+	if (nargs == 5 && ucv_type(uc_fn_arg(4)) != UC_NULL) {
+		if (!arg_number(vm, uc_fn_arg(4), &scale))
+			return NULL;
+
+		has_scale = true;
+	}
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		auto r = at::_scaled_dot_product_flash_attention(*q, *k, *v,
+			0.0, causal, false,
+			has_scale ? c10::optional<double>(scale) : c10::nullopt);
+
+		return tensor_wrap(vm, std::move(std::get<0>(r)), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
 
 /*
  * rms_norm_res(x, r, weight, eps): [residual, normed]
@@ -4779,6 +5641,7 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "shape",	tensor_shape },
 	{ "dtype",	tensor_dtype },
 	{ "numel",	tensor_numel },
+	{ "is_contiguous",	tensor_is_contiguous },
 	{ "fill_",	tensor_fill },
 	{ "cuda",	tensor_cuda },
 	{ "cpu",	tensor_cpu },
@@ -4790,10 +5653,12 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "contiguous",	tensor_contiguous },
 	{ "narrow",	tensor_narrow },
 	{ "unsqueeze",	tensor_unsqueeze },
+	{ "squeeze",	tensor_squeeze },
 	{ "expand",	tensor_expand },
 	{ "index",	tensor_index },
 	{ "gather",	tensor_gather },
 	{ "copy_",	tensor_copy_ },
+	{ "index_copy_",	tensor_index_copy_ },
 	{ "add",	tensor_add },
 	{ "add_",	tensor_add_ },
 	{ "mul",	tensor_mul },
@@ -4810,10 +5675,13 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "cos",	tensor_cos },
 	{ "sin",	tensor_sin },
 	{ "silu",	tensor_silu },
+	{ "sigmoid",	tensor_sigmoid },
+	{ "softplus",	tensor_softplus },
 	{ "softmax",	tensor_softmax },
 	{ "mean",	tensor_mean },
 	{ "sum",	tensor_sum },
 	{ "max",	tensor_max },
+	{ "argmax",	tensor_argmax },
 	{ "topk",	tensor_topk },
 	{ "pin",	tensor_pin },
 	{ "data_ptr",	tensor_data_ptr },
@@ -4825,6 +5693,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "zeros",	tensor_zeros },
 	{ "empty",	tensor_empty },
 	{ "ones",	tensor_ones },
+	{ "rand",	tensor_rand },
 	{ "full",	tensor_full },
 	{ "arange",	tensor_arange },
 	{ "from_array",	tensor_from_array },
@@ -4834,7 +5703,17 @@ static const uc_function_list_t torch_fns[] = {
 	{ "rms_norm",	torch_rms_norm },
 	{ "rope",	torch_rope },
 	{ "silu_mul",	torch_silu_mul },
+	{ "gdn_scan",	torch_gdn_scan },
+	{ "flash_attn_kvcache",	torch_flash_attn_kvcache },
 	{ "device_count",	torch_device_count },
+	{ "attn_decode",	torch_attn_decode },
+	{ "qk_norm_rope",	torch_qk_norm_rope },
+	{ "attn_gate",	torch_attn_gate },
+	{ "gdn_chunk",	torch_gdn_chunk },
+	{ "gdn_prep",	torch_gdn_prep },
+	{ "gdn_gates",	torch_gdn_gates },
+	{ "gdn_out_norm",	torch_gdn_out_norm },
+	{ "flash_attn",	torch_flash_attn },
 	{ "rms_norm_res",	torch_rms_norm_res },
 	{ "decode_attn",	torch_decode_attn },
 	{ "argmax_advance",	torch_argmax_advance },

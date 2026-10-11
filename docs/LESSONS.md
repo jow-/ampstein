@@ -135,3 +135,29 @@ Add new lessons at the end of the matching section.
   single emission and recursion for free.
 - **L109 — `struct.buffer` is the string builder of record** (O(1) appends,
   zero-copy `pull()`); it is not a script global — import it.
+
+## Qwen3.5 / 3.8 hybrid (Gated DeltaNet)
+
+- **L48 — ATen broadcasting aligns right.** Per-head vectors against
+  `(Hv, dk, dv)` states need `(Hv, 1, 1)`; in-place ops also refuse to resize.
+- **L56, L68 — Power cap.** Under a 180-220 W cap the SM clock falls from ~1.8 GHz
+  to 0.7-1.1 GHz under sustained tensor-core load; check
+  `nvidia-smi --query-gpu=clocks.sm,clocks_throttle_reasons.active` before
+  trusting a component budget. Decode is energy-bound.
+- **L57, L58 — One host thread feeds all GPUs.** Enqueueing a whole stage blocks
+  the host on that device's full queue while the others idle: interleave the
+  enqueue order across devices (the wavefront in `prefill_pipeline`). A `.cuda()`
+  of a pageable CPU tensor synchronises the stream — allocate on the device or
+  stage through pinned memory.
+- **L59 — Large-m gemm.** Beyond ~144 rows, reconstruct the weight once and use
+  cuBLAS (≈2x). The two paths differ by fp16 noise, so compare pipelined against
+  sequential prefill with identical chunk boundaries.
+- **L60 — Causal attention for a chunk with history** needs the FA2 entry
+  (`_scaled_dot_product_flash_attention`): the public `is_causal` aligns top-left,
+  an explicit mask forces the fp32 math backend.
+- **L61 — GeForce Ampere fp16 accumulate** runs at twice the fp32-accumulate rate
+  (`CUBLAS_COMPUTE_16F`): +8.5% prefill, perplexity unchanged. Keep an opt-out.
+- **L62, L63 — The delta-rule scan.** One block per (head, column slice) with the
+  state in registers has a ~1.2 µs/token floor; the chunked WY form only pays
+  with tiled tensor-core matmuls (naive loops lost 1.5x), and shared-memory
+  blocks > 50 KiB run one per SM, so 96 blocks on 82 SMs take two waves.

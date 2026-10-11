@@ -19,6 +19,19 @@
 
 import * as math from 'math';
 
+/* Greedy argmax over a (…, V) logits tensor: returns the winning token
+ * id per LAST position as an integer. Cheaper than topk(1) — no heap,
+ * no values tensor. Used by the speculative verify path and any hot
+ * greedy loop. */
+export function argmax_last(logits) {
+	let s = logits.shape();
+	let flat = (length(s) == 1) ? logits :
+		logits.narrow(length(s) - 2, s[length(s) - 2] - 1, 1)
+			.reshape([-1]);
+
+	return flat.argmax().item();
+}
+
 /* Sample one token id from `logits` (see above). opts keys:
  * temperature, top_k. */
 export function sample(logits, opts) {
