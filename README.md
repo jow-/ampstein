@@ -106,6 +106,8 @@ pointing the tests at models (`AMP_MODEL_*`).
 
 - [AGENTS.md](AGENTS.md) — layout, build, invariants, conventions.
 - [docs/LESSONS.md](docs/LESSONS.md) — hard-won, non-obvious facts.
+- [docs/OVERVIEW.md](docs/OVERVIEW.md) — motivation, architecture, features, usage.
+- [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — every environment variable.
 
 ## AI assistance
 
