@@ -72,6 +72,7 @@ res_is_type(uc_value_t *res, const char *want)
 // st.c is compiled as C; its symbols have C linkage from C++'s view.
 extern "C" {
 #include "st.h"
+#include "tokenizer.h"
 }
 
 extern void amp_tokenizer_init(uc_vm_t *vm, uc_value_t *scope);
@@ -708,6 +709,37 @@ tensor_zeros(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * empty(dims, dtype?, device?): torch.tensor
+ *
+ * As zeros(), uninitialized — for outputs a kernel fully overwrites.
+ */
+static uc_value_t *
+tensor_empty(uc_vm_t *vm, size_t nargs)
+{
+	std::vector<int64_t> dims;
+	at::ScalarType dt = at::kFloat;
+	at::Device dev(at::kCPU);
+
+	if (!parse_factory_args(vm, nargs, &dims, &dt, &dev))
+		return NULL;
+
+	if (dims.empty()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"at least one dimension required");
+		return NULL;
+	}
+
+	try {
+		at::Tensor t = at::empty(dims, at::TensorOptions().dtype(dt).device(dev));
+
+		return tensor_wrap(vm, std::move(t), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
  * ones(dims, dtype?, device?): torch.tensor
  *
  * As zeros(), filled with ones.
@@ -1299,6 +1331,24 @@ tensor_cpu(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * data_ptr(): integer
+ *
+ * The tensor's first element device address — the building block for
+ * the int64 pointer tables mgemm consumes. Stable for the tensor's
+ * lifetime (weights and persistent decode buffers never reallocate).
+ */
+static uc_value_t *
+tensor_data_ptr(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm);
+
+	if (!t)
+		return NULL;
+
+	return ucv_int64_new((int64_t)(uintptr_t)t->data_ptr());
+}
+
+/*
  * free()
  *
  * Explicitly releases the underlying tensor. The resource stays valid but
@@ -1557,6 +1607,118 @@ tensor_unsqueeze(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+/*
+ * copy_(src: torch.tensor): this
+ *
+ * In-place copy of `src` into this tensor (broadcasting src to this
+ * tensor's shape). The KV-cache write primitive.
+ */
+/*
+ * index(ids: tensor int64): torch.tensor
+ *
+ * Embedding-style gather along dim 0: returns a tensor shaped like ids
+ * with the last dimension replaced by this tensor's trailing shape.
+ * ids must be an int64 tensor of any shape.
+ */
+static uc_value_t *
+tensor_index(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm);
+	at::Tensor *ids;
+
+	if (!t)
+		return NULL;
+
+	if (nargs != 1 || !(ids = tensor_arg(vm, uc_fn_arg(0))))
+		return NULL;
+
+	try {
+		if (ids->scalar_type() != at::kLong) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"index ids must be an int64 tensor");
+			return NULL;
+		}
+
+		at::Tensor r = at::embedding(*t, *ids, -1, false, false);
+
+		return tensor_wrap(vm, std::move(r), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * gather(dim, index): torch.tensor
+ *
+ * at::gather along `dim`: index must be an int64 tensor with the same
+ * rank as this tensor; the result has index's shape with every other
+ * dimension equal to this tensor's. The per-row target-logprob
+ * primitive (log_softmax(logits).gather(-1, ids[:, None])).
+ */
+static uc_value_t *
+tensor_gather(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm);
+	at::Tensor *idx;
+	int64_t dim;
+
+	if (!t)
+		return NULL;
+
+	if (nargs != 2 || !arg_int(vm, uc_fn_arg(0), &dim) ||
+	    !(idx = tensor_arg(vm, uc_fn_arg(1))))
+		return NULL;
+
+	try {
+		if (idx->scalar_type() != at::kLong) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"gather index must be an int64 tensor");
+			return NULL;
+		}
+
+		at::Tensor r = at::gather(*t, dim, *idx);
+
+		return tensor_wrap(vm, std::move(r), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * expand(...sizes): torch.tensor
+ *
+ * Broadcast-expands this tensor to the given shape (size -1 keeps the
+ * original dimension). Dimensions of size 1 may only be expanded.
+ */
+static uc_value_t *
+tensor_expand(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm);
+	std::vector<uc_value_t *> args;
+	std::vector<int64_t> dims;
+
+	if (!t)
+		return NULL;
+
+	for (size_t i = 0; i < nargs; i++)
+		args.push_back(uc_fn_arg(i));
+
+	if (!parse_dims(vm, args.size(), args.data(), &dims))
+		return NULL;
+
+	try {
+		at::Tensor r = t->expand(
+			at::IntArrayRef(dims.data(), dims.size()));
+
+		return tensor_wrap(vm, std::move(r), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 static uc_value_t *
 tensor_copy_(uc_vm_t *vm, size_t nargs)
 {
@@ -1717,6 +1879,20 @@ tensor_log(uc_vm_t *vm, size_t nargs)
 {
 	return tensor_unary(vm, nargs, "log",
 		[](const at::Tensor &x) { return at::log(x); });
+}
+
+static uc_value_t *
+tensor_cos(uc_vm_t *vm, size_t nargs)
+{
+	return tensor_unary(vm, nargs, "cos",
+		[](const at::Tensor &x) { return at::cos(x); });
+}
+
+static uc_value_t *
+tensor_sin(uc_vm_t *vm, size_t nargs)
+{
+	return tensor_unary(vm, nargs, "sin",
+		[](const at::Tensor &x) { return at::sin(x); });
 }
 
 static uc_value_t *
@@ -2131,6 +2307,98 @@ struct graph_state {
 		side_pools(false) {}
 };
 
+/* fork (join = false: capture stream -> side) or join (side -> capture
+ * stream) through an event: inside a capture this becomes a graph edge */
+static void
+graph_link(cudaStream_t from, int from_dev, cudaStream_t to)
+{
+	cudaEvent_t ev;
+	c10::cuda::CUDAGuard g((c10::DeviceIndex)from_dev);
+
+	C10_CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+	C10_CUDA_CHECK(cudaEventRecord(ev, from));
+	C10_CUDA_CHECK(cudaStreamWaitEvent(to, ev, 0));
+	C10_CUDA_CHECK(cudaEventDestroy(ev));
+}
+
+/* end the side streams of a capture: join, restore, close the pools */
+static void
+graph_end_sides(graph_state *g)
+{
+	for (auto &sd : g->sides) {
+		if (!sd.stream)
+			continue;
+
+		try {
+			graph_link(sd.stream->stream(), sd.dev, g->pool_stream->stream());
+		}
+		catch (...) {
+		}
+
+		if (sd.prev)
+			c10::cuda::setCurrentCUDAStream(*sd.prev);
+
+		c10::cuda::CUDACachingAllocator::endAllocateToPool(
+			(c10::DeviceIndex)sd.dev, g->pool_id);
+	}
+}
+
+/* The one capture currently active on this thread, if any. */
+static graph_state *g_active = NULL;
+
+static void
+graph_free(void *data)
+{
+	graph_state *g = static_cast<graph_state *>(data);
+
+	if (!g)
+		return;
+
+	/* freed mid-capture (exception, explicit free(), GC): end the
+	 * capture and restore the stream, or every later ATen op would
+	 * keep recording into a dead pool stream */
+	if (g->capturing) {
+		graph_end_sides(g);
+
+		try {
+			c10::cuda::CUDAGuard dg((c10::DeviceIndex)g->dev_index);
+
+			g->graph->capture_end();
+		}
+		catch (...) {
+		}
+
+		g->capturing = false;
+
+		if (g->prev_stream)
+			c10::cuda::setCurrentCUDAStream(*g->prev_stream);
+	}
+
+	if (g == g_active)
+		g_active = NULL;
+
+	delete g->graph;
+
+	if (g->side_pools)
+		for (auto &sd : g->sides)
+			c10::cuda::CUDACachingAllocator::releasePool(
+				(c10::DeviceIndex)sd.dev, g->pool_id);
+
+	delete g;
+}
+
+static graph_state *
+graph_this(uc_vm_t *vm)
+{
+	auto *g = static_cast<graph_state *>(uc_fn_thisval(GRAPH_TYPE));
+
+	if (!g)
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"called on non-graph value");
+
+	return g;
+}
+
 /*
  * graph(): torch.graph
  *
@@ -2155,6 +2423,274 @@ torch_graph_new(uc_vm_t *vm, size_t nargs)
 
 	return uc_resource_new(ucv_resource_type_lookup(vm, GRAPH_TYPE), g);
 }
+
+/*
+ * capture_begin(device?, extra_devices?): this
+ *
+ * Starts recording on a pool stream. Every ATen op the VM runs until
+ * capture_end() is recorded into the graph. device (optional, null =
+ * default) selects the capture device: an index (default: current
+ * device) or a "cuda:N" string. Captured ops must run on tensors of
+ * THAT device — or of one of extra_devices (array of indices): each
+ * gets a side stream forked from the capture stream (and joined back by
+ * capture_end) plus a private allocator pool, so ops on several GPUs,
+ * cross-device copies included (their event barriers become graph
+ * edges), record into ONE multi-device graph that one replay() runs.
+ * ATen ops and guarded raw launches follow the tensor's device. A
+ * multi-device graph cannot be recaptured.
+ */
+static uc_value_t *
+graph_capture_begin(uc_vm_t *vm, size_t nargs)
+{
+	graph_state *g = graph_this(vm);
+	at::Device dev(at::kCUDA, 0);
+
+	if (!g)
+		return NULL;
+
+	std::vector<int> extra;
+	bool shared = false;
+	at::cuda::MempoolId_t shared_id = { 0, 0 };
+
+	if (nargs > 3 || (nargs >= 1 && ucv_type(uc_fn_arg(0)) != UC_NULL &&
+	    !parse_target_device(vm, uc_fn_arg(0), &dev))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (device?, extra_devices?, pool?)");
+		return NULL;
+	}
+
+	/* pool: the [a, b] pair another graph's pool() returned — this
+	 * capture then allocates from the same private pool (graphs that are
+	 * replayed one at a time can share it; the outputs of every capture
+	 * must stay referenced, the temporaries are reused) */
+	if (nargs == 3 && ucv_type(uc_fn_arg(2)) != UC_NULL) {
+		uc_value_t *pa = uc_fn_arg(2);
+
+		if (ucv_type(pa) != UC_ARRAY || ucv_array_length(pa) != 2 ||
+		    ucv_type(ucv_array_get(pa, 0)) != UC_INTEGER ||
+		    ucv_type(ucv_array_get(pa, 1)) != UC_INTEGER) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"pool must be the [a, b] array returned by pool()");
+			return NULL;
+		}
+
+		shared_id = { (unsigned long long)ucv_int64_get(ucv_array_get(pa, 0)),
+		              (unsigned long long)ucv_int64_get(ucv_array_get(pa, 1)) };
+		shared = true;
+	}
+
+	if (nargs >= 2 && ucv_type(uc_fn_arg(1)) != UC_NULL) {
+		uc_value_t *arr = uc_fn_arg(1);
+
+		if (ucv_type(arr) != UC_ARRAY) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"extra_devices must be an array of device indices");
+			return NULL;
+		}
+
+		for (size_t i = 0; i < ucv_array_length(arr); i++) {
+			uc_value_t *v = ucv_array_get(arr, i);
+			int64_t d = (ucv_type(v) == UC_INTEGER) ? ucv_int64_get(v) : -1;
+
+			if (d < 0 || d >= at::cuda::device_count() || d == dev.index()) {
+				uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+					"bad extra device index");
+				return NULL;
+			}
+
+			extra.push_back((int)d);
+		}
+	}
+
+	if (g->graph && !g->sides.empty()) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+			"multi-device graph cannot be recaptured");
+		return NULL;
+	}
+
+	if (g->capturing || g_active) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+			"a graph capture is already in progress");
+		return NULL;
+	}
+
+	try {
+		c10::cuda::CUDAGuard dev_guard(dev);
+
+		g->dev_index = dev.index();
+		g->prev_stream = c10::cuda::getCurrentCUDAStream(dev.index());
+		g->pool_stream = c10::cuda::getStreamFromPool(
+			/* high_priority */ false, dev.index());
+		c10::cuda::setCurrentCUDAStream(*g->pool_stream);
+
+		if (!extra.empty() || shared) {
+			g->pool_id = shared ? shared_id : at::cuda::graph_pool_handle();
+			g->graph->capture_begin(g->pool_id);
+		}
+		else {
+			g->graph->capture_begin();
+		}
+
+		g->capturing = true;
+		g_active = g;
+
+		if (!extra.empty()) {
+			cudaStreamCaptureStatus cs;
+			unsigned long long cid;
+
+			C10_CUDA_CHECK(cudaStreamGetCaptureInfo(g->pool_stream->stream(),
+				&cs, &cid));
+
+			for (int d : extra) {
+				graph_state::side sd;
+				c10::cuda::CUDAGuard sg((c10::DeviceIndex)d);
+
+				sd.dev = d;
+				c10::cuda::CUDACachingAllocator::createOrIncrefPool(
+					(c10::DeviceIndex)d, g->pool_id);
+				g->side_pools = true;
+				c10::cuda::CUDACachingAllocator::beginAllocateToPool(
+					(c10::DeviceIndex)d, g->pool_id,
+					[cid](cudaStream_t st) {
+						cudaStreamCaptureStatus s2;
+						unsigned long long id2;
+
+						return cudaStreamGetCaptureInfo(st, &s2, &id2) == cudaSuccess &&
+						       s2 == cudaStreamCaptureStatusActive && id2 == cid;
+					});
+				sd.prev = c10::cuda::getCurrentCUDAStream((c10::DeviceIndex)d);
+				sd.stream = c10::cuda::getStreamFromPool(false, (c10::DeviceIndex)d);
+				graph_link(g->pool_stream->stream(), g->dev_index, sd.stream->stream());
+				c10::cuda::setCurrentCUDAStream(*sd.stream);
+				g->sides.push_back(sd);
+			}
+		}
+	}
+	catch (const std::exception &e) {
+		if (g->prev_stream)
+			c10::cuda::setCurrentCUDAStream(*g->prev_stream);
+
+		RAISE(e.what());
+	}
+
+	return ucv_get(_uc_fn_this_res(vm));
+}
+
+/*
+ * capture_end(): this
+ *
+ * Stops recording and instantiates the graph.
+ */
+static uc_value_t *
+graph_capture_end(uc_vm_t *vm, size_t nargs)
+{
+	graph_state *g = graph_this(vm);
+
+	if (!g)
+		return NULL;
+
+	if (!g->capturing) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+			"not capturing");
+		return NULL;
+	}
+
+	/* CUDAGraph::capture_end checks the CURRENT device's current stream
+	 * against the capture stream: end on the capture's device (the
+	 * guard in capture_begin is scoped to that call, so the current
+	 * device is back to the default here — capturing on cuda:1 failed
+	 * with "Capture must end on the same stream it began on") */
+	c10::cuda::CUDAGuard dev_guard((c10::DeviceIndex)g->dev_index);
+
+	graph_end_sides(g);
+
+	try {
+		g->graph->capture_end();
+	}
+	catch (const std::exception &e) {
+		if (g->prev_stream)
+			c10::cuda::setCurrentCUDAStream(*g->prev_stream);
+
+		g->capturing = false;
+		g_active = NULL;
+		RAISE(e.what());
+	}
+
+	g->capturing = false;
+	g_active = NULL;
+
+	if (g->prev_stream)
+		c10::cuda::setCurrentCUDAStream(*g->prev_stream);
+
+	return ucv_get(_uc_fn_this_res(vm));
+}
+
+/*
+ * replay(): this
+ *
+ * Replays the captured work with the current buffer contents.
+ */
+static uc_value_t *
+graph_replay(uc_vm_t *vm, size_t nargs)
+{
+	graph_state *g = graph_this(vm);
+	uc_value_t *uv;
+	int64_t count = 1;
+
+	if (!g)
+		return NULL;
+
+	if (nargs >= 1) {
+		uv = uc_fn_arg(0);
+
+		if (ucv_type(uv) != UC_INTEGER || ucv_int64_get(uv) < 1) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"count must be a positive integer");
+			return NULL;
+		}
+
+		count = ucv_int64_get(uv);
+	}
+
+	try {
+		c10::cuda::OptionalCUDAGuard dev_guard(
+			g->dev_index >= 0 ? c10::optional<c10::DeviceIndex>(g->dev_index)
+					  : c10::nullopt);
+
+		for (int64_t i = 0; i < count; i++)
+			g->graph->replay();
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return ucv_get(_uc_fn_this_res(vm));
+}
+
+/*
+ * free(): this
+ *
+ * Explicitly releases the graph (same as letting the GC collect it).
+ */
+static uc_value_t *
+graph_free_method(uc_vm_t *vm, size_t nargs)
+{
+	void **slot = ucv_resource_dataptr(_uc_fn_this_res(vm), GRAPH_TYPE);
+
+	if (slot && *slot) {
+		graph_free(static_cast<graph_state *>(*slot));
+		*slot = NULL;
+	}
+
+	return NULL;
+}
+
+static const uc_function_list_t graph_methods[] = {
+	{ "capture_begin",	graph_capture_begin },
+	{ "capture_end",	graph_capture_end },
+	{ "replay",		graph_replay },
+	{ "free",		graph_free_method },
+};
 
 /*
  * where(cond, a, b): torch.tensor
@@ -2657,6 +3193,37 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& had_src_list = {},
     int num_had_src = 0
 );
+
+/*
+ * synchronize()
+ *
+ * Blocks until all queued CUDA work completes on every CUDA device
+ * (multi-GPU: work queued on different devices is independent). The
+ * benchmarking primitive: without it, wall-clock around GPU ops
+ * measures kernel-launch overhead, not compute.
+ */
+static uc_value_t *
+torch_synchronize(uc_vm_t *vm, size_t nargs)
+{
+	try {
+		int ndev = 0;
+
+		if (cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 1) {
+			for (int d = 0; d < ndev; d++) {
+				c10::cuda::CUDAGuard guard(d);
+
+				c10::cuda::device_synchronize();
+			}
+		}
+		else
+			c10::cuda::device_synchronize();
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
 
 /* --- fused kernels (src/amp_kernels.cu) ----------------------------------- */
 
@@ -3731,6 +4298,170 @@ torch_h2d(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * h2d_file(items: array, device?): array
+ *
+ * Batched weight loading straight from safetensors files. items is an
+ * array of [stfile, name] pairs; returns one CUDA tensor per pair
+ * (same shape/dtype as stored), in order. device (optional) is the
+ * target: an index (default 0) or a "cuda:N" string.
+ *
+ * This is the cold-load fast path: tensor bytes are read with
+ * sequential pread() into a pinned staging ring — avoiding the mmap
+ * page-fault path, which tops out around 0.4 GB/s on 4 KB faults —
+ * while previously enqueued device copies drain concurrently. The
+ * stream is synchronized before returning.
+ */
+static uc_value_t *
+torch_h2d_file(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *items = uc_fn_arg(0);
+	size_t n, i;
+	at::Device dev(at::kCUDA, 0);
+
+	if (nargs < 1 || nargs > 2 || ucv_type(items) != UC_ARRAY ||
+	    !parse_target_device(vm, uc_fn_arg(1), &dev)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (array of [stfile, name] pairs, device?)");
+		return NULL;
+	}
+
+	n = ucv_array_length(items);
+
+	struct src_ent {
+		st_file_t *f;
+		size_t file_off;
+		size_t nbytes;
+		at::ScalarType dt;
+		std::vector<int64_t> dims;
+	};
+
+	std::vector<src_ent> ents;
+
+	ents.reserve(n);
+
+	for (i = 0; i < n; i++) {
+		uc_value_t *pair = ucv_array_get(items, i);
+
+		if (ucv_type(pair) != UC_ARRAY ||
+		    ucv_array_length(pair) != 2) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"item %zu: expected [stfile, name]",
+				(unsigned long)i);
+			return NULL;
+		}
+
+		uc_value_t *fv = ucv_array_get(pair, 0);
+		uc_value_t *nv = ucv_array_get(pair, 1);
+		st_file_t *f = NULL;
+
+		if (ucv_type(fv) == UC_RESOURCE && res_is_type(fv, STFILE_TYPE))
+			f = static_cast<st_file_t *>(
+				ucv_resource_data(fv, STFILE_TYPE));
+
+		if (!f) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"item %zu: not a torch.stfile value",
+				(unsigned long)i);
+			return NULL;
+		}
+
+		if (ucv_type(nv) != UC_STRING) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"item %zu: expected a tensor name",
+				(unsigned long)i);
+			return NULL;
+		}
+
+		const char *dtype;
+		int64_t *shape;
+		size_t ndim, offset, nbytes;
+		int rc;
+
+		rc = st_lookup(f, ucv_string_get(nv), &dtype, &shape, &ndim,
+			&offset, &nbytes);
+
+		if (rc == ST_NOT_FOUND) {
+			uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+				"item %zu: no such tensor '%s'",
+				(unsigned long)i, ucv_string_get(nv));
+			return NULL;
+		}
+
+		if (rc < 0) {
+			uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+				"item %zu: malformed safetensors entry for '%s'",
+				(unsigned long)i, ucv_string_get(nv));
+			return NULL;
+		}
+
+		src_ent e;
+
+		e.f = f;
+
+		if (!st_dtype_to_at(dtype, &e.dt)) {
+			free(shape);
+			uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+				"item %zu: unsupported dtype %s",
+				(unsigned long)i, dtype);
+			return NULL;
+		}
+
+		e.dims.assign(shape, shape + ndim);
+		free(shape);
+		e.file_off = f->data_off + offset;
+		e.nbytes = nbytes;
+
+		ents.push_back(std::move(e));
+	}
+
+	uc_value_t *out = ucv_array_new_length(vm, (size_t)n);
+
+	if (!out)
+		return NULL;
+
+	try {
+		c10::cuda::CUDAGuard dev_guard(dev);
+		h2d_ring ring;
+		std::string err;
+
+		if (!ring.init(dev, &err))
+			throw std::runtime_error(err);
+
+		for (i = 0; i < n; i++) {
+			src_ent &ent = ents[i];
+
+			at::Tensor dst = at::empty(ent.dims,
+				at::TensorOptions().dtype(ent.dt)
+					.device(dev));
+
+			for (size_t off = 0; off < ent.nbytes;
+					off += ring.chunk_bytes) {
+				size_t len = std::min(ring.chunk_bytes,
+					ent.nbytes - off);
+
+				if (!ring.push_read(dst.data_ptr(), off,
+						ent.f->fd,
+						(off_t)(off + ent.file_off),
+						len, &err))
+					throw std::runtime_error(err);
+			}
+
+			ucv_array_set(out, i,
+				tensor_wrap(vm, std::move(dst), 0));
+		}
+
+		if (!ring.finish(&err))
+			throw std::runtime_error(err);
+	}
+	catch (const std::exception &e) {
+		ucv_put(out);
+		RAISE(e.what());
+	}
+
+	return out;
+}
+
+/*
  * exl3_reconstruct(unpacked, packed, K, mul1?, mcg?): torch.tensor
  *
  * Dequantizes an EXL3 trellis tensor into `unpacked` (fp16, in-place).
@@ -3787,6 +4518,27 @@ torch_exl3_reconstruct(uc_vm_t *vm, size_t nargs)
 	return ucv_get(unpacked_v);
 }
 
+void had_r_128
+(
+    const at::Tensor& input,
+    const at::Tensor& output,
+    const c10::optional<at::Tensor>& pre_scale,
+    const c10::optional<at::Tensor>& post_scale,
+    const float scale
+);
+
+void reconstruct_had_slice
+(
+    at::Tensor unpacked,
+    at::Tensor packed,
+    at::Tensor suh,
+    at::Tensor svh,
+    float K_,
+    bool mcg,
+    bool mul1,
+    int64_t n_offset
+);
+
 /* y = a @ b for the reconstruct path: cublasGemmEx with
  * CUBLAS_COMPUTE_16F — fp16 accumulation, the 2x tensor-core rate on
  * GeForce Ampere (fp32-accumulate MMA runs at half rate there). Measured
@@ -3799,6 +4551,142 @@ torch_exl3_reconstruct(uc_vm_t *vm, size_t nargs)
  * and is not built. */
 #include <ATen/cuda/CUDAContext.h>
 #include <cublas_v2.h>
+
+static void
+recon_mm(at::Tensor &y, const at::Tensor &a, const at::Tensor &b)
+{
+	static int f16acc = -1;
+
+	if (f16acc < 0) {
+		const char *e = getenv("AMP_GEMM_F16ACC");
+
+		f16acc = (e && *e == '0') ? 0 : 1;
+	}
+
+	if (!f16acc) {
+		at::mm_out(y, a, b);
+		return;
+	}
+
+	/* row-major y[m,n] = a[m,k] @ b[k,n]  ==  column-major
+	 * y^T[n,m] = b^T[n,k] @ a^T[k,m] */
+	int m = (int)a.size(0), k = (int)a.size(1), n = (int)b.size(1);
+	cublasHandle_t h = at::cuda::getCurrentCUDABlasHandle();
+	__half one = __float2half(1.0f), zero = __float2half(0.0f);
+
+	cublasSetStream(h, at::cuda::getCurrentCUDAStream().stream());
+
+	cublasStatus_t st = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
+		&one, b.data_ptr(), CUDA_R_16F, n, a.data_ptr(), CUDA_R_16F, k,
+		&zero, y.data_ptr(), CUDA_R_16F, n, CUBLAS_COMPUTE_16F,
+		CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+	if (st != CUBLAS_STATUS_SUCCESS)
+		throw std::runtime_error("recon_mm: cublasGemmEx failed");
+}
+
+/*
+ * exl3_gemm_recon(x, trellis, suh, svh, K, mul1?, mcg?): torch.tensor
+ *
+ * EXL3 matmul for MANY rows (prefill): dequantize the weight to fp16
+ * once, then one cuBLAS fp16 gemm — instead of exl3_gemm's on-the-fly
+ * trellis decode, which redoes the decode for every row tile and loses
+ * to reconstruct+hgemm beyond ~144 rows (exllamav3's
+ * AUTO_RECONSTRUCT_THRESHOLD; same two paths as its
+ * LinearEXL3.reconstruct_hgemm):
+ *
+ *   rows <  1024: xh = had(x * suh); W = reconstruct (rotated basis);
+ *                 y = xh @ W; y = had(y) * svh
+ *   rows >= 1024: W = reconstruct_had_slice (original basis, both
+ *                 Hadamards + scales folded in); y = x @ W
+ *
+ * x: (rows, k) fp16 contiguous; returns y (rows, n) fp16. The fp16 W
+ * scratch (k * n * 2 bytes) is allocated per call from the caching
+ * allocator. n must be <= 32768 (the reconstruct slice limit).
+ */
+static uc_value_t *
+torch_exl3_gemm_recon(uc_vm_t *vm, size_t nargs)
+{
+	bool mul1 = false, mcg = false;
+	double Kd;
+
+	if (nargs < 5 || nargs > 7 || !arg_number(vm, uc_fn_arg(4), &Kd)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (x, trellis, suh, svh, K, mul1?, mcg?)");
+		return NULL;
+	}
+
+	if (nargs >= 6 && !arg_bool(vm, uc_fn_arg(5), &mul1))
+		return NULL;
+
+	if (nargs == 7 && !arg_bool(vm, uc_fn_arg(6), &mcg))
+		return NULL;
+
+	at::Tensor *x = fused_arg(vm, uc_fn_arg(0), "exl3_gemm_recon: x", false);
+
+	if (!x)
+		return NULL;
+
+	at::Tensor *trellis = tensor_arg(vm, uc_fn_arg(1));
+	at::Tensor *suh = trellis ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	at::Tensor *svh = suh ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+
+	if (!svh)
+		return NULL;
+
+	if (trellis->dim() != 3) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"exl3_gemm_recon: trellis must be 3-D");
+		return NULL;
+	}
+
+	int64_t k = trellis->size(0) * 16;
+	int64_t n = trellis->size(1) * 16;
+
+	if (x->dim() != 2 || x->size(1) != k || suh->numel() != k ||
+	    svh->numel() != n || n > 32768) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"exl3_gemm_recon: incompatible shapes (x %lld x %lld, weight %lld x %lld)",
+			(long long)x->size(0), (long long)(x->dim() > 1 ? x->size(1) : 0),
+			(long long)k, (long long)n);
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		int64_t rows = x->size(0);
+		at::Tensor y = at::empty({ rows, n }, x->options());
+		at::Tensor w = at::empty({ k, n }, x->options());
+
+		static int64_t fused_rows = -1;
+
+		if (fused_rows < 0) {
+			const char *e = getenv("AMP_RECON_FUSED_ROWS");
+
+			fused_rows = e ? atoll(e) : 2048;
+		}
+
+		if (rows >= fused_rows) {
+			::reconstruct_had_slice(w, *trellis, *suh, *svh,
+				(float)Kd, mcg, mul1, 0);
+			recon_mm(y, *x, w);
+		}
+		else {
+			at::Tensor xh = at::empty_like(*x);
+
+			::had_r_128(*x, xh, *suh, c10::nullopt, 1.0f);
+			::reconstruct(w, *trellis, (float)Kd, mcg, mul1);
+			recon_mm(y, xh, w);
+			::had_r_128(y, y, c10::nullopt, *svh, 1.0f);
+		}
+
+		return tensor_wrap(vm, std::move(y), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
 
 /*
  * exl3_gemm(A, B, C, suh, svh, mul1?, mcg?)
@@ -3902,6 +4790,9 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "contiguous",	tensor_contiguous },
 	{ "narrow",	tensor_narrow },
 	{ "unsqueeze",	tensor_unsqueeze },
+	{ "expand",	tensor_expand },
+	{ "index",	tensor_index },
+	{ "gather",	tensor_gather },
 	{ "copy_",	tensor_copy_ },
 	{ "add",	tensor_add },
 	{ "add_",	tensor_add_ },
@@ -3916,6 +4807,8 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "neg",	tensor_neg },
 	{ "exp",	tensor_exp },
 	{ "log",	tensor_log },
+	{ "cos",	tensor_cos },
+	{ "sin",	tensor_sin },
 	{ "silu",	tensor_silu },
 	{ "softmax",	tensor_softmax },
 	{ "mean",	tensor_mean },
@@ -3923,18 +4816,21 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "max",	tensor_max },
 	{ "topk",	tensor_topk },
 	{ "pin",	tensor_pin },
+	{ "data_ptr",	tensor_data_ptr },
 	{ "free",	tensor_free_method },
 };
 
 static const uc_function_list_t torch_fns[] = {
 	{ "version",	amp_torch_version },
 	{ "zeros",	tensor_zeros },
+	{ "empty",	tensor_empty },
 	{ "ones",	tensor_ones },
 	{ "full",	tensor_full },
 	{ "arange",	tensor_arange },
 	{ "from_array",	tensor_from_array },
 	{ "st",		torch_st_open },
 	{ "st_save",	torch_st_save },
+	{ "synchronize",	torch_synchronize },
 	{ "rms_norm",	torch_rms_norm },
 	{ "rope",	torch_rope },
 	{ "silu_mul",	torch_silu_mul },
@@ -3945,6 +4841,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "mgemm",	torch_mgemm },
 	{ "ptr_array",	torch_ptr_array },
 	{ "h2d",		torch_h2d },
+	{ "h2d_file",	torch_h2d_file },
 	{ "graph",		torch_graph_new },
 	{ "cat",	torch_cat },
 	{ "stack",	torch_stack },
@@ -3952,6 +4849,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "sdpa",	torch_sdpa },
 	{ "where",	torch_where },
 	{ "exl3_reconstruct",	torch_exl3_reconstruct },
+	{ "exl3_gemm_recon",	torch_exl3_gemm_recon },
 	{ "exl3_gemm",	torch_exl3_gemm },
 };
 
@@ -3978,5 +4876,7 @@ uc_module_init(uc_vm_t *vm, uc_value_t *scope)
 
 	uc_type_declare(vm, TENSOR_TYPE, tensor_methods, tensor_free);
 	uc_type_declare(vm, STFILE_TYPE, stfile_methods, stfile_free);
+	uc_type_declare(vm, GRAPH_TYPE, graph_methods, graph_free);
 	uc_function_list_register(scope, torch_fns);
+	amp_tokenizer_init(vm, scope);
 }

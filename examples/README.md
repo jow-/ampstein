@@ -9,3 +9,7 @@ ucode -L build/lib -L src/ucode -ltorch=ampstein.torch examples/<script>.uc [-- 
 | Script | What |
 |---|---|
 | `version.uc` | the module loads and reports its libtorch version |
+| `mlp.uc` | a 2-layer MLP forward pass on the GPU, in pure ucode |
+| `chat.uc` | interactive terminal chat on a llama-family EXL3 model |
+| `bench.uc` | prefill and greedy decode throughput of the llama path (eager vs CUDA graph) |
+| `weight_sizes.uc` | checkpoint bytes by tensor family |

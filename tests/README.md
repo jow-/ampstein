@@ -34,6 +34,14 @@ torch and exllamav3 installed:
 
 ```sh
 python3 tests/oracle/make_fixture.py              # st_reader
+python3 tests/oracle/make_exl3_fixture.py         # exl3
+python3 tests/oracle/make_exl3_real_fixture.py    # exl3_real, exl3_recon
+python3 tests/oracle/make_exl3_stack_oracle.py    # exl3_stack
+python3 tests/oracle/make_shard_fixture.py        # weightmap
+python3 tests/oracle/make_llama_logits_oracle.py  # llama_*, graphdec*
+python3 tests/oracle/make_kld_oracle.py           # kld
+python3 tests/oracle/make_chat_prompt_oracle.py   # chat_prompt
+python3 tests/oracle/make_tokenizer_oracle.py     # tokenizer
 ```
 
 Each script documents its arguments (model directory, output) in its docstring.

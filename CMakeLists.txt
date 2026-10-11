@@ -72,12 +72,20 @@ include(cmake/Libtorch.cmake)
 set(CAFFE2_STATIC_LINK_CUDA ON)
 find_package(Torch REQUIRED)
 enable_language(CUDA)
+include(cmake/exl3.cmake)
+
+# Project-owned fused kernels (RMSNorm, RoPE) — NOT vendored code.
+add_library(amp_kernels OBJECT src/torch/amp_kernels.cu)
+target_compile_options(amp_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 
 # NB: target must not be named "torch" — find_package(Torch) imports an
 # INTERFACE target with that exact name.
 add_library(ucode_torch MODULE
     src/torch/amp_torch.cpp
     src/torch/st.c
+    src/torch/tokenizer.c
+    src/torch/amp_tokenizer.cpp
 )
 # Build tree mirrors the install layout (<build>/lib/ampstein/torch.so) so the
 # tests can use `-L <build>/lib -ltorch=ampstein.torch`.
@@ -97,7 +105,7 @@ set_target_properties(ucode_torch PROPERTIES
     INSTALL_RPATH "\$ORIGIN/${AMPSTEIN_TORCH_DIST_NAME}/torch/lib"
     INSTALL_RPATH_USE_LINK_PATH FALSE
 )
-target_link_libraries(ucode_torch PRIVATE ${TORCH_LIBRARIES} json-c)
+target_link_libraries(ucode_torch PRIVATE ${TORCH_LIBRARIES} json-c exl3_kernels amp_kernels pcre2-8)
 target_include_directories(ucode_torch PRIVATE src/torch vendor)
 target_compile_definitions(ucode_torch PRIVATE AMP_MODULE_TORCH_BUILD)
 
@@ -134,6 +142,8 @@ install(CODE "
     endif()")
 
 install(TARGETS ucode_torch LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/ampstein)
+install(DIRECTORY src/ucode/ampstein DESTINATION ${CMAKE_INSTALL_DATADIR}
+    FILES_MATCHING PATTERN "*.uc")
 
 # The runtime libraries only: shared objects (and their SONAME symlinks), no
 # python glue (libtorch_python.so, __init__.py), headers, static / bitcode

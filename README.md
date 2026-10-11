@@ -17,6 +17,8 @@ GPUs from ucode scripts, with no Python in the loop.
 │  torch.so  (ucode module, C++ with extern "C" ABI) │
 │  ├─ libtorch (ATen ops, allocator, CUDA runtime)   │
 │  ├─ safetensors reader (C, mmap, zero-copy views)  │
+│  ├─ vendored EXL3 kernels (gemm / gemv / dequant)  │
+│  └─ native BPE tokenizer (HF tokenizer.json)       │
 ├────────────────────────────────────────────────────┤
 │  CUDA driver / cuBLAS / cuDNN (via libtorch)       │
 └────────────────────────────────────────────────────┘
@@ -24,8 +26,10 @@ GPUs from ucode scripts, with no Python in the loop.
 
 ## Status
 
-- `torch.so` skeleton: tensors as ucode resources (GC finalizer, views),
-  zero-copy safetensors reader and writer.
+- Loads EXL3 checkpoints (`exl3_gemm` / `gemv` from the vendored kernels) and
+  runs llama-family models: prefill, KV-cache decode, CUDA-graph decode,
+  sampling — numerically matching exllamav3.
+- Native BPE tokenizer for HF `tokenizer.json` files (PCRE2 pre-tokenizer).
 
 ## Building and installing
 
