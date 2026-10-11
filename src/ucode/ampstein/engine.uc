@@ -36,6 +36,8 @@
 import * as qwen35 from './qwen35.uc';
 import * as uloop from 'uloop';
 import * as math from 'math';
+import * as sampler from './sampler.uc';
+import * as models from './models.uc';
 import * as qgraph from './qwen35_graph.uc';
 
 function now_ms() {
@@ -47,6 +49,10 @@ function now_ms() {
 /* Pipeline rounds per uloop tick during prefill: one round enqueues one
  * layer per device stage (host-side work only; the GPUs run behind). */
 const PIPE_ROUNDS = 8;
+
+// AMP_MTP_TIMING=1: per-phase MTP round times (synchronizing at phase
+// boundaries), printed per request
+const MTP_TIMING = getenv('AMP_MTP_TIMING') != null;
 
 function lcp(a, b) {
 	return torch.common_prefix(a, b);   // native: 100k+ ids per request
@@ -140,6 +146,13 @@ export function dist(logits, s, counts) {
 	return out;
 }
 
+/* Probability of token x under a dist() result. */
+function prob_of(d, x) {
+	let i = index(d.ids, x);
+
+	return (i >= 0) ? d.probs[i] : 0.0;
+}
+
 /* Draw from a dist() result, optionally excluding one token (the
  * speculative-sampling residual for a one-hot draft). */
 function draw(d, exclude) {
@@ -167,6 +180,18 @@ function draw(d, exclude) {
 	}
 
 	return last;
+}
+
+/* One speculative-sampling decision for a one-hot (greedy) draft x
+ * against the target distribution d: accept x with probability p(x),
+ * else draw the replacement from p with x removed. The emitted token is
+ * distributed exactly as p (tests/spec_sampling.uc). Returns
+ * {accepted, token}. */
+export function spec_step(d, x) {
+	if (math.rand(0, 1.0) < prob_of(d, x))
+		return {accepted: true, token: x};
+
+	return {accepted: false, token: draw(d, x)};
 }
 
 /* --- async sampling (notifier-driven) --------------------------------------- */
@@ -365,7 +390,8 @@ export function create(model, opts) {
 		cache.length = 0;
 	}
 
-	// GDN state snapshot buffers (allocated once): the prompt-cache snapshot
+	// GDN state snapshot buffers (allocated once): the prompt-cache
+	// snapshot (snap) and the MTP verify rollback (vsnap, below)
 	for (let i = 0; i < cfg.num_hidden_layers; i++) {
 		if (cfg.layer_types[i] != 'linear_attention')
 			continue;
@@ -377,18 +403,131 @@ export function create(model, opts) {
 	let ids = [];          // tokens currently processed into the cache
 	let snap_ids = null;   // token prefix the snapshot represents
 
-	// CUDA-graph decode steps (opts.graphs != false), captured now, before
-	// any prefill — the capture's warm-up runs clobber the cache, which
-	// zero_states() below clears.
+	// CUDA-graph decode steps (opts.graphs != false): sizes 1 (plain
+	// decode) and 1..W (MTP verify windows and replays). Captured now,
+	// before any prefill — the eager warmup inside clobbers the cache,
+	// which reset_state() below clears.
+	let mtp_planned = (model.mtp && opts.mtp_window > 0) ? opts.mtp_window : 0;
 	let graph = null;
+
+	// per-position GDN states for MTP verify (W >= 2): the W-token verify
+	// forward keeps every GDN layer's recurrent + conv state after each
+	// of its first W-1 tokens (qwen35.gdn_forward, cl.spec_*), so a
+	// rejection after token a restores them with one batched copy per GPU
+	// (rollback[a]) — no GDN snapshot before the verify, no re-run of the
+	// accepted tokens after it. Allocated before graph capture: the
+	// verify graph writes these buffers.
+	let spec = mtp_planned >= 2;
+	let rollback = [];
+
+	if (spec) {
+		for (let a = 0; a < mtp_planned - 1; a++)
+			push(rollback, {d: [], s: []});
+
+		for (let k in gdn_layers)
+			for (let cl in states(k)) {
+				let dev = 'cuda:' + cl.dev;
+
+				cl.spec_w = mtp_planned;
+				cl.spec_states = torch.zeros([ mtp_planned - 1, ...cl.rec_state.shape() ],
+					'float32', dev);
+				cl.spec_conv = [];
+
+				for (let a = 0; a < mtp_planned - 1; a++) {
+					push(cl.spec_conv, torch.zeros(cl.conv_state.shape(), 'float16', dev));
+					push(rollback[a].d, cl.rec_state, cl.conv_state);
+					push(rollback[a].s, cl.spec_states.narrow(0, a, 1), cl.spec_conv[a]);
+				}
+			}
+	}
 
 	if (opts.graphs != false) {
 		let sizes = [ 1 ];
+
+		// with per-position states only the verify size replays; the
+		// snapshot path re-runs 2..W-1 accepted tokens as well
+		if (spec)
+			push(sizes, mtp_planned);
+		else
+			for (let k = 2; k <= mtp_planned; k++)
+				push(sizes, k);
 
 		graph = qgraph.create(model, cache, sizes);
 
 		zero_states();
 	}
+
+	// MTP speculative decoding (opts.mtp_window > 0 and a checkpoint MTP
+	// head): the draft cache mirrors the target positions; generation
+	// then runs in rounds (draft W tokens, verify them in one target
+	// forward, accept by the speculative-sampling rule).
+	let M = model.mtp;
+
+	let mtp_w = (M && opts.mtp_window > 0) ? opts.mtp_window : 0;
+	let hid_w = model.hidden_width || cfg.hidden_size;     // width of the draft head's hidden input
+	let dc = cache.mtp;
+
+	// draft-step entries: the qwen35 MTP block
+	function mtp_run(token_ids, hidden, pos, head) {
+		return qwen35.mtp_chunk(cfg, M, model.embed_tokens, model.devs[0], token_ids,
+			hidden, dc, pos, head);
+	}
+
+	function mtp_run_ids(ids_dev, hidden, pos, head) {
+		return qwen35.mtp_chunk_ids(cfg, M, model.embed_tokens, model.devs[0], ids_dev,
+			hidden, dc, pos, head);
+	}
+	let draft_len = 0;       // draft cache positions [0, draft_len) valid
+	let vsnap = {};
+
+	if (mtp_w && !spec)
+		for (let k in gdn_layers)
+			vsnap[k] = snap_bufs(k);
+
+	// draft head (opt-in, opts.draft_vocab = N > 0): the lm_head
+	// restricted to the first N token ids (BPE ids are roughly frequency-
+	// ordered) plus the vocabulary tail with the added/special tokens —
+	// the draft only needs an argmax, and the full 248k-column head costs
+	// 1.1 ms per draft step. Measured on the 27B: N = 32768 lowers draft
+	// acceptance 90% -> 68-73% on code prompts and does not pay (the head
+	// is ~6% of a round); off by default (docs/LESSONS.md L66).
+	let draft_head = null;
+
+	if (mtp_w && opts.draft_vocab > 0 && model.lm_head.trellis) {
+		let V = model.lm_head.out_features;
+		let main = opts.draft_vocab;
+		let tail = 512;
+
+		if (main % 256 == 0 && main + tail < V && V % 256 == 0)
+			draft_head = models.sub_columns(model.lm_head,
+				[ [ 0, main ], [ V - tail, tail ] ]);
+	}
+
+	// Device-side draft chain state (async greedy rounds): c_dev holds
+	// the drafted token ids — slot 0 the round's seed, slots 1..W the
+	// chain's argmax results (cross-device copy_ from the draft head's
+	// device); rb is the pinned host side of the round: the acceptance
+	// count, the verify predictions (the bonus source) and the drafted
+	// tokens, all delivered by one copy_async batch per round.
+	let c_dev = null;
+	let rb = null;
+
+	if (mtp_w) {
+		c_dev = torch.zeros([mtp_w + 1], 'int64', 'cuda:' + model.devs[0]);
+
+		rb = {
+			a: torch.zeros([1], 'float32').pin(),
+			pred: torch.zeros([mtp_w], 'int64').pin(),
+			c: torch.zeros([mtp_w + 1], 'int64').pin(),
+
+			// the acceptance count: min over (i for mismatches, W for
+			// matches) — this index vector is the i side
+			idx: torch.arange(mtp_w, 'float32', 'cuda:' + model.devs[0])
+		};
+	}
+
+	let last_hidden = null;  // target post-norm hidden at ids[-1]
+	let snap_hidden = null;  // ... at the snapshot boundary - 1
 
 	let queue = [];
 	let job = null;
@@ -400,6 +539,8 @@ export function create(model, opts) {
 
 		ids = slice(snap_ids);
 		cache.length = length(ids);
+		draft_len = length(ids);
+		last_hidden = snap_hidden;
 	}
 
 	function reset_state() {
@@ -409,6 +550,9 @@ export function create(model, opts) {
 		// a fresh prefill overwrites the attention KV from position 0:
 		// an older snapshot's prefix is no longer in the cache
 		snap_ids = null;
+		snap_hidden = null;
+		draft_len = 0;
+		last_hidden = null;
 	}
 
 	/* Target forward of a few tokens at the cache's current length
@@ -454,6 +598,15 @@ export function create(model, opts) {
 
 		job = null;
 
+		if (MTP_TIMING && j.tm && j.rounds) {
+			let o = {};
+
+			for (let k in j.tm)
+				o[k] = (k == 'replays') ? j.tm[k] : sprintf('%.2f', j.tm[k] / j.rounds);
+
+			warn(`mtp timing (ms/round over ${j.rounds} rounds): ${o}\n`);
+		}
+
 		let now = now_ms();
 
 		j.on_done({
@@ -463,6 +616,8 @@ export function create(model, opts) {
 			reuse: j.reuse_from,
 			reuse_detail: j.reuse_detail,
 			completion_tokens: j.generated,
+			mtp: j.rounds ? {rounds: j.rounds, drafted: j.drafted,
+				accepted: j.accepted} : null,
 			timings: {
 				prefill_ms: j.t_prefill_done - j.t_start,
 				prefill_tokens: length(j.ids) - j.reuse_start,
@@ -480,6 +635,9 @@ export function create(model, opts) {
 		// the cache contents are undefined after a failed step
 		ids = [];
 		snap_ids = null;
+		snap_hidden = null;
+		draft_len = 0;
+		last_hidden = null;
 		cache.length = 0;
 
 		j.on_error(msg);
@@ -501,6 +659,56 @@ export function create(model, opts) {
 	function count_tok(j, tok) {
 		if (j.cnt_t)
 			j.cnt_t.narrow(0, tok, 1).add_(1.0);
+	}
+
+	/* The prefill hands out the post-norm hidden of each finished chunk
+	 * (opts.on_hidden) and the draft cache is seeded right then, so the
+	 * hidden of the whole prompt is never held (3 GiB at 247k tokens — a
+	 * late allocation that scaled with the prompt): seed_prev carries the
+	 * last row of the previous chunk into the next. */
+	// Two persistent buffers on the hidden's device, allocated once: prev
+	// (the last hidden row of the chunk before) and seedbuf (the draft
+	// block's input rows [prev, H[0 .. n-2]] of one sub-chunk). Per chunk
+	// only copy_ runs — no cat, and no view that keeps a finished chunk's
+	// hidden alive.
+	let seed_prev = null, seedbuf = null;
+
+	if (mtp_w) {
+		seed_prev = torch.zeros([1, 1, hid_w], 'float16', 'cuda:' + M.dev);
+		seedbuf = torch.zeros([1, chunk, hid_w], 'float16', 'cuda:' + M.dev);
+	}
+
+	function seed_start(j) {
+		if (j.pos == 0)
+			seed_prev.fill_(0);
+		else if (last_hidden != seed_prev)
+			seed_prev.copy_(last_hidden);
+
+		j.snap_hid = null;
+	}
+
+	function seed_chunk(j, pos, H) {
+		let n = H.shape()[1];
+
+		for (let o = 0; o < n; o += chunk) {
+			let len = (n - o < chunk) ? n - o : chunk;
+
+			// row 0: the hidden before this sub-chunk; rows 1..: H shifted by one
+			seedbuf.narrow(1, 0, 1).copy_((o == 0) ? seed_prev : H.narrow(1, o - 1, 1));
+
+			if (len > 1)
+				seedbuf.narrow(1, 1, len - 1).copy_(H.narrow(1, o, len - 1));
+
+			mtp_run(slice(j.ids, pos + o, pos + o + len), seedbuf.narrow(1, 0, len),
+				pos + o, null);
+		}
+
+		seed_prev.copy_(H.narrow(1, n - 1, 1));
+
+		// the hidden at the snapshot boundary - 1 is the last row of the
+		// chunk that ends there (the boundary is a chunk cut): one small copy
+		if (j.snap_at && pos + n == j.snap_at)
+			j.snap_hid = seed_prev.add(0.0);
 	}
 
 	/* Plan the reuse of the cache for j.ids and start the pipelined prefill
@@ -525,6 +733,11 @@ export function create(model, opts) {
 		j.logits = null;
 		j.snap_taken = false;
 
+		// MTP needs the draft cache in step with the target up to the
+		// reuse point, and the target hidden state just before it
+		j.use_mtp = mtp_w > 0 && (plan.start == 0 ||
+			(last_hidden != null && draft_len == plan.start));
+
 		// pipelined prefill of the new tokens (wavefront over the
 		// layer split, see qwen35.prefill_pipeline); the snapshot
 		// boundary becomes a chunk cut, and the GDN states are copied
@@ -533,9 +746,14 @@ export function create(model, opts) {
 		let snap_at = (j.snap_at && j.snap_at > j.pos && j.snap_at < length(j.ids)) ?
 			j.snap_at : 0;
 
+		if (j.use_mtp)
+			seed_start(j);
+
 		let popts = {
 			chunk: chunk,
 			cuts: snap_at ? [ snap_at ] : [],
+			hidden: j.use_mtp,
+			on_hidden: j.use_mtp ? (pos, H) => seed_chunk(j, pos, H) : null,
 			on_layer: function (chunk_end, li) {
 				if (!snap_at || chunk_end != snap_at || !snap[li])
 					return;
@@ -568,8 +786,16 @@ export function create(model, opts) {
 		if (j.sampling && j.sampling.seed != null)
 			math.srand(j.sampling.seed);
 
+		j.rounds = 0;
+		j.drafted = 0;
+		j.accepted = 0;
+
 		start_prefill(j);
 	}
+
+	/* Draft cache for the newly prefilled positions: the MTP input at
+	 * position i is (token i, target hidden at i-1); runs the MTP block
+	 * without its head, in chunks. */
 
 	/* Hand control back to the event loop until the device work
 	 * completes: arm the notifier (the AND of the model's streams —
@@ -624,6 +850,273 @@ export function create(model, opts) {
 			timer.set(0);
 	}
 
+	/* Acceptance bookkeeping + emit, shared by the synchronous round and
+	 * the async continuation. c: the round's token array (seed + W
+	 * drafts); a/bonus: the acceptance decision; vhidden: the verify
+	 * output's hidden (cache.hidden at verify time). mark/tm: MTP_TIMING
+	 * hooks — null from the async path, whose marks would measure host
+	 * enqueue, not device time. */
+	function mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows) {
+		let W = mtp_w;
+
+		// a stop id among the accepted drafts ends the round there: it
+		// becomes the round's last token (the bonus), so a consumer that
+		// vetoes it (job.on_eos) finds the state consistent — the drafts
+		// behind it were accepted conditional on it and are dropped
+		for (let i = 1; i <= a; i++) {
+			if (index(j.stop_ids, c[i]) >= 0) {
+				a = i - 1;
+				bonus = c[i];
+				break;
+			}
+		}
+
+		j.rounds++;
+		j.drafted += W;
+		j.accepted += a;
+
+		if (mark)
+			mark('accept');
+
+		// caches: roll back past the rejected writes
+		let p_new = p + ((a < W) ? a + 1 : W);
+		let H;
+
+		if (a < W - 1 && spec) {
+			// restore the GDN states after token a; the attention KV
+			// rolls back with the length, and row a of the verify output
+			// is the accepted prefix's hidden (causal)
+			torch.copy_many(rollback[a].d, rollback[a].s);
+			cache.length = p + a + 2;
+			H = vhidden.narrow(1, a, 1);
+
+			if (mark)
+				mark('replay');
+		}
+		else if (a < W - 1) {
+			for (let k in gdn_layers)
+				load_states(k, vsnap[k]);
+
+			cache.length = p + 1;
+			step_fwd(slice(c, 0, a + 1));
+			H = cache.hidden.narrow(1, a, 1);
+
+			if (mark)
+				mark('replay');
+
+			if (tm)
+				tm.replays = (tm.replays || 0) + 1;
+		}
+		else {
+			H = vhidden.narrow(1, (a < W) ? a : W - 1, 1);
+		}
+
+		for (let k = 0; k <= ((a < W) ? a : W - 1); k++)
+			push(ids, c[k]);
+
+		dc.length = p_new + 1;
+		draft_len = p_new + 1;
+		last_hidden = H.add(0.0);     // a copy: graph buffers are reused
+		j.t_next = (a < W) ? bonus : c[W];
+
+		// emit: the accepted drafts, then the bonus token
+		let emit = slice(c, 1, a + 1);
+
+		if (bonus != null)
+			push(emit, bonus);
+
+		for (let k = 0; k < length(emit); k++) {
+			let tok = emit[k];
+
+			if (index(j.stop_ids, tok) >= 0) {
+				// (only the bonus can be a stop id here; row a of the verify
+				// output is the distribution it was drawn from)
+				return finish('stop');
+			}
+
+			j.generated++;
+
+			if (k >= a)
+				count_tok(j, tok);
+
+			if (j.on_token(tok) == false)
+				return finish((j.alive && !j.alive()) ? 'cancelled' : 'stop');
+
+			if (j.generated >= j.max_new)
+				return finish('length');
+		}
+	}
+
+	/* One speculative round (EAGLE-1 with the checkpoint's MTP head, see
+	 * qwen35 generate_mtp for the round structure). Drafting is greedy,
+	 * so the draft distribution is one-hot: a drafted token x is accepted
+	 * with probability p(x) under the target's sampling distribution, and
+	 * a rejection draws from p with x removed — the output distribution
+	 * equals plain sampling (Leviathan et al. / Chen et al.); at
+	 * temperature 0 this is the exact-match rule. */
+	function mtp_round(j) {
+		let W = mtp_w;
+		let p = cache.length - 1;
+		let s = j.sampling || {};
+		let tm = j.tm, t_last = 0;
+
+		function mark(name) {
+			if (!MTP_TIMING)
+				return;
+
+			torch.synchronize();
+
+			let t = now_ms();
+
+			// time since the previous round's last mark: emit, HTTP,
+			// the event loop
+			if (!t_last && j.t_mark)
+				tm.between = (tm.between || 0) + (t - j.t_mark);
+			else if (t_last)
+				tm[name] = (tm[name] || 0) + (t - t_last);
+
+			t_last = j.t_mark = t;
+		}
+
+		if (MTP_TIMING && !tm)
+			tm = j.tm = {};
+
+		mark(null);
+
+		// near the context end or the token budget: plain decode for
+		// the rest (the draft cache then lags; MTP resumes after the
+		// next fresh prefill)
+		if (cache.length + W + 1 >= max_ctx || j.max_new - j.generated < 2) {
+			j.phase = 'decode';
+			j.use_mtp = false;
+			j.logits = step_fwd([j.t_next]);
+
+			for (let i = 0; i < 1; i++)
+				push(ids, j.t_next);
+
+			return;
+		}
+
+		// draft chain
+		let c = [j.t_next];
+		let D = last_hidden;
+		let temp = (s.temperature != null) ? s.temperature : 1.0;
+
+		// Async greedy round: the draft chain runs on the device (each
+		// step's argmax feeds the next step's embedding lookup straight
+		// from the device buffer), the verify replays with device-side
+		// token ids, and the acceptance prefix-count is computed on the
+		// device — one wake-up delivers a, the verify predictions and
+		// the drafted tokens to pinned host buffers. Requires a captured
+		// verify graph (the eager fallback scores host ids) and the plain
+		// lm_head; the sampled walk and the TP sharded draft head stay
+		// synchronous below.
+		if (temp <= 0 && !draft_head && graph &&
+			graph.has(W) && graph.run_dev) {
+			c_dev.narrow(0, 0, 1).fill_(j.t_next);
+
+			for (let k = 1; k <= W; k++) {
+				let r = mtp_run_ids(c_dev.narrow(0, k - 1, 1).view([1, 1]),
+					D, p + k, model.lm_head);
+
+				c_dev.narrow(0, k, 1).copy_(r.logits.reshape([-1]).argmax());
+				D = r.hidden;
+			}
+
+			// verify: one target forward over c[0 .. W-1] (device ids;
+			// advances cache.length like step_fwd)
+			let vr = graph.run_dev(c_dev.narrow(0, 0, W).view([1, W]),
+				cache.length);
+			// (the logits live on the head's device, the draft ids on the
+			// first one: bring the W predictions over)
+			let vpred = vr.logits.view([W, -1]).argmax(-1).cuda(model.devs[0]);
+
+			// acceptance: a = first index where vpred != c[1..W], or W
+			// on a full match — min over (i where mismatch, W where
+			// match); fp32 exact for W <= 2^24. NOT the mask sum: tokens
+			// can repeat, so matches may occur after a mismatch.
+			let cshift = c_dev.narrow(0, 1, W);
+			let m = vpred.le(cshift).to('float32')
+				.mul(cshift.le(vpred).to('float32'));
+			let cand = rb.idx.add(m.mul(W));
+
+			torch.copy_async(rb.a, cand.neg().max().neg().reshape([1]));
+			torch.copy_async(rb.pred, vpred);
+			torch.copy_async(rb.c, c_dev);
+
+			yield_gpu(function () {
+				let a = int(rb.a.item());
+				let vp = rb.pred.tolist();
+				let cc = rb.c.tolist();
+
+				mtp_finish(j, p, cc, a, (a < W) ? vp[a] : null, vr.hidden,
+					null, null, vr.logits.view([W, -1]));
+			});
+
+			return;
+		}
+
+		for (let k = 1; k <= W; k++) {
+			let r = mtp_run([c[k - 1]], D, p + k, draft_head || model.lm_head);
+
+			let am = sampler.argmax_last(r.logits);
+
+			push(c, draft_head ? draft_head.map(am) : am);
+
+			D = r.hidden;
+		}
+
+		mark('draft');
+
+		// verify: snapshot the GDN states (a rejection rolls them back),
+		// then one target forward over c[0 .. W-1]
+		if (!spec)
+			for (let k in gdn_layers)
+				save_states(k, vsnap[k]);
+
+		mark('snapshot');
+
+		let vlogits = step_fwd(slice(c, 0, W));
+		let vrows = vlogits.view([W, -1]);
+		let vhidden = cache.hidden;
+
+		mark('verify');
+
+		// acceptance: row k scores the token at p+k+2, i.e. c[k+1]
+		let a = 0, bonus = null;
+
+		if (temp <= 0) {
+			let vpred = vrows.argmax(-1).tolist();
+
+			while (a < W && vpred[a] == c[a + 1])
+				a++;
+
+			if (a < W)
+				bonus = vpred[a];
+		}
+		else {
+			// accepted drafts count toward the penalties of the next
+			// row right away; the emit loop below counts only the bonus
+			let cnt = counts_for(j, vrows);
+
+			for (let k = 0; k < W; k++) {
+				let x = c[k + 1];
+				let r = spec_step(dist(vrows.narrow(0, k, 1), s, cnt), x);
+
+				if (r.accepted) {
+					a++;
+					count_tok(j, x);
+					continue;
+				}
+
+				bonus = r.token;
+				break;
+			}
+		}
+
+		mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows);
+	}
+
 	/* Consume one decoded token: emit, bookkeeping, and the next
 	 * forward (or the hand-over to the MTP phase). Runs from the
 	 * notifier callback after the sampling results arrived. */
@@ -642,6 +1135,13 @@ export function create(model, opts) {
 
 		if (cache.length + 1 >= max_ctx)
 			return finish('length');
+
+		// MTP: the sampled token seeds the next round's draft chain
+		if (j.use_mtp) {
+			j.t_next = tok;
+			j.phase = 'mtp';
+			return;
+		}
 
 		j.logits = step_fwd([tok]);
 		push(ids, tok);
@@ -671,11 +1171,22 @@ export function create(model, opts) {
 
 			j.runner = null;
 
+			// (the draft cache was seeded chunk by chunk, seed_chunk)
+			if (j.use_mtp) {
+				dc.length = total;
+				draft_len = total;
+			}
+
 			push(ids, ...slice(j.ids, j.pos, total));
 
 			if (j.snap_taken) {
 				snap_ids = slice(j.ids, 0, j.snap_at);
+				snap_hidden = j.use_mtp ? j.snap_hid : null;
 			}
+
+			if (j.use_mtp)
+				last_hidden = seed_prev;           // (aliases the persistent buffer; copied on reuse)
+			j.snap_hid = null;
 
 			j.pos = total;
 
@@ -683,6 +1194,9 @@ export function create(model, opts) {
 				j.t_prefill_done = now_ms();    // (a forced continuation does not restart the clock)
 			j.phase = 'decode';
 		}
+
+		if (j.phase == 'mtp')
+			return mtp_round(j);
 
 		// decode: sample from the pending logits, emit, feed back.
 		// The sampling runs on the GPU; the host only walks the kept
@@ -792,6 +1306,16 @@ export function create(model, opts) {
 			}
 		}
 
+		if (cache.mtp && draft_len > 0) {
+			push(ents, [ 'draft.k',
+				cache.mtp.k_cache.narrow(2, 0, draft_len) ]);
+			push(ents, [ 'draft.v',
+				cache.mtp.v_cache.narrow(2, 0, draft_len) ]);
+		}
+
+		if (M && last_hidden)
+			push(ents, [ 'last_hidden', last_hidden ]);
+
 		torch.st_save(path, ents);
 
 		return length(ids);
@@ -844,6 +1368,21 @@ export function create(model, opts) {
 		ids = ids_t.tolist();
 		cache.length = N;
 		snap_ids = null;
+		snap_hidden = null;
+
+		if (cache.mtp && has('draft.k')) {
+			let dl = st.tensor('draft.k').shape()[2];
+
+			cache.mtp.k_cache.narrow(2, 0, dl)
+				.copy_(st.tensor('draft.k'));
+			cache.mtp.v_cache.narrow(2, 0, dl)
+				.copy_(st.tensor('draft.v'));
+			cache.mtp.length = dl;
+			draft_len = dl;
+		}
+
+		if (M && has('last_hidden'))
+			last_hidden = st.tensor('last_hidden').cuda(M.dev);
 
 		return N;
 	}
@@ -875,9 +1414,11 @@ export function create(model, opts) {
 		cached: function () {
 			let c = {live: length(ids), snapshot: snap_ids ? length(snap_ids) : 0};
 
+			c.draft = draft_len;
+
 			return c;
 		},
 
-		mtp_window: 0
+		mtp_window: mtp_w
 	};
 }

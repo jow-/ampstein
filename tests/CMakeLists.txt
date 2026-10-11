@@ -108,3 +108,15 @@ amp_test(chat_qwen35)
 amp_test(chat_jinja)
 # sampling_dist: engine.dist (tensor-op sampling) vs the reference implementation
 amp_test(sampling_dist)
+
+# --- MTP speculative decoding and the async engine
+# exl3_gemv_rows: EXL3 small-m products (verify rows) vs the dequantized reference
+amp_test(exl3_gemv_rows)
+# spec_sampling: speculative-sampling acceptance rule: emitted token ~ target p
+amp_test(spec_sampling)
+# qwen35_mtp: MTP speculative decoding == plain greedy, incl. rejections + state rollback
+amp_test(qwen35_mtp)
+# notifier: completion notifier + copy_async: uloop integration, AND semantics, pinned D2H
+amp_test(notifier)
+# engine_async: async sampling reproduces dist() / argmax exactly
+amp_test(engine_async)

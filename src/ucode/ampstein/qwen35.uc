@@ -960,6 +960,48 @@ export function prefill_pipeline(model, cache, ids, opts) {
 /* projected; the output predicts t_(i+1). Chained draft steps feed the */
 /* draft's own output hidden in place of the target hidden (EAGLE).     */
 
+/* Build the MTP head. Lives on `dev` — the model's LAST device, next to
+ * norm/lm_head (it consumes the post-norm hidden and shares the head). */
+export function build_mtp(ws, cfg, dev) {
+	dev = dev_of_dev(dev);
+	let M = {dev: dev, type: 'full_attention'};
+	let eps = cfg.rms_norm_eps;
+
+	M.pre_fc_norm_hidden =
+		ws.gpu16('mtp.pre_fc_norm_hidden.weight', dev).add(1.0);
+	M.pre_fc_norm_embedding =
+		ws.gpu16('mtp.pre_fc_norm_embedding.weight', dev).add(1.0);
+	M.fc = models.linear(ws, 'mtp.fc', true, dev);
+
+	if (!M.fc)
+		die('qwen35.build_mtp: no mtp.fc weight');
+
+	// one full-attention transformer block (same shape as a model layer)
+	let key = 'mtp.layers.0';
+
+	M.input_layernorm = ws.gpu16(key + '.input_layernorm.weight', dev)
+		.add(1.0);
+	M.post_attention_layernorm =
+		ws.gpu16(key + '.post_attention_layernorm.weight', dev)
+			.add(1.0);
+
+	M.q_proj = models.linear(ws, key + '.self_attn.q_proj', true, dev);
+	M.k_proj = models.linear(ws, key + '.self_attn.k_proj', true, dev);
+	M.v_proj = models.linear(ws, key + '.self_attn.v_proj', true, dev);
+	M.o_proj = models.linear(ws, key + '.self_attn.o_proj', true, dev);
+
+	M.q_norm_w = ws.gpu16(key + '.self_attn.q_norm.weight', dev).add(1.0);
+	M.k_norm_w = ws.gpu16(key + '.self_attn.k_norm.weight', dev).add(1.0);
+
+	M.gate_proj = models.linear(ws, key + '.mlp.gate_proj', true, dev);
+	M.up_proj = models.linear(ws, key + '.mlp.up_proj', true, dev);
+	M.down_proj = models.linear(ws, key + '.mlp.down_proj', true, dev);
+
+	M.norm = ws.gpu16('mtp.norm.weight', dev).add(1.0);
+
+	return M;
+}
+
 /* Run the MTP head over a chunk of S tokens paired with target hidden
  * states. token_ids: array (S); hidden: (1, S, hidden) fp16 tensor on
  * the MTP device — the target post-final-norm state ONE POSITION BACK
@@ -973,9 +1015,63 @@ export function prefill_pipeline(model, cache, ids, opts) {
  * on embed_dev. The device-side draft chain (engine.uc) feeds the
  * previous step's argmax result straight back without a host
  * round-trip; the array variant below uploads the ids. */
+export function mtp_chunk_ids(cfg, M, embed_tokens, embed_dev, ids,
+	hidden, cl, pos, head) {
+	let eps = cfg.rms_norm_eps;
+	let S = ids.shape()[1];
+
+	let emb = embed_tokens.index(ids).cuda(M.dev);
+
+	if (cl.mm)
+		mm_overlay(emb, cl.mm, pos, S, M.dev);
+
+	let e = rmsnorm_bias1(emb, M.pre_fc_norm_embedding, eps);
+	let y = rmsnorm_bias1(hidden, M.pre_fc_norm_hidden, eps);
+
+	let x = M.fc.forward(torch.cat([e, y], -1));
+
+	// transformer block (identical structure to a model layer)
+	let rr = rope_rows(cfg, cl.mm, cl, pos, S);
+
+	let r = rmsnorm_bias1(x, M.input_layernorm, eps);
+	x = x.add(attn_forward(cfg, M, r, rr.cos, rr.sin, cl, pos));
+
+	r = rmsnorm_bias1(x, M.post_attention_layernorm, eps);
+	x = x.add(mlp_forward(M, r));
+
+	// draft final norm + borrowed head (head == null: skip it — seeding
+	// the draft cache over a prompt needs no logits)
+	let D = rmsnorm_bias1(x, M.norm, eps);
+
+	return {logits: head ? head.forward(D) : null, hidden: D};
+}
+
+/* Array-ids variant: token_ids is a host array of S token ids (one
+ * blocking H2D upload per call — the synchronous paths only). */
+export function mtp_chunk(cfg, M, embed_tokens, embed_dev, token_ids,
+	hidden, cl, pos, head) {
+	let S = length(token_ids);
+	let ids = torch.from_array(mm_safe_ids(cfg, cl.mm, token_ids, pos),
+		'int64').view([1, S]).cuda(embed_dev);
+
+	return mtp_chunk_ids(cfg, M, embed_tokens, embed_dev, ids,
+		hidden, cl, pos, head);
+}
 
 /* Draft KV cache + rope tables for the MTP head (same layout as a
  * full-attention layer cache). */
+export function new_mtp_cache(cfg, max_seq, dev) {
+	return {
+		k_cache: torch.zeros([1, cfg.num_kv_heads, max_seq, cfg.head_dim],
+			'float16', 'cuda:' + dev),
+		v_cache: torch.zeros([1, cfg.num_kv_heads, max_seq, cfg.head_dim],
+			'float16', 'cuda:' + dev),
+		cos: null,
+		sin: null,
+		dev: dev,
+		length: 0
+	};
+}
 
 /* ------------------------------------------------------------------ */
 /* model                                                               */
@@ -1092,6 +1188,22 @@ export function load(model_dir, opts) {
 	let embed_tokens = ws.gpu16('model.language_model.embed_tokens.weight',
 		first_dev);
 
+	// optional MTP draft head: route its tensors to the last device
+	let mtp = null;
+
+	if (opts.mtp != false && ws.has('mtp.fc.trellis')) {
+		let mprefix = 'mtp.';
+
+		ws.upload(function (key) {
+			if (index(key, mprefix) == 0)
+				return last_dev;
+
+			return null;   // everything else: already routed / skip
+		});
+
+		mtp = build_mtp(ws, cfg, last_dev);
+	}
+
 	let layers = [];
 
 	for (let i = 0; i < cfg.num_hidden_layers; i++)
@@ -1116,6 +1228,7 @@ export function load(model_dir, opts) {
 		embed_tokens: embed_tokens,
 		norm: final_norm,
 		lm_head: head,
+		mtp: mtp,
 
 		/* Allocate per-layer caches for max_seq positions: GDN conv +
 		 * recurrent state, full-attention KV. */
@@ -1159,6 +1272,40 @@ export function load(model_dir, opts) {
 				}
 
 				push(cache.layers, cl);
+			}
+
+			// draft cache for the MTP head (last device)
+			if (this.mtp) {
+				let dc = new_mtp_cache(cfg, max_seq, last_dev);
+				let rc = rope_cache(cfg, max_seq, last_dev);
+
+				dc.cos = rc.cos;
+				dc.sin = rc.sin;
+				cache.mtp = dc;
+
+				// GDN recurrent-state snapshots for speculative rollback:
+				// the verify forward advances every GDN layer's state
+				// through ALL window tokens; rejected candidates pollute
+				// it (KV caches roll back with a length counter, the
+				// delta-rule state cannot). One buffer per GDN layer,
+				// allocated once, swapped in/out with copy_.
+				if (this.mtp) {
+					cache.gdn_snap = {};
+
+					for (let i = 0; i < cfg.num_hidden_layers; i++) {
+						let cl = cache.layers[i];
+
+						if (cl.type != 'linear_attention')
+							continue;
+
+						cache.gdn_snap[i] = [
+							torch.zeros(cl.rec_state.shape(),
+								'float32', 'cuda:' + cl.dev),
+							torch.zeros(cl.conv_state.shape(),
+								'float16', 'cuda:' + cl.dev)
+						];
+					}
+				}
 			}
 
 			return cache;
@@ -1255,6 +1402,184 @@ export function load(model_dir, opts) {
 			return out;
 		},
 
+		/* Speculative generation with the MTP draft head (greedy only —
+		 * temperature sampling needs rejection-sampling rules, future
+		 * work). opts: window (draft chain length W, default 4), seed.
+		 *
+		 * Round structure (EAGLE-1):
+		 *   entering: target processed positions 0..p; t_next = accepted
+		 *     token for p+1 (unprocessed); H = target post-norm hidden at
+		 *     p; draft cache filled through position p.
+		 *   chain: W draft steps. Step j feeds (c_(j-1), D_(j-1)) at draft
+		 *     position p+j, where c_0 = t_next, D_0 = H; output c_j is the
+		 *     candidate for target position p+j+1.
+		 *   verify: ONE target forward of [t_next, c_1 .. c_(W-1)] (W
+		 *     tokens at positions p+1..p+W). Row j predicts the token at
+		 *     p+j+2, i.e. checks candidate c_(j+1).
+		 *   accept: longest prefix a of matching rows; tokens c_1..c_a are
+		 *     confirmed, plus the bonus b = argmax(row a). Roll both
+		 *     caches back to p+a+2 entries (rejected verify/draft writes
+		 *     are overwritten by the next round).
+		 *
+		 * Returns prompt ++ generated ids. */
+		generate_mtp: function (prompt, max_new, opts) {
+			opts = opts || {};
+
+			if (!this.mtp)
+				return this.generate(prompt, max_new, opts);
+
+			if (opts.seed != null)
+				math.srand(opts.seed);
+
+			let W = (opts.window != null) ? opts.window : 4;
+			let cfg = this.cfg;
+			let eps = cfg.rms_norm_eps;
+			let M = this.mtp;
+			let mdev = M.dev;
+			let edev = this.devs[0];
+
+			let cache = this.new_cache(length(prompt) + max_new + W + 2);
+			let dc = cache.mtp;
+			let out = [];
+
+			for (let i = 0; i < length(prompt); i++)
+				push(out, prompt[i]);
+
+			// prefill: logits + post-norm hidden for every prompt position
+			let logits = this.forward_chunk(prompt, cache);
+			let H_all = cache.hidden;          // (1, S, hidden)
+			let S = length(prompt);
+
+			let t_next = sampler.argmax_last(logits);
+			push(out, t_next);
+
+			// seed the draft cache: input i = (t_i, H_(i-1)) at draft
+			// position i, H_-1 = zeros (exllamav3's carry initialization)
+			let zeros = torch.zeros([1, 1, cfg.hidden_size],
+				'float16', 'cuda:' + mdev);
+			let seed_h = torch.cat(
+				[zeros, H_all.narrow(1, 0, S - 1).cuda(mdev)], 1);
+
+			mtp_chunk(cfg, M, this.embed_tokens, edev, prompt, seed_h,
+				dc, 0, this.lm_head);
+
+			dc.length = S;
+
+			// round state: H = hidden at position p = S-1
+			let H = H_all.narrow(1, S - 1, 1);
+			let p = S - 1;
+
+			while (length(out) < max_new + S) {
+				// draft chain: W steps
+				let c = [t_next];       // c[0] = t_next (seed token)
+				let D = H;              // D[0] = target hidden
+
+				for (let j = 1; j <= W; j++) {
+					let r = mtp_chunk(cfg, M, this.embed_tokens, edev,
+						[c[j - 1]], D, dc, p + j, this.lm_head);
+
+					push(c, sampler.argmax_last(r.logits));
+					D = r.hidden;
+				}
+
+				dc.length = p + W + 1;
+
+				// verify: one target forward of W tokens. Snapshot every
+				// GDN recurrent + conv state first — the forward advances
+				// them through all W tokens, and rejected candidates would
+				// pollute them for everything that follows.
+				for (let k in cache.gdn_snap) {
+					cache.gdn_snap[k][0].copy_(cache.layers[k].rec_state);
+					cache.gdn_snap[k][1].copy_(cache.layers[k].conv_state);
+				}
+
+				let window = [c[0]];
+
+				for (let j = 1; j < W; j++)
+					push(window, c[j]);
+
+				let vlogits = this.forward_chunk(window, cache);
+				let vrows = vlogits.view([W, -1]);
+				let vpred = vrows.argmax(-1).tolist();
+				let vhidden = cache.hidden;    // (1, W, hidden)
+
+				// accept the longest matching prefix. a == W (everything
+				// matched): no bonus — c_W itself is the confirmed token for
+				// position p+W+1 and becomes the next round's seed; the
+				// target has only processed up to p+W. a < W: bonus b = the
+				// target's own prediction at row a (position p+a+2).
+				let a = 0;
+				let done = false;
+
+				while (a < W && vpred[a] == c[a + 1])
+					a++;
+
+				if (opts.debug)
+					printf('round: p=%d c=%J vpred=%J a=%d\n',
+						p, c, vpred, a);
+
+				for (let j = 1; j <= a; j++) {
+					push(out, c[j]);
+
+					if (c[j] == cfg.eos_token_id)
+						done = true;
+				}
+
+				if (a < W) {
+					let b = vpred[a];
+
+					push(out, b);
+					t_next = b;
+
+					if (b == cfg.eos_token_id)
+						done = true;
+				} else {
+					t_next = c[W];
+				}
+
+				// roll both caches back past the rejected writes; the next
+				// round's verify re-feeds from there
+				let p_new = p + ((a < W) ? a + 1 : W);
+
+				if (a < W - 1) {
+					// rejected candidates polluted the GDN recurrent states
+					// (the verify advanced them through all W tokens):
+					// restore the pre-verify snapshot, rewind the target
+					// cache to the pre-verify length and replay the
+					// accepted prefix (rows 0..a — same tokens, same
+					// positions, so the KV rewrites are idempotent). The
+					// replay also yields the correct hidden at the last
+					// accepted position.
+					for (let k in cache.gdn_snap) {
+						cache.layers[k].rec_state.copy_(cache.gdn_snap[k][0]);
+						cache.layers[k].conv_state.copy_(cache.gdn_snap[k][1]);
+					}
+
+					cache.length = p + 1;   // pre-verify length
+
+					this.forward_chunk(slice(c, 0, a + 1), cache);
+
+					H = cache.hidden.narrow(1, a, 1);
+				} else {
+					// a >= W-1: every fed token was confirmed — the caches
+					// are already consistent (length p+W+1)
+					H = vhidden.narrow(1, (a < W) ? a : W - 1, 1);
+				}
+
+				p = p_new;
+				dc.length = p_new + 1;
+
+				if (length(out) >= max_new + S)
+					done = true;
+
+				if (done)
+					break;
+			}
+
+			// a round may overshoot max_new — truncate
+			return (length(out) > max_new + S) ?
+				slice(out, 0, max_new + S) : out;
+		}
 	};
 
 	return model;

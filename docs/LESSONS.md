@@ -182,3 +182,27 @@ Add new lessons at the end of the matching section.
   `pkill -f <pattern>` from a command line that contains the pattern.
 - **L118 — The entry is a lean script** (argv, `--help`, bootstrap) that
   `import()`s the engine module; a script cannot have top-level `export`.
+
+## Speculative decoding and the async engine
+
+- **L51, L73 — Recurrent state does not roll back.** The verify forward advances
+  every GDN layer's state through all W tokens. Keep per-position states during
+  the verify and restore with one batched copy; replay from the *pre-verify*
+  length, never the post-rollback one.
+- **L65 — int8 GEMV precision** is ~8e-3 rel-rms against ~2.7e-3 for the fp16
+  kernel; plain decode and verify therefore do not share numerics, so
+  "speculative == plain" holds only for short continuations.
+- **L66 — Vocabulary-subset drafting does not pay:** BPE id order is a poor
+  frequency proxy and EXL3 columns select in 256-column blocks.
+- **L70 — Small-m products:** 4 rows cost ~1.4x one row; an int8 per-slice kernel
+  for M = 3, 4 lost to the tensor-core gemm. Upstream's `m <= 2` gate is right.
+- **L71 — FA2 varlen sizes its work by the cache capacity.** A 3-row verify at
+  180k keys cost 13.6 ms/layer; the split-KV `torch.attn_decode` is 1.2-3.3 ms.
+  Benchmark with the context users run.
+- **L76 — A prefix count is not a mask sum:** matches can recur after a mismatch.
+  Take the first mismatch as `min` over (index where mismatch, W where match).
+- **L82a, L83a, L84a — The mma decode kernel.** `mma.sync` accumulates, so give
+  each accumulator an explicit lifetime (a fragment declared in a loop is not
+  re-zeroed); compute shared-memory offsets from a constexpr row-byte size, not
+  another region's element count; kernel attributes are per device — key the
+  one-shot setup by `cudaGetDevice()` and test graph capture on the second GPU.

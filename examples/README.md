@@ -15,3 +15,4 @@ ucode -L build/lib -L src/ucode -ltorch=ampstein.torch examples/<script>.uc [-- 
 | `weight_sizes.uc` | checkpoint bytes by tensor family |
 | `bench_qwen35.uc` | Qwen3.5 / 3.8 benchmark over a multi-GPU layer split |
 | `bench_prefill.uc` | sequential versus pipelined prefill |
+| `bench_decode.uc` | plain greedy versus MTP speculative decoding |

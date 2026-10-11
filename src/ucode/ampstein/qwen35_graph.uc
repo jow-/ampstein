@@ -188,5 +188,37 @@ export function create(model, cache, sizes) {
 
 			return {logits: st.logits, hidden: st.hidden};
 		},
+
+		/* Run a DEVICE tensor of ids — int64 (1, S) on the first
+		 * stage's device — at position pos. Same contract as run(),
+		 * but the ids never touch the host: the device-side draft
+		 * chain feeds the verify directly (the D2D copy into the
+		 * graph's ids buffer is stream-ordered behind the chain). */
+		run_dev: function (ids_dev, pos) {
+			let S = ids_dev.shape()[1];
+			let st = by_size[S];
+
+			if (!st)
+				die(`qwen35_graph: no graph captured for step size ${S}`);
+
+			st.ids.copy_(ids_dev);
+
+			for (let k = 0; k < length(st.stages); k++) {
+				let s = st.stages[k];
+
+				s.pos.fill_(pos);
+				s.rpos.fill_(pos + qwen35.mm_off(cache.mm, pos));
+
+				if (k > 0)
+					s.h_in.copy_(st.stages[k - 1].h_out);
+
+				s.graph.replay();
+			}
+
+			cache.length = pos + S;
+			cache.hidden = st.hidden;
+
+			return {logits: st.logits, hidden: st.hidden};
+		}
 	};
 }

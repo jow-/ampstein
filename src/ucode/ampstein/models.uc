@@ -376,6 +376,63 @@ export function sliced(linears, outs, dev) {
 		}
 	};
 }
+/* Column sub-linear of an EXL3 linear: the output columns of `ranges`
+ * ([start, length] pairs, multiples of 256 — the trellis tiles are 16
+ * columns, the output Hadamard works in 128-column blocks, the int8 GEMV
+ * wants 256), concatenated. Computes exactly those columns of the full
+ * product (suh is per input, svh per output column, trellis tiles slice
+ * along their column dimension). Returns a LinearEXL3Seq-like object
+ * plus map(i): sub-column index -> original column. */
+export function sub_columns(lin, ranges) {
+	let ts = [], ss = [], offs = [], n = 0;
+
+	for (let i = 0; i < length(ranges); i++) {
+		let a = ranges[i][0], len = ranges[i][1];
+
+		if (a % 256 || len % 256 || a + len > lin.out_features)
+			die(`models.sub_columns: range [${a}, ${len}] not 256-aligned/in bounds`);
+
+		push(ts, lin.trellis.narrow(1, a / 16, len / 16));
+		push(ss, lin.svh.narrow(0, a, len));
+		push(offs, [ n, a, len ]);
+		n += len;
+	}
+
+	let sub = {
+		trellis: torch.cat(ts, 1).contiguous(),
+		suh: lin.suh,
+		svh: torch.cat(ss, 0).contiguous(),
+		bias: null,
+		K: lin.K,
+		mul1: lin.mul1,
+		mcg: lin.mcg,
+		dev: lin.dev,
+		in_features: lin.in_features,
+		out_features: n,
+
+		forward: function (x) {
+			let s = x.shape();
+			let flat = (length(s) == 2) ? x : x.view([-1, this.in_features]);
+			let out = torch.empty([flat.shape()[0], this.out_features],
+				'float16', 'cuda:' + this.dev);
+
+			torch.exl3_gemm(flat, this.trellis, out, this.suh, this.svh,
+				this.mul1, this.mcg);
+
+			return (length(s) == 2) ? out : out.view([s[0], s[1], this.out_features]);
+		},
+
+		map: function (i) {
+			for (let k = 0; k < length(offs); k++)
+				if (i < offs[k][0] + offs[k][2])
+					return offs[k][1] + (i - offs[k][0]);
+
+			return -1;
+		}
+	};
+
+	return sub;
+}
 
 /* Tensor-parallel shards of an EXL3 linear, placed on device `dev`:
  *

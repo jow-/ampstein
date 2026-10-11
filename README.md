@@ -35,6 +35,8 @@ Engine features:
 
 - Prompt-cache reuse: live state, plus a snapshot at the end of the previous
   message (recurrent layers cannot rewind).
+- MTP speculative decoding with the checkpoint's own draft head, an event-driven
+  decode loop and exact speculative sampling.
 
 ## Building and installing
 

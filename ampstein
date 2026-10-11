@@ -36,6 +36,7 @@ function usage() {
 	printf("  --gpus N              number of GPUs (default: all)\n");
 	printf("  --split N             layers per GPU (layer split)\n");
 	printf("  --chunk N             prefill chunk size (default 1024)\n");
+	printf("  --mtp N               speculative MTP window (default 3)\n");
 	printf("  --name NAME           served model name (default: basename of --model)\n");
 	printf("  --version             print version and exit\n");
 	printf("  --help                print this help and exit\n");
@@ -79,6 +80,8 @@ function parse_args() {
 		gpus: null,
 		split: null,
 		chunk: 1024,
+		mtp: 3,
+		draft_vocab: 0,
 		name: null,
 	};
 
@@ -101,6 +104,8 @@ function parse_args() {
 		case '--split': a.split = int(v); i++; break;
 		case '--chunk': a.chunk = int(v); a.chunk_set = true; i++; break;
 		case '--name': a.name = v; i++; break;
+		case '--mtp': a.mtp = int(v); a.mtp_set = true; i++; break;
+		case '--draft-vocab': a.draft_vocab = int(v); i++; break;
 		default:
 			warn(`unknown argument '${k}'\n`);
 			exit(1);

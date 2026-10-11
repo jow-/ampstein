@@ -1789,6 +1789,68 @@ amp_attn_gate_fp16(const void *a, long ast, long ash, const void *g, long gst,
 #define AMP_COMM_MAXB 16
 
 /*
+ * Batched contiguous copies on one device: up to AMP_CM_MAX (src, dst,
+ * bytes) entries in one launch (the speculative-decoding rollback copies
+ * every GDN layer's recurrent + conv state: 96 entries per GPU under
+ * 6-way TP, otherwise 96 launches). Bytes must be multiples of 16 and
+ * pointers 16-byte aligned (fp32/fp16 tensors from the caching
+ * allocator). Grid (blocks per entry, entries).
+ */
+#define AMP_CM_MAX 128
+
+struct amp_cm_tab {
+	const void *src[AMP_CM_MAX];
+	void *dst[AMP_CM_MAX];
+	long n16[AMP_CM_MAX];
+};
+
+__global__ void
+amp_copy_many_kernel(amp_cm_tab tab)
+{
+	const int e = blockIdx.y;
+	const uint4 *s = (const uint4 *)tab.src[e];
+	uint4 *d = (uint4 *)tab.dst[e];
+	long n = tab.n16[e];
+
+	for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+	     i += (long)gridDim.x * blockDim.x)
+		d[i] = s[i];
+}
+
+extern "C" int
+amp_copy_many(const void *const *src, void *const *dst, const long *bytes,
+             int n, cudaStream_t stream)
+{
+	for (int base = 0; base < n; base += AMP_CM_MAX) {
+		amp_cm_tab tab;
+		int m = (n - base < AMP_CM_MAX) ? n - base : AMP_CM_MAX;
+		long most = 0;
+
+		for (int i = 0; i < m; i++) {
+			if (bytes[base + i] % 16 || ((uintptr_t)src[base + i] | (uintptr_t)dst[base + i]) % 16)
+				return (int)cudaErrorInvalidValue;
+
+			tab.src[i] = src[base + i];
+			tab.dst[i] = dst[base + i];
+			tab.n16[i] = bytes[base + i] / 16;
+			most = (tab.n16[i] > most) ? tab.n16[i] : most;
+		}
+
+		int bpe = (int)((most + 256 * 4 - 1) / (256 * 4));
+
+		bpe = (bpe < 1) ? 1 : (bpe > 64 ? 64 : bpe);
+		amp_copy_many_kernel<<<dim3(bpe, m), 256, 0, stream>>>(tab);
+
+		cudaError_t rc = cudaGetLastError();
+
+		if (rc != cudaSuccess)
+			return (int)rc;
+	}
+
+	return 0;
+}
+
+/*
  * Split-KV decode attention over a KV cache with a DEVICE-side key
  * count (CUDA-graph-safe), for S <= 5 query rows (plain decode, MTP
  * verify windows) with GQA:

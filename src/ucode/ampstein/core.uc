@@ -115,9 +115,14 @@ export function serve(args) {
 	let eng = engine.create(model, {
 		max_ctx: args.ctx,
 		prefill_chunk: args.chunk,
+		mtp_window: args.mtp,
+		draft_vocab: args.draft_vocab,
 	});
 
 	let banner = `ampstein: model loaded in ${time() - t0}s`;
+
+	if (eng.mtp_window)
+		banner += `, MTP speculative decoding (window ${eng.mtp_window})`;
 
 	warn(banner + '\n');
 
@@ -280,6 +285,10 @@ export function serve(args) {
 		let pf = (t.prefill_ms > 0) ? t.prefill_tokens * 1000 / t.prefill_ms : 0;
 		let dc = (t.decode_ms > 0) ? t.decode_tokens * 1000 / t.decode_ms : 0;
 
+		let mtp = info.mtp ? sprintf(', MTP %d rounds, %.0f%% of drafts accepted, %.2f tok/round',
+			info.mtp.rounds, 100.0 * info.mtp.accepted / info.mtp.drafted,
+			info.completion_tokens * 1.0 / info.mtp.rounds) : '';
+
 		let why = '';
 		let d = info.reuse_detail;
 
@@ -295,10 +304,10 @@ export function serve(args) {
 		}
 
 		warn(sprintf('%s: prompt %d (cached %d via %s%s), prefill %d tok in %.0f ms (%.1f tok/s), ' +
-			'decode %d tok in %.0f ms (%.1f tok/s), finish %s\n',
+			'decode %d tok in %.0f ms (%.1f tok/s)%s, finish %s\n',
 			kind, info.prompt_tokens, info.cached_tokens, info.reuse, why,
 			t.prefill_tokens, t.prefill_ms, pf, t.decode_tokens, t.decode_ms, dc,
-			info.reason));
+			mtp, info.reason));
 	}
 
 	/* Intermediate prefill progress: the engine calls on_progress once per
@@ -770,7 +779,7 @@ export function serve(args) {
 
 			writefile(CACHE_META, sprintf('%J', {
 				format: 1, model: args.model, tokens: n,
-				max_ctx: eng.max_ctx}));
+				max_ctx: eng.max_ctx, mtp: eng.mtp_window}));
 
 			warn(`ampstein: saved ${n} cached tokens to ${CACHE_ST}\n`);
 		}

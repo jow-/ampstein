@@ -3472,6 +3472,10 @@ amp_gdn_scan_f32(const void *q, const void *k, const void *v, const void *beta,
                 int Hv, int dk, int dv, float scale, void *states_out,
                 int n_out, cudaStream_t stream);
 
+extern "C" int
+amp_copy_many(const void *const *src, void *const *dst, const long *bytes,
+             int n, cudaStream_t stream);
+
 extern "C" long
 amp_attn_dec_ws_floats(int S, int Hq, int Hk, int E, int ns);
 
@@ -4482,6 +4486,80 @@ torch_attn_decode(uc_vm_t *vm, size_t nargs)
 	catch (const std::exception &e) {
 		RAISE(e.what());
 	}
+}
+
+/*
+ * copy_many(dsts, srcs): null
+ *
+ * dsts[i].copy_(srcs[i]) for every i, batched: one kernel launch per
+ * device (pointer table) instead of one per pair. Pairs must be
+ * contiguous, of equal byte size (a multiple of 16), on the same CUDA
+ * device; dtypes are not converted. Runs on each device's current
+ * stream, like copy_.
+ */
+static uc_value_t *
+torch_copy_many(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *da = uc_fn_arg(0), *sa = uc_fn_arg(1);
+
+	if (ucv_type(da) != UC_ARRAY || ucv_type(sa) != UC_ARRAY ||
+	    ucv_array_length(da) != ucv_array_length(sa)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (dsts, srcs): tensor arrays of equal length");
+		return NULL;
+	}
+
+	std::map<int, std::vector<size_t>> by_dev;
+	std::vector<at::Tensor *> d, s;
+
+	for (size_t i = 0; i < ucv_array_length(da); i++) {
+		at::Tensor *dt = tensor_arg(vm, ucv_array_get(da, i));
+		at::Tensor *st = dt ? tensor_arg(vm, ucv_array_get(sa, i)) : NULL;
+
+		if (!st)
+			return NULL;
+
+		size_t bytes = dt->numel() * dt->element_size();
+
+		if (!dt->is_cuda() || !st->is_cuda() || dt->get_device() != st->get_device() ||
+		    !dt->is_contiguous() || !st->is_contiguous() ||
+		    bytes != st->numel() * st->element_size() || bytes % 16) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"copy_many: pair %zu: contiguous CUDA tensors on one device, "
+				"equal byte size (multiple of 16)", i);
+			return NULL;
+		}
+
+		d.push_back(dt);
+		s.push_back(st);
+		by_dev[dt->get_device()].push_back(i);
+	}
+
+	try {
+		for (auto &kv : by_dev) {
+			c10::cuda::CUDAGuard g((c10::DeviceIndex)kv.first);
+			std::vector<const void *> src;
+			std::vector<void *> dst;
+			std::vector<long> bytes;
+
+			for (size_t i : kv.second) {
+				src.push_back(s[i]->data_ptr());
+				dst.push_back(d[i]->data_ptr());
+				bytes.push_back((long)(d[i]->numel() * d[i]->element_size()));
+			}
+
+			int rc = amp_copy_many(src.data(), dst.data(), bytes.data(),
+				(int)src.size(), c10::cuda::getCurrentCUDAStream().stream());
+
+			if (!launch_ok(vm, rc, "copy_many"))
+				return NULL;
+		}
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
 }
 
 /*
@@ -6148,6 +6226,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "flash_attn_kvcache",	torch_flash_attn_kvcache },
 	{ "device_count",	torch_device_count },
 	{ "common_prefix",	torch_common_prefix },
+	{ "copy_many",	torch_copy_many },
 	{ "copy_async",	torch_copy_async },
 	{ "notifier",	torch_notifier },
 	{ "attn_decode",	torch_attn_decode },
