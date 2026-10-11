@@ -85,6 +85,7 @@ add_library(ucode_torch MODULE
     src/torch/amp_torch.cpp
     src/torch/st.c
     src/torch/tokenizer.c
+    src/torch/image.c
     src/torch/amp_tokenizer.cpp
 )
 # Build tree mirrors the install layout (<build>/lib/ampstein/torch.so) so the

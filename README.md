@@ -38,6 +38,7 @@ Engine features:
 - MTP speculative decoding with the checkpoint's own draft head, an event-driven
   decode loop and exact speculative sampling.
 - Tensor-parallel decode (peer-to-peer all-reduce, N ranks), also with MTP.
+- Image input (`image_url` data URLs) through the model's vision tower.
 
 ## Building and installing
 

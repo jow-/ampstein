@@ -128,3 +128,13 @@ amp_test(p2p_comm)
 amp_test(attn_decode_tp)
 # qwen35_tp: tensor-parallel qwen35 (eager + multi-GPU graph) vs the layer split
 amp_test(qwen35_tp)
+
+# --- Vision
+# vision_preprocess: native image preprocessing vs the PIL oracle
+amp_test(vision_preprocess)
+# vision_tower: ViT + merger vs exllamav3's tower
+amp_test(vision_tower)
+# mrope: MRoPE positions / cos-sin rows / embedding overlay
+amp_test(mrope)
+# qwen35_vision: image prompt through the 27B: continuation, chunking invariance, graph decode
+amp_test(qwen35_vision)

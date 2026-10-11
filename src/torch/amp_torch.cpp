@@ -47,6 +47,7 @@
 extern "C" {
 #include <ucode/module.h>
 #include <ucode/vm.h>
+#include "image.h"
 }
 
 #define TENSOR_TYPE "torch.tensor"
@@ -6349,6 +6350,211 @@ static const uc_function_list_t stfile_methods[] = {
 	{ "free",	stfile_free_method },
 };
 
+/*
+ * gelu_tanh(): torch.tensor — GELU with the tanh approximation
+ * (hidden_act "gelu_pytorch_tanh", the vision tower's MLP activation).
+ */
+static uc_value_t *
+tensor_gelu_tanh(uc_vm_t *vm, size_t nargs)
+{
+	return tensor_unary(vm, nargs, "gelu_tanh",
+		[](const at::Tensor &x) { return at::gelu(x, "tanh"); });
+}
+
+/*
+ * layer_norm(x, weight, bias, eps): torch.tensor
+ *
+ * LayerNorm over the last dim. x, weight, bias must share a dtype
+ * (the vision tower keeps its residual stream in fp32 and casts the
+ * normalized result down for the fp16 linears).
+ */
+static uc_value_t *
+torch_layer_norm(uc_vm_t *vm, size_t nargs)
+{
+	double eps;
+
+	if (nargs != 4 || !arg_number(vm, uc_fn_arg(3), &eps)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (x, weight, bias, eps)");
+		return NULL;
+	}
+
+	at::Tensor *x = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *w = x ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *b = w ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+
+	if (!b)
+		return NULL;
+
+	try {
+		at::Tensor r = at::layer_norm(*x, { w->size(0) }, *w, *b, eps);
+
+		return tensor_wrap(vm, std::move(r), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * image_prepare(data: string, opts): object
+ *
+ * Decodes an encoded image (PNG/JPEG/BMP/GIF/TGA/PSD/PNM bytes) and
+ * produces the vision tower's input: smart-resized (PIL-compatible
+ * bicubic), normalized, flattened patches. opts: { patch_size,
+ * merge_size, temporal_patch_size, min_pixels, max_pixels,
+ * image_mean: [3], image_std: [3] }.
+ *
+ * Returns { patches: fp16 CPU tensor (grid_h * grid_w, 3 * tp * ps * ps),
+ * grid: [1, grid_h, grid_w], width, height, new_width, new_height }.
+ */
+static bool
+opt_number(uc_vm_t *vm, uc_value_t *opts, const char *key, double *out)
+{
+	uc_value_t *v = ucv_object_get(opts, key, NULL);
+
+	if (!v) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"image_prepare: missing option '%s'", key);
+		return false;
+	}
+
+	return arg_number(vm, v, out);
+}
+
+static uc_value_t *
+torch_image_prepare(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *data = uc_fn_arg(0), *opts = uc_fn_arg(1);
+
+	if (nargs != 2 || ucv_type(data) != UC_STRING ||
+	    ucv_type(opts) != UC_OBJECT) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (data, opts)");
+		return NULL;
+	}
+
+	struct amp_image_params p;
+	double d;
+
+	memset(&p, 0, sizeof(p));
+
+	if (!opt_number(vm, opts, "patch_size", &d)) return NULL;
+	p.patch_size = (int)d;
+	if (!opt_number(vm, opts, "merge_size", &d)) return NULL;
+	p.merge_size = (int)d;
+	if (!opt_number(vm, opts, "temporal_patch_size", &d)) return NULL;
+	p.temporal_patch_size = (int)d;
+	if (ucv_object_get(opts, "min_tokens", NULL) || ucv_object_get(opts, "target_w", NULL)) {
+		/* canvas / target modes: the pixel limits are not used */
+	}
+	else {
+		if (!opt_number(vm, opts, "min_pixels", &d)) return NULL;
+		p.min_pixels = (long)d;
+		if (!opt_number(vm, opts, "max_pixels", &d)) return NULL;
+		p.max_pixels = (long)d;
+	}
+
+	/* GLM-5 canvas mode: min_tokens / max_tokens instead of min/max pixels */
+	{
+		uc_value_t *mt = ucv_object_get(opts, "min_tokens", NULL);
+
+		if (mt) {
+			if (!arg_number(vm, mt, &d)) return NULL;
+			p.min_tokens = (long)d;
+			if (!opt_number(vm, opts, "max_tokens", &d)) return NULL;
+			p.max_tokens = (long)d;
+			p.max_pixels = 1;
+		}
+	}
+
+	/* DeepSeek-V4 mode: the final size comes from the caller */
+	{
+		uc_value_t *tw = ucv_object_get(opts, "target_w", NULL);
+
+		if (tw) {
+			if (!arg_number(vm, tw, &d)) return NULL;
+			p.target_w = (int)d;
+			if (!opt_number(vm, opts, "target_h", &d)) return NULL;
+			p.target_h = (int)d;
+			p.pad = ucv_is_truish(ucv_object_get(opts, "pad", NULL)) ? 1 : 0;
+			p.max_pixels = 1;
+
+			if (p.target_w < p.patch_size || p.target_h < p.patch_size ||
+			    p.target_w % p.patch_size || p.target_h % p.patch_size)
+				RAISE("image_prepare: target size must be a multiple of the patch size");
+		}
+	}
+
+	if (p.patch_size < 1 || p.merge_size < 1 || p.temporal_patch_size < 1 ||
+	    p.max_pixels < 1)
+		RAISE("image_prepare: invalid geometry options");
+
+	const char *keys[2] = { "image_mean", "image_std" };
+
+	for (int k = 0; k < 2; k++) {
+		uc_value_t *a = ucv_object_get(opts, keys[k], NULL);
+
+		if (!a || ucv_type(a) != UC_ARRAY || ucv_array_length(a) != 3) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"image_prepare: '%s' must be an array of 3 numbers", keys[k]);
+			return NULL;
+		}
+
+		for (int c = 0; c < 3; c++) {
+			if (!arg_number(vm, ucv_array_get(a, c), &d))
+				return NULL;
+
+			(k ? p.std : p.mean)[c] = (float)d;
+		}
+	}
+
+	struct amp_image_result r;
+	char err[256] = "";
+
+	if (amp_image_prepare((const unsigned char *)ucv_string_get(data),
+	                     ucv_string_length(data), &p, &r, err, sizeof(err))) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+			"image_prepare: %s", err);
+		return NULL;
+	}
+
+	uc_value_t *res = NULL;
+
+	try {
+		int64_t rows = (int64_t)r.grid_h * r.grid_w;
+		int64_t cols = (int64_t)3 * p.temporal_patch_size *
+			p.patch_size * p.patch_size;
+		at::Tensor f = at::from_blob(r.patches, { rows, cols },
+			at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+		at::Tensor h = f.to(at::kHalf).contiguous();
+
+		free(r.patches);
+		r.patches = NULL;
+
+		res = ucv_object_new(vm);
+		ucv_object_add(res, "patches", tensor_wrap(vm, std::move(h), 0));
+
+		uc_value_t *grid = ucv_array_new(vm);
+
+		ucv_array_push(grid, ucv_int64_new(1));
+		ucv_array_push(grid, ucv_int64_new(r.grid_h));
+		ucv_array_push(grid, ucv_int64_new(r.grid_w));
+		ucv_object_add(res, "grid", grid);
+		ucv_object_add(res, "width", ucv_int64_new(r.width));
+		ucv_object_add(res, "height", ucv_int64_new(r.height));
+		ucv_object_add(res, "new_width", ucv_int64_new(r.new_width));
+		ucv_object_add(res, "new_height", ucv_int64_new(r.new_height));
+
+		return res;
+	}
+	catch (const std::exception &e) {
+		free(r.patches);
+		ucv_put(res);
+		RAISE(e.what());
+	}
+}
+
 static const uc_function_list_t tensor_methods[] = {
 	{ "item",	tensor_item },
 	{ "tolist",	tensor_tolist },
@@ -6391,6 +6597,7 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "sin",	tensor_sin },
 	{ "silu",	tensor_silu },
 	{ "sigmoid",	tensor_sigmoid },
+	{ "gelu_tanh",	tensor_gelu_tanh },
 	{ "softplus",	tensor_softplus },
 	{ "softmax",	tensor_softmax },
 	{ "cumsum",	tensor_cumsum },
@@ -6419,6 +6626,8 @@ static const uc_function_list_t torch_fns[] = {
 	{ "rms_norm",	torch_rms_norm },
 	{ "rope",	torch_rope },
 	{ "silu_mul",	torch_silu_mul },
+	{ "layer_norm",	torch_layer_norm },
+	{ "image_prepare",	torch_image_prepare },
 	{ "gdn_scan",	torch_gdn_scan },
 	{ "flash_attn_kvcache",	torch_flash_attn_kvcache },
 	{ "p2p_comm",	torch_p2p_comm },

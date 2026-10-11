@@ -218,3 +218,12 @@ Add new lessons at the end of the matching section.
   stores before the block barrier (a single-thread fence gave a deterministic
   token flip); a kernel that spins on a peer deadlocks if another kernel is
   lazily module-loaded meanwhile — warm everything up first.
+
+## Vision
+
+- **L78 — Identity versus content of image rows.** Token history compares ids, so
+  every image row carries a marker id (`MARK_BASE` + 28 bits of the image's
+  SHA-256) and only the embedding gather sees the real pad id. Positions after an
+  image differ from KV slots by a constant — graphs take a separate `rpos`.
+- **L79 — `int64_tensor.mul(16)` promotes to float** and then fails as an index.
+  Scale integer index arrays on the host before `from_array`.

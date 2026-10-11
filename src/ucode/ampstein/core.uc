@@ -22,6 +22,16 @@ import * as chat_jinja from './chat_jinja.uc';
 import * as chat_qwen35 from './chat_qwen35.uc';
 import * as qwen35 from './qwen35.uc';
 import * as qwen35_tp from './qwen35_tp.uc';
+import * as qwen35_vision from './qwen35_vision.uc';
+
+// digest.so is optional (not built on every host): images are then keyed
+// by a cheap length+sample fingerprint instead of SHA-256
+let sha256 = null;
+
+try {
+	sha256 = require('digest').sha256;
+}
+catch (e) {}
 
 function now_s() {
 	return time();
@@ -196,10 +206,182 @@ export function serve(args) {
 	// re-encode costs 268 ms.
 	let prefix_cache = utpl.prefix_cache();
 
+	// positions of <|image_pad|> in ids[from..] (offset by from)
+	function scan_pads(ids, from) {
+		let out = [];
+		let pad = cfg.image_token_id;
+
+		for (let i = from; i < length(ids); i++)
+			if (ids[i] == pad)
+				push(out, i);
+
+		return out;
+	}
+
 	function encode_prefix(r) {
 		return prefix_cache.run(
 			(segs) => utpl.encode_segments(tok, {segments: segs}),
-			r, null);
+			r, scan_pads);
+	}
+
+	// image pad positions of the ids encode_prefix() just returned
+	function prefix_pads() {
+		let c = prefix_cache.get();
+
+		if (c.pads == null)
+			c.pads = scan_pads(c.ids, 0);
+
+		return c.pads;
+	}
+
+	/* --- vision -------------------------------------------------------------------- */
+
+	let vis = null;                   // the tower, loaded on first use
+	let img_cache = {map: {}, order: [ ]};
+
+	function vision() {
+		if (!args.vision)
+			die('image input is disabled (--no-vision)');
+
+		if (!cfg.vision_merge)
+			die('this model has no (supported) vision tower');
+
+		if (!vis) {
+			let t = time();
+
+			warn(`ampstein: loading the vision tower on cuda:${args.vision_device}\n`);
+			vis = GLM ? glm5_vision.load(args.model, {
+				device: args.vision_device,
+				max_tokens: int(args.image_max_pixels / 784)       // 28 x 28 pixels per row
+			}) : qwen35_vision.load(args.model, {
+				device: args.vision_device,
+				max_pixels: args.image_max_pixels
+			});
+			warn(`ampstein: vision tower loaded in ${time() - t}s\n`);
+		}
+
+		return vis;
+	}
+
+	// image bytes of an OpenAI image_url / Qwen image content part
+	function image_bytes(part) {
+		let u = part.image_url;
+
+		if (type(u) == 'object')
+			u = u.url;
+
+		if (u == null)
+			u = part.image;
+
+		if (type(u) == 'object')
+			u = u.url;
+
+		if (type(u) != 'string')
+			die('image part has no url');
+
+		if (index(u, 'data:') != 0)
+			die('only data: URLs are supported for images (base64-encode the image)');
+
+		let comma = index(u, ',');
+
+		if (comma < 0 || index(substr(u, 0, comma), ';base64') < 0)
+			die('image data: URL must be base64-encoded');
+
+		let bytes = b64dec(substr(u, comma + 1));
+
+		if (bytes == null || length(bytes) == 0)
+			die('image data: URL is not valid base64');
+
+		return bytes;
+	}
+
+	// identity of an image: SHA-256 when digest.so exists, else length plus a
+	// rolling hash of up to 4096 sampled bytes
+	function image_key(bytes) {
+		if (sha256)
+			return sha256(bytes);
+
+		let n = length(bytes), h = n % 2147483647;
+		let step = (n > 4096) ? int(n / 4096) : 1;
+
+		for (let i = 0; i < n; i += step)
+			h = (h * 31 + ord(bytes, i)) % 2147483647;
+
+		return sprintf('%08x%08x', n, h);
+	}
+
+	// tower output for one image part; recently seen images are cached
+	function image_embedding(part) {
+		let bytes = image_bytes(part);
+		let key = image_key(bytes);
+		let hit = img_cache.map[key];
+
+		if (hit) {
+			img_cache.order = [ ...filter(img_cache.order, (k) => k != key), key ];
+
+			return hit;
+		}
+
+		let t = time();
+		let r = vision().embed(bytes);
+
+		// debug: AMP_VIS_EMB=<safetensors with 'emb'> replaces the tower output (A/B of the text side)
+		let ovr = getenv('AMP_VIS_EMB');
+
+		if (ovr)
+			r.emb = torch.st(ovr).tensor('emb').cuda(args.vision_device).to('float16');
+
+		let e = {
+			key: key,
+			emb: r.emb,
+			grid: r.grid,
+			n: r.n_tokens,
+			marker: qwen35.mm_marker(key)
+		};
+
+		warn(`ampstein: image ${r.width}x${r.height} -> ${r.new_width}x${r.new_height}, ` +
+			`${r.n_tokens} tokens (${sprintf('%.2f', time() - t)}s)\n`);
+
+		img_cache.map[key] = e;
+		push(img_cache.order, key);
+
+		while (length(img_cache.order) > args.image_cache) {
+			let old = shift(img_cache.order);
+
+			delete img_cache.map[old];
+		}
+
+		return e;
+	}
+
+	// unexpanded prompt ids (one <|image_pad|> per image) -> ids with every
+	// pad replaced by the image's marker ids; returns {ids, images} where
+	// images = [{start, grid, emb}] for the engine
+	function expand_images(ids, pads, embs) {
+		if (length(pads) != length(embs))
+			die('image placeholder count does not match the image parts ' +
+			    '(literal "<|image_pad|>" in the text?)');
+
+		let out = [], images = [], prev = 0;
+
+		for (let k = 0; k < length(pads); k++) {
+			for (let o = prev; o < pads[k]; o += 4096)
+				push(out, ...slice(ids, o, (o + 4096 < pads[k]) ? o + 4096 : pads[k]));
+
+			let e = embs[k];
+
+			push(images, {start: length(out), grid: e.grid, emb: e.emb});
+
+			for (let r = 0; r < e.n; r++)
+				push(out, e.marker);
+
+			prev = pads[k] + 1;
+		}
+
+		for (let o = prev; o < length(ids); o += 4096)
+			push(out, ...slice(ids, o, (o + 4096 < length(ids)) ? o + 4096 : length(ids)));
+
+		return {ids: out, images: images};
 	}
 
 	// stop tokens: generation_config's eos list, plus <|im_end|>
@@ -427,6 +609,20 @@ export function serve(args) {
 		}
 
 		let prefix_ids = encode_prefix(r);
+		let images = null;
+
+		if (length(r.images)) {
+			try {
+				let embs = map(r.images, (part) => image_embedding(part));
+				let x = expand_images(prefix_ids, prefix_pads(), embs);
+
+				prefix_ids = x.ids;
+				images = x.images;
+			}
+			catch (e) {
+				return api_error(res, 400, e.message, 'invalid_request_error', null, 'messages');
+			}
+		}
 
 		let gen_ids = tok.encode(r.gen, true);
 		let prefix_len = length(prefix_ids);   // BEFORE extending: ids aliases prefix_ids (L81)
@@ -511,6 +707,7 @@ export function serve(args) {
 
 		eng.submit({
 			ids: ids,
+			images: images,
 			snap_at: prefix_len,
 			max_new: max_new_of(body, length(ids)),
 			sampling: sampling_of(body),

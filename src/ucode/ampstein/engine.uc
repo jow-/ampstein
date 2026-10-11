@@ -23,6 +23,11 @@
 // Job interface (see submit()):
 //   job.ids        prompt token ids
 //   job.snap_at    prefix length to snapshot (0/null: none)
+//   job.images     optional [{start, grid, emb}]: images in the prompt,
+//                  start = position of the image's first row in `ids`,
+//                  grid = the vision tower's patch grid [1, gh, gw],
+//                  emb = its (rows, hidden) output. `ids` carries a
+//                  qwen35.MARK_BASE+ marker id on every image row.
 //   job.max_new    generation limit
 //   job.sampling   {temperature, top_k, top_p, min_p, seed,
 //                    presence_penalty, frequency_penalty}
@@ -785,6 +790,28 @@ export function create(model, opts) {
 
 		if (j.sampling && j.sampling.seed != null)
 			math.srand(j.sampling.seed);
+
+		// multimodal: the image spans of THIS prompt (null: text only).
+		// The history `ids` carries a marker id on every image row, so
+		// prefix reuse below can never match two different images; the
+		// spans give the text layers their MRoPE positions and the
+		// prefill its vision embeddings.
+		try {
+			let mm = model.mm_build ? model.mm_build(cfg, j.images) :
+				qwen35.mm_build(cfg, j.images);
+
+			for (let im in (j.images || []))
+				if (im.start + (im.emb ? im.emb.shape()[0] : 0) > length(j.ids))
+					die('image span exceeds the prompt');
+
+			cache.mm = mm;
+
+			if (cache.mtp)
+				cache.mtp.mm = mm;
+		}
+		catch (e) {
+			return fail('invalid image input: ' + e.message);
+		}
 
 		j.rounds = 0;
 		j.drafted = 0;

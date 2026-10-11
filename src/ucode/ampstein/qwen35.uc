@@ -151,12 +151,58 @@ export function rope_cache(cfg, max_seq, dev) {
 /* position, so prompt-prefix reuse can never confuse two images; the  */
 /* gather below is fed the plain image-pad id instead.                 */
 
-     // 1 << 30, above any vocabulary
+export const MARK_BASE = 1073741824;     // 1 << 30, above any vocabulary
+
+/* Marker id for an image identified by a hex digest string. */
+export function mm_marker(digest) {
+	return MARK_BASE + hex(substr(digest, 0, 7));
+}
 
 /* Image spans for a prompt. images: array of {start (absolute prompt
  * position of the first image row), grid [1, gh, gw] (patch grid),
  * emb ((n, hidden) fp16 tensor, n = gh*gw/merge^2)}. Returns null for
  * no images, else the object the rope/embedding helpers take. */
+export function mm_build(cfg, images) {
+	if (!images || !length(images))
+		return null;
+
+	let m = cfg.vision_merge;
+
+	if (!m)
+		die('qwen35: checkpoint has no vision_config (text-only model)');
+
+	let spans = [];
+	let off = 0;
+	let prev_end = 0;
+
+	for (let im in images) {
+		let gh = im.grid[1] / m, gw = im.grid[2] / m;
+		let n = gh * gw;
+
+		if (im.emb && im.emb.shape()[0] != n)
+			die(`qwen35: image embedding has ${im.emb.shape()[0]} rows, grid needs ${n}`);
+
+		if (im.start < prev_end)
+			die('qwen35: overlapping or unordered image spans');
+
+		let base = im.start + off;
+		let ext = (gh > gw) ? gh : gw;
+
+		if (ext < 1)
+			ext = 1;
+
+		push(spans, {
+			start: im.start, n: n, gh: gh, gw: gw, emb: im.emb,
+			base: base, off_before: off,
+			off_after: base + ext - (im.start + n)
+		});
+
+		off = base + ext - (im.start + n);
+		prev_end = im.start + n;
+	}
+
+	return {spans: spans, memo: {}, inv: {}, masks: {}, end_off: off};
+}
 
 /* RoPE offset for a TEXT token at absolute position `pos`: the rope
  * position is pos + mm_off(mm, pos). */

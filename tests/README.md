@@ -46,6 +46,8 @@ python3 tests/oracle/make_tokenizer_oracle.py     # tokenizer
 python3 tests/oracle/make_chat_qwen35_oracle.py   # utpl_template, chat_jinja, chat_qwen35
 python3 tests/oracle/make_qwen35_layer_oracle.py  # qwen35_layers
 python3 tests/oracle/make_qwen35_full_oracle.py   # qwen35_full, qwen35_mtp
+python3 tests/oracle/make_vision_oracle.py        # vision_tower, qwen35_vision
+python3 tests/oracle/make_mrope_oracle.py         # mrope
 ```
 
 Each script documents its arguments (model directory, output) in its docstring.
