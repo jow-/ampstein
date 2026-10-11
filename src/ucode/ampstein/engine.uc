@@ -457,7 +457,8 @@ export function create(model, opts) {
 			for (let k = 2; k <= mtp_planned; k++)
 				push(sizes, k);
 
-		graph = qgraph.create(model, cache, sizes);
+		graph = model.graphs ? model.graphs(cache, sizes) :
+			qgraph.create(model, cache, sizes);
 
 		zero_states();
 	}
@@ -472,15 +473,20 @@ export function create(model, opts) {
 	let hid_w = model.hidden_width || cfg.hidden_size;     // width of the draft head's hidden input
 	let dc = cache.mtp;
 
-	// draft-step entries: the qwen35 MTP block
+	// draft-step entry points: a model with its own MTP block (GLM)
+	// provides model.mtp_chunk / mtp_chunk_ids, else the qwen35 block
 	function mtp_run(token_ids, hidden, pos, head) {
-		return qwen35.mtp_chunk(cfg, M, model.embed_tokens, model.devs[0], token_ids,
-			hidden, dc, pos, head);
+		return model.mtp_chunk ?
+			model.mtp_chunk(token_ids, hidden, dc, pos, head) :
+			qwen35.mtp_chunk(cfg, M, model.embed_tokens, model.devs[0], token_ids,
+				hidden, dc, pos, head);
 	}
 
 	function mtp_run_ids(ids_dev, hidden, pos, head) {
-		return qwen35.mtp_chunk_ids(cfg, M, model.embed_tokens, model.devs[0], ids_dev,
-			hidden, dc, pos, head);
+		return model.mtp_chunk_ids ?
+			model.mtp_chunk_ids(ids_dev, hidden, dc, pos, head) :
+			qwen35.mtp_chunk_ids(cfg, M, model.embed_tokens, model.devs[0], ids_dev,
+				hidden, dc, pos, head);
 	}
 	let draft_len = 0;       // draft cache positions [0, draft_len) valid
 	let vsnap = {};
@@ -571,6 +577,334 @@ export function create(model, opts) {
 		return model.forward_chunk(token_ids, cache);
 	}
 
+	/* --- host-RAM prompt-cache store ----------------------------------
+	 * The engine holds ONE live state (+ one snapshot). When a request
+	 * does not continue it (another conversation, a side request of the
+	 * client, a cancelled turn), the live state is moved to page-locked
+	 * host RAM instead of being thrown away, and a later request that
+	 * extends a stored state swaps it back (a 100k-token prefix is
+	 * ~6.5 GB: ~1 s over PCIe against ~100 s of prefill). An entry keeps
+	 * the token ids, the attention KV (chunks of KV_CHUNK tokens), the GDN
+	 * states, the MTP draft cache and hidden, and the snapshot taken at
+	 * the last stable prefix, so both reuse points of the old state
+	 * survive. opts.cache_ram (GiB, 0: off) bounds the total; LRU. */
+	const KV_CHUNK = 4096;
+	const STORE_MIN_TOKENS = 2048;    // smaller states are cheaper to recompute
+	const STORE_MIN_GAIN = 512;       // a stored hit must save at least this much
+	let store = [];                   // oldest first
+	let store_bytes = 0;
+	let store_budget = int((opts.cache_ram || 0) * 1073741824);
+
+	function elsize(t) {
+		let d = t.dtype();
+
+		return (d == 'float32' || d == 'int32') ? 4 : (d == 'int64' || d == 'float64') ? 8 :
+			(d == 'int8' || d == 'uint8' || d == 'bool') ? 1 : 2;
+	}
+
+	function is_gdn(i) {
+		return cfg.layer_types[i] == 'linear_attention';
+	}
+
+	function tbytes(t) {
+		return t.numel() * elsize(t);
+	}
+
+	// every layer holds attention KV or GDN states (not e.g. MLA latent
+	// caches): else the store stays off
+	function store_supported() {
+		let kv = false;
+
+		for (let i = 0; i < cfg.num_hidden_layers; i++)
+			for (let cl in states(i)) {
+				if (is_gdn(i)) {
+					if (!cl.rec_state)
+						return false;
+				}
+				else if (cl.k_cache)
+					kv = true;
+				else
+					return false;
+			}
+
+		return kv && (!cache.mtp || cache.mtp.k_cache != null);
+	}
+
+	if (store_budget > 0 && !store_supported()) {
+		warn('engine: host-RAM cache store not supported by this model, disabled\n');
+		store_budget = 0;
+	}
+
+	function to_host(src, e) {
+		if (src.numel() == 0)
+			return src.cpu();
+
+		let h = torch.pinned_empty(src.shape(), src.dtype());
+
+		h.copy_(src);
+		e.bytes += tbytes(h);
+
+		return h;
+	}
+
+	/* Tiered precision of a stored KV region (a stored state is idle: the
+	 * far past matters least to the next token). Chunk by chunk, by the
+	 * distance of its end from the end of the state: the last `tail` tokens
+	 * stay fp16, up to `q8` tokens back they are int8 (groups of 32,
+	 * error ~0.7%), further back int4 (~11%); the first chunk (attention
+	 * sinks) is never below int8, and a state shorter than `min` tokens is
+	 * stored exactly (cheap to hold, cheap to lose). opts.cache_quant:
+	 * 'off' | {min, tail, q8} (tokens). Returns 16, 8 or 4. */
+	let qcfg = {min: 16384, tail: 8192, q8: 40960};
+
+	if (opts.cache_quant == 'off')
+		qcfg = null;
+	else if (type(opts.cache_quant) == 'object')
+		qcfg = {...qcfg, ...opts.cache_quant};
+
+	function tier_of(o, m, n) {
+		if (!qcfg || n < qcfg.min)
+			return 16;
+
+		let d = n - (o + m);
+		let t = (d < qcfg.tail) ? 16 : (d < qcfg.q8) ? 8 : 4;
+
+		return (o == 0 && t == 4) ? 8 : t;
+	}
+
+	// bytes of one KV chunk (k + v) of `m` tokens at tier t
+	function chunk_bytes(shape, m, t) {
+		let vals = 2 * shape[1] * m * shape[3];
+
+		return (t == 16) ? vals * 2 : (t == 8) ? vals + vals / 16 : vals / 2 + vals / 16;
+	}
+
+	function kv_to_host(c, dev, n, e) {
+		let chunks = [];
+		let sh = c.k_cache.shape();
+		let kvh = sh[1], hd = sh[3];
+
+		for (let o = 0; o < n; o += KV_CHUNK) {
+			let m = min(KV_CHUNK, n - o);
+			let t = tier_of(o, m, n);
+			let ch = {tier: t, m: m, x: []};
+
+			for (let src in [ c.k_cache, c.v_cache ]) {
+				let v = src.narrow(2, o, m);
+
+				if (t == 16) {
+					push(ch.x, to_host(v, e));
+					continue;
+				}
+
+				let rows = v.contiguous().view([ kvh * m, hd ]);
+				let q = torch.empty([ kvh * m, (t == 8) ? hd : hd / 2 ], 'int8', 'cuda:' + dev);
+				let sc = torch.empty([ kvh * m, hd / 32 ], 'float16', 'cuda:' + dev);
+
+				if (t == 8)
+					torch.kv_q8_put(rows, q, sc, 0);
+				else
+					torch.kv_q4_put(rows, q, sc, 0);
+
+				push(ch.x, [ to_host(q, e), to_host(sc, e) ]);
+			}
+
+			push(chunks, ch);
+		}
+
+		return chunks;
+	}
+
+	function kv_from_host(c, dev, chunks, n) {
+		let sh = c.k_cache.shape();
+		let kvh = sh[1], hd = sh[3];
+
+		for (let k = 0; k * KV_CHUNK < n; k++) {
+			let o = k * KV_CHUNK;
+			let m = min(KV_CHUNK, n - o);
+			let ch = chunks[k];
+			let dst = [ c.k_cache, c.v_cache ];
+
+			for (let x = 0; x < 2; x++) {
+				let src = ch.x[x];
+
+				if (ch.tier != 16) {
+					let q = src[0].cuda(dev), sc = src[1].cuda(dev);
+
+					src = (ch.tier == 8 ? torch.kv_q8_get(q, sc, 0, kvh * ch.m) :
+						torch.kv_q4_get(q, sc, 0, kvh * ch.m)).view([ 1, kvh, ch.m, hd ]);
+				}
+
+				if (m < ch.m)
+					src = src.narrow(2, 0, m);
+
+				dst[x].narrow(2, o, m).copy_(src);
+			}
+		}
+	}
+
+	function store_estimate() {
+		let n = length(ids), b = 0;
+
+		for (let i = 0; i < cfg.num_hidden_layers; i++)
+			for (let cl in states(i)) {
+				if (!is_gdn(i)) {
+					let sh = cl.k_cache.shape();
+
+					for (let o = 0; o < n; o += KV_CHUNK) {
+						let m = min(KV_CHUNK, n - o);
+
+						b += chunk_bytes(sh, m, tier_of(o, m, n));
+					}
+				}
+				else
+					b += 2 * (tbytes(cl.rec_state) + tbytes(cl.conv_state));
+			}
+
+		if (cache.mtp && draft_len > 0) {
+			let sh = cache.mtp.k_cache.shape();
+
+			for (let o = 0; o < draft_len; o += KV_CHUNK) {
+				let m = min(KV_CHUNK, draft_len - o);
+
+				b += chunk_bytes(sh, m, tier_of(o, m, draft_len));
+			}
+		}
+
+		return b;
+	}
+
+	function store_drop(k) {
+		store_bytes -= store[k].bytes;
+
+		splice(store, k, 1);
+	}
+
+	/* Move the live state (and its snapshot) to host RAM. Returns true when
+	 * stored; any failure leaves the store as it was. */
+	function store_put() {
+		let n = length(ids);
+		let est = store_estimate();
+
+		if (n < STORE_MIN_TOKENS || cache.length != n)
+			return false;
+
+		if (store_budget <= 0 || est > store_budget)
+			return false;
+
+		// a stored state that is a prefix of this one is superseded
+		for (let k = length(store) - 1; k >= 0; k--)
+			if (lcp(store[k].ids, ids) == store[k].n)
+				store_drop(k);
+
+		// make room: evict the oldest entries
+		while (store_bytes + est > store_budget && length(store))
+			store_drop(0);
+
+		let e = {ids: slice(ids), n: n, bytes: 0, kv: {}, gdn: {}, dl: draft_len,
+			hid: null, snap_ids: null, snap: null, snap_hid: null, draft: null};
+		let t0 = now_ms();
+
+		try {
+			torch.synchronize();
+
+			for (let i = 0; i < cfg.num_hidden_layers; i++) {
+				let sts = states(i);
+
+				e[is_gdn(i) ? 'gdn' : 'kv'][i] = map(sts, (cl) => !is_gdn(i) ?
+					kv_to_host(cl, cl.dev, n, e) : [ to_host(cl.rec_state, e), to_host(cl.conv_state, e) ]);
+			}
+
+			if (cache.mtp && draft_len > 0)
+				e.draft = kv_to_host(cache.mtp, M.dev, draft_len, e);
+
+			if (last_hidden)
+				e.hid = to_host(last_hidden, e);
+
+			if (snap_ids != null && lcp(snap_ids, ids) == length(snap_ids)) {
+				e.snap_ids = slice(snap_ids);
+				e.snap = {};
+
+				for (let k in gdn_layers)
+					e.snap[k] = map(snap[k], (b) => [ to_host(b[0], e), to_host(b[1], e) ]);
+
+				if (snap_hidden)
+					e.snap_hid = to_host(snap_hidden, e);
+			}
+		}
+		catch (err) {
+			warn(`engine: cache store: offload failed (${err.message})\n`);
+
+			return false;
+		}
+
+		push(store, e);
+		store_bytes += e.bytes;
+		warn(sprintf('engine: cache store: %d tokens moved to host RAM in %.0f ms (%d entries, %.1f GiB)\n',
+			n, now_ms() - t0, length(store), store_bytes / 1073741824.0));
+
+		return true;
+	}
+
+	/* Swap stored entry e back into the live buffers up to `start` tokens:
+	 * start == e.n restores the live state, else the entry's snapshot
+	 * (start == length(e.snap_ids)). e must already be out of the list. */
+	function store_restore(e, start) {
+		let t0 = now_ms();
+		let live = (start == e.n);
+
+		for (let i = 0; i < cfg.num_hidden_layers; i++) {
+			let sts = states(i);
+
+			for (let r = 0; r < length(sts); r++) {
+				if (!is_gdn(i))
+					kv_from_host(sts[r], sts[r].dev, e.kv[i][r], start);
+				else if (live) {
+					sts[r].rec_state.copy_(e.gdn[i][r][0]);
+					sts[r].conv_state.copy_(e.gdn[i][r][1]);
+				}
+			}
+		}
+
+		if (e.snap) {
+			for (let k in gdn_layers)
+				for (let r = 0; r < length(snap[k]); r++) {
+					snap[k][r][0].copy_(e.snap[k][r][0]);
+					snap[k][r][1].copy_(e.snap[k][r][1]);
+				}
+
+			snap_ids = slice(e.snap_ids);
+			snap_hidden = e.snap_hid ? e.snap_hid.cuda(M.dev) : null;
+		}
+		else {
+			snap_ids = null;
+			snap_hidden = null;
+		}
+
+		let dl = min(e.dl, start);
+
+		if (cache.mtp && e.draft && dl > 0)
+			kv_from_host(cache.mtp, M.dev, e.draft, dl);
+
+		if (live) {
+			ids = slice(e.ids);
+			cache.length = e.n;
+			last_hidden = e.hid ? e.hid.cuda(M.dev) : null;
+		}
+		else
+			restore_snapshot();
+
+		// the draft cache only follows when the entry had it up to `start`
+		draft_len = (cache.mtp && dl == start && (!live || e.dl == start)) ? start : 0;
+
+		if (!draft_len)
+			last_hidden = null;
+
+		torch.synchronize();
+		warn(sprintf('engine: cache store: %d tokens restored from host RAM in %.0f ms\n',
+			start, now_ms() - t0));
+	}
+
 	/* Decide where the job's prompt starts: live state, snapshot, a stored
 	 * state or 0. Returns {from, start, detail}. */
 	function plan_reuse(prompt) {
@@ -595,7 +929,58 @@ export function create(model, opts) {
 			det.div_new = slice(prompt, max(live - 4, 0), live + 8);
 		}
 
-		return plan;
+		if (store_budget <= 0)
+			return plan;
+
+		// best stored state that the prompt extends
+		let hit = null, hit_start = 0, hit_k = -1;
+
+		for (let k = 0; k < length(store); k++) {
+			let e = store[k];
+
+			let l = lcp(e.ids, prompt);
+
+			if (l == e.n && e.n < length(prompt) && e.n > hit_start) {
+				hit = e; hit_start = e.n; hit_k = k;
+			}
+			else if (e.snap_ids && length(e.snap_ids) < length(prompt) &&
+			         length(e.snap_ids) > hit_start &&
+			         lcp(e.snap_ids, prompt) == length(e.snap_ids)) {
+				hit = e; hit_start = length(e.snap_ids); hit_k = k;
+			}
+		}
+
+		if (hit && hit_start < plan.start + STORE_MIN_GAIN)
+			hit = null;
+
+		// the live state is about to be (mostly) dropped — what it still
+		// contributes is plan.start, whatever a stored hit adds on top —
+		// keep it in RAM
+		if (length(ids) >= STORE_MIN_TOKENS && plan.start < length(ids) / 2) {
+			if (hit)
+				splice(store, hit_k, 1);       // (out of the way of the LRU eviction)
+
+			if (hit)
+				store_bytes -= hit.bytes;
+
+			det.stored = store_put();
+		}
+		else if (hit) {
+			splice(store, hit_k, 1);
+			store_bytes -= hit.bytes;
+		}
+
+		if (!hit)
+			return plan;
+
+		det.ram_from = hit_start;
+
+		let tr = now_ms();
+
+		store_restore(hit, hit_start);
+		det.ram_ms = now_ms() - tr;
+
+		return {from: 'ram', start: hit_start, detail: det};
 	}
 
 	function finish(reason) {
@@ -768,7 +1153,9 @@ export function create(model, opts) {
 			}
 		};
 
-		j.runner = qwen35.prefill_pipeline(model, cache, slice(j.ids, j.pos), popts);
+		j.runner = model.prefill_pipeline ?
+			model.prefill_pipeline(cache, slice(j.ids, j.pos), popts) :
+			qwen35.prefill_pipeline(model, cache, slice(j.ids, j.pos), popts);
 	}
 
 	function begin(j) {
@@ -818,6 +1205,53 @@ export function create(model, opts) {
 		j.accepted = 0;
 
 		start_prefill(j);
+	}
+
+	/* Forced tokens (j.force(): the server's reasoning budget): the
+	 * generation continues as if the prompt had been extended by them. At
+	 * a step boundary the cache holds every emitted token except, in the
+	 * MTP phase, the pending t_next — so the continuation is the live-
+	 * reuse prefill of [t_next] + forced; the GDN state, the KV and the
+	 * draft cache follow through the ordinary prefill path, and MTP goes
+	 * on afterwards. The forced tokens count as generated (usage, max_new)
+	 * and as seen by the penalties; the caller has already shown them to
+	 * its consumer. */
+	function inject(j, forced, skip_next) {
+		let room = j.max_new - j.generated - 1;
+
+		if (max_ctx - cache.length - 2 < room)
+			room = max_ctx - cache.length - 2;
+
+		if (length(forced) > room)
+			forced = slice(forced, 0, room);
+
+		if (length(forced) == 0)
+			return false;
+
+		let tail = (j.phase == 'mtp' && !skip_next) ? [ j.t_next ] : [];
+
+		push(tail, ...forced);
+
+		for (let f in forced) {
+			j.generated++;
+			count_tok(j, f);
+		}
+
+		let keep = {rounds: j.rounds, drafted: j.drafted, accepted: j.accepted,
+			t_prefill_done: j.t_prefill_done};
+
+		j.ids = slice(ids, 0);
+		push(j.ids, ...tail);
+		j.snap_at = 0;
+		j.phase = 'prefill';
+		j.injected = (j.injected || 0) + length(forced);
+		start_prefill(j);
+		j.rounds = keep.rounds;
+		j.drafted = keep.drafted;
+		j.accepted = keep.accepted;
+		j.t_prefill_done = keep.t_prefill_done;
+
+		return true;
 	}
 
 	/* Draft cache for the newly prefilled positions: the MTP input at
@@ -1230,6 +1664,15 @@ export function create(model, opts) {
 			j.phase = 'decode';
 		}
 
+		// forced tokens from the consumer (the server's reasoning budget):
+		// polled at every step boundary, where the state is consistent
+		if (j.force) {
+			let f = j.force();
+
+			if (f && length(f) && inject(j, f))
+				return;
+		}
+
 		if (j.phase == 'mtp')
 			return mtp_round(j);
 
@@ -1422,6 +1865,76 @@ export function create(model, opts) {
 		return N;
 	}
 
+	/* Startup warm-up (as exllamav3's "Warming up"): run the worst-case
+	 * shapes once — a full prefill chunk at the END of the context (the
+	 * sparse attention then sees its largest pool count), a decode step,
+	 * and the MTP verify and draft shapes — so the caching allocator
+	 * reserves its whole working set NOW. A context that does not fit then
+	 * fails at load with a clear message instead of in the middle of the
+	 * first long request, and requests afterwards reuse reserved blocks
+	 * (no cudaMalloc on the serving path). The caches are reset after. */
+	function warmup() {
+		if (opts.warmup == false)
+			return;
+
+		let t0 = now_ms();
+		let W = mtp_w, H = hid_w;
+		let n = (chunk < max_ctx / 2) ? chunk : int(max_ctx / 2);
+		let pos0 = max_ctx - n - W - 4;
+
+		if (pos0 < 0)
+			pos0 = 0;
+
+		try {
+			zero_states();
+			cache.length = pos0;
+
+			let wids = [];
+
+			for (let i = 0; i < n; i++)
+				push(wids, 0);
+
+			let popts = {chunk: n, cuts: [], hidden: W > 0};
+			let run = model.prefill_pipeline ?
+				model.prefill_pipeline(cache, wids, popts) :
+				qwen35.prefill_pipeline(model, cache, wids, popts);
+
+			while (run.step(1)) {}
+
+			let hid = (W > 0) ? run.hidden() : null;
+
+			// decode step, MTP verify window, draft steps
+			step_fwd([ 0 ]);
+
+			if (W > 0) {
+				let w = [];
+
+				for (let i = 0; i < W; i++)
+					push(w, 0);
+
+				step_fwd(w);
+
+				let D = torch.zeros([ 1, 1, H ], 'float16', 'cuda:' + M.dev);
+
+				for (let k = 0; k < W; k++)
+					D = mtp_run([ 0 ], D, pos0 + k, model.lm_head).hidden;
+
+				if (hid)
+					mtp_run(slice(wids, 0, 2), hid.narrow(1, 0, 2).contiguous(), pos0, null);
+			}
+
+			torch.synchronize();
+		}
+		catch (e) {
+			die(`engine warm-up failed (context ${max_ctx}, chunk ${n} does not fit in VRAM?): ${e.message}`);
+		}
+
+		reset_state();
+		warn(`engine: warm-up done in ${sprintf('%.1f', (now_ms() - t0) / 1000.0)} s\n`);
+	}
+
+	warmup();
+
 	return {
 		max_ctx: max_ctx,
 
@@ -1450,6 +1963,8 @@ export function create(model, opts) {
 			let c = {live: length(ids), snapshot: snap_ids ? length(snap_ids) : 0};
 
 			c.draft = draft_len;
+			c.stored = length(store);
+			c.stored_bytes = store_bytes;
 
 			return c;
 		},

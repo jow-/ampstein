@@ -138,3 +138,49 @@ amp_test(vision_tower)
 amp_test(mrope)
 # qwen35_vision: image prompt through the 27B: continuation, chunking invariance, graph decode
 amp_test(qwen35_vision)
+
+# --- GLM-5.3-Flash and the engine's cache store
+# kv_q8: Q8 latent cache rows put / get
+amp_test(kv_q8)
+# idx_score: fused DSA indexer scoring kernel
+amp_test(idx_score)
+# skinny: deterministic split-K fp32 product, 1..8 rows
+amp_test(skinny)
+# glm5_chat: GLM chat template renderer + output parser (pure ucode)
+amp_test(glm5_chat)
+# glm5_blocks: mHC dense blocks vs the oracle
+amp_test(glm5_blocks)
+# glm5_kda: KDA layer vs the oracle
+amp_test(glm5_kda)
+# glm5_mla: MLA layer vs the oracle
+amp_test(glm5_mla)
+# glm5_moe: MoE layer vs the oracle
+amp_test(glm5_moe)
+# glm5_full: full model vs the oracle
+amp_test(glm5_full)
+# glm5_long: long context: indexer selection + sparse attention
+amp_test(glm5_long)
+# glm5_ppl: perplexity / KLD on real text beyond index_topk
+amp_test(glm5_ppl)
+# glm5_mtp_split: MTP head on the layer split
+amp_test(glm5_mtp_split)
+# glm5_tp: tensor / expert parallel
+amp_test(glm5_tp)
+# glm5_tp_graph: TP decode graphs
+amp_test(glm5_tp_graph)
+# glm5_tp_pipe: pipeline of TP stages
+amp_test(glm5_tp_pipe)
+# glm5_mtp: MTP draft head under TP
+amp_test(glm5_mtp)
+# glm5_vision: GLM vision tower vs the oracle
+amp_test(glm5_vision)
+# engine_inject: force() hook (reasoning budget): forced continuation == extended prompt
+amp_test(engine_inject)
+# engine_store: host-RAM prompt-cache store: restore == fresh prefill
+amp_test(engine_store)
+# engine_store_quant: tiered KV quantization of stored state at long context
+amp_test(engine_store_quant)
+# the TP tests again as a pipeline of three 2-rank stages
+amp_test(glm5_tp_stages SCRIPT glm5_tp ENV AMP_GLM5_STAGES=3)
+amp_test(glm5_tp_graph_stages SCRIPT glm5_tp_graph ENV AMP_GLM5_STAGES=3)
+amp_test(glm5_mtp_stages SCRIPT glm5_mtp ENV AMP_GLM5_STAGES=3)

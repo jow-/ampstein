@@ -169,6 +169,15 @@ tensor_arg(uc_vm_t *vm, uc_value_t *v)
 	return tensor_arg_impl(vm, v, true);
 }
 
+static at::Tensor *
+tensor_arg_opt(uc_vm_t *vm, uc_value_t *v)
+{
+	if (v && ucv_type(v) == UC_NULL)
+		return NULL;
+
+	return tensor_arg_impl(vm, v, true);
+}
+
 /* Multi-GPU: raw kernel launches and cudaMemcpyAsync calls run on the
  * CURRENT device's stream — a tensor living on another device would be
  * dereferenced across devices (illegal memory access). ATen ops set
@@ -1864,6 +1873,36 @@ tensor_index_copy_(uc_vm_t *vm, size_t nargs)
 	return ucv_get(_uc_fn_this_res(vm));
 }
 
+static uc_value_t *
+tensor_index_add_(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm), *idx, *src;
+	int64_t dim;
+
+	if (!t)
+		return NULL;
+
+	if (nargs != 3 || !arg_int(vm, uc_fn_arg(0), &dim) ||
+	    !(idx = tensor_arg(vm, uc_fn_arg(1))) ||
+	    !(src = tensor_arg(vm, uc_fn_arg(2))))
+		return NULL;
+
+	try {
+		if (idx->scalar_type() != at::kLong) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"index must be an int64 tensor");
+			return NULL;
+		}
+
+		t->index_add_(dim, *idx, *src);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return ucv_get(_uc_fn_this_res(vm));
+}
+
 /* --- elementwise arithmetic ---------------------------------------------- */
 
 /*
@@ -1933,6 +1972,53 @@ tensor_sub(uc_vm_t *vm, size_t nargs)
 	return tensor_binary_out(vm, nargs, "sub",
 		[](const at::Tensor &a, const at::Tensor &b) { return at::sub(a, b); },
 		[](const at::Tensor &a, double s) { return at::sub(a, s); });
+}
+
+/*
+ * clamp(min, max): torch.tensor — either bound may be null (open).
+ */
+static uc_value_t *
+tensor_clamp(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm);
+	double lo = 0, hi = 0;
+	bool has_lo = false, has_hi = false;
+
+	if (!t)
+		return NULL;
+
+	if (nargs != 2) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (min, max)");
+		return NULL;
+	}
+
+	if (ucv_type(uc_fn_arg(0)) != UC_NULL) {
+		if (!arg_number(vm, uc_fn_arg(0), &lo))
+			return NULL;
+
+		has_lo = true;
+	}
+
+	if (ucv_type(uc_fn_arg(1)) != UC_NULL) {
+		if (!arg_number(vm, uc_fn_arg(1), &hi))
+			return NULL;
+
+		has_hi = true;
+	}
+
+	if (!has_lo && !has_hi)
+		RAISE("clamp: at least one bound is required");
+
+	try {
+		at::Tensor r = at::clamp(*t,
+			has_lo ? c10::optional<at::Scalar>(lo) : c10::nullopt,
+			has_hi ? c10::optional<at::Scalar>(hi) : c10::nullopt);
+
+		return tensor_wrap(vm, std::move(r), 0);
+	}
+	catch (const std::exception &e2) {
+		RAISE(e2.what());
+	}
 }
 
 /*
@@ -2304,6 +2390,48 @@ tensor_pin(uc_vm_t *vm, size_t nargs)
 			return at::from_blob(p, c.sizes(), [](void *q) { cudaFreeHost(q); },
 				c.options());
 		});
+}
+
+/*
+ * pinned_empty(dims, dtype?): torch.tensor
+ *
+ * Uninitialized page-locked CPU tensor (cudaHostAllocPortable, like pin()):
+ * the target of copy_async and the source of async H2D copies. Backs the
+ * engine's host-RAM prompt-cache store.
+ */
+static uc_value_t *
+torch_pinned_empty(uc_vm_t *vm, size_t nargs)
+{
+	std::vector<int64_t> dims;
+	at::ScalarType dt = at::kFloat;
+	at::Device dev(at::kCPU);
+
+	if (!parse_factory_args(vm, nargs, &dims, &dt, &dev))
+		return NULL;
+
+	if (dims.empty()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"at least one dimension required");
+		return NULL;
+	}
+
+	try {
+		at::Tensor t = at::empty(dims, at::TensorOptions().dtype(dt).device(at::kCPU));
+		size_t n = t.nbytes();
+		void *p = NULL;
+
+		if (n == 0)
+			return tensor_wrap(vm, std::move(t), 0);
+
+		if (cudaHostAlloc(&p, n, cudaHostAllocPortable) != cudaSuccess)
+			RAISE("pinned_empty: out of page-locked memory");
+
+		return tensor_wrap(vm, at::from_blob(p, t.sizes(),
+			[](void *q) { cudaFreeHost(q); }, t.options()), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
 }
 
 /* --- Phase 1: structural ops --------------------------------------------- */
@@ -2788,6 +2916,30 @@ graph_capture_begin(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * pool(): [a, b]
+ *
+ * The id of the graph's private allocator pool, to pass as the third
+ * argument of another graph's capture_begin() (shared pool). [0, 0] for a
+ * graph that was never captured.
+ */
+static uc_value_t *
+graph_pool(uc_vm_t *vm, size_t nargs)
+{
+	graph_state *g = graph_this(vm);
+
+	if (!g)
+		return NULL;
+
+	at::cuda::MempoolId_t id = g->graph->pool();
+	uc_value_t *a = ucv_array_new_length(vm, 2);
+
+	ucv_array_push(a, ucv_int64_new((int64_t)id.first));
+	ucv_array_push(a, ucv_int64_new((int64_t)id.second));
+
+	return a;
+}
+
+/*
  * capture_end(): this
  *
  * Stops recording and instantiates the graph.
@@ -2899,6 +3051,7 @@ graph_free_method(uc_vm_t *vm, size_t nargs)
 static const uc_function_list_t graph_methods[] = {
 	{ "capture_begin",	graph_capture_begin },
 	{ "capture_end",	graph_capture_end },
+	{ "pool",		graph_pool },
 	{ "replay",		graph_replay },
 	{ "free",		graph_free_method },
 };
@@ -3355,6 +3508,40 @@ torch_st_tensor(uc_vm_t *vm, size_t nargs)
 	return res;
 }
 
+/* --- EXL3 kernels (vendored, see vendor/exl3) --------------------------- */
+
+// quant/exl3_moe_coop.cu: fused decode-shaped MoE (two launches per layer)
+void exl3_moe_coop
+(
+    const at::Tensor& x,
+    const at::Tensor& sel,
+    const at::Tensor& rw,
+    int min_expert,
+    int max_expert,
+    int Hi,
+    const at::Tensor& g_trellis, const at::Tensor& g_suh, const at::Tensor& g_svh,
+    const at::Tensor& u_trellis, const at::Tensor& u_suh, const at::Tensor& u_svh,
+    const at::Tensor& d_trellis, const at::Tensor& d_suh, const at::Tensor& d_svh,
+    const c10::optional<at::Tensor>& g_bias,
+    const c10::optional<at::Tensor>& u_bias,
+    const c10::optional<at::Tensor>& d_bias,
+    float Kg, float Ku, float Kd,
+    bool mcg, bool mul1,
+    int act,
+    float act_limit,
+    bool gated,
+    at::Tensor& had_g,
+    at::Tensor& had_u,
+    at::Tensor& gu_g,
+    at::Tensor& gu_u,
+    at::Tensor& act_out,
+    at::Tensor& d_out,
+    at::Tensor& ctr,
+    at::Tensor& out,
+    const c10::optional<at::Tensor>& sh_out,
+    const c10::optional<at::Tensor>& sh_gate_w
+);
+
 // Upstream signatures (global namespace, from quant/exl3_gemm.cuh and
 // quant/reconstruct.cuh). Compiled into the exl3_kernels object lib.
 int exl3_gemm
@@ -3369,6 +3556,32 @@ int exl3_gemm
     bool mcg,
     bool mul1,
     int force_num_sms
+);
+
+// mHC hyper-connection kernels (vendor/exl3/exllamav3_ext/hc_mix.cu)
+int hc_mix_num_chunks(int R, int row_len);
+
+void hc_mix
+(
+    const at::Tensor& streams,
+    const at::Tensor& fn,
+    const at::Tensor& base,
+    const at::Tensor& scale,
+    double rms_eps,
+    double hc_eps,
+    int64_t sinkhorn_iters,
+    at::Tensor partials,
+    at::Tensor post,
+    at::Tensor comb,
+    at::Tensor collapsed
+);
+
+void hc_apply
+(
+    at::Tensor x,
+    const at::Tensor& y,
+    const at::Tensor& post,
+    const c10::optional<at::Tensor>& comb
 );
 
 void reconstruct
@@ -3472,6 +3685,21 @@ amp_gdn_scan_f32(const void *q, const void *k, const void *v, const void *beta,
                 const void *gexp, void *state, void *out, int S, int Hk,
                 int Hv, int dk, int dv, float scale, void *states_out,
                 int n_out, cudaStream_t stream);
+
+extern "C" int
+amp_kda_scan_f32(const void *q, const void *k, const void *v, const void *beta,
+                const void *g, void *state, void *out, int S, int H, int dk,
+                int dv, float scale, void *states_out, int n_out,
+                cudaStream_t stream);
+
+extern "C" int
+amp_kda_gates(const void *f, const void *dt_bias, const void *decay,
+             const void *braw, void *g, void *beta, long S, int H, int DK,
+             float lb, float beta_scale, cudaStream_t stream);
+
+extern "C" int
+amp_kda_out_norm(const void *core, const void *z, const void *w, int w_is_half,
+                void *out, long rows, int dv, float eps, cudaStream_t stream);
 
 extern "C" int
 amp_copy_many(const void *const *src, void *const *dst, const long *bytes,
@@ -3935,6 +4163,113 @@ torch_silu_mul(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * idx_score(q, pools, w, scale, pos0, P): torch.tensor
+ *
+ * Fused DSA indexer scoring (amp_idx_score in src/amp_kernels.cu):
+ *   out[r][p] = pool p selectable by query r (p * P + P - 1 <= pos0 + r) ?
+ *       sum_h w[r][h] * scale * relu(q[r][h] . pools[p]) : -65504   (fp16)
+ * q (R, H, 128) fp16 with H a multiple of 32 (GLM 32, DeepSeek 64: the heads run in halves of
+ * 32 inside one kernel, summed in fp32), pools (n_pools, 128) fp16, w (R, H) fp32, all
+ * contiguous on one CUDA device; returns (R, n_pools) fp16.
+ */
+extern "C" int
+amp_idx_score(const void *q, const void *pools, const void *w, void *out,
+             int R, int n_pools, float scale, int pos0, int P, int HI, cudaStream_t stream);
+
+static uc_value_t *
+torch_idx_score(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 6)
+		RAISE("idx_score: expected (q, pools, w, scale, pos0, P)");
+
+	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *pk = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *w = pk ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+
+	if (!q || !pk || !w)
+		return NULL;
+
+	uc_value_t *sv = uc_fn_arg(3), *pv = uc_fn_arg(4), *kv = uc_fn_arg(5);
+
+	if (!sv || !pv || !kv || ucv_type(pv) != UC_INTEGER || ucv_type(kv) != UC_INTEGER ||
+	    (ucv_type(sv) != UC_DOUBLE && ucv_type(sv) != UC_INTEGER))
+		RAISE("idx_score: scale must be a number, pos0 and P integers");
+
+	if (q->scalar_type() != at::kHalf || pk->scalar_type() != at::kHalf ||
+	    w->scalar_type() != at::kFloat || q->device().type() != at::kCUDA ||
+	    pk->device() != q->device() || w->device() != q->device() ||
+	    !q->is_contiguous() || !pk->is_contiguous() || !w->is_contiguous() ||
+	    q->dim() != 3 || q->size(1) < 32 || q->size(1) % 32 || q->size(2) != 128 ||
+	    pk->dim() != 2 || pk->size(1) != 128 ||
+	    w->dim() != 2 || w->size(0) != q->size(0) || w->size(1) != q->size(1))
+		RAISE("idx_score: q (R,H,128) fp16 with H a multiple of 32, pools (n,128) fp16, w (R,H) fp32, "
+		      "contiguous on one CUDA device");
+
+	long R = q->size(0), n = pk->size(0);
+	double scale = (ucv_type(sv) == UC_DOUBLE) ? ucv_double_get(sv) : (double)ucv_int64_get(sv);
+	int64_t pos0 = ucv_int64_get(pv), P = ucv_int64_get(kv);
+
+	if (P < 1 || pos0 < 0 || n > 0x7fffff00L / (P + 1))
+		RAISE("idx_score: bad pos0 / P");
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		at::Tensor out = at::empty({ R, n },
+			at::TensorOptions().dtype(at::kHalf).device(q->device()));
+
+		int rc = amp_idx_score(q->data_ptr(), pk->data_ptr(), w->data_ptr(), out.data_ptr(),
+			(int)R, (int)n, (float)scale, (int)pos0, (int)P, (int)q->size(1),
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "idx_score"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * mem_info(dev): [allocated, reserved, free, total] bytes of CUDA device
+ * `dev` — what the caching allocator hands to tensors, what it holds from
+ * the driver, and the driver's view (cudaMemGetInfo, i.e. including the
+ * CUDA context and non-PyTorch allocations).
+ */
+static uc_value_t *
+torch_mem_info(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *dv = uc_fn_arg(0);
+
+	if (nargs != 1 || !dv || ucv_type(dv) != UC_INTEGER)
+		RAISE("mem_info: expected (device index)");
+
+	int dev = (int)ucv_int64_get(dv);
+
+	try {
+		c10::cuda::CUDAGuard g((c10::DeviceIndex)dev);
+		auto st = c10::cuda::CUDACachingAllocator::getDeviceStats(dev);
+		size_t fr = 0, tot = 0;
+
+		cudaMemGetInfo(&fr, &tot);
+
+		uc_value_t *a = ucv_array_new_length(vm, 4);
+
+		ucv_array_push(a, ucv_int64_new((int64_t)st.allocated_bytes[0].current));
+		ucv_array_push(a, ucv_int64_new((int64_t)st.reserved_bytes[0].current));
+		ucv_array_push(a, ucv_int64_new((int64_t)fr));
+		ucv_array_push(a, ucv_int64_new((int64_t)tot));
+
+		return a;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
  * kv_q8_put(src, q, s, pos)
  * kv_q8_get(q, s, idx) / kv_q8_get(q, s, start, rows): torch.tensor
  *
@@ -3947,6 +4282,332 @@ torch_silu_mul(uc_vm_t *vm, size_t nargs)
 /* RAISE with printf-style arguments (the handler's `vm` in scope) */
 #define RAISEF(...) \
 	do { uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, __VA_ARGS__); return NULL; } while (0)
+
+extern "C" int
+amp_kvq8_put(const void *src, void *q, void *s, const long long *idx,
+            long start, long rows, int dim, cudaStream_t stream);
+
+extern "C" int
+amp_kvq8_get(const void *q, const void *s, void *out, const long long *idx,
+            long start, long rows, int dim, cudaStream_t stream);
+
+static bool
+kvq8_check(uc_vm_t *vm, at::Tensor *q, at::Tensor *s, long *dim, const char *what)
+{
+	if (!q || !s)
+		return false;
+
+	if (q->scalar_type() != at::kChar || q->device().type() != at::kCUDA ||
+	    !q->is_contiguous() || q->dim() != 2 ||
+	    s->scalar_type() != at::kHalf || s->device() != q->device() ||
+	    !s->is_contiguous() || s->dim() != 2) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"%s: q must be a contiguous (cap, dim) int8 CUDA tensor and s "
+			"a contiguous (cap, dim/32) fp16 tensor on the same device", what);
+		return false;
+	}
+
+	*dim = q->size(1);
+
+	if (*dim % 32 || *dim > 4096 || s->size(1) != *dim / 32 || s->size(0) != q->size(0)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"%s: dim must be a multiple of 32 (<= 4096) with matching scales", what);
+		return false;
+	}
+
+	return true;
+}
+
+static uc_value_t *
+torch_kv_q8_put(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 4) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (src, q, s, pos)");
+		return NULL;
+	}
+
+	at::Tensor *src = fused_arg(vm, uc_fn_arg(0), "kv_q8_put: src", false);
+	at::Tensor *q = src ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *s = q ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	long dim = 0;
+
+	if (!kvq8_check(vm, q, s, &dim, "kv_q8_put"))
+		return NULL;
+
+	if (src->device() != q->device() || src->dim() != 2 || src->size(1) != dim)
+		RAISEF("kv_q8_put: src must be (rows, %ld) fp16 on the cache's device", dim);
+
+	long rows = src->size(0), start = 0;
+	const long long *idx = NULL;
+	uc_value_t *pv = uc_fn_arg(3);
+
+	if (pv && ucv_type(pv) == UC_RESOURCE) {
+		at::Tensor *pt = tensor_arg(vm, pv);
+
+		if (!pt)
+			return NULL;
+
+		if (pt->scalar_type() != at::kLong || pt->device() != q->device() ||
+		    !pt->is_contiguous() || pt->numel() != rows)
+			RAISEF("kv_q8_put: pos must be an int64 tensor of %ld rows on the cache's device", rows);
+
+		idx = (const long long *)pt->data_ptr();
+	}
+	else {
+		if (!pv || ucv_type(pv) != UC_INTEGER)
+			RAISE("kv_q8_put: pos must be an integer or an int64 tensor");
+
+		start = (long)ucv_int64_get(pv);
+
+		if (start < 0 || start + rows > q->size(0))
+			RAISEF("kv_q8_put: rows %ld..%ld out of range (capacity %ld)",
+				start, start + rows, (long)q->size(0));
+	}
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		int rc = amp_kvq8_put(src->data_ptr(), q->data_ptr(), s->data_ptr(), idx,
+			start, rows, (int)dim, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "kv_q8_put"))
+			return NULL;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+static uc_value_t *
+torch_kv_q8_get(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 3 && nargs != 4) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q, s, idx) or (q, s, start, rows)");
+		return NULL;
+	}
+
+	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *s = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	long dim = 0, rows = 0, start = 0;
+	const long long *idx = NULL;
+
+	if (!kvq8_check(vm, q, s, &dim, "kv_q8_get"))
+		return NULL;
+
+	uc_value_t *av = uc_fn_arg(2);
+
+	if (nargs == 3) {
+		at::Tensor *it = tensor_arg(vm, av);
+
+		if (!it)
+			return NULL;
+
+		if (it->scalar_type() != at::kLong || it->device() != q->device() ||
+		    !it->is_contiguous())
+			RAISE("kv_q8_get: idx must be a contiguous int64 tensor on the cache's device");
+
+		idx = (const long long *)it->data_ptr();
+		rows = it->numel();
+	}
+	else {
+		uc_value_t *bv = uc_fn_arg(3);
+
+		if (!av || !bv || ucv_type(av) != UC_INTEGER || ucv_type(bv) != UC_INTEGER)
+			RAISE("kv_q8_get: start and rows must be integers");
+
+		start = (long)ucv_int64_get(av);
+		rows = (long)ucv_int64_get(bv);
+
+		if (start < 0 || rows < 0 || start + rows > q->size(0))
+			RAISEF("kv_q8_get: rows %ld..%ld out of range (capacity %ld)",
+				start, start + rows, (long)q->size(0));
+	}
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		at::Tensor out = at::empty({ rows, dim },
+			at::TensorOptions().dtype(at::kHalf).device(q->device()));
+
+		int rc = amp_kvq8_get(q->data_ptr(), s->data_ptr(), out.data_ptr(), idx,
+			start, rows, (int)dim, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "kv_q8_get"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/* Q4 variants of the above (amp_kvq4_*): q is (cap, dim/2) bytes, two signed
+ * 4-bit codes each, scales absmax / 7. */
+extern "C" int
+amp_kvq4_put(const void *src, void *q, void *s, const long long *idx,
+            long start, long rows, int dim, cudaStream_t stream);
+
+extern "C" int
+amp_kvq4_get(const void *q, const void *s, void *out, const long long *idx,
+            long start, long rows, int dim, cudaStream_t stream);
+
+static bool
+kvq4_check(uc_vm_t *vm, at::Tensor *q, at::Tensor *s, long *dim, const char *what)
+{
+	if (!q || !s)
+		return false;
+
+	if (q->scalar_type() != at::kChar || q->device().type() != at::kCUDA ||
+	    !q->is_contiguous() || q->dim() != 2 ||
+	    s->scalar_type() != at::kHalf || s->device() != q->device() ||
+	    !s->is_contiguous() || s->dim() != 2) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"%s: q must be a contiguous (cap, dim/2) int8 CUDA tensor and s "
+			"a contiguous (cap, dim/32) fp16 tensor on the same device", what);
+		return false;
+	}
+
+	*dim = q->size(1) * 2;
+
+	if (*dim % 32 || *dim > 4096 || s->size(1) != *dim / 32 || s->size(0) != q->size(0)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"%s: dim must be a multiple of 32 (<= 4096) with matching scales", what);
+		return false;
+	}
+
+	return true;
+}
+
+static uc_value_t *
+torch_kv_q4_put(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 4) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (src, q, s, pos)");
+		return NULL;
+	}
+
+	at::Tensor *src = fused_arg(vm, uc_fn_arg(0), "kv_q4_put: src", false);
+	at::Tensor *q = src ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *s = q ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	long dim = 0;
+
+	if (!kvq4_check(vm, q, s, &dim, "kv_q4_put"))
+		return NULL;
+
+	if (src->device() != q->device() || src->dim() != 2 || src->size(1) != dim)
+		RAISEF("kv_q4_put: src must be (rows, %ld) fp16 on the cache's device", dim);
+
+	long rows = src->size(0), start = 0;
+	const long long *idx = NULL;
+	uc_value_t *pv = uc_fn_arg(3);
+
+	if (pv && ucv_type(pv) == UC_RESOURCE) {
+		at::Tensor *pt = tensor_arg(vm, pv);
+
+		if (!pt)
+			return NULL;
+
+		if (pt->scalar_type() != at::kLong || pt->device() != q->device() ||
+		    !pt->is_contiguous() || pt->numel() != rows)
+			RAISEF("kv_q4_put: pos must be an int64 tensor of %ld rows on the cache's device", rows);
+
+		idx = (const long long *)pt->data_ptr();
+	}
+	else {
+		if (!pv || ucv_type(pv) != UC_INTEGER)
+			RAISE("kv_q4_put: pos must be an integer or an int64 tensor");
+
+		start = (long)ucv_int64_get(pv);
+
+		if (start < 0 || start + rows > q->size(0))
+			RAISEF("kv_q4_put: rows %ld..%ld out of range (capacity %ld)",
+				start, start + rows, (long)q->size(0));
+	}
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		int rc = amp_kvq4_put(src->data_ptr(), q->data_ptr(), s->data_ptr(), idx,
+			start, rows, (int)dim, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "kv_q4_put"))
+			return NULL;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+static uc_value_t *
+torch_kv_q4_get(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 3 && nargs != 4) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q, s, idx) or (q, s, start, rows)");
+		return NULL;
+	}
+
+	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *s = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	long dim = 0, rows = 0, start = 0;
+	const long long *idx = NULL;
+
+	if (!kvq4_check(vm, q, s, &dim, "kv_q4_get"))
+		return NULL;
+
+	uc_value_t *av = uc_fn_arg(2);
+
+	if (nargs == 3) {
+		at::Tensor *it = tensor_arg(vm, av);
+
+		if (!it)
+			return NULL;
+
+		if (it->scalar_type() != at::kLong || it->device() != q->device() ||
+		    !it->is_contiguous())
+			RAISE("kv_q4_get: idx must be a contiguous int64 tensor on the cache's device");
+
+		idx = (const long long *)it->data_ptr();
+		rows = it->numel();
+	}
+	else {
+		uc_value_t *bv = uc_fn_arg(3);
+
+		if (!av || !bv || ucv_type(av) != UC_INTEGER || ucv_type(bv) != UC_INTEGER)
+			RAISE("kv_q4_get: start and rows must be integers");
+
+		start = (long)ucv_int64_get(av);
+		rows = (long)ucv_int64_get(bv);
+
+		if (start < 0 || rows < 0 || start + rows > q->size(0))
+			RAISEF("kv_q4_get: rows %ld..%ld out of range (capacity %ld)",
+				start, start + rows, (long)q->size(0));
+	}
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		at::Tensor out = at::empty({ rows, dim },
+			at::TensorOptions().dtype(at::kHalf).device(q->device()));
+
+		int rc = amp_kvq4_get(q->data_ptr(), s->data_ptr(), out.data_ptr(), idx,
+			start, rows, (int)dim, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "kv_q4_get"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
 
 /*
  * gdn_scan(q, k, v, beta, gexp, state, scale): torch.tensor
@@ -4863,6 +5524,328 @@ static const uc_function_list_t comm_methods[] = {
 	{ "info",	comm_info },
 };
 
+int exl3_moe_max_concurrency(int device);
+void exl3_moe_gather
+(
+    at::Tensor output_state,
+    const at::Tensor& output_scratch,
+    const at::Tensor& flat_expert,
+    const at::Tensor& inv_order,
+    const at::Tensor& expert_start,
+    const at::Tensor& slot_base,
+    const at::Tensor& slot_kind,
+    const at::Tensor& weight_sorted
+);
+
+void exl3_moe
+(
+    const at::Tensor& hidden_state,
+    const at::Tensor& output_state,
+    const at::Tensor& expert_count,
+    const at::Tensor& token_sorted,
+    const at::Tensor& weight_sorted,
+    const at::Tensor& temp_state_g,
+    const at::Tensor& temp_state_u,
+    const at::Tensor& temp_intermediate_g,
+    const at::Tensor& temp_intermediate_u,
+    const int act_function,
+    const float K_gate,
+    const float K_up,
+    const float K_down,
+    const at::Tensor& gate_ptrs_trellis,
+    const at::Tensor& gate_ptrs_suh,
+    const at::Tensor& gate_ptrs_svh,
+    const at::Tensor& up_ptrs_trellis,
+    const at::Tensor& up_ptrs_suh,
+    const at::Tensor& up_ptrs_svh,
+    const at::Tensor& down_ptrs_trellis,
+    const at::Tensor& down_ptrs_suh,
+    const at::Tensor& down_ptrs_svh,
+    const bool gate_mcg,
+    const bool gate_mul1,
+    const bool up_mcg,
+    const bool up_mul1,
+    const bool down_mcg,
+    const bool down_mul1,
+    const float act_limit,
+    const int num_active,
+    const c10::optional<at::Tensor>& output_scratch,
+    const c10::optional<at::Tensor>& fused_base,
+    const int count_lo,
+    const int count_hi,
+    const int m_tile
+);
+
+/* torch.moe_coop(x, sel, rw, cfg, sh_out?)
+ *
+ * Fused decode-shaped MoE: two launches run every (token, expert) slot of
+ * x (bsz <= 8 rows) through gate/up, the activation and down, weighted by
+ * rw and summed per token into cfg.out (fp32). Routing stays on the device
+ * (sel int64 (bsz, topk), rw fp16) — no host round trip, graph-capturable.
+ * cfg is an object holding the static parts: tensors g_trellis g_suh g_svh
+ * u_* d_* (int64 device pointer tables), had_g had_u gu_g gu_u act_out
+ * d_out ctr out (scratch, see exl3_moe_coop_prepare) and numbers Hi Kg Ku
+ * Kd act act_limit, booleans mcg mul1. sh_out: optional fp32 (bsz, H)
+ * shared-expert output added into the sum. */
+static uc_value_t *
+torch_moe_coop(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *x, *sel, *rw;
+	uc_value_t *cfg = (nargs >= 4) ? uc_fn_arg(3) : NULL;
+
+	if (nargs < 4 || nargs > 5 || !(x = tensor_arg(vm, uc_fn_arg(0))) ||
+	    !(sel = tensor_arg(vm, uc_fn_arg(1))) ||
+	    !(rw = tensor_arg(vm, uc_fn_arg(2))))
+		return NULL;
+
+	if (ucv_type(cfg) != UC_OBJECT)
+		RAISE("moe_coop: cfg must be an object");
+
+	std::map<std::string, at::Tensor *> t;
+	static const char *names[] = { "g_trellis", "g_suh", "g_svh", "u_trellis",
+		"u_suh", "u_svh", "d_trellis", "d_suh", "d_svh", "had_g", "had_u",
+		"gu_g", "gu_u", "act_out", "d_out", "ctr", "out" };
+
+	for (const char *n : names) {
+		at::Tensor *tt = tensor_arg_opt(vm, ucv_object_get(cfg, n, NULL));
+
+		if (!tt)
+			RAISE((std::string("moe_coop: cfg.") + n + " must be a tensor").c_str());
+
+		t[n] = tt;
+	}
+
+	auto num = [&](const char *k, double dflt) {
+		uc_value_t *v = ucv_object_get(cfg, k, NULL);
+
+		return (v && ucv_type(v) == UC_DOUBLE) ? ucv_double_get(v) :
+		       (v && ucv_type(v) == UC_INTEGER) ? (double)ucv_int64_get(v) : dflt;
+	};
+	auto flag = [&](const char *k) {
+		uc_value_t *v = ucv_object_get(cfg, k, NULL);
+
+		return v && ucv_type(v) == UC_BOOLEAN && ucv_boolean_get(v);
+	};
+
+	c10::optional<at::Tensor> sh;
+
+	if (nargs == 5 && ucv_type(uc_fn_arg(4)) != UC_NULL) {
+		at::Tensor *s = tensor_arg(vm, uc_fn_arg(4));
+
+		if (!s)
+			return NULL;
+
+		sh = *s;
+	}
+
+	try {
+		exl3_moe_coop(*x, *sel, *rw, (int)num("min_expert", -1), (int)num("max_expert", -1),
+			(int)num("Hi", 0),
+			*t["g_trellis"], *t["g_suh"], *t["g_svh"],
+			*t["u_trellis"], *t["u_suh"], *t["u_svh"],
+			*t["d_trellis"], *t["d_suh"], *t["d_svh"],
+			c10::nullopt, c10::nullopt, c10::nullopt,
+			(float)num("Kg", 0), (float)num("Ku", 0), (float)num("Kd", 0),
+			flag("mcg"), flag("mul1"), (int)num("act", 0),
+			(float)num("act_limit", 0), true,
+			*t["had_g"], *t["had_u"], *t["gu_g"], *t["gu_u"],
+			*t["act_out"], *t["d_out"], *t["ctr"], *t["out"],
+			sh, c10::nullopt);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+extern "C" int
+amp_skinny_f32(const float *x, const float *w, float *out, float *part, int *cnt,
+              int M, int K, int N, long part_floats, int cnt_len, cudaStream_t stream);
+
+/* torch.skinny(x, w): x (M, K) fp32, w (K, N) fp32 -> (M, N) fp32 for
+ * M <= 8 (decode / verify rows); deterministic split-K, graph-capturable.
+ * Replaces torch.matmul where cuBLAS falls back to a slow generic GEMM
+ * for 2..8 rows. */
+static uc_value_t *
+torch_skinny(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 2) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (x, w)");
+		return NULL;
+	}
+
+	at::Tensor *x = f32_arg(vm, uc_fn_arg(0), "skinny: x");
+	at::Tensor *w = x ? f32_arg(vm, uc_fn_arg(1), "skinny: w") : NULL;
+
+	if (!w)
+		return NULL;
+
+	if (x->dim() != 2 || w->dim() != 2 || x->size(1) != w->size(0) ||
+	    x->size(0) < 1 || x->size(0) > 8 || !x->is_contiguous() ||
+	    !w->is_contiguous() || x->get_device() != w->get_device())
+		RAISE("skinny: x (M<=8, K) and w (K, N) must be contiguous fp32 on one device");
+
+	int M = (int)x->size(0), K = (int)x->size(1), N = (int)w->size(1);
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		/* per-device split-K workspace + tile counters (persist: graphs
+		 * replay with these addresses; the reducer re-zeroes the counters) */
+		static std::vector<at::Tensor> part_ws(64), cnt_ws(64);
+		int dev = x->get_device();
+		const long part_n = 32L * 1024 * 1024 / 4;     // 32 MiB
+		const int cnt_n = 4096;
+
+		if (!part_ws[dev].defined()) {
+			part_ws[dev] = at::zeros({ part_n }, x->options());
+			cnt_ws[dev] = at::zeros({ cnt_n }, x->options().dtype(at::kInt));
+			at::cuda::device_synchronize();
+		}
+
+		at::Tensor out = at::empty({ M, N }, x->options());
+		int rc = amp_skinny_f32((const float *)x->data_ptr(), (const float *)w->data_ptr(),
+			(float *)out.data_ptr(), (float *)part_ws[dev].data_ptr(),
+			(int *)cnt_ws[dev].data_ptr(), M, K, N, part_n, cnt_n,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "skinny"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/* torch.moe_concurrency(dev): expert groups the fused MoE kernel runs at once. */
+static uc_value_t *
+torch_moe_concurrency(uc_vm_t *vm, size_t nargs)
+{
+	int dev = (nargs >= 1 && ucv_type(uc_fn_arg(0)) == UC_INTEGER) ?
+		(int)ucv_int64_get(uc_fn_arg(0)) : 0;
+
+	try {
+		return ucv_int64_new(exl3_moe_max_concurrency(dev));
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/* torch.moe_fused(y, out, count, tok_sorted, w_sorted, cfg, num_active, lo, hi, m_tile
+ *                 [, scratch, slot_base])
+ *
+ * Token-sorted fused MoE (exl3_moe): experts with lo <= rows <= hi run
+ * gate/up/act/down on their gathered rows and atomically accumulate
+ * weight * result into out (fp32, zero-initialised, same shape as y) — in
+ * arrival order, so the sum is not bit-reproducible run to run. With scratch
+ * (fp32 [slots, hidden]) and slot_base (int64 per expert) each assignment
+ * owns a slot instead and torch.moe_gather sums them in a fixed order.
+ * cfg: pointer tables g_/u_/d_ {trellis,suh,svh}, temps ts_g ts_u ti_g ti_u,
+ * numbers Kg Ku Kd act act_limit, booleans mcg mul1. */
+static uc_value_t *
+torch_moe_fused(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *y, *out, *cnt, *tok, *w;
+	uc_value_t *cfg = (nargs >= 6) ? uc_fn_arg(5) : NULL;
+
+	if ((nargs != 10 && nargs != 12) || !(y = tensor_arg(vm, uc_fn_arg(0))) ||
+	    !(out = tensor_arg(vm, uc_fn_arg(1))) ||
+	    !(cnt = tensor_arg(vm, uc_fn_arg(2))) ||
+	    !(tok = tensor_arg(vm, uc_fn_arg(3))) ||
+	    !(w = tensor_arg(vm, uc_fn_arg(4))))
+		return NULL;
+
+	at::Tensor *scr = NULL, *sbase = NULL;
+
+	if (nargs == 12 && (!(scr = tensor_arg(vm, uc_fn_arg(10))) || !(sbase = tensor_arg(vm, uc_fn_arg(11)))))
+		return NULL;
+
+	if (ucv_type(cfg) != UC_OBJECT)
+		RAISE("moe_fused: cfg must be an object");
+
+	std::map<std::string, at::Tensor *> t;
+	static const char *names[] = { "g_trellis", "g_suh", "g_svh", "u_trellis",
+		"u_suh", "u_svh", "d_trellis", "d_suh", "d_svh", "ts_g", "ts_u",
+		"ti_g", "ti_u" };
+
+	for (const char *n : names) {
+		at::Tensor *tt = tensor_arg_opt(vm, ucv_object_get(cfg, n, NULL));
+
+		if (!tt)
+			RAISE((std::string("moe_fused: cfg.") + n + " must be a tensor").c_str());
+
+		t[n] = tt;
+	}
+
+	auto num = [&](const char *k) {
+		uc_value_t *v = ucv_object_get(cfg, k, NULL);
+
+		return (v && ucv_type(v) == UC_DOUBLE) ? ucv_double_get(v) :
+		       (v && ucv_type(v) == UC_INTEGER) ? (double)ucv_int64_get(v) : 0.0;
+	};
+	auto flag = [&](const char *k) {
+		uc_value_t *v = ucv_object_get(cfg, k, NULL);
+
+		return v && ucv_type(v) == UC_BOOLEAN && ucv_boolean_get(v);
+	};
+	auto arg_i = [&](size_t i) {
+		uc_value_t *v = uc_fn_arg(i);
+
+		return (v && ucv_type(v) == UC_INTEGER) ? (int)ucv_int64_get(v) : 0;
+	};
+
+	try {
+		exl3_moe(*y, *out, *cnt, *tok, *w,
+			*t["ts_g"], *t["ts_u"], *t["ti_g"], *t["ti_u"],
+			(int)num("act"), (float)num("Kg"), (float)num("Ku"), (float)num("Kd"),
+			*t["g_trellis"], *t["g_suh"], *t["g_svh"],
+			*t["u_trellis"], *t["u_suh"], *t["u_svh"],
+			*t["d_trellis"], *t["d_suh"], *t["d_svh"],
+			flag("mcg"), flag("mul1"), flag("mcg"), flag("mul1"), flag("mcg"), flag("mul1"),
+			(float)num("act_limit"), arg_i(6),
+			scr ? c10::optional<at::Tensor>(*scr) : c10::nullopt,
+			sbase ? c10::optional<at::Tensor>(*sbase) : c10::nullopt,
+			arg_i(7), arg_i(8), arg_i(9));
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+/* torch.moe_gather(out, scratch, flat_expert, inv_order, expert_start, slot_base, slot_kind, w_sorted)
+ *
+ * The fixed-order reduction of torch.moe_fused's per-assignment slots: every token's top-k slots
+ * are summed in k order and added to its row of out (fp32). flat_expert: (T * K) local expert
+ * id per assignment; inv_order: position of each assignment in the expert-sorted list;
+ * expert_start / slot_base / slot_kind: per-expert tables (kind 1 = slots hold weighted outputs). */
+static uc_value_t *
+torch_moe_gather(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t[8];
+
+	if (nargs != 8)
+		RAISE("moe_gather: expected 8 tensors");
+
+	for (size_t i = 0; i < 8; i++)
+		if (!(t[i] = tensor_arg(vm, uc_fn_arg(i))))
+			return NULL;
+
+	try {
+		exl3_moe_gather(*t[0], *t[1], *t[2], *t[3], *t[4], *t[5], *t[6], *t[7]);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
 /* --- stream fork / join (intra-graph concurrency) ------------------------ */
 
 /* Side-stream branches for independent op chains. Slot k of a device is one
@@ -4879,6 +5862,111 @@ static const uc_function_list_t comm_methods[] = {
  * caching allocator knows nothing about the side stream). */
 #define AMP_FORK_MAXD 16
 #define AMP_FORK_MAXK 4
+
+struct fork_slot {
+	bool init = false;
+	std::optional<c10::cuda::CUDAStream> side, origin;
+	int dev = 0;
+	cudaEvent_t ev_start = NULL, ev_done = NULL;
+};
+
+static fork_slot fork_slots[AMP_FORK_MAXD][AMP_FORK_MAXK];
+
+static fork_slot *
+fork_slot_arg(uc_vm_t *vm, size_t nargs)
+{
+	int64_t dev, k;
+
+	if (nargs != 2 || !arg_int(vm, uc_fn_arg(0), &dev) || !arg_int(vm, uc_fn_arg(1), &k) ||
+	    dev < 0 || dev >= AMP_FORK_MAXD || dev >= at::cuda::device_count() ||
+	    k < 0 || k >= AMP_FORK_MAXK) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (device index, branch slot 0..3)");
+		return NULL;
+	}
+
+	fork_slot *f = &fork_slots[dev][k];
+
+	if (!f->init) {
+		c10::cuda::CUDAGuard g((c10::DeviceIndex)dev);
+
+		/* slots 2..3: communication (the double-buffered prefill's
+		 * all-reduces) — high priority, so the reduction kernel gets the
+		 * next free SM slots ahead of the compute stream's pending blocks */
+		f->side = c10::cuda::getStreamFromPool(k >= 2, (c10::DeviceIndex)dev);
+		f->dev = (int)dev;
+		cudaEventCreateWithFlags(&f->ev_start, cudaEventDisableTiming);
+		cudaEventCreateWithFlags(&f->ev_done, cudaEventDisableTiming);
+		f->init = true;
+	}
+
+	return f;
+}
+
+static uc_value_t *
+torch_stream_side(uc_vm_t *vm, size_t nargs)
+{
+	fork_slot *f = fork_slot_arg(vm, nargs);
+
+	if (!f)
+		return NULL;
+
+	try {
+		c10::cuda::CUDAGuard g((c10::DeviceIndex)f->dev);
+
+		f->origin = c10::cuda::getCurrentCUDAStream((c10::DeviceIndex)f->dev);
+		cudaEventRecord(f->ev_start, f->origin->stream());
+		cudaStreamWaitEvent(f->side->stream(), f->ev_start, 0);
+		c10::cuda::setCurrentCUDAStream(*f->side);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+static uc_value_t *
+torch_stream_main(uc_vm_t *vm, size_t nargs)
+{
+	fork_slot *f = fork_slot_arg(vm, nargs);
+
+	if (!f)
+		return NULL;
+
+	try {
+		c10::cuda::CUDAGuard g((c10::DeviceIndex)f->dev);
+
+		cudaEventRecord(f->ev_done, f->side->stream());
+		c10::cuda::setCurrentCUDAStream(*f->origin);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+static uc_value_t *
+torch_stream_wait(uc_vm_t *vm, size_t nargs)
+{
+	fork_slot *f = fork_slot_arg(vm, nargs);
+
+	if (!f)
+		return NULL;
+
+	try {
+		c10::cuda::CUDAGuard g((c10::DeviceIndex)f->dev);
+
+		cudaStreamWaitEvent(c10::cuda::getCurrentCUDAStream((c10::DeviceIndex)f->dev).stream(),
+			f->ev_done, 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
 
 /* --- completion notifier (eventfd + cudaLaunchHostFunc) ------------------- */
 
@@ -6361,6 +7449,15 @@ tensor_gelu_tanh(uc_vm_t *vm, size_t nargs)
 		[](const at::Tensor &x) { return at::gelu(x, "tanh"); });
 }
 
+/* gelu(): torch.tensor — exact (erf) GELU, the GLM-5 vision merger's
+ * activation (GELU "approximate none"). */
+static uc_value_t *
+tensor_gelu(uc_vm_t *vm, size_t nargs)
+{
+	return tensor_unary(vm, nargs, "gelu",
+		[](const at::Tensor &x) { return at::gelu(x, "none"); });
+}
+
 /*
  * layer_norm(x, weight, bias, eps): torch.tensor
  *
@@ -6555,6 +7652,320 @@ torch_image_prepare(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+/*
+ * hc_mix(streams, fn, base, scale, rms_eps, hc_eps, sinkhorn_iters):
+ *   [post, comb, collapsed]
+ *
+ * mHC HyperConnection mix for one sublayer site (GLM-5.3 / DeepSeek-V4):
+ * streams (R, 4, D) fp32 contiguous -> post (R, 4) fp32, comb (R, 4, 4)
+ * fp32 (Sinkhorn-normalized) and collapsed (R, D) fp16 (the sublayer
+ * input before its norm). fn (24, 4*D), base (24), scale (3) are fp32
+ * (an fp16 fn is accepted too: the decode-size traffic saver).
+ */
+static uc_value_t *
+torch_hc_mix(uc_vm_t *vm, size_t nargs)
+{
+	double rms_eps, hc_eps, iters;
+
+	if (nargs != 7 || !arg_number(vm, uc_fn_arg(4), &rms_eps) ||
+	    !arg_number(vm, uc_fn_arg(5), &hc_eps) ||
+	    !arg_number(vm, uc_fn_arg(6), &iters)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (streams, fn, base, scale, rms_eps, hc_eps, sinkhorn_iters)");
+		return NULL;
+	}
+
+	at::Tensor *st = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *fn = st ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *base = fn ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	at::Tensor *scale = base ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+
+	if (!scale)
+		return NULL;
+
+	if (st->dim() != 3 || st->size(1) != 4 || st->scalar_type() != at::kFloat ||
+	    !st->is_contiguous() || st->size(2) % 4 || !st->is_cuda())
+		RAISE("hc_mix: streams must be a contiguous fp32 CUDA tensor (R, 4, D), D % 4 == 0");
+
+	if (fn->size(0) != 24 || fn->size(1) != 4 * st->size(2) || !fn->is_contiguous() ||
+	    base->numel() != 24 || scale->numel() != 3)
+		RAISE("hc_mix: fn must be (24, 4*D), base (24), scale (3)");
+
+	try {
+		TensorDeviceGuard dg(*st);
+
+		int64_t R = st->size(0), D = st->size(2);
+		int chunks = hc_mix_num_chunks((int)R, (int)(4 * D));
+		auto f32 = st->options();
+		at::Tensor partials = at::empty({ R, chunks, 24 + 1 }, f32);
+		at::Tensor post = at::empty({ R, 4 }, f32);
+		at::Tensor comb = at::empty({ R, 4, 4 }, f32);
+		at::Tensor coll = at::empty({ R, D }, st->options().dtype(at::kHalf));
+
+		hc_mix(*st, *fn, *base, *scale, rms_eps, hc_eps, (int64_t)iters,
+			partials, post, comb, coll);
+
+		uc_value_t *r = ucv_array_new(vm);
+
+		ucv_array_push(r, tensor_wrap(vm, std::move(post), 0));
+		ucv_array_push(r, tensor_wrap(vm, std::move(comb), 0));
+		ucv_array_push(r, tensor_wrap(vm, std::move(coll), 0));
+
+		return r;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * hc_apply(x, y, post, comb): x
+ *
+ * Residual update of one sublayer site, IN PLACE on the streams:
+ * x <- post (x) y + comb^T x. x (R, 4, D) fp32, y (R, D) fp16 or fp32,
+ * post (R, 4) fp32, comb (R, 4, 4) fp32. Returns x.
+ */
+static uc_value_t *
+torch_hc_apply(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 4) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (x, y, post, comb)");
+		return NULL;
+	}
+
+	at::Tensor *x = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *y = x ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *post = y ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	at::Tensor *comb = NULL;
+
+	/* comb may be null: the gated-residual form (Qwen3.8-Flash-Next),
+	 * x[h] += post[h] * y without a stream-mixing matrix */
+	if (post && ucv_type(uc_fn_arg(3)) != UC_NULL)
+		comb = tensor_arg(vm, uc_fn_arg(3));
+
+	if (!post || (!comb && ucv_type(uc_fn_arg(3)) != UC_NULL))
+		return NULL;
+
+	if (x->dim() != 3 || x->size(1) != 4 || x->scalar_type() != at::kFloat ||
+	    !x->is_contiguous() || x->size(2) % 4 || !x->is_cuda() ||
+	    !y->is_contiguous() || !post->is_contiguous() ||
+	    (comb && !comb->is_contiguous()) ||
+	    (y->scalar_type() != at::kHalf && y->scalar_type() != at::kFloat) ||
+	    post->scalar_type() != at::kFloat ||
+	    (comb && comb->scalar_type() != at::kFloat) ||
+	    y->numel() != x->size(0) * x->size(2) || post->numel() != x->size(0) * 4 ||
+	    (comb && comb->numel() != x->size(0) * 16))
+		RAISE("hc_apply: bad shapes/dtypes (x (R,4,D) fp32, y (R,D), post (R,4), comb (R,4,4) or null)");
+
+	try {
+		TensorDeviceGuard dg(*x);
+		c10::optional<at::Tensor> co;
+
+		if (comb)
+			co = *comb;
+
+		hc_apply(*x, *y, *post, co);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return ucv_get(uc_fn_arg(0));
+}
+
+/*
+ * kda_scan(q, k, v, beta, g, state, scale, states_out?): torch.tensor
+ *
+ * Kimi delta attention scan (GLM-5.3): gated delta rule with per-key-
+ * channel log-decay g. q, k (S, H, DK) fp32 (l2-normalized), v (S, H, dv)
+ * fp32, beta (S, H) fp32, g (S, H, DK) fp32, state (H, DK, dv) fp32
+ * (updated in place). Returns out (S, H, dv) fp32 = scale * S^T q.
+ */
+static uc_value_t *
+torch_kda_scan(uc_vm_t *vm, size_t nargs)
+{
+	double scale;
+
+	if ((nargs != 7 && nargs != 8) || !arg_number(vm, uc_fn_arg(6), &scale)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q, k, v, beta, g, state, scale, states_out?)");
+		return NULL;
+	}
+
+	at::Tensor *q = f32_arg(vm, uc_fn_arg(0), "kda_scan: q");
+	at::Tensor *k = q ? f32_arg(vm, uc_fn_arg(1), "kda_scan: k") : NULL;
+	at::Tensor *v = k ? f32_arg(vm, uc_fn_arg(2), "kda_scan: v") : NULL;
+	at::Tensor *beta = v ? f32_arg(vm, uc_fn_arg(3), "kda_scan: beta") : NULL;
+	at::Tensor *g = beta ? f32_arg(vm, uc_fn_arg(4), "kda_scan: g") : NULL;
+	at::Tensor *st = g ? f32_arg(vm, uc_fn_arg(5), "kda_scan: state") : NULL;
+
+	if (!st)
+		return NULL;
+
+	at::Tensor *so = NULL;
+	uc_value_t *sov = uc_fn_arg(7);
+
+	if (nargs == 8 && ucv_type(sov) != UC_NULL) {
+		if (!(so = f32_arg(vm, sov, "kda_scan: states_out")))
+			return NULL;
+
+		if (so->dim() != 4 || so->size(0) > q->size(0) ||
+		    so->size(1) != st->size(0) || so->size(2) != st->size(1) ||
+		    so->size(3) != st->size(2) || so->get_device() != st->get_device())
+			RAISE("kda_scan: states_out must be (n <= S, H, DK, dv) on the state's device");
+	}
+
+	if (q->dim() != 3 || k->sizes() != q->sizes() || g->sizes() != q->sizes() ||
+	    v->dim() != 3 || v->size(0) != q->size(0) || v->size(1) != q->size(1) ||
+	    st->dim() != 3 || st->size(0) != q->size(1) || st->size(1) != q->size(2) ||
+	    st->size(2) != v->size(2) || beta->numel() != q->size(0) * q->size(1))
+		RAISE("kda_scan: incompatible shapes");
+
+	int dev = q->get_device();
+
+	if (k->get_device() != dev || v->get_device() != dev ||
+	    beta->get_device() != dev || g->get_device() != dev ||
+	    st->get_device() != dev)
+		RAISE("kda_scan: all tensors must be on the same device");
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		at::Tensor out = at::empty({ v->size(0), v->size(1), v->size(2) },
+			v->options());
+
+		int rc = amp_kda_scan_f32(q->data_ptr(), k->data_ptr(), v->data_ptr(),
+			beta->data_ptr(), g->data_ptr(), st->data_ptr(), out.data_ptr(),
+			(int)q->size(0), (int)q->size(1), (int)q->size(2),
+			(int)v->size(2), (float)scale, so ? so->data_ptr() : NULL,
+			so ? (int)so->size(0) : 0,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "kda_scan"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * kda_gates(f, dt_bias, decay, braw, lower_bound, beta_scale): [g, beta]
+ *
+ * f (S, H*DK) fp32 forget-gate logits, dt_bias (H*DK) fp32, decay (H) fp32
+ * (= exp(A_log)), braw (S, H) fp32 beta logits. Returns g (S, H, DK) =
+ * lower_bound * sigmoid(decay * (f + dt_bias)) and beta (S, H) =
+ * sigmoid(braw * beta_scale), both fp32.
+ */
+static uc_value_t *
+torch_kda_gates(uc_vm_t *vm, size_t nargs)
+{
+	double lb, bscale;
+
+	if (nargs != 6 || !arg_number(vm, uc_fn_arg(4), &lb) ||
+	    !arg_number(vm, uc_fn_arg(5), &bscale)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (f, dt_bias, decay, braw, lower_bound, beta_scale)");
+		return NULL;
+	}
+
+	at::Tensor *f = f32_arg(vm, uc_fn_arg(0), "kda_gates: f");
+	at::Tensor *dt = f ? f32_arg(vm, uc_fn_arg(1), "kda_gates: dt_bias") : NULL;
+	at::Tensor *dec = dt ? f32_arg(vm, uc_fn_arg(2), "kda_gates: decay") : NULL;
+	at::Tensor *br = dec ? f32_arg(vm, uc_fn_arg(3), "kda_gates: braw") : NULL;
+
+	if (!br)
+		return NULL;
+
+	int64_t S = f->size(0), H = dec->numel();
+
+	if (f->dim() != 2 || dt->numel() != f->size(1) || H <= 0 ||
+	    f->size(1) % H || br->numel() != S * H)
+		RAISE("kda_gates: incompatible shapes");
+
+	int64_t DK = f->size(1) / H;
+
+	TensorDeviceGuard dg(*f);
+
+	try {
+		at::Tensor g = at::empty({ S, H, DK }, f->options());
+		at::Tensor beta = at::empty({ S, H }, f->options());
+
+		int rc = amp_kda_gates(f->data_ptr(), dt->data_ptr(), dec->data_ptr(),
+			br->data_ptr(), g.data_ptr(), beta.data_ptr(), (long)S, (int)H,
+			(int)DK, (float)lb, (float)bscale,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "kda_gates"))
+			return NULL;
+
+		uc_value_t *r = ucv_array_new(vm);
+
+		ucv_array_push(r, tensor_wrap(vm, std::move(g), 0));
+		ucv_array_push(r, tensor_wrap(vm, std::move(beta), 0));
+
+		return r;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * kda_out_norm(core, z, weight, eps): torch.tensor
+ *
+ * core (S, H, dv) fp32, z (S, H*dv) fp32 gate logits, weight (dv) fp16 or
+ * fp32. Returns (1, S, H*dv) fp16 = weight * rmsnorm(core) * sigmoid(z).
+ */
+static uc_value_t *
+torch_kda_out_norm(uc_vm_t *vm, size_t nargs)
+{
+	double eps;
+
+	if (nargs != 4 || !arg_number(vm, uc_fn_arg(3), &eps)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (core, z, weight, eps)");
+		return NULL;
+	}
+
+	at::Tensor *core = f32_arg(vm, uc_fn_arg(0), "kda_out_norm: core");
+	at::Tensor *z = core ? f32_arg(vm, uc_fn_arg(1), "kda_out_norm: z") : NULL;
+	at::Tensor *w = z ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+
+	if (!w)
+		return NULL;
+
+	bool wh = w->scalar_type() == at::kHalf;
+
+	if (core->dim() != 3 || z->numel() != core->numel() ||
+	    w->numel() != core->size(2) || !w->is_cuda() || !w->is_contiguous() ||
+	    (!wh && w->scalar_type() != at::kFloat))
+		RAISE("kda_out_norm: incompatible shapes/dtypes");
+
+	TensorDeviceGuard dg(*core);
+
+	try {
+		int64_t S = core->size(0), H = core->size(1), dv = core->size(2);
+		at::Tensor out = at::empty({ 1, S, H * dv },
+			core->options().dtype(at::kHalf));
+
+		int rc = amp_kda_out_norm(core->data_ptr(), z->data_ptr(),
+			w->data_ptr(), wh ? 1 : 0, out.data_ptr(), (long)(S * H), (int)dv,
+			(float)eps, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "kda_out_norm"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 static const uc_function_list_t tensor_methods[] = {
 	{ "item",	tensor_item },
 	{ "tolist",	tensor_tolist },
@@ -6579,6 +7990,7 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "gather",	tensor_gather },
 	{ "copy_",	tensor_copy_ },
 	{ "index_copy_",	tensor_index_copy_ },
+	{ "index_add_",	tensor_index_add_ },
 	{ "add",	tensor_add },
 	{ "add_",	tensor_add_ },
 	{ "mul",	tensor_mul },
@@ -6586,6 +7998,7 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "div",	tensor_div },
 	{ "sub",	tensor_sub },
 	{ "pow",	tensor_pow },
+	{ "clamp",	tensor_clamp },
 	{ "sqrt",	tensor_sqrt },
 	{ "abs",	tensor_abs },
 	{ "rsqrt",	tensor_rsqrt },
@@ -6598,6 +8011,7 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "silu",	tensor_silu },
 	{ "sigmoid",	tensor_sigmoid },
 	{ "gelu_tanh",	tensor_gelu_tanh },
+	{ "gelu",	tensor_gelu },
 	{ "softplus",	tensor_softplus },
 	{ "softmax",	tensor_softmax },
 	{ "cumsum",	tensor_cumsum },
@@ -6615,6 +8029,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "version",	amp_torch_version },
 	{ "zeros",	tensor_zeros },
 	{ "empty",	tensor_empty },
+	{ "pinned_empty",	torch_pinned_empty },
 	{ "ones",	tensor_ones },
 	{ "rand",	tensor_rand },
 	{ "full",	tensor_full },
@@ -6626,15 +8041,34 @@ static const uc_function_list_t torch_fns[] = {
 	{ "rms_norm",	torch_rms_norm },
 	{ "rope",	torch_rope },
 	{ "silu_mul",	torch_silu_mul },
+	{ "idx_score",	torch_idx_score },
+	{ "mem_info",	torch_mem_info },
+	{ "kv_q8_put",	torch_kv_q8_put },
+	{ "kv_q8_get",	torch_kv_q8_get },
+	{ "kv_q4_put",	torch_kv_q4_put },
+	{ "kv_q4_get",	torch_kv_q4_get },
 	{ "layer_norm",	torch_layer_norm },
+	{ "hc_mix",	torch_hc_mix },
+	{ "hc_apply",	torch_hc_apply },
 	{ "image_prepare",	torch_image_prepare },
 	{ "gdn_scan",	torch_gdn_scan },
+	{ "kda_scan",	torch_kda_scan },
+	{ "kda_gates",	torch_kda_gates },
+	{ "kda_out_norm",	torch_kda_out_norm },
 	{ "flash_attn_kvcache",	torch_flash_attn_kvcache },
 	{ "p2p_comm",	torch_p2p_comm },
 	{ "device_count",	torch_device_count },
 	{ "common_prefix",	torch_common_prefix },
 	{ "copy_many",	torch_copy_many },
 	{ "copy_async",	torch_copy_async },
+	{ "moe_coop",	torch_moe_coop },
+	{ "skinny",	torch_skinny },
+	{ "stream_side",	torch_stream_side },
+	{ "stream_main",	torch_stream_main },
+	{ "stream_wait",	torch_stream_wait },
+	{ "moe_fused",	torch_moe_fused },
+	{ "moe_gather",	torch_moe_gather },
+	{ "moe_concurrency",	torch_moe_concurrency },
 	{ "notifier",	torch_notifier },
 	{ "attn_decode",	torch_attn_decode },
 	{ "qk_norm_rope",	torch_qk_norm_rope },

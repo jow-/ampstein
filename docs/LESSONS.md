@@ -227,3 +227,40 @@ Add new lessons at the end of the matching section.
   image differ from KV slots by a constant — graphs take a separate `rpos`.
 - **L79 — `int64_tensor.mul(16)` promotes to float** and then fails as an index.
   Scale integer index arrays on the host before `from_array`.
+
+## GLM-5.3-Flash, the prompt-cache store and long contexts
+
+- **L84 — Loading 117 GB over six 24 GiB cards.** The weights cache keeps both the
+  raw upload and a cast copy (`ws.release`), expandable segments avoid 2 GiB of
+  fragmentation, and placement balances bytes, not layer counts.
+- **L85 — Judge a deep model by its continuation.** End-to-end logits rel-rms was
+  8% while every layer stayed at 0.2-0.3%; a few outlier tokens carry the error.
+  The decisive check is the greedy continuation against the oracle.
+- **L87 (a, c) — Decode latency is not throughput:** back-to-back graph steps
+  pipeline across devices, so benchmark with each token depending on the
+  previous. Concurrent branches in a captured graph are free speed, but never run
+  two EXL3 products at once (they share per-device lock buffers).
+- **L88 — Near-tie flips are not regressions.** Print the logit margin at the
+  first divergence and teacher-force the oracle. cuBLAS runs `(1,K)x(K,N)` fp32 as
+  a GEMV but `(2..8,K)` as a slow GEMM — `torch.skinny` replaces it.
+- **L90 — Layer-split decode and verify are kernel-bound:** graph-capturing the
+  eager MLA layers changed nothing, and a 3-row verify pays for the union of the
+  rows' experts.
+- **L91 — Long-context allocation.** No arena: libtorch's caching allocator, the
+  full KV at load, and a warm-up that runs the worst-case shapes so an unfitting
+  context fails at startup. Allocations that scale with the prompt are bugs.
+- **L92, L93 — Pipeline of TP stages.** `--tp --stages N` trades 30-40% prefill
+  for ~27% decode at long context; the stage all-reduce is only 9-13% of hybrid
+  prefill, the rest is half-sized kernels and replicated indexer work.
+- **L94 — The DSA indexer dominated prefill, and the host thread was the
+  bottleneck.** A fused scoring kernel and 256-row slabs cut launches 58k → 13k
+  per chunk (+30%). Count launches before blaming kernels: one ATen op costs
+  ~25 µs of ucode + dispatch. Prefill is not deterministic (atomics, router
+  near-ties) — compare NLL on real text, and benchmark with ≥ 32k tokens.
+- **L96 — Reasoning budget.** A soft nudge and a forced close are injected through
+  the engine's `force()` hook at step boundaries; the continuation re-enters the
+  ordinary prefill path as a live-reuse prefill of the tail.
+- **L97 — The host-RAM store.** One live state plus one snapshot loses every
+  other conversation; parking states in pinned RAM (tiered fp16 / int8 / int4 KV
+  by distance from the end) restores a 100k-token prefix in ~1 s against ~100 s
+  of prefill. Log *why* a request did not reuse the live state.

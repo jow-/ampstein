@@ -20,9 +20,13 @@ import * as engine from './engine.uc';
 import * as utpl from './utpl.uc';
 import * as chat_jinja from './chat_jinja.uc';
 import * as chat_qwen35 from './chat_qwen35.uc';
+import * as chat_glm5 from './chat_glm5.uc';
 import * as qwen35 from './qwen35.uc';
 import * as qwen35_tp from './qwen35_tp.uc';
 import * as qwen35_vision from './qwen35_vision.uc';
+import * as glm5 from './glm5.uc';
+import * as glm5_tp from './glm5_tp.uc';
+import * as glm5_vision from './glm5_vision.uc';
 
 // digest.so is optional (not built on every host): images are then keyed
 // by a cheap length+sample fingerprint instead of SHA-256
@@ -89,12 +93,26 @@ export function serve(args) {
 		gen_cfg = {};
 	}
 
-	// default device count: two (the dense Qwen layer-splits over a pair)
-	if (args.gpus == null)
-		args.gpus = 2;
+	// model family: GLM-5.x (Glm5NextForConditionalGeneration) or Qwen3.5/3.8
+	if (args.arch == 'auto') {
+		let arch = '';
 
-	let chat = chat_qwen35;
-	let cfg = qwen35.load_config(args.model);
+		try {
+			arch = '' + (json(readfile(args.model + '/config.json')).architectures || [''])[0];
+		}
+		catch (e) {}
+
+		args.arch = (index(arch, 'Glm5Next') == 0) ? 'glm5' : 'qwen35';
+	}
+
+	const GLM = (args.arch == 'glm5');
+
+	// default device count: every GPU for GLM (117 GB), two for the dense Qwen
+	if (args.gpus == null)
+		args.gpus = GLM ? torch.device_count() : 2;
+
+	let chat = GLM ? chat_glm5 : chat_qwen35;
+	let cfg = GLM ? glm5.load_config(args.model) : qwen35.load_config(args.model);
 
 	/* The transpiled chat template: chat_template.jinja -> jinja2utpl ->
 	   loadstring, compiled ONCE here; this closure is invoked for every
@@ -119,11 +137,31 @@ export function serve(args) {
 	let t0 = time();
 	let tok = torch.tokenizer(args.model);
 
+	// --cache-mode FP16 (default) | Q8: the GLM latent KV cache as int8 codes
+	// with group scales (544 instead of 1024 bytes per token and MLA layer)
+	if (args.cache_mode && args.cache_mode != 'FP16' && args.cache_mode != 'Q8') {
+		warn('ampstein: --cache-mode must be FP16 or Q8\n');
+		exit(1);
+	}
+
+	let kv_bits = (args.cache_mode == 'Q8') ? 8 : null;
+
+	if (kv_bits && !GLM)
+		warn('ampstein: --cache-mode Q8 is implemented for GLM only (ignored)\n');
+
 	let model;
 
-	model = qwen35.load(args.model, {devices: devs, mtp: args.mtp > 0});
+	if (GLM) {
+		model = args.tp ? glm5_tp.load(args.model, {devices: args.gpus, kv_bits: kv_bits, mtp: args.mtp > 0,
+			stages: args.stages, max_seq: args.ctx, prefill_rows: args.chunk}) :
+			glm5.load(args.model, {devices: args.gpus, mtp: args.mtp > 0, kv_bits: kv_bits,
+				max_seq: args.ctx});
+	}
+	else {
+		model = qwen35.load(args.model, {devices: devs, mtp: args.mtp > 0});
+	}
 
-	if (args.tp) {
+	if (args.tp && !GLM) {
 		if (args.gpus < 2) {
 			warn('ampstein: --tp needs --gpus >= 2\n');
 			exit(1);
@@ -141,13 +179,17 @@ export function serve(args) {
 		prefill_chunk: args.chunk,
 		mtp_window: args.mtp,
 		draft_vocab: args.draft_vocab,
+		warmup: args.warmup,
+		cache_ram: args.cache_ram,
+		cache_quant: args.cache_quant,
+		graphs: (GLM && getenv('AMP_GLM5_NO_GRAPHS')) ? false : null
 	});
 
 	let banner = `ampstein: model loaded in ${time() - t0}s`;
 
 	if (args.tp)
 		banner += `, tensor parallel over ${model.G} GPUs` +
-			` (${model.comm.info().mode} all-reduce)`;
+			(GLM ? ' (expert parallel MoE)' : ` (${model.comm.info().mode} all-reduce)`);
 
 	if (eng.mtp_window)
 		banner += `, MTP speculative decoding (window ${eng.mtp_window})`;
@@ -167,6 +209,8 @@ export function serve(args) {
 	(function restore_cache() {
 		let meta;
 
+		if (GLM)
+			return;     // the cache-state file format is Qwen-specific for now
 		try {
 			meta = json(readfile(CACHE_META));
 		}
@@ -243,7 +287,7 @@ export function serve(args) {
 		if (!args.vision)
 			die('image input is disabled (--no-vision)');
 
-		if (!cfg.vision_merge)
+		if (GLM ? !cfg.has_vision : !cfg.vision_merge)
 			die('this model has no (supported) vision tower');
 
 		if (!vis) {
@@ -500,6 +544,9 @@ export function serve(args) {
 			if (d.div_old)
 				why += `, diverges: ${sprintf('%J', safe_decode(d.div_old))} -> ${sprintf('%J', safe_decode(d.div_new))}`;
 
+			if (d.stored)
+				why += ', previous state moved to RAM';
+
 			why += ']';
 		}
 
@@ -602,6 +649,8 @@ export function serve(args) {
 				enable_thinking: enable_thinking,
 				reasoning_effort: kw.reasoning_effort || effort,
 				preserve_thinking: kw.preserve_thinking,
+				clear_thinking: kw.clear_thinking,
+				vision: GLM && args.vision && cfg.has_vision
 			});
 		}
 		catch (e) {
@@ -651,6 +700,45 @@ export function serve(args) {
 		let content = struct.buffer(), reasoning = struct.buffer();
 		let calls = [];
 		let stopped = false;
+
+		// Reasoning budget. After `nudge_at` reasoning tokens a soft nudge is
+		// appended to the model's thinking (it carries on and usually wraps up);
+		// after `limit_at` the block is closed by force (nudge_text / close_text
+		// end in </think>) and the model answers. Both are injected through the
+		// engine's force() hook, at a step boundary (an MTP round may overshoot
+		// by up to the window). Defaults: --reasoning-nudge / --reasoning-limit;
+		// per request: reasoning_nudge_tokens / reasoning_max_tokens or
+		// reasoning_budget: {nudge, limit}.
+		function budget_num(flat, nested, dflt) {
+			let v = (flat != null) ? flat : nested;
+
+			return (v != null && v > 0) ? int(v) : (v != null ? 0 : dflt);
+		}
+
+		let rb = body.reasoning_budget || {};
+		let nudge_at = budget_num(body.reasoning_nudge_tokens, rb.nudge, args.reasoning_nudge);
+		let limit_at = budget_num(body.reasoning_max_tokens, rb.limit, args.reasoning_limit);
+		let budgeted = r.thinking && (nudge_at > 0 || limit_at > 0);
+		let rtoks = 0, nudged = false, closed = false, pending = null, pending_kind = null;
+
+		if (nudge_at > 0 && limit_at > 0 && nudge_at >= limit_at)
+			nudge_at = 0;
+
+		function budget_check() {
+			if (!budgeted || pending != null || p.mode() != 'reason')
+				return;
+
+			if (limit_at > 0 && rtoks >= limit_at && !closed) {
+				closed = true;
+				pending_kind = 'limit';
+				pending = tok.encode(args.reasoning_close_text != null ? args.reasoning_close_text : chat.REASONING_CLOSE, true);
+			}
+			else if (nudge_at > 0 && rtoks >= nudge_at && !nudged) {
+				nudged = true;
+				pending_kind = 'nudge';
+				pending = tok.encode(args.reasoning_nudge_text != null ? args.reasoning_nudge_text : chat.REASONING_NUDGE, true);
+			}
+		}
 
 		function chunk(delta, finish) {
 			return {
@@ -729,12 +817,41 @@ export function serve(args) {
 			},
 
 			on_token: function (t) {
+				if (budgeted && p.mode() == 'reason')
+					rtoks++;
+
 				emit(p.feed(dt.push(t)));
+				budget_check();
 
 				if (stopped)
 					return false;
 
 				return stream ? !res.finished() && res.alive() : res.alive();
+			},
+
+			// the engine polls this at every step boundary
+			force: !budgeted ? null : function () {
+				if (pending == null)
+					return null;
+
+				let f = pending;
+
+				pending = null;
+
+				// the model may have closed the block itself since the check
+				if (p.mode() != 'reason')
+					return null;
+
+				warn(`chat ${id}: reasoning ${pending_kind} ` +
+					`after ${rtoks} tokens, forcing ${length(f)} tokens\n`);
+
+				// show the forced text in the stream like generated text
+				for (let i = 0; i < length(f); i++)
+					emit(p.feed(dt.push(f[i])));
+
+				rtoks += length(f);
+
+				return f;
 			},
 
 			on_done: function (info) {
@@ -990,6 +1107,8 @@ export function serve(args) {
 		shutting_down = true;
 
 		try {
+			if (GLM)
+				die('not supported for this architecture yet');
 			let n = eng.save_state(CACHE_ST);
 
 			writefile(CACHE_META, sprintf('%J', {

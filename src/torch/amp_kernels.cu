@@ -2332,6 +2332,787 @@ amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
 	return (int)cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Kimi delta attention (KDA, GLM-5.3 linear-attention layers): the gated
+// delta rule with a PER-KEY-CHANNEL decay. Sequential form, fp32, exact
+// math of exllamav3's torch_recurrent_kda:
+//
+//   S    = diag(exp(g_t)) S                  (decay each key row i)
+//   kv   = S^T k_t
+//   S    = S + k_t (x) (beta_t (v_t - kv))
+//   o_t  = scale * S^T q_t
+//
+//   q, k   (S, H, DK) fp32, l2-normalized      v (S, H, dv) fp32
+//   g      (S, H, DK) fp32 log-decay           beta (S, H) fp32
+//   state  (H, DK, dv) fp32, updated in place  out (S, H, dv) fp32
+//
+// Same grid/register layout as amp_gdn_scan_kernel: thread j owns state
+// column j of its head; the per-token q/k/decay rows go through shared
+// memory.
+// ---------------------------------------------------------------------------
+
+template <int DK>
+__global__ __launch_bounds__(AMP_GDN_VT)
+void amp_kda_scan_kernel(const float *__restrict__ q, const float *__restrict__ k,
+                        const float *__restrict__ v, const float *__restrict__ beta,
+                        const float *__restrict__ g, float *__restrict__ state,
+                        float *__restrict__ out, int S, int H, int dv,
+                        float scale, float *__restrict__ states_out, int n_out)
+{
+	const int h = blockIdx.x;
+	const int j = blockIdx.y * AMP_GDN_VT + threadIdx.x;
+
+	__shared__ float sq[DK];
+	__shared__ float sk[DK];
+	__shared__ float sg[DK];
+
+	float st[DK];
+	float *sp = state + (size_t)h * DK * dv + j;
+
+#pragma unroll
+	for (int i = 0; i < DK; i++)
+		st[i] = sp[(size_t)i * dv];
+
+	for (int t = 0; t < S; t++) {
+		const float *qt = q + ((size_t)t * H + h) * DK;
+		const float *kt = k + ((size_t)t * H + h) * DK;
+		const float *gt = g + ((size_t)t * H + h) * DK;
+
+		for (int i = threadIdx.x; i < DK; i += AMP_GDN_VT) {
+			sq[i] = qt[i];
+			sk[i] = kt[i];
+			sg[i] = expf(gt[i]);
+		}
+
+		__syncthreads();
+
+		float kv = 0.0f;
+
+#pragma unroll
+		for (int i = 0; i < DK; i++) {
+			st[i] *= sg[i];
+			kv = fmaf(st[i], sk[i], kv);
+		}
+
+		const float vn = beta[(size_t)t * H + h] *
+			(v[((size_t)t * H + h) * dv + j] - kv);
+
+		float o = 0.0f;
+
+#pragma unroll
+		for (int i = 0; i < DK; i++) {
+			st[i] = fmaf(sk[i], vn, st[i]);
+			o = fmaf(st[i], sq[i], o);
+		}
+
+		out[((size_t)t * H + h) * dv + j] = o * scale;
+
+		if (t < n_out) {
+			float *so = states_out + ((size_t)t * H + h) * DK * dv + j;
+
+#pragma unroll
+			for (int i = 0; i < DK; i++)
+				so[(size_t)i * dv] = st[i];
+		}
+
+		__syncthreads();
+	}
+
+#pragma unroll
+	for (int i = 0; i < DK; i++)
+		sp[(size_t)i * dv] = st[i];
+}
+
+extern "C" int
+amp_kda_scan_f32(const void *q, const void *k, const void *v, const void *beta,
+                const void *g, void *state, void *out, int S, int H, int dk,
+                int dv, float scale, void *states_out, int n_out,
+                cudaStream_t stream)
+{
+	if (S <= 0)
+		return 0;
+
+	if (H <= 0 || dv % AMP_GDN_VT != 0) {
+		fprintf(stderr, "amp_kda_scan: unsupported heads/dims (H %d, dv %d)\n", H, dv);
+		return -1;
+	}
+
+	dim3 grid(H, dv / AMP_GDN_VT);
+
+	if (dk == 128)
+		amp_kda_scan_kernel<128><<<grid, AMP_GDN_VT, 0, stream>>>(
+			(const float *)q, (const float *)k, (const float *)v,
+			(const float *)beta, (const float *)g, (float *)state,
+			(float *)out, S, H, dv, scale, (float *)states_out, n_out);
+	else if (dk == 64)
+		amp_kda_scan_kernel<64><<<grid, AMP_GDN_VT, 0, stream>>>(
+			(const float *)q, (const float *)k, (const float *)v,
+			(const float *)beta, (const float *)g, (float *)state,
+			(float *)out, S, H, dv, scale, (float *)states_out, n_out);
+	else {
+		fprintf(stderr, "amp_kda_scan: unsupported k head dim %d (64, 128)\n", dk);
+		return -1;
+	}
+
+	return (int)cudaGetLastError();
+}
+
+// Skinny fp32 product for decode / verify rows: out (M, N) = x (M, K) @ w (K, N)
+// with M <= 8, all fp32 row-major. cuBLAS runs these as GEMVs for one row but
+// as a slow generic GEMM for 2..8 (38 us for 4096 x 128). One warp reads 32
+// lanes x VEC consecutive columns of a weight row per step (coalesced), a
+// block's 8 warps split a chunk of rows, the chunks of a column tile are
+// reduced in a fixed order by the last-arriving block (deterministic).
+//   grid (column tiles, chunks); part: (chunks, M, N) workspace; cnt: one
+//   int per column tile (zero; reset by the reducer).
+#define AMP_SK_WARPS 8
+
+template <int M, int VEC>
+__global__ void amp_skinny_kernel(const float *__restrict__ x, const float *__restrict__ w,
+                                 float *__restrict__ out, float *__restrict__ part,
+                                 int *__restrict__ cnt, int K, int N, int rows_per_chunk)
+{
+	constexpr int COLS = 32 * VEC;
+	__shared__ float red[AMP_SK_WARPS][M][COLS];
+	__shared__ int s_last;
+
+	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+	const int col0 = blockIdx.x * COLS + lane * VEC;
+	const int r0 = blockIdx.y * rows_per_chunk;
+	const int r1 = min(K, r0 + rows_per_chunk);
+	const int nchunks = gridDim.y;
+
+	float acc[M][VEC];
+
+#pragma unroll
+	for (int m = 0; m < M; m++)
+#pragma unroll
+		for (int v = 0; v < VEC; v++)
+			acc[m][v] = 0.0f;
+
+	for (int r = r0 + warp; r < r1; r += AMP_SK_WARPS) {
+		float xv[M];
+
+#pragma unroll
+		for (int m = 0; m < M; m++)
+			xv[m] = x[(size_t)m * K + r];
+
+		if (col0 < N) {
+			const float *wr = w + (size_t)r * N + col0;
+
+			if (VEC == 4) {
+				float4 wv = *(const float4 *)wr;
+
+#pragma unroll
+				for (int m = 0; m < M; m++) {
+					acc[m][0] = fmaf(xv[m], wv.x, acc[m][0]);
+					acc[m][1] = fmaf(xv[m], wv.y, acc[m][1]);
+					acc[m][2] = fmaf(xv[m], wv.z, acc[m][2]);
+					acc[m][3] = fmaf(xv[m], wv.w, acc[m][3]);
+				}
+			}
+			else {
+				float wv = *wr;
+
+#pragma unroll
+				for (int m = 0; m < M; m++)
+					acc[m][0] = fmaf(xv[m], wv, acc[m][0]);
+			}
+		}
+	}
+
+#pragma unroll
+	for (int m = 0; m < M; m++)
+#pragma unroll
+		for (int v = 0; v < VEC; v++)
+			red[warp][m][lane * VEC + v] = acc[m][v];
+
+	__syncthreads();
+
+	// sum the warps (fixed order) -> this chunk's partial
+	for (int i = threadIdx.x; i < M * COLS; i += blockDim.x) {
+		const int m = i / COLS, c = i % COLS;
+		const int col = blockIdx.x * COLS + c;
+
+		float sum = 0.0f;
+
+#pragma unroll
+		for (int wi = 0; wi < AMP_SK_WARPS; wi++)
+			sum += red[wi][m][c];
+
+		if (col < N) {
+			if (nchunks == 1)
+				out[(size_t)m * N + col] = sum;
+			else
+				part[((size_t)blockIdx.y * M + m) * N + col] = sum;
+		}
+	}
+
+	if (nchunks == 1)
+		return;
+
+	__threadfence();
+	__syncthreads();
+
+	if (threadIdx.x == 0)
+		s_last = (atomicAdd(&cnt[blockIdx.x], 1) == nchunks - 1);
+
+	__syncthreads();
+
+	if (!s_last)
+		return;
+
+	__threadfence();
+
+	for (int i = threadIdx.x; i < M * COLS; i += blockDim.x) {
+		const int m = i / COLS, c = i % COLS;
+		const int col = blockIdx.x * COLS + c;
+
+		if (col >= N)
+			continue;
+
+		float sum = 0.0f;
+
+		for (int ch = 0; ch < nchunks; ch++)
+			sum += __ldcg(&part[((size_t)ch * M + m) * N + col]);
+
+		out[(size_t)m * N + col] = sum;
+	}
+
+	if (threadIdx.x == 0)
+		cnt[blockIdx.x] = 0;
+}
+
+template <int M>
+static int amp_skinny_launch_m(const float *x, const float *w, float *out, float *part,
+                              int *cnt, int K, int N, int rpc, int ntiles, int nchunks,
+                              bool vec4, cudaStream_t stream)
+{
+	dim3 grid(ntiles, nchunks);
+
+	if (vec4)
+		amp_skinny_kernel<M, 4><<<grid, AMP_SK_WARPS * 32, 0, stream>>>(x, w, out, part, cnt, K, N, rpc);
+	else
+		amp_skinny_kernel<M, 1><<<grid, AMP_SK_WARPS * 32, 0, stream>>>(x, w, out, part, cnt, K, N, rpc);
+
+	return (int)cudaGetLastError();
+}
+
+// part must hold >= nchunks_max * M * N floats; cnt >= ntiles ints (zeroed)
+extern "C" int
+amp_skinny_f32(const float *x, const float *w, float *out, float *part, int *cnt,
+              int M, int K, int N, long part_floats, int cnt_len, cudaStream_t stream)
+{
+	if (M < 1 || M > 8 || K < 1 || N < 1)
+		return (int)cudaErrorInvalidValue;
+
+	const bool vec4 = (N % 4 == 0) && (((uintptr_t)w & 15) == 0);
+	const int cols = 32 * (vec4 ? 4 : 1);
+	const int ntiles = (N + cols - 1) / cols;
+	int nchunks = 1;
+	int rpc = K;
+
+	// enough blocks to cover the device's bandwidth: aim for >= 64
+	if (ntiles < 64 && K >= 128) {
+		nchunks = (64 + ntiles - 1) / ntiles;
+
+		if (nchunks > K / 64) nchunks = K / 64;
+		if (nchunks < 1) nchunks = 1;
+
+		rpc = ((K + nchunks - 1) / nchunks + 7) / 8 * 8;
+		nchunks = (K + rpc - 1) / rpc;
+	}
+
+	if (nchunks > 1 && ((long)nchunks * M * N > part_floats || ntiles > cnt_len))
+		return (int)cudaErrorInvalidValue;
+
+	switch (M) {
+	case 1: return amp_skinny_launch_m<1>(x, w, out, part, cnt, K, N, rpc, ntiles, nchunks, vec4, stream);
+	case 2: return amp_skinny_launch_m<2>(x, w, out, part, cnt, K, N, rpc, ntiles, nchunks, vec4, stream);
+	case 3: return amp_skinny_launch_m<3>(x, w, out, part, cnt, K, N, rpc, ntiles, nchunks, vec4, stream);
+	case 4: return amp_skinny_launch_m<4>(x, w, out, part, cnt, K, N, rpc, ntiles, nchunks, vec4, stream);
+	case 5: return amp_skinny_launch_m<5>(x, w, out, part, cnt, K, N, rpc, ntiles, nchunks, vec4, stream);
+	case 6: return amp_skinny_launch_m<6>(x, w, out, part, cnt, K, N, rpc, ntiles, nchunks, vec4, stream);
+	case 7: return amp_skinny_launch_m<7>(x, w, out, part, cnt, K, N, rpc, ntiles, nchunks, vec4, stream);
+	default: return amp_skinny_launch_m<8>(x, w, out, part, cnt, K, N, rpc, ntiles, nchunks, vec4, stream);
+	}
+}
+
+// KDA gates: g = lb * sigmoid(decay_h * (f + dt_bias)) (log-decay, per key
+// channel; decay_h = exp(A_log_h)), beta = sigmoid(braw * beta_scale).
+//   f (S, H*DK) fp32, dt_bias (H*DK) fp32, decay (H) fp32, braw (S, H) fp32
+//   g (S, H, DK) fp32 out, beta (S, H) fp32 out
+__global__ void amp_kda_gates_kernel(const float *__restrict__ f,
+                                    const float *__restrict__ dt_bias,
+                                    const float *__restrict__ decay,
+                                    const float *__restrict__ braw,
+                                    float *__restrict__ g, float *__restrict__ beta,
+                                    long n, int H, int DK, float lb,
+                                    float beta_scale)
+{
+	long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (idx >= n)
+		return;
+
+	int c = (int)(idx % ((long)H * DK));      // channel within the token
+	int h = c / DK;
+	float x = (f[idx] + dt_bias[c]) * decay[h];
+
+	g[idx] = lb / (1.0f + expf(-x));
+
+	// one beta per (token, head): the first channel's thread writes it
+	if (c % DK == 0) {
+		long t = idx / ((long)H * DK);
+		float b = braw[t * H + h] * beta_scale;
+
+		beta[t * H + h] = 1.0f / (1.0f + expf(-b));
+	}
+}
+
+extern "C" int
+amp_kda_gates(const void *f, const void *dt_bias, const void *decay,
+             const void *braw, void *g, void *beta, long S, int H, int DK,
+             float lb, float beta_scale, cudaStream_t stream)
+{
+	long n = S * H * DK;
+
+	if (n <= 0)
+		return 0;
+
+	amp_kda_gates_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(
+		(const float *)f, (const float *)dt_bias, (const float *)decay,
+		(const float *)braw, (float *)g, (float *)beta, n, H, DK, lb,
+		beta_scale);
+
+	return (int)cudaGetLastError();
+}
+
+// KDA output: gated RMSNorm over the v head dim with a SIGMOID gate, fp32:
+//   out = w * (core * rsqrt(mean(core^2) + eps)) * sigmoid(z)
+//   core (S, H, dv) fp32; z (S, H*dv) fp32; w (dv) fp16/fp32 (as wfmt);
+//   out (S, H*dv) fp16. Block per (token, head), dv threads.
+template <typename W_T>
+__global__ void amp_kda_out_norm_kernel(const float *__restrict__ core,
+                                       const float *__restrict__ z,
+                                       const W_T *__restrict__ w,
+                                       __half *__restrict__ out, int dv,
+                                       float eps)
+{
+	const size_t row = blockIdx.x;
+	const int e = threadIdx.x;
+	float f = core[row * dv + e];
+	float ss = f * f;
+
+	__shared__ float red[32];
+
+#pragma unroll
+	for (int off = 16; off > 0; off >>= 1)
+		ss += __shfl_down_sync(0xffffffffu, ss, off);
+
+	if ((e & 31) == 0)
+		red[e >> 5] = ss;
+
+	__syncthreads();
+
+	if (e < 32) {
+		float s2 = (e < (int)(blockDim.x >> 5)) ? red[e] : 0.0f;
+
+#pragma unroll
+		for (int off = 16; off > 0; off >>= 1)
+			s2 += __shfl_down_sync(0xffffffffu, s2, off);
+
+		if (e == 0)
+			red[0] = rsqrtf(s2 / dv + eps);
+	}
+
+	__syncthreads();
+
+	float wf;
+
+	if constexpr (sizeof(W_T) == 2)
+		wf = __half2float(w[e]);
+	else
+		wf = w[e];
+
+	float zf = z[row * dv + e];
+
+	out[row * dv + e] = __float2half(wf * (f * red[0]) / (1.0f + expf(-zf)));
+}
+
+extern "C" int
+amp_kda_out_norm(const void *core, const void *z, const void *w, int w_is_half,
+                void *out, long rows, int dv, float eps, cudaStream_t stream)
+{
+	if (rows <= 0)
+		return 0;
+
+	if (dv > 1024 || dv % 32 != 0) {
+		fprintf(stderr, "amp_kda_out_norm: unsupported dv %d\n", dv);
+		return -1;
+	}
+
+	if (w_is_half)
+		amp_kda_out_norm_kernel<__half><<<(unsigned)rows, dv, 0, stream>>>(
+			(const float *)core, (const float *)z, (const __half *)w,
+			(__half *)out, dv, eps);
+	else
+		amp_kda_out_norm_kernel<float><<<(unsigned)rows, dv, 0, stream>>>(
+			(const float *)core, (const float *)z, (const float *)w,
+			(__half *)out, dv, eps);
+
+	return (int)cudaGetLastError();
+}
+
+// Q8 latent (KV) cache rows: `dim` values per row in groups of 32, one
+// symmetric int8 code per value and one fp16 scale (absmax / 127) per
+// group — 544 bytes per 512-value row instead of 1024. put quantizes the
+// source rows to destination rows idx[row] (or start + row when idx is
+// NULL); get dequantizes rows idx[row] / start + row to fp16. One block per
+// row, dim / 4 threads (each owns 4 values; 8 threads per group).
+__global__ void amp_kvq8_put_kernel(const __half *__restrict__ src,
+                                   signed char *__restrict__ q,
+                                   __half *__restrict__ s,
+                                   const long long *__restrict__ idx,
+                                   long start, int dim)
+{
+	int t = threadIdx.x;
+	long dst = idx ? (long)idx[blockIdx.x] : start + blockIdx.x;
+	const __half2 *p = (const __half2 *)(src + (long)blockIdx.x * dim) + 2 * t;
+	float2 a = __half22float2(p[0]);
+	float2 b = __half22float2(p[1]);
+	float amax = fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(b.x), fabsf(b.y)));
+
+	for (int o = 1; o < 8; o <<= 1)
+		amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+
+	// quantize against the ROUNDED scale so the dequantized value is the
+	// nearest grid point of what is stored
+	__half sh = __float2half(amax * (1.0f / 127.0f));
+	float sf = __half2float(sh);
+	float inv = sf > 0.0f ? 1.0f / sf : 0.0f;
+	int c0 = max(-127, min(127, __float2int_rn(a.x * inv)));
+	int c1 = max(-127, min(127, __float2int_rn(a.y * inv)));
+	int c2 = max(-127, min(127, __float2int_rn(b.x * inv)));
+	int c3 = max(-127, min(127, __float2int_rn(b.y * inv)));
+
+	((int *)(q + dst * dim))[t] = (c0 & 0xff) | ((c1 & 0xff) << 8) |
+		((c2 & 0xff) << 16) | ((c3 & 0xff) << 24);
+
+	if ((t & 7) == 0)
+		s[dst * (dim / 32) + (t >> 3)] = sh;
+}
+
+__global__ void amp_kvq8_get_kernel(const signed char *__restrict__ q,
+                                   const __half *__restrict__ s,
+                                   __half *__restrict__ out,
+                                   const long long *__restrict__ idx,
+                                   long start, int dim)
+{
+	int t = threadIdx.x;
+	long src = idx ? (long)idx[blockIdx.x] : start + blockIdx.x;
+	int w = ((const int *)(q + src * dim))[t];
+	float sf = __half2float(s[src * (dim / 32) + (t >> 3)]);
+	__half2 *o = (__half2 *)(out + (long)blockIdx.x * dim) + 2 * t;
+
+	o[0] = __floats2half2_rn(sf * (float)(signed char)(w & 0xff),
+	                         sf * (float)(signed char)((w >> 8) & 0xff));
+	o[1] = __floats2half2_rn(sf * (float)(signed char)((w >> 16) & 0xff),
+	                         sf * (float)(signed char)((w >> 24) & 0xff));
+}
+
+extern "C" int
+amp_kvq8_put(const void *src, void *q, void *s, const long long *idx,
+            long start, long rows, int dim, cudaStream_t stream)
+{
+	if (rows <= 0)
+		return 0;
+
+	amp_kvq8_put_kernel<<<(unsigned)rows, dim / 4, 0, stream>>>(
+		(const __half *)src, (signed char *)q, (__half *)s, idx, start, dim);
+
+	return (int)cudaGetLastError();
+}
+
+extern "C" int
+amp_kvq8_get(const void *q, const void *s, void *out, const long long *idx,
+            long start, long rows, int dim, cudaStream_t stream)
+{
+	if (rows <= 0)
+		return 0;
+
+	amp_kvq8_get_kernel<<<(unsigned)rows, dim / 4, 0, stream>>>(
+		(const signed char *)q, (const __half *)s, (__half *)out, idx, start, dim);
+
+	return (int)cudaGetLastError();
+}
+
+// Q4 cache rows (the host-RAM prompt-cache store's oldest tier): as the Q8
+// rows above with a signed 4-bit code per value (absmax / 7 per group of 32),
+// two codes per byte: a row of `dim` values is dim / 2 bytes. Each thread
+// owns 4 values = 16 bits of code.
+__global__ void amp_kvq4_put_kernel(const __half *__restrict__ src,
+                                   unsigned short *__restrict__ q,
+                                   __half *__restrict__ s,
+                                   const long long *__restrict__ idx,
+                                   long start, int dim)
+{
+	int t = threadIdx.x;
+	long dst = idx ? (long)idx[blockIdx.x] : start + blockIdx.x;
+	const __half2 *p = (const __half2 *)(src + (long)blockIdx.x * dim) + 2 * t;
+	float2 a = __half22float2(p[0]);
+	float2 b = __half22float2(p[1]);
+	float amax = fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(b.x), fabsf(b.y)));
+
+	for (int o = 1; o < 8; o <<= 1)
+		amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+
+	__half sh = __float2half(amax * (1.0f / 7.0f));
+	float sf = __half2float(sh);
+	float inv = sf > 0.0f ? 1.0f / sf : 0.0f;
+	int c0 = max(-7, min(7, __float2int_rn(a.x * inv)));
+	int c1 = max(-7, min(7, __float2int_rn(a.y * inv)));
+	int c2 = max(-7, min(7, __float2int_rn(b.x * inv)));
+	int c3 = max(-7, min(7, __float2int_rn(b.y * inv)));
+
+	q[dst * (dim / 4) + t] = (unsigned short)((c0 & 0xf) | ((c1 & 0xf) << 4) |
+		((c2 & 0xf) << 8) | ((c3 & 0xf) << 12));
+
+	if ((t & 7) == 0)
+		s[dst * (dim / 32) + (t >> 3)] = sh;
+}
+
+__device__ __forceinline__ float amp_nib(unsigned w, int i)
+{
+	return (float)((int)(w << (28 - 4 * i)) >> 28);
+}
+
+__global__ void amp_kvq4_get_kernel(const unsigned short *__restrict__ q,
+                                   const __half *__restrict__ s,
+                                   __half *__restrict__ out,
+                                   const long long *__restrict__ idx,
+                                   long start, int dim)
+{
+	int t = threadIdx.x;
+	long src = idx ? (long)idx[blockIdx.x] : start + blockIdx.x;
+	unsigned w = q[src * (dim / 4) + t];
+	float sf = __half2float(s[src * (dim / 32) + (t >> 3)]);
+	__half2 *o = (__half2 *)(out + (long)blockIdx.x * dim) + 2 * t;
+
+	o[0] = __floats2half2_rn(sf * amp_nib(w, 0), sf * amp_nib(w, 1));
+	o[1] = __floats2half2_rn(sf * amp_nib(w, 2), sf * amp_nib(w, 3));
+}
+
+extern "C" int
+amp_kvq4_put(const void *src, void *q, void *s, const long long *idx,
+            long start, long rows, int dim, cudaStream_t stream)
+{
+	if (rows <= 0)
+		return 0;
+
+	amp_kvq4_put_kernel<<<(unsigned)rows, dim / 4, 0, stream>>>(
+		(const __half *)src, (unsigned short *)q, (__half *)s, idx, start, dim);
+
+	return (int)cudaGetLastError();
+}
+
+extern "C" int
+amp_kvq4_get(const void *q, const void *s, void *out, const long long *idx,
+            long start, long rows, int dim, cudaStream_t stream)
+{
+	if (rows <= 0)
+		return 0;
+
+	amp_kvq4_get_kernel<<<(unsigned)rows, dim / 4, 0, stream>>>(
+		(const unsigned short *)q, (const __half *)s, (__half *)out, idx, start, dim);
+
+	return (int)cudaGetLastError();
+}
+
+// DSA indexer scoring, fused (GLM-5.3 sparse attention):
+//
+//   out[r][p] = valid(r, p) ? fp16( sum_h w[r][h] * scale * relu(q[r][h] . pool[p]) )
+//                           : -65504
+//
+// with HI = 32 index heads of D = 128 dims and valid = (p * P + P - 1 <=
+// pos0 + r) (a pool is selectable once all of its tokens are visible). The
+// composite ATen path materialised the (R * HI, n_pools) score matrix and
+// made six passes over it (matmul, scale, clamp, weighted bmm: 800 MB per
+// 32-query slab at 65k pools); this reads the pooled keys once per 8 queries
+// and writes only (R, n_pools).
+//
+// One CTA = 8 queries (one warp each: its 32 heads are two m16 tiles) x 64
+// pools. The pool tile sits in shared memory (row stride 136 halves: the
+// B-fragment loads are bank-conflict free); the q fragments of a warp stay in
+// registers for the whole K = 128 loop. mma.sync m16n8k16 (fp16 in, fp32
+// accumulate); relu, the per-head weight and the sum over heads happen on the
+// accumulator fragments (a shuffle reduction over the 8 lanes that share a
+// column).
+#define IDX_D 128
+#define IDX_TILE 64
+#define IDX_QPB 8
+#define IDX_STRIDE 136
+
+__device__ __forceinline__ void
+amp_mma_16816(float *c, const uint32_t *a, uint32_t b0, uint32_t b1)
+{
+	asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+	             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+	             : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+	             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__global__ void __launch_bounds__(256)
+amp_idx_score_kernel(const __half *__restrict__ q, const __half *__restrict__ pools,
+                    const float *__restrict__ w, __half *__restrict__ out,
+                    int R, int n_pools, float scale, int pos0, int P, int HI)
+{
+	extern __shared__ __half sp[];            // IDX_TILE x IDX_STRIDE
+
+	const int lane = threadIdx.x & 31;
+	const int warp = threadIdx.x >> 5;
+	const int p0 = blockIdx.x * IDX_TILE;
+	const int r = blockIdx.y * IDX_QPB + warp;
+
+	for (int i = threadIdx.x; i < IDX_TILE * (IDX_D / 8); i += 256) {
+		int row = i >> 4, c = i & 15;
+		int pr = p0 + row;
+		uint4 v = make_uint4(0, 0, 0, 0);
+
+		if (pr < n_pools)
+			v = *(const uint4 *)(pools + (long)pr * IDX_D + c * 8);
+
+		*(uint4 *)(sp + row * IDX_STRIDE + c * 8) = v;
+	}
+
+	__syncthreads();
+
+	if (r >= R)
+		return;
+
+	// Heads are processed in halves of 32 (two m tiles of 16): the pool tile in shared memory is
+	// shared by all halves and each half adds its relu * weight contribution into S (fp32), so
+	// 64 indexer heads cost one pass over the pool and one fp16 rounding of the final sum.
+	const int g = lane >> 2, t = lane & 3;
+	float S[8][2];
+
+	#pragma unroll
+	for (int nt = 0; nt < 8; nt++)
+		S[nt][0] = S[nt][1] = 0.0f;
+
+	for (int hh = 0; hh < HI / 32; hh++) {
+		const int hb = hh * 32;
+
+		// q fragments: A[mt][ks][0..3]; rows = heads hb + mt * 16 + lane / 4 (+ 8)
+		uint32_t A[2][8][4];
+
+		#pragma unroll
+		for (int mt = 0; mt < 2; mt++) {
+			const __half *r0 = q + ((long)r * HI + hb + mt * 16 + g) * IDX_D + t * 2;
+			const __half *r1 = r0 + 8 * IDX_D;
+
+			#pragma unroll
+			for (int ks = 0; ks < 8; ks++) {
+				A[mt][ks][0] = *(const uint32_t *)(r0 + ks * 16);
+				A[mt][ks][1] = *(const uint32_t *)(r1 + ks * 16);
+				A[mt][ks][2] = *(const uint32_t *)(r0 + ks * 16 + 8);
+				A[mt][ks][3] = *(const uint32_t *)(r1 + ks * 16 + 8);
+			}
+		}
+
+		float acc[2][8][4];
+
+		#pragma unroll
+		for (int mt = 0; mt < 2; mt++)
+			#pragma unroll
+			for (int nt = 0; nt < 8; nt++)
+				acc[mt][nt][0] = acc[mt][nt][1] = acc[mt][nt][2] = acc[mt][nt][3] = 0.0f;
+
+		#pragma unroll
+		for (int ks = 0; ks < 8; ks++) {
+			uint32_t b[8][2];
+
+			#pragma unroll
+			for (int nt = 0; nt < 8; nt++) {
+				const __half *bp = sp + (nt * 8 + g) * IDX_STRIDE + ks * 16 + t * 2;
+
+				b[nt][0] = *(const uint32_t *)bp;
+				b[nt][1] = *(const uint32_t *)(bp + 8);
+			}
+
+			#pragma unroll
+			for (int mt = 0; mt < 2; mt++)
+				#pragma unroll
+				for (int nt = 0; nt < 8; nt++)
+					amp_mma_16816(acc[mt][nt], A[mt][ks], b[nt][0], b[nt][1]);
+		}
+
+		// head weights of this thread's accumulator rows (g and g + 8 of each m tile)
+		float wh[2][2];
+
+		#pragma unroll
+		for (int mt = 0; mt < 2; mt++) {
+			wh[mt][0] = w[(long)r * HI + hb + mt * 16 + g] * scale;
+			wh[mt][1] = w[(long)r * HI + hb + mt * 16 + g + 8] * scale;
+		}
+
+		#pragma unroll
+		for (int nt = 0; nt < 8; nt++)
+			#pragma unroll
+			for (int mt = 0; mt < 2; mt++) {
+				S[nt][0] += fmaxf(acc[mt][nt][0], 0.0f) * wh[mt][0] + fmaxf(acc[mt][nt][2], 0.0f) * wh[mt][1];
+				S[nt][1] += fmaxf(acc[mt][nt][1], 0.0f) * wh[mt][0] + fmaxf(acc[mt][nt][3], 0.0f) * wh[mt][1];
+			}
+	}
+
+	const int qpos = pos0 + r;
+
+	#pragma unroll
+	for (int nt = 0; nt < 8; nt++) {
+		float s0 = S[nt][0], s1 = S[nt][1];
+
+		// sum the 8 lanes (g = 0..7) that hold the same columns
+		#pragma unroll
+		for (int o = 4; o < 32; o <<= 1) {
+			s0 += __shfl_xor_sync(0xffffffffu, s0, o);
+			s1 += __shfl_xor_sync(0xffffffffu, s1, o);
+		}
+
+		if (g == 0) {
+			int pa = p0 + nt * 8 + t * 2;
+
+			if (pa < n_pools)
+				out[(long)r * n_pools + pa] =
+					(pa * P + P - 1 <= qpos) ? __float2half(s0) : __float2half(-65504.0f);
+
+			if (pa + 1 < n_pools)
+				out[(long)r * n_pools + pa + 1] =
+					((pa + 1) * P + P - 1 <= qpos) ? __float2half(s1) : __float2half(-65504.0f);
+		}
+	}
+}
+
+extern "C" int
+amp_idx_score(const void *q, const void *pools, const void *w, void *out,
+             int R, int n_pools, float scale, int pos0, int P, int HI, cudaStream_t stream)
+{
+	if (R <= 0 || n_pools <= 0)
+		return 0;
+
+	if (HI < 32 || HI % 32 != 0)
+		return -1;
+
+	dim3 grid((unsigned)((n_pools + IDX_TILE - 1) / IDX_TILE),
+	          (unsigned)((R + IDX_QPB - 1) / IDX_QPB));
+	size_t smem = (size_t)IDX_TILE * IDX_STRIDE * sizeof(__half);
+
+	amp_idx_score_kernel<<<grid, 256, smem, stream>>>(
+		(const __half *)q, (const __half *)pools, (const float *)w,
+		(__half *)out, R, n_pools, scale, pos0, P, HI);
+
+	return (int)cudaGetLastError();
+}
+
 /* ------------------------------------------------------------------ */
 /* Tensor-core (mma) split-KV decode attention.                        */
 /*                                                                     */

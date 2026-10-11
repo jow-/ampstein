@@ -30,6 +30,7 @@ GPUs from ucode scripts, with no Python in the loop.
 |---|---|---|
 | Llama-3 style dense | `llama.uc` | EXL3 weights, CUDA-graph decode, library use (no server path) |
 | Qwen3.5 / Qwen3.8 hybrid (Gated DeltaNet) | `qwen35.uc` | layer split over several GPUs, CUDA-graph decode |
+| GLM-5.3-Flash | `glm5.uc` | MLA + KDA hybrid, MoE, DSA indexer, MTP, tensor / expert parallel stages, vision |
 
 Engine features:
 
@@ -39,6 +40,8 @@ Engine features:
   decode loop and exact speculative sampling.
 - Tensor-parallel decode (peer-to-peer all-reduce, N ranks), also with MTP.
 - Image input (`image_url` data URLs) through the model's vision tower.
+- Host-RAM prompt-cache store with tiered KV precision, reasoning-token budget,
+  Q8 latent cache.
 
 ## Building and installing
 

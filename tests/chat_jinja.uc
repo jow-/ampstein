@@ -25,6 +25,7 @@
 import * as chat_jinja from 'ampstein.chat_jinja';
 import * as utpl from 'ampstein.utpl';
 import * as chat_qwen35 from 'ampstein.chat_qwen35';
+import * as chat_glm5 from 'ampstein.chat_glm5';
 import { readfile, stat } from 'fs';
 
 const DIR = `${sourcepath(0, true)}/fixtures`;
@@ -37,6 +38,11 @@ let FAMS = [
 	  cases: DIR + '/chat_qwen35_cases.json',
 	  field: 'expected',
 	  opts: chat_qwen35.tpl_opts },
+	{ name: 'glm5',
+	  tpl: DIR + '/chat_glm5_template.jinja',
+	  cases: DIR + '/chat_glm5.json',
+	  field: 'prompt',
+	  opts: chat_glm5.tpl_opts }
 ];
 
 let fails = 0, total = 0, ran = 0;
@@ -154,6 +160,28 @@ for (let fi = 0; fi < length(FAMS); fi++) {
 		      'qwen35: placeholder missing from the rendered text');
 		check(nth_occurrence_taint(r.segments, chat_qwen35.IMAGE_PLACEHOLDER, 0) == true,
 		      'qwen35: placeholder not in a trusted segment');
+	}
+	else {
+		let IMG = chat_glm5.IMAGE_PLACEHOLDER;
+		let M = () => [{ role: 'user', content: [
+			{ type: 'text', text: 'hi' },
+			{ type: 'image_url', image_url: { url: 'https://x/y.png' } }
+		] }];
+
+		/* vision on: image parts swapped for the marker (trusted) */
+		let r = render_prompt(M(), null, { vision: true });
+
+		check(length(r.images) == 1, 'glm5: vision: image part not collected');
+		check(index(r.text, IMG) >= 0, 'glm5: vision: marker missing');
+		check(nth_occurrence_taint(r.segments, IMG, 0) == true,
+		      'glm5: vision: marker span not trusted');
+
+		/* vision off: the template's reminder, nothing collected */
+		let r2 = render_prompt(M(), null, {});
+
+		check(length(r2.images) == 0, 'glm5: no-vision: part was collected');
+		check(index(r2.text, 'unable to process this image') >= 0,
+		      'glm5: no-vision: template reminder missing');
 	}
 }
 

@@ -53,6 +53,26 @@ foreach(h RANGE 1 3)
         ${EXL3_DIR}/quant/comp_units/exl3_gemv_int8_inst_sq_h${h}.cu)
 endforeach()
 
+# --- mixture of experts: fused token-sorted MoE (prefill / small batches) and
+# the fused decode-shaped MoE (two launches per layer), instances per K
+file(GLOB EXL3_MOE_INSTS ${EXL3_DIR}/quant/comp_units/exl3_moe_inst_*.cu)
+list(APPEND EXL3_KERNEL_SRCS
+    ${EXL3_DIR}/quant/exl3_moe.cu
+    ${EXL3_DIR}/quant/exl3_moe_coop.cu
+    ${EXL3_MOE_INSTS})
+
+foreach(k RANGE 1 8)
+    list(APPEND EXL3_KERNEL_SRCS
+        ${EXL3_DIR}/quant/comp_units/exl3_moe_coop_inst_k${k}.cu)
+endforeach()
+foreach(h RANGE 1 3)
+    list(APPEND EXL3_KERNEL_SRCS
+        ${EXL3_DIR}/quant/comp_units/exl3_moe_coop_inst_h${h}.cu)
+endforeach()
+
+# --- mHC mixing (GLM-5.3)
+list(APPEND EXL3_KERNEL_SRCS ${EXL3_DIR}/hc_mix.cu)
+
 add_library(exl3_kernels OBJECT ${EXL3_KERNEL_SRCS})
 
 target_include_directories(exl3_kernels PRIVATE

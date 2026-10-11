@@ -40,7 +40,11 @@ function usage() {
 	printf("  --tp                  tensor parallel\n");
 	printf("  --tp-share F          tensor-parallel share (two GPUs, default 0.5)\n");
 	printf("  --name NAME           served model name (default: basename of --model)\n");
+	printf("  --cache-ram GiB       page-locked host RAM for parked states (default 32, 0 off)\n");
+	printf("  --reasoning-nudge N   after N reason tokens append soft close nudge (default 0 off)\n");
+	printf("  --reasoning-limit Y   force-close reasoning after Y tokens (default 0 off)\n");
 	printf("  --no-vision           disable image input\n");
+	printf("  --arch ARCH           force architecture: auto|qwen35|glm5 (default auto)\n");
 	printf("  --version             print version and exit\n");
 	printf("  --help                print this help and exit\n");
 }
@@ -85,7 +89,14 @@ function parse_args() {
 		chunk: 1024,
 		mtp: 3,
 		draft_vocab: 0,
+		reasoning_nudge: 0,
+		reasoning_limit: 0,
+		cache_ram: 32,
+		cache_quant: null,
+		reasoning_nudge_text: null,
+		reasoning_close_text: null,
 		name: null,
+		arch: 'auto',
 		vision: true,
 		vision_device: 0,
 		image_max_pixels: 2097152,
@@ -112,13 +123,26 @@ function parse_args() {
 		case '--chunk': a.chunk = int(v); a.chunk_set = true; i++; break;
 		case '--name': a.name = v; i++; break;
 		case '--mtp': a.mtp = int(v); a.mtp_set = true; i++; break;
+		case '--cache-mode': a.cache_mode = uc(v); i++; break;
+		case '--reasoning-nudge': a.reasoning_nudge = int(v); i++; break;
+		case '--reasoning-limit': a.reasoning_limit = int(v); i++; break;
+		case '--cache-ram': a.cache_ram = +v; i++; break;
+		case '--cache-quant': a.cache_quant = (v == 'off') ? 'off' : (a.cache_quant || {}); i++; break;
+		case '--cache-quant-min': a.cache_quant = { ...(a.cache_quant || {}), min: int(v) }; i++; break;
+		case '--cache-quant-tail': a.cache_quant = { ...(a.cache_quant || {}), tail: int(v) }; i++; break;
+		case '--cache-quant-q8': a.cache_quant = { ...(a.cache_quant || {}), q8: int(v) }; i++; break;
+		case '--reasoning-nudge-text': a.reasoning_nudge_text = v; i++; break;
+		case '--reasoning-close-text': a.reasoning_close_text = v; i++; break;
 		case '--draft-vocab': a.draft_vocab = int(v); i++; break;
+		case '--arch': a.arch = v; i++; break;
 		case '--no-vision': a.vision = false; break;
+		case '--no-warmup': a.warmup = false; break;
 		case '--vision-device': a.vision_device = int(v); i++; break;
 		case '--image-max-pixels': a.image_max_pixels = int(v); i++; break;
 		case '--image-cache': a.image_cache = int(v); i++; break;
 		case '--tp': a.tp = true; break;
 		case '--tp-share': a.tp_share = +v; i++; break;
+		case '--stages': a.stages = int(v); i++; break;
 		default:
 			warn(`unknown argument '${k}'\n`);
 			exit(1);

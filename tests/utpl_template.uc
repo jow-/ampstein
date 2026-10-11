@@ -28,6 +28,8 @@ const DIR = `${sourcepath(0, true)}/fixtures`;
 let FAMS = [
 	{ tpl: DIR + '/chat_qwen35_template.jinja',
 	  cases: DIR + '/chat_qwen35_cases.json', field: 'expected' },
+	{ tpl: DIR + '/chat_glm5_template.jinja',
+	  cases: DIR + '/chat_glm5.json', field: 'prompt' }
 ];
 
 /* Generated fixtures (gitignored): skip, not fail, when absent (CTest
