@@ -20,6 +20,7 @@ reimplemented (QTIP trellis decoding has bit-exactness requirements).
 | Path | What |
 |---|---|
 | `src/torch/` | the `torch.so` module: tensors, safetensors, native bindings |
+| `vendor/exl3/` | exllamav3 kernels (MIT), see `vendor/exl3/VERSION`, `PATCHES.md` |
 | `cmake/` | libtorch download / cache |
 | `tests/` | ucode tests run by CTest; `tests/oracle/` generates fixtures (Python, test-only) |
 | `examples/` | small runnable scripts and benchmarks |
