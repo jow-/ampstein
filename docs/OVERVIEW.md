@@ -355,6 +355,15 @@ ampstein --model /data/models/Qwen3.8-27B-exl3-5.00bpw \
     --host 0.0.0.0 --port 8041 --ctx 65536 --mtp 3
 ```
 
+Qwen3.8-27B on two GPUs with tensor parallelism and the DFlash 2 drafter
+(see `docs/DFLASH.md`; needs the target and the `DFlash2` draft checkpoint):
+
+```sh
+ampstein --model /data/models/Qwen3.8-27B-exl3-5.00bpw --tp --ctx 262144 \
+    --dflash /data/models/Qwen3.8-27B-DFlash2-EXL3-4.00bpw \
+    --host 0.0.0.0 --port 8041
+```
+
 DeepSeek-V4 on six GPUs, as stages of tensor-parallel pairs, with the
 end-of-turn hook for agent use:
 
@@ -372,8 +381,9 @@ Common flags (`ampstein --help` lists them all):
 | `--ctx N` | maximum context in tokens |
 | `--gpus N`, `--split N` | devices used, layer-split boundary (two GPUs) |
 | `--tp`, `--stages N` | tensor parallel, number of pipeline stages |
-| `--mtp W` | speculative window (MTP head or DSpark drafter; 0 = off) |
-| `--chunk N` | prefill chunk size |
+| `--mtp W` | speculative window (MTP head or DSpark drafter; 0 = off); with `--dflash` the drafts per round (default 7) |
+| `--dflash DIR` | DFlash 2 drafter checkpoint (Qwen3.5 / 3.8, needs `--tp`) |
+| `--chunk N` | prefill chunk size (default 1024; 4096 for Qwen3.5 / 3.8 and Qwen-Flash-Next with `--tp`) |
 | `--cache-ram GiB` | pinned host RAM for parked conversations |
 | `--slots auto\|N` | resident device slots for parked conversations |
 | `--slice-tokens N` | time slice length for co-generation |
