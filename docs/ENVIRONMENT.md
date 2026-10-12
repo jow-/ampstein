@@ -160,6 +160,10 @@ Typical workflow (this is how the empty-split bug was found): run with
 | `AMP_QWEN4_MTP_TAP` | on (only `0` disables) | MTP input: per-stream stack (reference default) vs averaged. |
 | `AMP_QWEN4_NO_MTP_GRAPH` | unset | Do not CUDA-graph the MTP draft step. |
 | `AMP_GDN_CHUNK` | off (only `1` enables) | Block-parallel GDN scan from chunk length 64 up (`qwen35.uc`). Experimental, opt-in. |
+| `AMP_GDN_NO_ABG` **(opt-out)** | unset | Qwen3.5/3.8: compute the fp16 `in_proj_a` / `in_proj_b` products and the gates as separate launches for decode / verify rows instead of `torch.gdn_ab_gates`. |
+| `AMP_NO_MLP_BUNDLE` **(opt-out)** | unset | Qwen3.5/3.8: run gate and up as two GEMMs for decode / verify rows instead of one `mgemm` launch. |
+| `AMP_TP_PF_ROWS` | `--chunk` | Qwen3.5/3.8 TP: rows of the second P2P communicator used for prefill all-reduces (payloads above it take the peer-copy path). `0` disables it. ~`(2 * ranks + 2) * rows * hidden * 2` bytes per rank. |
+| `AMP_GDN_SCAN_CFG` | `0` (default shape) | GDN scan kernel shape, for experiments: `0` = register-blocked (`11`), `10`-`13` = other register-blocked shapes, `VT*100+RS` (e.g. `3204`, `6401`) = the per-column form. Read once at module load. |
 | `AMP_GDN_TRACE` | unset | See [Diagnostics](#gdn_trace). |
 
 ## GLM-5 (`src/ucode/ampstein/glm5.uc`, `src/ucode/ampstein/glm5_tp.uc`)

@@ -265,6 +265,50 @@ Add new lessons at the end of the matching section.
   by distance from the end) restores a 100k-token prefix in ~1 s against ~100 s
   of prefill. Log *why* a request did not reuse the live state.
 
+## Decode and prefill kernel latency (Qwen3.8-27B, 2 x 3090)
+
+- **L123 — A split-KV kernel must size its splits by the live length.**
+  `attn_decode` launched `4 * SMs / Hk` splits for every context, so a
+  300-token context ran 164 near-empty blocks and its combine kernel walked
+  164 workspace rows twice, serially (56 us at one row, 144 us at four, 16
+  layers: ~8% of a verify round). Both kernels derive the effective split
+  count from the device length (`amp_ad_nse`, at least 128 keys per split);
+  the workspace keeps the launch's layout.
+- **L124 — Count what a "small" op costs at the verify width.** The fp16
+  `in_proj_a/b` matmuls (24 columns) are a 3 us cuBLAS GEMV at one row but a
+  28 us cutlass WMMA kernel at four, two per GDN layer: ~9% of the verify
+  forward. `gdn_ab_gates` does both products and the gate math in one
+  launch. Profile at the speculative window, not at one row.
+- **L125 — The decode rmsnorm was latency-bound, not bandwidth-bound.** 2-byte
+  loads, 256 threads, two dependent passes: 12 us for 5120 elements, 130 per
+  round. 8-byte chunks with a block sized to the row: ~3 us.
+- **L126 — The GDN scan is shared-memory-instruction bound.** One thread per
+  state column needs its own LDS of every k / q element: ~1500 LDS wavefronts
+  per token per head, whatever the block shape. Register-blocking four
+  columns per thread with 128-bit loads, rows split over 8 lanes, and
+  `cp.async` double-buffered 16-token tiles took it from 1.26 to 0.47 us per
+  token (+9% prefill end to end). Splitting only the rows, or only
+  prefetching, gained 1.1-1.7x. Run micro-benchmarks for ~1 s so the clocks
+  ramp (L44).
+- **L127 — Near-tie flips in `qwen35_mtp`.** Changing the scan's summation
+  order moved the logit margin of one token from +0.047 to -0.008 (one fp16
+  ULP at 15.7) while the kernel still matched the fp32 reference to 1e-8. The
+  test now accepts a divergence only when the plain model's own logits tie
+  within 0.02 (L37, L88).
+- **L128 — Decode on this host is power-capped, not bandwidth-bound.** Both
+  cards sit at the 220 W software cap (SM 1.4-1.5 GHz of 2.1, DRAM ~54%
+  utilised): the EXL3 trellis decode is ALU work, so the clock is the limit.
+  `nvidia-smi -q -d PERFORMANCE` / `clocks_throttle_reasons.sw_power_cap`
+  confirms it before any kernel work is blamed.
+- **L129 — TP prefill idled the GPUs in the copy-path all-reduce.** Peer
+  `copy_` + three fp32 elementwise kernels per all-reduce kept both 3090s at
+  ~56% busy (the stalls were cross-device stream events, with neither card
+  computing). A second P2P communicator sized to the chunk (direct peer
+  stores, as GLM already does) gave +13% at chunk 2048 and, with 4096-row
+  chunks, 1.9-2.0k tok/s against 1.4k at the start. A double-buffered
+  two-half prefill with the copies on side streams measured no better than
+  the plain copy path (as for GLM, L94): fix the mechanism before overlapping.
+
 ## Qwen3.8-Flash-Next
 
 - **L98 — Bring-up.** A partial-model mode (`layers: N`) checks blocks 0-3 in
