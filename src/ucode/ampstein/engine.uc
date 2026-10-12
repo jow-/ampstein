@@ -2741,6 +2741,8 @@ export function create(model, opts) {
 
 		// the live state is in the entry now: the engine starts empty (the buffers are overwritten)
 		ids = [];
+		tsnap_ids = null;
+		tsnap_hidden = null;
 		snap_ids = null;
 		snap_aux = null;
 		snap_hidden = null;
@@ -3013,6 +3015,8 @@ export function create(model, opts) {
 
 		ids = ids_t.tolist();
 		cache.length = N;
+		tsnap_ids = null;
+		tsnap_hidden = null;
 		snap_ids = null;
 		snap_hidden = null;
 
