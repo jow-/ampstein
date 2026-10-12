@@ -125,6 +125,45 @@ expect_raise('gdn_ab_gates: too many rows', function () {
 
 	torch.gdn_ab_gates(x, w, w, f, f);
 });
+/* DFlash kernels */
+expect_raise('dflash_conv: wrong arg count', function () {
+	torch.dflash_conv(xc, xc, xc, 0);
+});
+expect_raise('dflash_conv: base shape', function () {
+	let d = torch.zeros([2, 4 * 8 / 4], 'float16', 'cuda');
+
+	torch.dflash_conv(xc, d, torch.zeros([2, 8], 'float16', 'cuda'), 0, 4);
+});
+expect_raise('dflash_conv: which out of range', function () {
+	let d = torch.zeros([2, 8], 'float16', 'cuda');
+	let b = torch.zeros([2, 2, 8], 'float16', 'cuda');
+
+	torch.dflash_conv(xc, d, b, 2, 4);
+});
+expect_raise('dflash_conv_res: h not fp32', function () {
+	let d = torch.zeros([2, 8], 'float16', 'cuda');
+	let b = torch.zeros([2, 2, 8], 'float16', 'cuda');
+
+	torch.dflash_conv_res(xc, xc, d, b, 0, 4, 1.0);
+});
+expect_raise('rms_norm_f32: fp16 input', function () {
+	torch.rms_norm_f32(xc, wc, 1e-6);
+});
+expect_raise('rms_norm_f32: weight size', function () {
+	torch.rms_norm_f32(torch.zeros([2, 8], 'float32', 'cuda'),
+		torch.zeros([4], 'float16', 'cuda'), 1e-6);
+});
+expect_raise('dflash_select: wrong arg count', function () {
+	torch.dflash_select(xc, xc);
+});
+expect_raise('dflash_select: cand not int64', function () {
+	let u = torch.zeros([2, 4], 'float32', 'cuda');
+	let hp = torch.zeros([2, 8], 'float16', 'cuda');
+	let cb = torch.zeros([16, 8], 'float16', 'cuda');
+	let an = torch.zeros([1], 'int64', 'cuda');
+
+	torch.dflash_select(u, torch.zeros([2, 4], 'float32', 'cuda'), hp, an, cb, cb);
+});
 expect_raise('rms_norm_res: dim %% 4 != 0', function () {
 	torch.rms_norm_res(xc, xc, torch.zeros([6], 'float16', 'cuda'), 1e-5);
 });

@@ -3787,6 +3787,24 @@ amp_gdn_ab_gates(const void *x, const void *wa, const void *wb,
                 int S, int K, int Hv, cudaStream_t stream);
 
 extern "C" int
+amp_dflash_conv(const void *h, const void *dyn, const void *base, void *out,
+               int R, int H, int G, long dstride, cudaStream_t stream);
+
+extern "C" int
+amp_rms_norm_f32in(const void *x, const void *w, void *out, long rows, int dim,
+                  double eps, cudaStream_t stream);
+
+extern "C" int
+amp_dflash_conv_res(void *h, const void *y, const void *dyn, const void *base,
+                   int R, int H, int G, long dstride, float scale,
+                   cudaStream_t stream);
+
+extern "C" int
+amp_dflash_select(const void *unary, const void *cand, const void *hp,
+                 const void *anchor, const void *pred, const void *succ,
+                 void *out, int W, int K, int R, cudaStream_t stream);
+
+extern "C" int
 amp_gdn_out_norm(const void *core, const void *z, const void *w, void *out,
                 long rows, int dv, float eps, cudaStream_t stream);
 
@@ -5169,15 +5187,15 @@ torch_gdn_prep(uc_vm_t *vm, size_t nargs)
 
 	/* snapshots: per-token copies of the conv state window (same
 	 * shape and layout as conv_state), written in the state kernel */
-	void *snap[4] = { NULL, NULL, NULL, NULL };
+	void *snap[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
 	int nsnap = 0;
 
 	if (nargs == 7 && ucv_type(specv) == UC_ARRAY) {
 		nsnap = (int)ucv_array_length(specv);
 
-		if (nsnap > 4 || nsnap > S) {
+		if (nsnap > 8 || nsnap > S) {
 			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
-				"gdn_prep: at most 4 snapshots, and not more than the rows");
+				"gdn_prep: at most 8 snapshots, and not more than the rows");
 			return NULL;
 		}
 
@@ -5350,6 +5368,239 @@ torch_gdn_ab_gates(uc_vm_t *vm, size_t nargs)
 		ucv_array_push(arr, tensor_wrap(vm, std::move(gexp), 0));
 
 		return arr;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * dflash_conv(h, dyn, base, which, group): torch.tensor
+ *
+ * DFlash 2 two-tap grouped dynamic causal convolution over one draft
+ * block (rows are positions; row 0 reads zero padding for tap 1):
+ *   out[r] = (base[which][0] + dyn[r][which][0][g]) * h[r]
+ *          + (base[which][1] + dyn[r][which][1][g]) * h[r - 1]
+ * h (R, H) fp16 contiguous; dyn (R, 2 * 2 * H / group) fp16 contiguous
+ * (the kernel projection's output, [which][tap][group]); base (2, 2, H)
+ * fp16 contiguous. Returns (R, H).
+ */
+static uc_value_t *
+torch_dflash_conv(uc_vm_t *vm, size_t nargs)
+{
+	int64_t which, group;
+
+	if (nargs != 5 || !arg_int(vm, uc_fn_arg(3), &which) ||
+	    !arg_int(vm, uc_fn_arg(4), &group)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (h, dyn, base, which, group)");
+		return NULL;
+	}
+
+	at::Tensor *h = fused_arg(vm, uc_fn_arg(0), "dflash_conv: h", false);
+	at::Tensor *dyn = h ? fused_arg(vm, uc_fn_arg(1), "dflash_conv: dyn", false) : NULL;
+	at::Tensor *base = dyn ? fused_arg(vm, uc_fn_arg(2), "dflash_conv: base", false) : NULL;
+
+	if (!base)
+		return NULL;
+
+	if (h->dim() != 2 || which < 0 || which > 1 || group < 1 ||
+	    base->dim() != 3 || base->size(0) != 2 || base->size(1) != 2 ||
+	    base->size(2) != h->size(1) || h->size(1) % group != 0 ||
+	    dyn->dim() != 2 || dyn->size(0) != h->size(0) ||
+	    dyn->size(1) != 4 * (h->size(1) / group)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"dflash_conv: incompatible shapes");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*h);
+
+	try {
+		int64_t R = h->size(0), H = h->size(1);
+		int64_t groups = H / group;
+		at::Tensor out = at::empty_like(*h);
+
+		/* dyn is [which][tap][group] per row: this call's two taps */
+		const __half *dp = (const __half *)dyn->data_ptr() + which * 2 * groups;
+		const __half *bp = (const __half *)base->data_ptr() + which * 2 * H;
+
+		int rc = amp_dflash_conv(h->data_ptr(), dp, bp, out.data_ptr(), (int)R,
+			(int)H, (int)group, (long)dyn->size(1),
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "dflash_conv"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * rms_norm_f32(x, weight, eps): torch.tensor
+ *
+ * RMSNorm of an fp32 (R, H) tensor to fp16: fp16(x * rsqrt(mean(x^2) +
+ * eps)) * weight, the rounding points of rms_norm. weight (H) fp16.
+ */
+static uc_value_t *
+torch_rms_norm_f32(uc_vm_t *vm, size_t nargs)
+{
+	double eps;
+
+	if (nargs != 3 || !arg_number(vm, uc_fn_arg(2), &eps)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (x, weight, eps)");
+		return NULL;
+	}
+
+	at::Tensor *x = f32_arg(vm, uc_fn_arg(0), "rms_norm_f32: x");
+	at::Tensor *w = x ? fused_arg(vm, uc_fn_arg(1), "rms_norm_f32: weight", false) : NULL;
+
+	if (!w)
+		return NULL;
+
+	if (x->dim() != 2 || !x->is_contiguous() || w->numel() != x->size(1) ||
+	    x->device() != w->device()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"rms_norm_f32: x must be contiguous (R, H) fp32 and weight (H) on its device");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		at::Tensor out = at::empty(x->sizes(), x->options().dtype(at::kHalf));
+		int rc = amp_rms_norm_f32in(x->data_ptr(), w->data_ptr(), out.data_ptr(),
+			(long)x->size(0), (int)x->size(1), eps,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "rms_norm_f32"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * dflash_conv_res(h, y, dyn, base, which, group, scale): h
+ *
+ * h (R, H) fp32 += scale * conv2(y) in place, conv2 as dflash_conv.
+ * Returns h.
+ */
+static uc_value_t *
+torch_dflash_conv_res(uc_vm_t *vm, size_t nargs)
+{
+	int64_t which, group;
+	double scale;
+
+	if (nargs != 7 || !arg_int(vm, uc_fn_arg(4), &which) ||
+	    !arg_int(vm, uc_fn_arg(5), &group) || !arg_number(vm, uc_fn_arg(6), &scale)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (h, y, dyn, base, which, group, scale)");
+		return NULL;
+	}
+
+	at::Tensor *h = f32_arg(vm, uc_fn_arg(0), "dflash_conv_res: h");
+	at::Tensor *y = h ? fused_arg(vm, uc_fn_arg(1), "dflash_conv_res: y", false) : NULL;
+	at::Tensor *dyn = y ? fused_arg(vm, uc_fn_arg(2), "dflash_conv_res: dyn", false) : NULL;
+	at::Tensor *base = dyn ? fused_arg(vm, uc_fn_arg(3), "dflash_conv_res: base", false) : NULL;
+
+	if (!base)
+		return NULL;
+
+	if (h->dim() != 2 || !h->is_contiguous() || y->sizes() != h->sizes() ||
+	    which < 0 || which > 1 || group < 1 || base->dim() != 3 ||
+	    base->size(0) != 2 || base->size(1) != 2 || base->size(2) != h->size(1) ||
+	    h->size(1) % group != 0 || dyn->dim() != 2 || dyn->size(0) != h->size(0) ||
+	    dyn->size(1) != 4 * (h->size(1) / group) || y->device() != h->device() ||
+	    dyn->device() != h->device() || base->device() != h->device()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"dflash_conv_res: incompatible shapes or devices");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*h);
+
+	try {
+		int64_t R = h->size(0), H = h->size(1);
+		int64_t groups = H / group;
+		const __half *dp = (const __half *)dyn->data_ptr() + which * 2 * groups;
+		const __half *bp = (const __half *)base->data_ptr() + which * 2 * H;
+
+		int rc = amp_dflash_conv_res(h->data_ptr(), y->data_ptr(), dp, bp,
+			(int)R, (int)H, (int)group, (long)dyn->size(1), (float)scale,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "dflash_conv_res"))
+			return NULL;
+
+		return ucv_get(uc_fn_arg(0));
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * dflash_select(unary, cand, hp, anchor, pred_codebook, succ_codebook):
+ * torch.tensor
+ *
+ * The DFlash 2 candidate selector's greedy walk (see amp_kernels.cu):
+ * unary (W, K) fp32, cand (W, K) int64, hp (W, R) fp16 (the hidden
+ * projection of the draft hidden), anchor (1) int64, pred / succ
+ * codebooks (V, R) fp16. Returns the chosen token ids (W) int64.
+ */
+static uc_value_t *
+torch_dflash_select(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 6) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (unary, cand, hp, anchor, pred_codebook, succ_codebook)");
+		return NULL;
+	}
+
+	at::Tensor *un = f32_arg(vm, uc_fn_arg(0), "dflash_select: unary");
+	at::Tensor *cd = un ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *hp = cd ? fused_arg(vm, uc_fn_arg(2), "dflash_select: hp", false) : NULL;
+	at::Tensor *an = hp ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+	at::Tensor *pr = an ? fused_arg(vm, uc_fn_arg(4), "dflash_select: pred", false) : NULL;
+	at::Tensor *sc = pr ? fused_arg(vm, uc_fn_arg(5), "dflash_select: succ", false) : NULL;
+
+	if (!sc)
+		return NULL;
+
+	if (un->dim() != 2 || cd->scalar_type() != at::kLong || !cd->is_contiguous() ||
+	    cd->sizes() != un->sizes() || hp->dim() != 2 || hp->size(0) != un->size(0) ||
+	    an->scalar_type() != at::kLong || an->numel() != 1 ||
+	    pr->dim() != 2 || pr->sizes() != sc->sizes() || pr->size(1) != hp->size(1) ||
+	    un->size(1) > 32 || hp->size(1) > 1024 || un->size(0) < 1 ||
+	    cd->device() != un->device() || hp->device() != un->device() ||
+	    an->device() != un->device() || pr->device() != un->device() ||
+	    sc->device() != un->device()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"dflash_select: incompatible shapes, dtypes or devices");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*un);
+
+	try {
+		int64_t W = un->size(0), K = un->size(1), R = hp->size(1);
+		at::Tensor out = at::empty({ W }, cd->options());
+
+		int rc = amp_dflash_select(un->data_ptr(), cd->data_ptr(), hp->data_ptr(),
+			an->data_ptr(), pr->data_ptr(), sc->data_ptr(), out.data_ptr(),
+			(int)W, (int)K, (int)R, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "dflash_select"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
 	}
 	catch (const std::exception &e) {
 		RAISE(e.what());
@@ -8891,6 +9142,10 @@ static const uc_function_list_t torch_fns[] = {
 	{ "gdn_prep",	torch_gdn_prep },
 	{ "gdn_gates",	torch_gdn_gates },
 	{ "gdn_ab_gates",	torch_gdn_ab_gates },
+	{ "dflash_conv",	torch_dflash_conv },
+	{ "dflash_select",	torch_dflash_select },
+	{ "rms_norm_f32",	torch_rms_norm_f32 },
+	{ "dflash_conv_res",	torch_dflash_conv_res },
 	{ "gdn_out_norm",	torch_gdn_out_norm },
 	{ "flash_attn",	torch_flash_attn },
 	{ "rms_norm_res",	torch_rms_norm_res },

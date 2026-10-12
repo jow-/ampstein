@@ -1563,7 +1563,7 @@ __global__ void amp_gdn_prep_kernel(const __half *__restrict__ qkv,
 /* Per-token snapshots of the conv state for the speculative verify:
  * snapshot t is the window of K-1 padded inputs ending at token t,
  * (D, K-1) like the state itself. */
-#define AMP_GDN_SPEC_MAX 4
+#define AMP_GDN_SPEC_MAX 8
 
 struct amp_gdn_spec {
 	__half *p[AMP_GDN_SPEC_MAX];
@@ -1779,6 +1779,252 @@ amp_gdn_ab_gates(const void *x, const void *wa, const void *wb,
 		(const __half *)x, (const __half *)wa, (const __half *)wb,
 		(const float *)dt_bias, (const float *)nea, (float *)beta,
 		(float *)gexp, S, K, Hv);
+
+	return (int)cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// DFlash 2 drafter (docs/DFLASH.md)
+//
+// amp_dflash_conv: the two-tap grouped dynamic causal convolution of one
+// draft block, fused: out[r, c] = (base[0][c] + dyn[r, 0, c / G]) * h[r, c]
+//                              + (base[1][c] + dyn[r, 1, c / G]) * h[r - 1, c]
+// (h[-1] = 0: taps never cross the block start). h (R, H) fp16; dyn: row
+// stride `dstride` elements, [tap][group] contiguous from `dyn`; base
+// (2, H) fp16 [tap][channel]. fp32 math, one rounding.
+//
+// amp_dflash_select: the candidate selector's walk. For position p, with
+// predecessor q (the anchor for p = 0, else the token chosen at p - 1):
+//   score(k) = unary[p, k] + < pred[q] * hp[p], succ[cand[p, k]] >
+// and the chosen token is cand[p, argmax_k score(k)]. One block, the
+// positions are sequential (each depends on the previous choice).
+// ---------------------------------------------------------------------------
+
+__global__ void amp_dflash_conv_kernel(const __half *__restrict__ h,
+                                      const __half *__restrict__ dyn,
+                                      const __half *__restrict__ base,
+                                      __half *__restrict__ out, int H, int G,
+                                      long dstride)
+{
+	const int r = blockIdx.x;
+	const int groups = H / G;
+
+	for (int c = threadIdx.x; c < H; c += blockDim.x) {
+		const int g = c / G;
+		float k0 = __half2float(base[c]) +
+			__half2float(dyn[(size_t)r * dstride + g]);
+		float k1 = __half2float(base[H + c]) +
+			__half2float(dyn[(size_t)r * dstride + groups + g]);
+		float v = k0 * __half2float(h[(size_t)r * H + c]);
+
+		if (r > 0)
+			v += k1 * __half2float(h[(size_t)(r - 1) * H + c]);
+
+		out[(size_t)r * H + c] = __float2half(v);
+	}
+}
+
+extern "C" int
+amp_dflash_conv(const void *h, const void *dyn, const void *base, void *out,
+               int R, int H, int G, long dstride, cudaStream_t stream)
+{
+	if (R <= 0)
+		return 0;
+
+	if (H <= 0 || G <= 0 || H % G != 0) {
+		fprintf(stderr, "amp_dflash_conv: unsupported H %d / group %d\n", H, G);
+		return -1;
+	}
+
+	amp_dflash_conv_kernel<<<R, 256, 0, stream>>>((const __half *)h,
+		(const __half *)dyn, (const __half *)base, (__half *)out, H, G, dstride);
+
+	return (int)cudaGetLastError();
+}
+
+// DFlash residual-stream kernels (fp32 stream: the drafter's attention /
+// MLP outputs carry ~5e3 massive-activation channels that overflow fp16
+// after a layer or two; its reference runs in bf16).
+//   amp_rms_norm_f32in: out = fp16(x * rsqrt(mean(x^2) + eps)) * w
+//   amp_dflash_conv_res: h += scale * conv2(y)   (h fp32 in place)
+__global__ void amp_rms_norm_f32in_kernel(const float *__restrict__ x,
+                                         const __half *__restrict__ w,
+                                         __half *__restrict__ out, int dim,
+                                         float eps)
+{
+	const int row = blockIdx.x;
+	const float *xr = x + (size_t)row * dim;
+	float acc = 0.0f;
+
+	for (int i = threadIdx.x; i < dim; i += blockDim.x)
+		acc += xr[i] * xr[i];
+
+#pragma unroll
+	for (int off = 16; off > 0; off >>= 1)
+		acc += __shfl_down_sync(0xffffffffu, acc, off);
+
+	__shared__ float warp_sum[32];
+
+	if ((threadIdx.x & 31) == 0)
+		warp_sum[threadIdx.x >> 5] = acc;
+
+	__syncthreads();
+
+	if (threadIdx.x == 0) {
+		float total = 0.0f;
+
+		for (int i = 0; i < (int)(blockDim.x >> 5); i++)
+			total += warp_sum[i];
+
+		warp_sum[0] = rsqrtf(total / dim + eps);
+	}
+
+	__syncthreads();
+
+	const float sc = warp_sum[0];
+
+	for (int i = threadIdx.x; i < dim; i += blockDim.x)
+		out[(size_t)row * dim + i] = __hmul(__float2half(xr[i] * sc), w[i]);
+}
+
+extern "C" int
+amp_rms_norm_f32in(const void *x, const void *w, void *out, long rows, int dim,
+                  double eps, cudaStream_t stream)
+{
+	if (rows <= 0 || dim <= 0)
+		return 0;
+
+	amp_rms_norm_f32in_kernel<<<(int)rows, 256, 0, stream>>>((const float *)x,
+		(const __half *)w, (__half *)out, dim, (float)eps);
+
+	return (int)cudaGetLastError();
+}
+
+__global__ void amp_dflash_conv_res_kernel(float *__restrict__ h,
+                                          const __half *__restrict__ y,
+                                          const __half *__restrict__ dyn,
+                                          const __half *__restrict__ base,
+                                          int H, int G, long dstride,
+                                          float scale)
+{
+	const int r = blockIdx.x;
+	const int groups = H / G;
+
+	for (int c = threadIdx.x; c < H; c += blockDim.x) {
+		const int g = c / G;
+		float k0 = __half2float(base[c]) +
+			__half2float(dyn[(size_t)r * dstride + g]);
+		float k1 = __half2float(base[H + c]) +
+			__half2float(dyn[(size_t)r * dstride + groups + g]);
+		float v = k0 * __half2float(y[(size_t)r * H + c]);
+
+		if (r > 0)
+			v += k1 * __half2float(y[(size_t)(r - 1) * H + c]);
+
+		h[(size_t)r * H + c] += scale * v;
+	}
+}
+
+extern "C" int
+amp_dflash_conv_res(void *h, const void *y, const void *dyn, const void *base,
+                   int R, int H, int G, long dstride, float scale,
+                   cudaStream_t stream)
+{
+	if (R <= 0)
+		return 0;
+
+	if (H <= 0 || G <= 0 || H % G != 0) {
+		fprintf(stderr, "amp_dflash_conv_res: unsupported H %d / group %d\n", H, G);
+		return -1;
+	}
+
+	amp_dflash_conv_res_kernel<<<R, 256, 0, stream>>>((float *)h,
+		(const __half *)y, (const __half *)dyn, (const __half *)base, H, G,
+		dstride, scale);
+
+	return (int)cudaGetLastError();
+}
+
+#define AMP_DFS_THREADS 256
+#define AMP_DFS_MAXK 32
+
+__global__ void amp_dflash_select_kernel(const float *__restrict__ unary,
+                                        const long *__restrict__ cand,
+                                        const __half *__restrict__ hp,
+                                        const long *__restrict__ anchor,
+                                        const __half *__restrict__ pred,
+                                        const __half *__restrict__ succ,
+                                        long *__restrict__ out, int W, int K,
+                                        int R)
+{
+	__shared__ float prod[1024];
+	__shared__ float score[AMP_DFS_MAXK];
+	__shared__ long prev;
+
+	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+	const int nwarp = blockDim.x >> 5;
+
+	if (threadIdx.x == 0)
+		prev = anchor[0];
+
+	__syncthreads();
+
+	for (int p = 0; p < W; p++) {
+		for (int t = threadIdx.x; t < R; t += blockDim.x)
+			prod[t] = __half2float(pred[(size_t)prev * R + t]) *
+				__half2float(hp[(size_t)p * R + t]);
+
+		__syncthreads();
+
+		for (int k = warp; k < K; k += nwarp) {
+			const __half *sr = succ + (size_t)cand[(size_t)p * K + k] * R;
+			float d = 0.0f;
+
+			for (int t = lane; t < R; t += 32)
+				d += prod[t] * __half2float(sr[t]);
+
+#pragma unroll
+			for (int off = 16; off > 0; off >>= 1)
+				d += __shfl_down_sync(0xffffffffu, d, off);
+
+			if (lane == 0)
+				score[k] = unary[(size_t)p * K + k] + d;
+		}
+
+		__syncthreads();
+
+		if (threadIdx.x == 0) {
+			int best = 0;
+
+			for (int k = 1; k < K; k++)
+				if (score[k] > score[best])
+					best = k;
+
+			prev = cand[(size_t)p * K + best];
+			out[p] = prev;
+		}
+
+		__syncthreads();
+	}
+}
+
+extern "C" int
+amp_dflash_select(const void *unary, const void *cand, const void *hp,
+                 const void *anchor, const void *pred, const void *succ,
+                 void *out, int W, int K, int R, cudaStream_t stream)
+{
+	if (W <= 0)
+		return 0;
+
+	if (K < 1 || K > AMP_DFS_MAXK || R < 1 || R > 1024) {
+		fprintf(stderr, "amp_dflash_select: unsupported K %d / rank %d\n", K, R);
+		return -1;
+	}
+
+	amp_dflash_select_kernel<<<1, AMP_DFS_THREADS, 0, stream>>>(
+		(const float *)unary, (const long *)cand, (const __half *)hp,
+		(const long *)anchor, (const __half *)pred, (const __half *)succ,
+		(long *)out, W, K, R);
 
 	return (int)cudaGetLastError();
 }
