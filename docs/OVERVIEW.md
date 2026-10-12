@@ -289,7 +289,7 @@ orders of magnitude, not as a benchmark suite.
 |---|---|---|---|---|
 | Llama-3.2-1B, 4.0 bpw | 1 × 3090 | 350-380 tok/s (exllamav3: ~300) | — | — |
 | Qwen3.8-27B, 5-6 bpw (hybrid) | two-GPU host, 2 × 3090, layer split | ~25-28 tok/s | 40-65 tok/s (MTP) | 1.0-1.3k tok/s |
-| Qwen3.8-27B, 5-6 bpw | two-GPU host, 2 × 3090, TP | ~33 tok/s | 53-83 tok/s (MTP) | — |
+| Qwen3.8-27B, 5-6 bpw | two-GPU host, 2 × 3090, TP | ~33 tok/s | 53-83 tok/s (MTP); 98-214 tok/s (DFlash 2, `docs/DFLASH.md`) | ~1.9k tok/s |
 | Qwen3.8-27B, 6.0 bpw | six-GPU host, 6 GPUs, layer split | ~25 tok/s | — | — |
 | Qwen3.8-27B, 6.0 bpw | six-GPU host, 6 GPUs, TP over 2 / 3 / 4 / 6 ranks | 37 / 46 / 54 / 57 tok/s | — | — |
 | Qwen3.8-Flash-Next, 6 bpw (MoE, ~100 GB) | six-GPU host, 3 stages × TP-2 | ~43 tok/s | 52-77 tok/s (MTP) | 2.0-2.1k tok/s at 32k depth |
@@ -450,6 +450,6 @@ that are not busy serving; many skip (exit 125) when they can't run.
 | `docs/MEMORY.md` | memory model: no late allocations, KV growth |
 | `docs/PARALLEL.md` | multi-GPU placement over slow links |
 | `docs/SESSIONS.md` | session parking, RAM store, slicing |
-| `docs/QWEN4.md`, `docs/GLM5.md`, `docs/DSV4.md` | model families |
+| `docs/QWEN4.md`, `docs/GLM5.md`, `docs/DSV4.md`, `docs/DFLASH.md` | model families, the DFlash drafter |
 | `docs/TELEMETRY.md` | statistics collection (proposal) |
 | `LESSONS.md`, `ENVIRONMENT.md`, `../AGENTS.md` | lessons, environment variables, operating guide |

@@ -41,6 +41,8 @@ Engine features:
 - MTP speculative decoding with the checkpoint's own draft head, an event-driven
   decode loop and exact speculative sampling.
 - Tensor-parallel decode (peer-to-peer all-reduce, N ranks), also with MTP.
+- DFlash 2 block drafter for Qwen3.8-27B (`--tp --dflash DIR`, `docs/DFLASH.md`):
+  7 drafts per round, 1.2-2x the MTP decode speed on two 3090s.
 - Image input (`image_url` data URLs) through the model's vision tower.
 - Host-RAM prompt-cache store with tiered KV precision, reasoning-token budget,
   Q8 latent cache.

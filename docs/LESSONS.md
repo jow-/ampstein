@@ -308,6 +308,19 @@ Add new lessons at the end of the matching section.
   chunks, 1.9-2.0k tok/s against 1.4k at the start. A double-buffered
   two-half prefill with the copies on side streams measured no better than
   the plain copy path (as for GLM, L94): fix the mechanism before overlapping.
+- **L130 — A bf16 drafter overflows fp16 on its massive channels.** DFlash 2's
+  attention output carries ~5e3 in one channel from layer 0 (`h` reached 4.8e4
+  after one layer and inf after two); the same weights are fine in bf16. Keep
+  the residual stream in fp32 and pre-scale the producing projections' `svh`
+  (exact, the output scale is linear). The EXL3 linears themselves matched
+  the bf16 checkpoint to 7% rel-rms (4 bpw): check each primitive against the
+  unquantized weights before suspecting the architecture.
+- **L131 — A 7-row verify costs what a 3-row one does.** With the gemms on
+  16-row MMA tiles the verify forward stayed ~26 ms from 3 to 7 rows, so the
+  window is nearly free and the drafter quality decides: MTP at 3 drafts
+  accepts 2.2-2.9 tokens per round, DFlash 2 at 7 drafts 3.2-6.9. The only
+  new cost is attention for > 5 rows (two `attn_decode` row groups; the FA2
+  path sizes its work by the cache capacity, L71).
 
 ## Qwen3.8-Flash-Next
 
