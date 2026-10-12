@@ -424,7 +424,10 @@ export function create(model, opts) {
 	// decode) and 1..W (MTP verify windows and replays). Captured now,
 	// before any prefill — the eager warmup inside clobbers the cache,
 	// which reset_state() below clears.
-	let mtp_planned = (model.mtp && opts.mtp_window > 0) ? opts.mtp_window : 0;
+	// DFlash 2 block drafter (qwen35_tp + dflash.uc): replaces the draft CHAIN of the MTP round,
+	// everything after it (verify window, GDN rollback, acceptance) is shared
+	let DF = model.dflash || null;
+	let mtp_planned = ((model.mtp || DF) && opts.mtp_window > 0) ? opts.mtp_window : 0;
 	let graph = null;
 
 	// per-position GDN states for MTP verify (W >= 2): the W-token verify
@@ -500,6 +503,13 @@ export function create(model, opts) {
 			SP.build(graph, cache, wins);
 		}
 
+		if (DF && mtp_planned > 0) {
+			if (!graph || !graph.feat || !graph.has(mtp_planned) || DF.W != mtp_planned)
+				die(`engine: the DFlash drafter needs the captured verify graph (window ${DF.W})`);
+
+			DF.build(() => graph.feat(mtp_planned));
+		}
+
 		zero_states();
 	}
 
@@ -507,7 +517,8 @@ export function create(model, opts) {
 	// head): the draft cache mirrors the target positions; generation
 	// then runs in rounds (draft W tokens, verify them in one target
 	// forward, accept by the speculative-sampling rule).
-	let M = model.mtp;
+	let M = model.mtp || DF;
+	let df_pprev = null;     // DFlash: position of the last verify's first row (its taps are fresh)
 
 	let mtp_w = (M && opts.mtp_window > 0) ? opts.mtp_window : 0;
 	let hid_w = model.hidden_width || cfg.hidden_size;     // width of the draft head's hidden input
@@ -597,6 +608,11 @@ export function create(model, opts) {
 		draft_len = length(ids);
 		last_hidden = snap_hidden;
 
+		if (DF) {
+			DF.reset();
+			df_pprev = null;
+		}
+
 		if (model.aux_set && snap_aux)
 			model.aux_set(cache, snap_aux);
 	}
@@ -611,6 +627,11 @@ export function create(model, opts) {
 		snap_hidden = null;
 		draft_len = 0;
 		last_hidden = null;
+
+		if (DF) {
+			DF.reset();
+			df_pprev = null;
+		}
 	}
 
 	/* Target forward of a few tokens at the cache's current length
@@ -1660,7 +1681,7 @@ export function create(model, opts) {
 
 		// MTP needs the draft cache in step with the target up to the
 		// reuse point, and the target hidden state just before it
-		j.use_mtp = mtp_w > 0 && (plan.start == 0 ||
+		j.use_mtp = mtp_w > 0 && (DF || plan.start == 0 ||
 			(last_hidden != null && draft_len == plan.start));
 		j.use_dspark = !!(SP && graph && graph.has(1) && !j.no_dspark);
 
@@ -1678,15 +1699,24 @@ export function create(model, opts) {
 		let snap_at = (j.snap_at && j.snap_at > j.pos && j.snap_at < length(j.ids)) ?
 			j.snap_at : 0;
 
-		if (j.use_mtp)
+		if (j.use_mtp && !DF)
 			seed_start(j);
+
+		// DFlash: only the newest window of the prompt matters to the drafter
+		let df_from = DF ? length(j.ids) - DF.window - 64 : 0;
+
+		df_pprev = null;
 
 		let popts = {
 			chunk: chunk,
 			cuts: snap_at ? [ snap_at ] : [],
-			hidden: j.use_mtp,
-			on_hidden: j.use_mtp ? (pos, H) => seed_chunk(j, pos, H) : null,
-			on_taps: SP ? (taps, pos) => SP.prefill_rows(taps, pos) : null,
+			hidden: j.use_mtp && !DF,
+			on_hidden: (j.use_mtp && !DF) ? (pos, H) => seed_chunk(j, pos, H) : null,
+			on_taps: SP ? (taps, pos) => SP.prefill_rows(taps, pos) :
+				DF ? function (taps, pos) {
+					if (pos + taps[0].shape()[1] > df_from)
+						DF.prefill_rows(taps, pos);
+				} : null,
 			on_layer: function (chunk_end, li) {
 				if (!snap_at || chunk_end != snap_at || !snap[li])
 					return;
@@ -1974,7 +2004,9 @@ export function create(model, opts) {
 		if (model.aux_ids)
 			model.aux_ids(cache, ids);
 
-		dc.length = p_new + 1;
+		if (dc)
+			dc.length = p_new + 1;
+
 		draft_len = p_new + 1;
 		last_hidden = H.add(0.0);     // a copy: graph buffers are reused
 		j.t_next = (a < W) ? bonus : c[W];
@@ -2089,10 +2121,16 @@ export function create(model, opts) {
 		// verify graph (the eager fallback scores host ids) and the plain
 		// lm_head; the sampled walk and the TP sharded draft head stay
 		// synchronous below.
-		if (temp <= 0 && !sharded && !draft_head && graph &&
+		if (temp <= 0 && (DF || (!sharded && !draft_head)) && graph &&
 		    graph.has(W) && graph.run_dev) {
 			c_dev.narrow(0, 0, 1).fill_(j.t_next);
 
+			if (DF) {
+				// the block drafter's W ids land in c_dev[1 .. W] on the device
+				DF.draft_async(j.t_next, df_pprev, cache.length, c_dev.narrow(0, 1, W));
+				df_pprev = cache.length;
+			}
+			else
 			for (let k = 1; k <= W; k++) {
 				let r = mtp_run_ids(c_dev.narrow(0, k - 1, 1).view([1, 1]),
 					D, p + k, model.lm_head);
@@ -2134,6 +2172,15 @@ export function create(model, opts) {
 			return;
 		}
 
+		if (DF) {
+			// one block-diffusion pass proposes the W drafts (greedy walk of the
+			// candidate selector: a deterministic one-hot proposal, lossless under
+			// the acceptance rules below); its context rows are the last verify's
+			// taps, fresh in the graph's buffers when df_pprev is set
+			push(c, ...DF.draft(j.t_next, df_pprev, cache.length));
+			df_pprev = cache.length;
+		}
+		else
 		for (let k = 1; k <= W; k++) {
 			let r = mtp_run([c[k - 1]], D, p + k, sharded ? null : (draft_head || model.lm_head));
 
@@ -2399,7 +2446,9 @@ export function create(model, opts) {
 
 			// (the draft cache was seeded chunk by chunk, seed_chunk)
 			if (j.use_mtp) {
-				dc.length = total;
+				if (dc)
+					dc.length = total;
+
 				draft_len = total;
 			}
 
@@ -2407,11 +2456,11 @@ export function create(model, opts) {
 
 			if (j.snap_taken) {
 				snap_ids = slice(j.ids, 0, j.snap_at);
-				snap_hidden = j.use_mtp ? j.snap_hid : null;
+				snap_hidden = (j.use_mtp && !DF) ? j.snap_hid : null;
 				snap_aux = j.snap_aux;
 			}
 
-			if (j.use_mtp)
+			if (j.use_mtp && !DF)
 				last_hidden = seed_prev;           // (aliases the persistent buffer; copied on reuse)
 			j.snap_hid = null;
 
@@ -2602,7 +2651,12 @@ export function create(model, opts) {
 
 			// the MTP chain needs the draft cache and hidden of exactly this position; without
 			// them (a state stored without a draft) the rest of the job decodes plainly
-			if (j.phase == 'mtp' && !(cache.mtp && draft_len == cache.length && last_hidden != null)) {
+			if (DF) {
+				// the drafter ring is not stored: it refills from the next rounds' taps
+				DF.reset();
+				df_pprev = null;
+			}
+			else if (j.phase == 'mtp' && !(cache.mtp && draft_len == cache.length && last_hidden != null)) {
 				j.use_mtp = false;
 				j.phase = 'decode';
 				j.logits = step_fwd([ j.t_next ]);
@@ -2839,7 +2893,7 @@ export function create(model, opts) {
 			for (let i = 0; i < n; i++)
 				push(wids, 0);
 
-			let popts = {chunk: n, cuts: [], hidden: W > 0};
+			let popts = {chunk: n, cuts: [], hidden: W > 0 && !DF};
 			let run = model.prefill_pipeline ?
 				model.prefill_pipeline(cache, wids, popts) :
 				qwen35.prefill_pipeline(model, cache, wids, popts);
@@ -2859,13 +2913,15 @@ export function create(model, opts) {
 
 				step_fwd(w);
 
-				let D = torch.zeros([ 1, 1, H ], 'float16', 'cuda:' + M.dev);
+				if (!DF) {
+					let D = torch.zeros([ 1, 1, H ], 'float16', 'cuda:' + M.dev);
 
-				for (let k = 0; k < W; k++)
-					D = mtp_run([ 0 ], D, pos0 + k, model.lm_head).hidden;
+					for (let k = 0; k < W; k++)
+						D = mtp_run([ 0 ], D, pos0 + k, model.lm_head).hidden;
 
-				if (hid)
-					mtp_run(slice(wids, 0, 2), hid.narrow(1, 0, 2).contiguous(), pos0, null);
+					if (hid)
+						mtp_run(slice(wids, 0, 2), hid.narrow(1, 0, 2).contiguous(), pos0, null);
+				}
 			}
 
 			torch.synchronize();

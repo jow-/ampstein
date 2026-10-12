@@ -36,7 +36,8 @@ function usage() {
 	printf("  --gpus N              number of GPUs (default: all)\n");
 	printf("  --split N             layers per GPU (layer split)\n");
 	printf("  --chunk N             prefill chunk size (default 1024)\n");
-	printf("  --mtp N               speculative MTP window (default 3)\n");
+	printf("  --mtp N               speculative MTP window (default 3; 7 with --dflash)\n");
+	printf("  --dflash DIR          DFlash 2 drafter (Qwen3.5/3.8 --tp): --mtp N is its window\n");
 	printf("  --tp                  tensor parallel\n");
 	printf("  --tp-share F          tensor-parallel share (two GPUs, default 0.5)\n");
 	printf("  --name NAME           served model name (default: basename of --model)\n");
@@ -133,6 +134,7 @@ function parse_args() {
 		case '--chunk': a.chunk = int(v); a.chunk_set = true; i++; break;
 		case '--name': a.name = v; i++; break;
 		case '--mtp': a.mtp = int(v); a.mtp_set = true; i++; break;
+		case '--dflash': a.dflash = v; i++; break;
 		case '--cache-mode': a.cache_mode = uc(v); i++; break;
 		case '--reasoning-nudge': a.reasoning_nudge = int(v); i++; break;
 		case '--reasoning-limit': a.reasoning_limit = int(v); i++; break;

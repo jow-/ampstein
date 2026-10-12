@@ -362,7 +362,40 @@ export function shard(model, opts) {
 
 			s = allreduce(this, p);
 
-			return map(h, (x, g) => x.add(s[g]));
+			let hn = map(h, (x, g) => x.add(s[g]));
+
+			// drafter taps (DFlash): the residual stream after layer i
+			// (replicated: rank 0's copy). The tensors are fresh per
+			// layer, so holding them costs no copy.
+			if (this.cap && this.cap.at['' + i] != null)
+				this.cap.out[this.cap.at['' + i]] = hn[0];
+
+			return hn;
+		},
+
+		/* Set (ids: array of layer indices) or clear (null) the drafter
+		 * taps: forward() then returns {feat: [per tap (1, S, H)]} and the
+		 * captured graphs record the taps of their rows. */
+		set_taps: function (ids) {
+			this.tap_ids = ids;
+			this.tap_at = {};
+
+			for (let k = 0; k < length(ids || []); k++)
+				this.tap_at['' + ids[k]] = k;
+		},
+
+		tap_start: function () {
+			if (!this.tap_ids)
+				return null;
+
+			let out = [];
+
+			for (let k = 0; k < length(this.tap_ids); k++)
+				push(out, null);
+
+			this.cap = {at: this.tap_at, out: out};
+
+			return out;
 		},
 
 		/* Logits gathered on rank 0 for the last `rows` positions (null:
@@ -487,6 +520,9 @@ export function shard(model, opts) {
 
 						d.pos_idx = d.ramp.add(d.pos);
 						d.seqused = d.pos_idx.narrow(0, S - 1, 1).add(1).to('int32');
+						// 6..10 rows: the key count of the first row group
+						// of the split attention (qwen35.attn_forward_dev)
+						d.seqused_a = (S > 5) ? d.pos_idx.narrow(0, S - (S >> 1) - 1, 1).add(1).to('int32') : null;
 						d.rope_idx = d.ramp.add(d.rpos);
 						d.cos = d.cos_tab.index(d.rope_idx);
 						d.sin = d.sin_tab.index(d.rope_idx);
@@ -495,9 +531,13 @@ export function shard(model, opts) {
 					let h0 = tp.embed_tokens.index(st.ids);
 					let h = map(devs, (d, g) => (g == 0) ? h0 : h0.cuda(d));
 
+					let feat = tp.tap_start();
+
 					for (let i = 0; i < cfg.num_hidden_layers; i++)
 						h = tp.layer(i, h, cache, null, st.dev);
 
+					tp.cap = null;
+					st.feat = feat;
 					st.out = tp.head(h, null);
 				};
 
@@ -525,14 +565,28 @@ export function shard(model, opts) {
 					return by_size[S] != null;
 				},
 
+				/* run() with the token ids already on rank 0's device ((1, S)
+				 * int64): no host round trip (async speculative rounds) */
+				run_dev: function (ids_dev, pos) {
+					return this.run_with(ids_dev, pos);
+				},
+
 				run: function (ids, pos) {
-					let S = length(ids);
+					return this.run_with(null, pos, ids);
+				},
+
+				run_with: function (ids_dev, pos, ids) {
+					let S = ids_dev ? ids_dev.shape()[1] : length(ids);
 					let st = by_size[S];
 
 					if (!st)
 						die(`qwen35_tp: no graph captured for step size ${S}`);
 
-					st.ids.copy_(torch.from_array(ids, 'int64', 'cuda:' + devs[0]).view([1, S]));
+					if (ids_dev)
+						st.ids.copy_(ids_dev);
+					else
+						st.ids.copy_(torch.from_array(ids, 'int64', 'cuda:' + devs[0]).view([1, S]));
+
 					st.dev[0].pos.fill_(pos);
 					st.dev[0].rpos.fill_(pos + qwen35.mm_off(cache.mm, pos));
 
@@ -541,8 +595,15 @@ export function shard(model, opts) {
 					barrier(st);     // the others wait for the replay
 					cache.length = pos + S;
 					cache.hidden = st.out.hidden;
+					cache.feat = st.feat;
 
 					return st.out;
+				},
+
+				/* the drafter taps (per tap (1, S, H)) the graph of size
+				 * S writes — persistent buffers */
+				feat: function (S) {
+					return by_size[S] ? by_size[S].feat : null;
 				}
 			};
 		},
@@ -555,6 +616,7 @@ export function shard(model, opts) {
 			let pos = cache.length;
 			let h0 = qwen35.embed_rows(this, cache.mm, ids, pos);
 			let h = map(devs, (d, g) => (g == 0) ? h0 : h0.cuda(d));
+			let feat = this.tap_start();
 
 			for (let i = 0; i < cfg.num_hidden_layers; i++) {
 				h = this.layer(i, h, cache, pos, null);
@@ -563,11 +625,14 @@ export function shard(model, opts) {
 					on_layer(i);
 			}
 
+			this.cap = null;
 			cache.length = pos + S;
 
 			let r = this.head(h, rows, hidden_all);
 
 			cache.hidden = r.hidden;
+			cache.feat = feat;
+			r.feat = feat;
 
 			return r;
 		},
@@ -613,6 +678,9 @@ export function shard(model, opts) {
 
 						if (opts.hidden)
 							push(parts, res.hidden);
+
+						if (opts.on_taps && res.feat)
+							opts.on_taps(res.feat, a);
 
 						if (last)
 							logits = res.logits;

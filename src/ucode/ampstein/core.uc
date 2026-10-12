@@ -34,6 +34,7 @@ import * as dsv4 from './dsv4.uc';
 import * as dsv4_tp from './dsv4_tp.uc';
 import * as dsv4_vision from './dsv4_vision.uc';
 import * as dspark_tp from './dspark_tp.uc';
+import * as dflash from './dflash.uc';
 
 // digest.so is optional (not built on every host): images are then keyed
 // by a cheap length+sample fingerprint instead of SHA-256
@@ -128,6 +129,17 @@ export function serve(args) {
 	if (Q4 && args.mtp == 1)
 		args.mtp = 2;
 
+	// DFlash: the block size is 8, a round proposes up to 7 drafts (--mtp N lowers it)
+	if (args.dflash) {
+		if (!args.tp || args.arch != 'qwen35') {
+			warn('ampstein: --dflash needs --tp on a Qwen3.5 / 3.8 model\n');
+			exit(1);
+		}
+
+		if (!args.mtp_set)
+			args.mtp = 7;
+	}
+
 	// tensor-parallel prefill is host-bound per chunk (thousands of launches across the ranks per
 	// layer pass): bigger chunks amortise it (37k tokens: 4096 -> 657 tok/s)
 	if (Q4 && args.tp && !args.chunk_set)
@@ -215,7 +227,7 @@ export function serve(args) {
 			qwen4.load(args.model, {devices: args.gpus, mtp: args.mtp > 0});
 	}
 	else {
-		model = qwen35.load(args.model, {devices: devs, mtp: args.mtp > 0});
+		model = qwen35.load(args.model, {devices: devs, mtp: args.mtp > 0 && !args.dflash});
 	}
 
 	if (DS && args.tp && args.mtp > 0) {
@@ -236,6 +248,14 @@ export function serve(args) {
 
 		model = qwen35_tp.shard(model, {devices: ranks, f0: args.tp_share,
 			prefill_rows: args.chunk});
+
+		if (args.dflash) {
+			// DFlash 2 block drafter: --mtp N is its window of drafts per round (default 7);
+			// the target's taps are recorded by the forward and the verify graphs
+			model.dflash = dflash.load(args.dflash, model, {window: args.mtp});
+			model.set_taps(model.dflash.layer_ids);
+			warn(`ampstein: DFlash drafter loaded (window ${args.mtp})\n`);
+		}
 	}
 	let eng = engine.create(model, {
 		max_ctx: args.ctx,
@@ -260,7 +280,11 @@ export function serve(args) {
 			(GLM || Q4 || DS ? ' (expert parallel MoE)' : ` (${model.comm.info().mode} all-reduce)`);
 
 	if (eng.mtp_window)
-		banner += `, MTP speculative decoding (window ${eng.mtp_window})`;
+		banner += model.dflash ? `, speculative decoding (window ${eng.mtp_window})` :
+			`, MTP speculative decoding (window ${eng.mtp_window})`;
+
+	if (model.dflash)
+		banner += ', DFlash drafter';
 
 	if (model.dspark)
 		banner += ', DSpark speculative decoding';

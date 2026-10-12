@@ -536,12 +536,12 @@ export function gdn_forward(cfg, L, x, cl) {
 
 	// fused: causal conv1d + silu + q/k/v split + fp32 + q/k l2norm,
 	// conv state updated in place — and, for a verify window, the
-	// per-token conv snapshots (cl.spec_conv, at most 4) written by the
+	// per-token conv snapshots (cl.spec_conv, at most 8) written by the
 	// same state kernel instead of a cat + one copy each
 	let snaps = null;
 
 	if (spec) {
-		snaps = (S - 1 <= 4) ? slice(cl.spec_conv, 0, S - 1) : null;
+		snaps = (S - 1 <= 8) ? slice(cl.spec_conv, 0, S - 1) : null;
 
 		if (!snaps) {
 			let km1 = cl.conv_state.shape()[2];
@@ -744,6 +744,21 @@ export function attn_forward_dev(cfg, L, x, cl, st) {
 			st.seqused, 1.0 / math.sqrt(hd), null,
 			(hd == 64 || hd == 128 || hd == 256) && (nh / kvh) * S <= 32 ? 1 : 0);
 				// (S, nh, hd)
+	else if (S <= 10 && st.seqused_a != null && (nh / kvh) * ((S + 1) >> 1) <= 32) {
+		// 6..10 rows (a DFlash verify window): two attn_decode launches over row
+		// groups of S1 and S2 = S - S1 rows. A call's row s attends keys
+		// [0, len - Sg + s]: the second group takes the full key count, the first
+		// one (len - S2, st.seqused_a) — the same keys per row as one S-row call.
+		let S1 = S - (S >> 1), S2 = S >> 1;
+		let qc = q.contiguous().view([S, nh, hd]);
+		let kc = cl.k_cache.view([kvh, max_seq, hd]), vc = cl.v_cache.view([kvh, max_seq, hd]);
+		let sc = 1.0 / math.sqrt(hd);
+
+		o = torch.cat([
+			torch.attn_decode(qc.narrow(0, 0, S1), kc, vc, st.seqused_a, sc, null, 1),
+			torch.attn_decode(qc.narrow(0, S1, S2), kc, vc, st.seqused, sc, null, 1)
+		], 0);
+	}
 	else
 		o = torch.flash_attn_kvcache(q.view([S, nh, hd]),
 			cl.k_cache.view([kvh, max_seq, hd]).transpose(0, 1),

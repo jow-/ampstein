@@ -128,6 +128,9 @@ amp_test(p2p_comm)
 amp_test(attn_decode_tp)
 # qwen35_tp: tensor-parallel qwen35 (eager + multi-GPU graph) vs the layer split
 amp_test(qwen35_tp)
+# dflash_draft: DFlash 2 drafter on the TP model; its block must match the
+# target's own greedy continuation (needs AMP_MODEL_DFLASH)
+amp_test(dflash_draft)
 
 # --- Vision
 # vision_preprocess: native image preprocessing vs the PIL oracle

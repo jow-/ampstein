@@ -94,6 +94,7 @@ function build(model, cache, S) {
 		// device-side positions for this step
 		s.pos_idx = s.ramp.add(s.pos);
 		s.seqused = s.pos_idx.narrow(0, S - 1, 1).add(1).to('int32');
+		s.seqused_a = (S > 5) ? s.pos_idx.narrow(0, S - (S >> 1) - 1, 1).add(1).to('int32') : null;
 
 		// RoPE rows follow the text position, which trails the KV slot
 		// by a constant after an image (multimodal prompts)
