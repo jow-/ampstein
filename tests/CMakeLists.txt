@@ -181,6 +181,8 @@ amp_test(glm5_vision)
 amp_test(engine_inject)
 # engine_store: host-RAM prompt-cache store: restore == fresh prefill
 amp_test(engine_store)
+# engine_turn: the turn checkpoint (resume where a template re-render diverges)
+amp_test(engine_turn)
 # engine_store_quant: tiered KV quantization of stored state at long context
 amp_test(engine_store_quant)
 # engine_store_glm5: host-RAM store for GLM-5.3 (MLA latent rows, KDA states, MTP draft cache)

@@ -335,7 +335,12 @@ export function create(model, opts) {
 	let cache = model.new_cache(max_ctx);
 
 	let snap = {};
+	let tsnap = {};          // the turn checkpoint (see plan_reuse): second GDN snapshot
 	let gdn_layers = [];
+
+	// The turn checkpoint is the generic path's (per-layer states + KV rewind by length);
+	// models with their own cache export or aux recurrent state keep one snapshot
+	const TS_OK = !model.aux_get && !model.cache_export;
 
 	/* GPU completion notifier + pinned result buffers for the async
 	 * decode loop (see the async sampling section above). The engine
@@ -415,10 +420,23 @@ export function create(model, opts) {
 
 		push(gdn_layers, i);
 		snap[i] = snap_bufs(i);
+		tsnap[i] = TS_OK ? snap_bufs(i) : null;
+	}
+
+	if (TS_OK && length(gdn_layers)) {
+		let tb = 0;
+
+		for (let k in gdn_layers)
+			for (let b in tsnap[k])
+				tb += b[0].numel() * 4 + b[1].numel() * 2;
+
+		warn(sprintf('engine: turn checkpoint buffers: %.1f MiB\n', tb / 1048576.0));
 	}
 
 	let ids = [];          // tokens currently processed into the cache
 	let snap_ids = null;   // token prefix the snapshot represents
+	let tsnap_ids = null;  // ... the turn checkpoint (always a prefix of `ids`, else null)
+	let tsnap_hidden = null;
 
 	// CUDA-graph decode steps (opts.graphs != false): sizes 1 (plain
 	// decode) and 1..W (MTP verify windows and replays). Captured now,
@@ -608,6 +626,12 @@ export function create(model, opts) {
 		draft_len = length(ids);
 		last_hidden = snap_hidden;
 
+		// a checkpoint past the snapshot is no longer a prefix of the cache
+		if (tsnap_ids != null && length(tsnap_ids) > length(ids)) {
+			tsnap_ids = null;
+			tsnap_hidden = null;
+		}
+
 		if (DF) {
 			DF.reset();
 			df_pprev = null;
@@ -617,9 +641,32 @@ export function create(model, opts) {
 			model.aux_set(cache, snap_aux);
 	}
 
+	/* Rewind to the turn checkpoint: GDN states from tsnap, the attention
+	 * KV by length. The end-of-prompt snapshot lies past it and is dropped
+	 * (its states no longer fit the rewound KV). */
+	function restore_turn() {
+		for (let k in gdn_layers)
+			load_states(k, tsnap[k]);
+
+		ids = slice(tsnap_ids);
+		cache.length = length(ids);
+		draft_len = length(ids);
+		last_hidden = tsnap_hidden;
+		snap_ids = null;
+		snap_hidden = null;
+		snap_aux = null;
+
+		if (DF) {
+			DF.reset();
+			df_pprev = null;
+		}
+	}
+
 	function reset_state() {
 		zero_states();
 		ids = [];
+		tsnap_ids = null;
+		tsnap_hidden = null;
 
 		// a fresh prefill overwrites the attention KV from position 0:
 		// an older snapshot's prefix is no longer in the cache
@@ -960,7 +1007,7 @@ export function create(model, opts) {
 	 * of the latent cache rows (one replica per layer), the KDA states, the snapshot buffers and the
 	 * draft cache. An entry in a slot is exact (no age tiers) and swaps back device to device. */
 	function new_slot_generic() {
-		let sl = {kv: {}, gdn: {}, snap: {}, draft: null};
+		let sl = {kv: {}, gdn: {}, snap: {}, tsnap: {}, draft: null};
 
 		for (let i = 0; i < cfg.num_hidden_layers; i++) {
 			let sts = states(i);
@@ -974,8 +1021,10 @@ export function create(model, opts) {
 				sl.kv[i] = mla_alloc(sts[0]);
 		}
 
-		for (let k in gdn_layers)
+		for (let k in gdn_layers) {
 			sl.snap[k] = snap_bufs(k);
+			sl.tsnap[k] = TS_OK ? snap_bufs(k) : null;
+		}
 
 		if (mtp_mla())
 			sl.draft = mla_alloc(mtp_mla()[0]);
@@ -997,6 +1046,11 @@ export function create(model, opts) {
 		if (e.snap)
 			for (let k in keys(e.slot.snap))
 				for (let p in e.slot.snap[k])
+					b += tbytes(p[0]) + tbytes(p[1]);
+
+		if (e.tsnap)
+			for (let k in keys(e.slot.tsnap))
+				for (let p in e.slot.tsnap[k])
 					b += tbytes(p[0]) + tbytes(p[1]);
 
 		if (e.draft && e.slot.draft)
@@ -1159,6 +1213,13 @@ export function create(model, opts) {
 						e.snap[q] = map(sl.snap[q], (p) => [ to_host(p[0], h), to_host(p[1], h) ]);
 				}
 
+				if (e.tsnap) {
+					e.tsnap = {};
+
+					for (let q in keys(sl.tsnap))
+						e.tsnap[q] = map(sl.tsnap[q], (p) => [ to_host(p[0], h), to_host(p[1], h) ]);
+				}
+
 				if (e.draft && sl.draft)
 					e.draft = mla_to_host(sl.draft, sl.draft.dev, e.dl, h);
 				else
@@ -1216,7 +1277,8 @@ export function create(model, opts) {
 		}
 
 		let e = {ids: slice(ids), n: n, bytes: 0, kv: {}, gdn: {}, dl: draft_len,
-			hid: null, snap_ids: null, snap: null, snap_hid: null, draft: null, slot: null};
+			hid: null, snap_ids: null, snap: null, snap_hid: null, draft: null, slot: null,
+			tsnap_ids: null, tsnap: null, tsnap_hid: null};
 		let t0 = now_ms();
 
 		try {
@@ -1306,6 +1368,26 @@ export function create(model, opts) {
 					e.snap_hid = to_host(snap_hidden, e);
 			}
 
+			// the turn checkpoint rides along (a prefix of the live state)
+			if (TS_OK && tsnap_ids != null && lcp(tsnap_ids, ids) == length(tsnap_ids)) {
+				e.tsnap_ids = slice(tsnap_ids);
+				e.tsnap = {};
+
+				for (let k in gdn_layers) {
+					if (slot) {
+						for (let r = 0; r < length(tsnap[k]); r++) {
+							slot.tsnap[k][r][0].copy_(tsnap[k][r][0]);
+							slot.tsnap[k][r][1].copy_(tsnap[k][r][1]);
+						}
+					}
+					else
+						e.tsnap[k] = map(tsnap[k], (b) => [ to_host(b[0], e), to_host(b[1], e) ]);
+				}
+
+				if (tsnap_hidden)
+					e.tsnap_hid = to_host(tsnap_hidden, e);
+			}
+
 			if (slot) {
 				torch.synchronize();
 				e.slot = slot;
@@ -1354,6 +1436,8 @@ export function create(model, opts) {
 
 			snap_hidden = null;
 			last_hidden = null;
+			tsnap_ids = null;
+			tsnap_hidden = null;
 
 			if (live) {
 				ids = slice(e.ids);
@@ -1399,6 +1483,27 @@ export function create(model, opts) {
 			}
 		}
 
+		// restoring to the entry's turn checkpoint (when the snapshot lies past it)
+		let turn = !live && e.tsnap_ids != null && start == length(e.tsnap_ids) &&
+			!(e.snap_ids != null && start == length(e.snap_ids));
+
+		if (e.tsnap) {
+			let ts = e.slot ? e.slot.tsnap : e.tsnap;
+
+			for (let k in gdn_layers)
+				for (let r = 0; r < length(tsnap[k]); r++) {
+					tsnap[k][r][0].copy_(ts[k][r][0]);
+					tsnap[k][r][1].copy_(ts[k][r][1]);
+				}
+
+			tsnap_ids = slice(e.tsnap_ids);
+			tsnap_hidden = e.tsnap_hid ? e.tsnap_hid.cuda(M.dev) : null;
+		}
+		else {
+			tsnap_ids = null;
+			tsnap_hidden = null;
+		}
+
 		if (e.snap) {
 			let es = e.slot ? e.slot.snap : e.snap;
 
@@ -1434,6 +1539,8 @@ export function create(model, opts) {
 			cache.length = e.n;
 			last_hidden = e.hid ? e.hid.cuda(M.dev) : null;
 		}
+		else if (turn)
+			restore_turn();
 		else
 			restore_snapshot();
 
@@ -1475,6 +1582,21 @@ export function create(model, opts) {
 		else
 			plan = {from: 'fresh', start: 0, detail: det};
 
+		// the turn checkpoint (end of the last user message): when the template
+		// re-renders the assistant / tool turns after it differently (reasoning
+		// dropped once a new user message arrives), the divergence point lies
+		// between this checkpoint and the end-of-prompt snapshot
+		if (tsnap_ids != null) {
+			let tl = lcp(tsnap_ids, prompt);
+
+			det.turn = length(tsnap_ids);
+			det.turn_lcp = tl;
+
+			if (tl == length(tsnap_ids) && length(tsnap_ids) < length(prompt) &&
+			    length(tsnap_ids) > plan.start)
+				plan = {from: 'turn', start: length(tsnap_ids), detail: det};
+		}
+
 		if (live < length(ids) && live > 0) {
 			det.div_old = slice(ids, max(live - 4, 0), live + 8);
 			det.div_new = slice(prompt, max(live - 4, 0), live + 8);
@@ -1501,6 +1623,11 @@ export function create(model, opts) {
 			         length(e.snap_ids) > hit_start &&
 			         lcp(e.snap_ids, prompt) == length(e.snap_ids)) {
 				hit = e; hit_start = length(e.snap_ids); hit_k = k;
+			}
+			else if (e.tsnap_ids && length(e.tsnap_ids) < length(prompt) &&
+			         length(e.tsnap_ids) > hit_start &&
+			         lcp(e.tsnap_ids, prompt) == length(e.tsnap_ids)) {
+				hit = e; hit_start = length(e.tsnap_ids); hit_k = k;
 			}
 		}
 
@@ -1580,6 +1707,8 @@ export function create(model, opts) {
 
 		// the cache contents are undefined after a failed step
 		ids = [];
+		tsnap_ids = null;
+		tsnap_hidden = null;
 		snap_ids = null;
 		snap_hidden = null;
 		draft_len = 0;
@@ -1655,6 +1784,9 @@ export function create(model, opts) {
 		// chunk that ends there (the boundary is a chunk cut): one small copy
 		if (j.snap_at && pos + n == j.snap_at)
 			j.snap_hid = seed_prev.add(0.0);
+
+		if (j.tcut && pos + n == j.tcut)
+			j.tsnap_hid = seed_prev.add(0.0);
 	}
 
 	/* Plan the reuse of the cache for j.ids and start the pipelined prefill
@@ -1666,6 +1798,8 @@ export function create(model, opts) {
 
 		if (plan.from == 'snapshot')
 			restore_snapshot();
+		else if (plan.from == 'turn')
+			restore_turn();
 		else if (plan.from == 'fresh')
 			reset_state();
 
@@ -1699,6 +1833,26 @@ export function create(model, opts) {
 		let snap_at = (j.snap_at && j.snap_at > j.pos && j.snap_at < length(j.ids)) ?
 			j.snap_at : 0;
 
+		// the turn checkpoint is taken the same way, at the end of the last
+		// user message, unless the cache already holds one there
+		let t_at = (TS_OK && j.turn_at && j.turn_at > j.pos && j.turn_at < length(j.ids) &&
+			length(gdn_layers) && !(tsnap_ids != null && length(tsnap_ids) == j.turn_at &&
+			lcp(tsnap_ids, j.ids) == j.turn_at)) ? j.turn_at : 0;
+
+		j.tcut = t_at;
+		j.tsnap_taken = false;
+		j.tsnap_hid = null;
+
+		let cuts = [];
+
+		if (snap_at)
+			push(cuts, snap_at);
+
+		if (t_at && t_at != snap_at)
+			push(cuts, t_at);
+
+		cuts = sort(cuts, (a, b) => a - b);
+
 		if (j.use_mtp && !DF)
 			seed_start(j);
 
@@ -1709,7 +1863,7 @@ export function create(model, opts) {
 
 		let popts = {
 			chunk: chunk,
-			cuts: snap_at ? [ snap_at ] : [],
+			cuts: cuts,
 			hidden: j.use_mtp && !DF,
 			on_hidden: (j.use_mtp && !DF) ? (pos, H) => seed_chunk(j, pos, H) : null,
 			on_taps: SP ? (taps, pos) => SP.prefill_rows(taps, pos) :
@@ -1718,11 +1872,15 @@ export function create(model, opts) {
 						DF.prefill_rows(taps, pos);
 				} : null,
 			on_layer: function (chunk_end, li) {
-				if (!snap_at || chunk_end != snap_at || !snap[li])
-					return;
+				if (snap_at && chunk_end == snap_at && snap[li]) {
+					save_states(li, snap[li]);
+					j.snap_taken = true;
+				}
 
-				save_states(li, snap[li]);
-				j.snap_taken = true;
+				if (t_at && chunk_end == t_at && tsnap[li]) {
+					save_states(li, tsnap[li]);
+					j.tsnap_taken = true;
+				}
 			},
 			on_aux: function (chunk_end) {
 				if (snap_at && chunk_end == snap_at && model.aux_get) {
@@ -1825,6 +1983,7 @@ export function create(model, opts) {
 		j.ids = slice(ids, 0);
 		push(j.ids, ...tail);
 		j.snap_at = 0;
+		j.turn_at = 0;
 		j.phase = 'prefill';
 		j.injected = (j.injected || 0) + length(forced);
 		start_prefill(j);
@@ -2434,6 +2593,8 @@ export function create(model, opts) {
 				// consistent only once it has, so drop the reuse info
 				ids = [];
 				snap_ids = null;
+				tsnap_ids = null;
+				tsnap_hidden = null;
 				return finish('cancelled');
 			}
 
@@ -2453,6 +2614,13 @@ export function create(model, opts) {
 			}
 
 			push(ids, ...slice(j.ids, j.pos, total));
+
+			if (j.tsnap_taken) {
+				tsnap_ids = slice(j.ids, 0, j.tcut);
+				tsnap_hidden = (j.use_mtp && !DF) ? j.tsnap_hid : null;
+			}
+
+			j.tsnap_hid = null;
 
 			if (j.snap_taken) {
 				snap_ids = slice(j.ids, 0, j.snap_at);
@@ -2674,6 +2842,7 @@ export function create(model, opts) {
 
 		j.ids = [ ...j.park_ids, ...tail ];
 		j.snap_at = 0;
+		j.turn_at = 0;
 		j.phase = 'prefill';
 		j.injected = (j.injected || 0) + 1;
 		j.pend_logits = null;

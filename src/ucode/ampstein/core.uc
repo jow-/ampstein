@@ -364,6 +364,59 @@ export function serve(args) {
 			r, scan_pads);
 	}
 
+	/* Turn checkpoint boundary: the token index just after the last user
+	 * message. Chat templates drop the reasoning of assistant turns that
+	 * precede the last user message, so when a new user message arrives
+	 * (typically while a tool loop was running) the prompt changes from the
+	 * first assistant turn after the PREVIOUS user message on. The engine
+	 * keeps a recurrent-state checkpoint there (job.turn_at). One entry is
+	 * cached per user turn: the boundary's token count is computed once
+	 * (a render and a segment encode of the part up to it), later requests
+	 * of the same turn find the cached segments as a prefix of theirs. */
+	let turn_cache = null;     // {lu, segs, n}
+
+	function turn_boundary(r, messages, tools, ropts, prefix_len, has_images) {
+		if (has_images || type(messages) != 'array')
+			return 0;
+
+		let lu = -1;
+
+		for (let i = 0; i < length(messages); i++)
+			if (type(messages[i]) == 'object' && messages[i].role == 'user')
+				lu = i;
+
+		if (lu < 0)
+			return 0;
+
+		if (lu == length(messages) - 1) {
+			turn_cache = {lu: lu, segs: r.segments, n: prefix_len};
+
+			return prefix_len;
+		}
+
+		if (turn_cache && turn_cache.lu == lu && utpl.seg_prefix(r.segments, turn_cache.segs) >= 0)
+			return turn_cache.n;
+
+		try {
+			let r1 = render_prompt(slice(messages, 0, lu + 1), tools, ropts);
+
+			if (utpl.seg_prefix(r.segments, r1.segments) < 0)
+				return 0;
+
+			let n = length(utpl.encode_segments(tok, {segments: r1.segments}));
+
+			if (n <= 0 || n > prefix_len)
+				return 0;
+
+			turn_cache = {lu: lu, segs: r1.segments, n: n};
+
+			return n;
+		}
+		catch (e) {
+			return 0;
+		}
+	}
+
 	// image pad positions of the ids encode_prefix() just returned
 	function prefix_pads() {
 		let c = prefix_cache.get();
@@ -803,14 +856,16 @@ export function serve(args) {
 
 		let r;
 
+		let ropts = {
+			enable_thinking: enable_thinking,
+			reasoning_effort: kw.reasoning_effort || effort,
+			preserve_thinking: kw.preserve_thinking,
+			clear_thinking: kw.clear_thinking,
+			vision: (GLM || DS) && args.vision && cfg.has_vision
+		};
+
 		try {
-			r = render_prompt(body.messages, tools, {
-				enable_thinking: enable_thinking,
-				reasoning_effort: kw.reasoning_effort || effort,
-				preserve_thinking: kw.preserve_thinking,
-				clear_thinking: kw.clear_thinking,
-				vision: (GLM || DS) && args.vision && cfg.has_vision
-			});
+			r = render_prompt(body.messages, tools, ropts);
 		}
 		catch (e) {
 			return api_error(res, 400, e.message, 'invalid_request_error', null, 'messages');
@@ -834,6 +889,7 @@ export function serve(args) {
 
 		let gen_ids = tok.encode(r.gen, true);
 		let prefix_len = length(prefix_ids);   // BEFORE extending: ids aliases prefix_ids (L81)
+		let turn_at = turn_boundary(r, body.messages, tools, ropts, prefix_len, length(r.images) > 0);
 		let ids = prefix_ids;     // fresh array (encode / expansion): extend in place
 
 		push(ids, ...gen_ids);
@@ -968,6 +1024,7 @@ export function serve(args) {
 			ids: ids,
 			images: images,
 			snap_at: prefix_len,
+			turn_at: turn_at,
 			max_new: max_new_of(body, length(ids)),
 			sampling: sampling_of(body),
 			stop_ids: stop_ids,
