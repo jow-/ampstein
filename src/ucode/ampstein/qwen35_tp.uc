@@ -164,6 +164,13 @@ function shard_layer(cfg, plan, L, g, dev) {
  * and MTP windows; prefill chunks take the copy path */
 const P2P_ROWS = 16;
 
+/* prefill chunks up to opts.prefill_rows (default PF_ROWS) go through a
+ * second P2P communicator: direct peer stores, no cross-device stream
+ * events and no fp32 temporaries (+13..17% prefill over the copy path
+ * below, which larger chunks and AMP_TP_PF_ROWS=0 take). Costs
+ * (2 * ranks + 2) * rows * hidden * 2 bytes per rank. */
+const PF_ROWS = 2048;
+
 /* all-reduce p (one partial per rank) -> per-rank sums, bit-identical
  * across ranks. Small payloads: torch.p2p_comm (direct peer stores +
  * flags, no cross-device stream dependency — those cost 25-90 us of
@@ -175,6 +182,9 @@ function allreduce(tp, p) {
 
 	if (p[0].numel() <= tp.comm_cap)
 		return map(p, (x, g) => tp.comm.allreduce(x, g));
+
+	if (tp.comm_pf && p[0].numel() <= tp.comm_pf_cap)
+		return map(p, (x, g) => tp.comm_pf.allreduce(x.contiguous(), g));
 
 	let out = [];
 
@@ -234,10 +244,14 @@ export function shard(model, opts) {
 
 	let heads = map(devs, (d, g) => models.cols(model.lm_head, [ plan.vocab[g] ], d));
 	let cap = P2P_ROWS * cfg.hidden_size;
+	let pf_rows = (getenv('AMP_TP_PF_ROWS') != null) ? int(getenv('AMP_TP_PF_ROWS')) :
+		(opts.prefill_rows || PF_ROWS);
 
 	let tp = {
 		cfg: cfg, cfg_g: cg, plan: plan, layers: layers,
 		comm: torch.p2p_comm(devs, cap), comm_cap: cap,
+		comm_pf: (pf_rows > P2P_ROWS) ? torch.p2p_comm(devs, pf_rows * cfg.hidden_size) : null,
+		comm_pf_cap: pf_rows * cfg.hidden_size,
 		embed_tokens: model.embed_tokens,
 		norm: map(devs, (d) => model.norm.cuda(d)),
 		lm_heads: heads,

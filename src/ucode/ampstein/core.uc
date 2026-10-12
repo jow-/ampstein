@@ -133,6 +133,12 @@ export function serve(args) {
 	if (Q4 && args.tp && !args.chunk_set)
 		args.chunk = (args.stages > 1) ? 1024 : 4096;
 
+	// Qwen3.5 / 3.8 TP: the prefill all-reduces use a P2P communicator sized from the chunk and
+	// the recon GEMM amortises better; 4096 measured +~15% over 1024 on two 3090s (the
+	// communicator costs ~250 MB per rank)
+	if (args.arch == 'qwen35' && args.tp && !args.chunk_set && !(args.stages > 1))
+		args.chunk = 4096;
+
 
 	// DeepSeek-V4: pairs of GPUs (tensor-parallel) in a pipeline of stages, with the DSpark block
 	// drafter (--mtp 0 turns it off, --dspark-window N verifies N drafts per round, default 4);
@@ -228,7 +234,8 @@ export function serve(args) {
 		for (let g = 0; g < args.gpus; g++)
 			push(ranks, g);
 
-		model = qwen35_tp.shard(model, {devices: ranks, f0: args.tp_share});
+		model = qwen35_tp.shard(model, {devices: ranks, f0: args.tp_share,
+			prefill_rows: args.chunk});
 	}
 	let eng = engine.create(model, {
 		max_ctx: args.ctx,
