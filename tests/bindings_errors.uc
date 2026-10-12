@@ -102,6 +102,29 @@ expect_raise('rms_norm: cpu tensor', function () {
 expect_raise('rms_norm: dim mismatch', function () {
 	torch.rms_norm(xc, torch.zeros([4], 'float16', 'cuda'), 1e-5);
 });
+expect_raise('gdn_ab_gates: wrong arg count', function () {
+	torch.gdn_ab_gates(xc, xc, xc);
+});
+expect_raise('gdn_ab_gates: cpu tensor', function () {
+	let w = torch.zeros([2, 8], 'float16', 'cuda');
+	let f = torch.zeros([2], 'float32', 'cuda');
+
+	torch.gdn_ab_gates(cpu, w, w, f, f);
+});
+expect_raise('gdn_ab_gates: K mismatch', function () {
+	let w = torch.zeros([2, 8], 'float16', 'cuda');
+	let x = torch.zeros([1, 1, 6], 'float16', 'cuda');
+	let f = torch.zeros([2], 'float32', 'cuda');
+
+	torch.gdn_ab_gates(x, w, w, f, f);
+});
+expect_raise('gdn_ab_gates: too many rows', function () {
+	let w = torch.zeros([2, 8], 'float16', 'cuda');
+	let x = torch.zeros([1, 9, 8], 'float16', 'cuda');
+	let f = torch.zeros([2], 'float32', 'cuda');
+
+	torch.gdn_ab_gates(x, w, w, f, f);
+});
 expect_raise('rms_norm_res: dim %% 4 != 0', function () {
 	torch.rms_norm_res(xc, xc, torch.zeros([6], 'float16', 'cuda'), 1e-5);
 });

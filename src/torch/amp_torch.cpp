@@ -3773,12 +3773,18 @@ amp_gdn_chunk_f32(const void *q, const void *k, const void *v, const void *beta,
 extern "C" int
 amp_gdn_prep_fp16(const void *qkv, void *conv_state, const void *conv_w,
                  void *q, void *k, void *v, int S, int D, int K, int Hk,
-                 int Hv, int hd, cudaStream_t stream);
+                 int Hv, int hd, void *const *spec, int nspec,
+                 cudaStream_t stream);
 
 extern "C" int
 amp_gdn_gates(const void *a, const void *b, const void *dt_bias,
              const void *nea, void *beta, void *gexp, int S, int Hv,
              cudaStream_t stream);
+
+extern "C" int
+amp_gdn_ab_gates(const void *x, const void *wa, const void *wb,
+                const void *dt_bias, const void *nea, void *beta, void *gexp,
+                int S, int K, int Hv, cudaStream_t stream);
 
 extern "C" int
 amp_gdn_out_norm(const void *core, const void *z, const void *w, void *out,
@@ -5135,10 +5141,13 @@ torch_gdn_prep(uc_vm_t *vm, size_t nargs)
 {
 	int64_t Hk, Hv, hd;
 
-	if (nargs != 6 || !arg_int(vm, uc_fn_arg(3), &Hk) ||
-	    !arg_int(vm, uc_fn_arg(4), &Hv) || !arg_int(vm, uc_fn_arg(5), &hd)) {
+	uc_value_t *specv = uc_fn_arg(6);
+
+	if ((nargs != 6 && nargs != 7) || !arg_int(vm, uc_fn_arg(3), &Hk) ||
+	    !arg_int(vm, uc_fn_arg(4), &Hv) || !arg_int(vm, uc_fn_arg(5), &hd) ||
+	    (nargs == 7 && ucv_type(specv) != UC_NULL && ucv_type(specv) != UC_ARRAY)) {
 		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
-			"expected (qkv, conv_state, conv_w, Hk, Hv, head_dim)");
+			"expected (qkv, conv_state, conv_w, Hk, Hv, head_dim, snapshots?)");
 		return NULL;
 	}
 
@@ -5158,6 +5167,37 @@ torch_gdn_prep(uc_vm_t *vm, size_t nargs)
 		return NULL;
 	}
 
+	/* snapshots: per-token copies of the conv state window (same
+	 * shape and layout as conv_state), written in the state kernel */
+	void *snap[4] = { NULL, NULL, NULL, NULL };
+	int nsnap = 0;
+
+	if (nargs == 7 && ucv_type(specv) == UC_ARRAY) {
+		nsnap = (int)ucv_array_length(specv);
+
+		if (nsnap > 4 || nsnap > S) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"gdn_prep: at most 4 snapshots, and not more than the rows");
+			return NULL;
+		}
+
+		for (int i = 0; i < nsnap; i++) {
+			at::Tensor *t = fused_arg(vm, ucv_array_get(specv, i),
+				"gdn_prep: snapshot", false);
+
+			if (!t)
+				return NULL;
+
+			if (t->numel() != cs->numel() || t->get_device() != cs->get_device()) {
+				uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+					"gdn_prep: snapshot must match conv_state");
+				return NULL;
+			}
+
+			snap[i] = t->data_ptr();
+		}
+	}
+
 	TensorDeviceGuard dg(*qkv);
 
 	try {
@@ -5169,7 +5209,7 @@ torch_gdn_prep(uc_vm_t *vm, size_t nargs)
 		int rc = amp_gdn_prep_fp16(qkv->data_ptr(), cs->data_ptr(),
 			cw->data_ptr(), q.data_ptr(), k.data_ptr(), v.data_ptr(),
 			(int)S, (int)D, (int)cw->size(1), (int)Hk, (int)Hv, (int)hd,
-			c10::cuda::getCurrentCUDAStream().stream());
+			snap, nsnap, c10::cuda::getCurrentCUDAStream().stream());
 
 		if (!launch_ok(vm, rc, "gdn_prep"))
 			return NULL;
@@ -5233,6 +5273,75 @@ torch_gdn_gates(uc_vm_t *vm, size_t nargs)
 			(int)Hv, c10::cuda::getCurrentCUDAStream().stream());
 
 		if (!launch_ok(vm, rc, "gdn_gates"))
+			return NULL;
+
+		uc_value_t *arr = ucv_array_new(vm);
+
+		ucv_array_push(arr, tensor_wrap(vm, std::move(beta), 0));
+		ucv_array_push(arr, tensor_wrap(vm, std::move(gexp), 0));
+
+		return arr;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * gdn_ab_gates(x, wa, wb, dt_bias, neg_exp_a_log): [beta, gexp]
+ *
+ * gdn_gates fed straight from the hidden state: a = x @ wa^T and
+ * b = x @ wb^T (fp16 weights, fp32 accumulation, rounded to fp16) plus
+ * the gate math, one launch, for S <= 8 rows. x (…, K) fp16 contiguous,
+ * wa / wb (Hv, K) fp16 contiguous, dt_bias / neg_exp_a_log (Hv) fp32.
+ * Returns beta, gexp as (S, Hv) fp32.
+ */
+static uc_value_t *
+torch_gdn_ab_gates(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 5) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (x, wa, wb, dt_bias, neg_exp_a_log)");
+		return NULL;
+	}
+
+	at::Tensor *x = fused_arg(vm, uc_fn_arg(0), "gdn_ab_gates: x", false);
+	at::Tensor *wa = x ? fused_arg(vm, uc_fn_arg(1), "gdn_ab_gates: wa", false) : NULL;
+	at::Tensor *wb = wa ? fused_arg(vm, uc_fn_arg(2), "gdn_ab_gates: wb", false) : NULL;
+	at::Tensor *dtb = wb ? f32_arg(vm, uc_fn_arg(3), "gdn_ab_gates: dt_bias") : NULL;
+	at::Tensor *nea = dtb ? f32_arg(vm, uc_fn_arg(4), "gdn_ab_gates: neg_exp_a_log") : NULL;
+
+	if (!nea)
+		return NULL;
+
+	if (wa->dim() != 2 || wb->sizes() != wa->sizes() || x->dim() < 1) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"gdn_ab_gates: wa and wb must be (Hv, K)");
+		return NULL;
+	}
+
+	int64_t Hv = wa->size(0), K = wa->size(1);
+
+	if (Hv == 0 || K == 0 || (K & 1) || x->size(-1) != K || x->numel() % K != 0 ||
+	    dtb->numel() != Hv || nea->numel() != Hv || x->numel() / K > 8) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"gdn_ab_gates: incompatible shapes (K even, at most 8 rows)");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		int64_t S = x->numel() / K;
+		auto f32 = x->options().dtype(at::kFloat);
+		at::Tensor beta = at::empty({ S, Hv }, f32);
+		at::Tensor gexp = at::empty({ S, Hv }, f32);
+
+		int rc = amp_gdn_ab_gates(x->data_ptr(), wa->data_ptr(), wb->data_ptr(),
+			dtb->data_ptr(), nea->data_ptr(), beta.data_ptr(), gexp.data_ptr(),
+			(int)S, (int)K, (int)Hv, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "gdn_ab_gates"))
 			return NULL;
 
 		uc_value_t *arr = ucv_array_new(vm);
@@ -8781,6 +8890,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "gdn_chunk",	torch_gdn_chunk },
 	{ "gdn_prep",	torch_gdn_prep },
 	{ "gdn_gates",	torch_gdn_gates },
+	{ "gdn_ab_gates",	torch_gdn_ab_gates },
 	{ "gdn_out_norm",	torch_gdn_out_norm },
 	{ "flash_attn",	torch_flash_attn },
 	{ "rms_norm_res",	torch_rms_norm_res },

@@ -496,6 +496,9 @@ export function delta_rule_scan(q, k, v, beta, gexp, state, scale, dev) {
 const GDN_CHUNK = (getenv('AMP_GDN_CHUNK') == '1');
 const GDN_CHUNK_MIN = 64;
 
+/* opt-out: separate a / b projections + gates for decode rows */
+const GDN_NO_ABG = getenv('AMP_GDN_NO_ABG') != null;
+
 export function gdn_forward(cfg, L, x, cl) {
 	let S = x.shape()[1];
 	let Hv = cfg.ln_num_v_heads;
@@ -503,12 +506,25 @@ export function gdn_forward(cfg, L, x, cl) {
 	// projections (fp16)
 	let qkv = L.in_proj_qkv.forward(x);     // (1,S,fdim_qkv)
 	let z = L.in_proj_z.forward(x);         // (1,S,ln_v_dim)
-	let b = L.in_proj_b.forward(x);         // (1,S,Hv)
-	let a = L.in_proj_a.forward(x);         // (1,S,Hv)
+	// fused: beta = sigmoid(b), gexp = exp(-exp(A_log) * softplus(a + dt_bias)).
+	// Decode and verify rows (S <= 8) with fp16 a / b weights compute the
+	// two projections in the same launch: at 4 rows the matmul falls on a
+	// 28 us cutlass kernel each (two per GDN layer)
+	let gates;
 
-	// fused: beta = sigmoid(b), gexp = exp(-exp(A_log) * softplus(a + dt_bias))
-	let gates = torch.gdn_gates(a.contiguous(), b.contiguous(), L.dt_bias,
-		L.neg_exp_a_log);
+	if (S <= 8 && !GDN_NO_ABG && L.in_proj_a.weight != null &&
+	    L.in_proj_a.bias == null && L.in_proj_b.bias == null &&
+	    L.in_proj_b.weight != null) {
+		gates = torch.gdn_ab_gates(x.contiguous(), L.in_proj_a.weight,
+			L.in_proj_b.weight, L.dt_bias, L.neg_exp_a_log);
+	}
+	else {
+		let b = L.in_proj_b.forward(x);         // (1,S,Hv)
+		let a = L.in_proj_a.forward(x);         // (1,S,Hv)
+
+		gates = torch.gdn_gates(a.contiguous(), b.contiguous(), L.dt_bias,
+			L.neg_exp_a_log);
+	}
 
 	// speculative verify (the engine set cl.spec_w = W and this is the
 	// W-token verify step): keep the state after each of the first W-1
@@ -518,18 +534,26 @@ export function gdn_forward(cfg, L, x, cl) {
 	// (engine: copy_many) instead of re-running the accepted tokens
 	let spec = cl.spec_w && S == cl.spec_w;
 
-	if (spec) {
-		let km1 = cl.conv_state.shape()[2];
-		let win = torch.cat([ cl.conv_state, qkv.transpose(1, 2) ], 2);
+	// fused: causal conv1d + silu + q/k/v split + fp32 + q/k l2norm,
+	// conv state updated in place — and, for a verify window, the
+	// per-token conv snapshots (cl.spec_conv, at most 4) written by the
+	// same state kernel instead of a cat + one copy each
+	let snaps = null;
 
-		for (let t = 0; t < S - 1; t++)
-			cl.spec_conv[t].copy_(win.narrow(2, t + 1, km1));
+	if (spec) {
+		snaps = (S - 1 <= 4) ? slice(cl.spec_conv, 0, S - 1) : null;
+
+		if (!snaps) {
+			let km1 = cl.conv_state.shape()[2];
+			let win = torch.cat([ cl.conv_state, qkv.transpose(1, 2) ], 2);
+
+			for (let t = 0; t < S - 1; t++)
+				cl.spec_conv[t].copy_(win.narrow(2, t + 1, km1));
+		}
 	}
 
-	// fused: causal conv1d + silu + q/k/v split + fp32 + q/k l2norm,
-	// conv state updated in place
 	let qkv3 = torch.gdn_prep(qkv.contiguous(), cl.conv_state, L.conv_w,
-		cfg.ln_num_k_heads, Hv, cfg.ln_k_head_dim);
+		cfg.ln_num_k_heads, Hv, cfg.ln_k_head_dim, snaps);
 
 	// delta rule (fp32 state): the sequential kernel; the 64-token-block
 	// WY/UT kernel (torch.gdn_chunk, same math, tests/gdn_scan.uc) is
@@ -730,7 +754,48 @@ export function attn_forward_dev(cfg, L, x, cl, st) {
 }
 
 /* SwiGLU MLP. */
+/* gate and up as ONE cooperative launch for decode / verify rows (S <= 8):
+ * two ~50 us gemms at four rows become one. The bundle needs both
+ * products to share K and the codebook (mixed-bitrate checkpoints assign
+ * K per tensor), and writes into persistent buffers, so it is built once
+ * per row count and kept on the layer (the CUDA graphs bake the buffer
+ * addresses). Returns null when the pair cannot be fused. */
+const MLP_BUNDLE = getenv('AMP_NO_MLP_BUNDLE') == null;
+
+function mlp_bundle(L, S) {
+	let g = L.gate_proj, u = L.up_proj;
+
+	if (!MLP_BUNDLE || g.trellis == null || u.trellis == null || g.bias || u.bias ||
+	    g.K != u.K || g.mul1 != u.mul1 || g.mcg != u.mcg ||
+	    g.in_features != u.in_features || g.out_features != u.out_features)
+		return null;
+
+	if (L.gu_bundle == null)
+		L.gu_bundle = {};
+
+	let key = '' + S;
+
+	if (L.gu_bundle[key] == null) {
+		let dev = g.dev;
+		let out = torch.zeros([2, S, g.out_features], 'float16', 'cuda:' + dev);
+
+		L.gu_bundle[key] = models.multi([ g, u ], out, dev);
+	}
+
+	return L.gu_bundle[key];
+}
+
 export function mlp_forward(L, x) {
+	let S = x.shape()[1];
+	let gu = (S <= 8 && x.shape()[0] == 1) ? mlp_bundle(L, S) : null;
+
+	if (gu) {
+		gu.run(x.contiguous());
+
+		return L.down_proj.forward(torch.silu_mul(gu.out.narrow(0, 0, 1),
+			gu.out.narrow(0, 1, 1)));
+	}
+
 	let gate = L.gate_proj.forward(x);
 	let up = L.up_proj.forward(x);
 

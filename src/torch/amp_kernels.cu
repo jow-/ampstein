@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <stddef.h>
 
@@ -77,12 +78,95 @@ __global__ void amp_rms_norm_kernel(const __half *__restrict__ x,
 	}
 }
 
+// The same RMSNorm with 4-half (8-byte) chunks per thread and a block
+// sized to the row, like amp_rms_norm_res_kernel: at decode (1-5 rows) the
+// scalar kernel above is latency-bound (12 us for 5120 dims; this one is
+// ~3 us). Requires dim % 4 == 0 and 8-byte aligned rows.
+__global__ void amp_rms_norm_vec_kernel(const __half *__restrict__ x,
+                                       const __half *__restrict__ w,
+                                       __half *__restrict__ out,
+                                       int dim, float eps)
+{
+	const int row = blockIdx.x;
+	const int cnt = dim >> 2;
+	const __half *xr = x + (size_t)row * dim;
+	__half *yr = out + (size_t)row * dim;
+
+	float acc = 0.0f;
+
+	for (int c = threadIdx.x; c < cnt; c += blockDim.x) {
+		uint2 xv = *(const uint2 *)(xr + c * 4);
+		float2 v0 = __half22float2(*reinterpret_cast<__half2 *>(&xv.x));
+		float2 v1 = __half22float2(*reinterpret_cast<__half2 *>(&xv.y));
+
+		acc += v0.x * v0.x + v0.y * v0.y;
+		acc += v1.x * v1.x + v1.y * v1.y;
+	}
+
+#pragma unroll
+	for (int off = 16; off > 0; off >>= 1)
+		acc += __shfl_down_sync(0xffffffffu, acc, off);
+
+	__shared__ float warp_sum[32];
+
+	if ((threadIdx.x & 31) == 0)
+		warp_sum[threadIdx.x >> 5] = acc;
+
+	__syncthreads();
+
+	if (threadIdx.x == 0) {
+		float total = 0.0f;
+
+		for (int i = 0; i < (int)(blockDim.x >> 5); i++)
+			total += warp_sum[i];
+
+		warp_sum[0] = rsqrtf(total / dim + eps);
+	}
+
+	__syncthreads();
+
+	const float scale = warp_sum[0];
+
+	for (int c = threadIdx.x; c < cnt; c += blockDim.x) {
+		uint2 xv = *(const uint2 *)(xr + c * 4);
+		uint2 wv = *(const uint2 *)(w + c * 4);
+		float2 v0 = __half22float2(*reinterpret_cast<__half2 *>(&xv.x));
+		float2 v1 = __half22float2(*reinterpret_cast<__half2 *>(&xv.y));
+
+		/* normalize in fp32, round to fp16, THEN multiply by the weight
+		 * in fp16 — as the scalar kernel */
+		__half2 n0 = __hmul2(__floats2half2_rn(v0.x * scale, v0.y * scale),
+			*reinterpret_cast<__half2 *>(&wv.x));
+		__half2 n1 = __hmul2(__floats2half2_rn(v1.x * scale, v1.y * scale),
+			*reinterpret_cast<__half2 *>(&wv.y));
+
+		*(uint2 *)(yr + c * 4) = make_uint2(
+			*reinterpret_cast<unsigned *>(&n0),
+			*reinterpret_cast<unsigned *>(&n1));
+	}
+}
+
 extern "C" int
 amp_rms_norm_fp16(const void *x, const void *w, void *out,
                  long rows, int dim, double eps, cudaStream_t stream)
 {
 	if (rows <= 0 || dim <= 0)
 		return 0;
+
+	if ((dim & 3) == 0 && !(((uintptr_t)x | (uintptr_t)w | (uintptr_t)out) & 7)) {
+		int threads = dim >> 2;
+
+		if (threads > 1024)
+			threads = 1024;
+
+		threads = (threads + 31) & ~31;
+
+		amp_rms_norm_vec_kernel<<<(int)rows, threads, 0, stream>>>(
+			(const __half *)x, (const __half *)w, (__half *)out,
+			dim, (float)eps);
+
+		return (int)cudaGetLastError();
+	}
 
 	amp_rms_norm_kernel<<<(int)rows, AMP_RMS_BLOCK, 0, stream>>>(
 		(const __half *)x, (const __half *)w, (__half *)out,
@@ -898,86 +982,405 @@ amp_argmax_advance_fp16(const void *logits, int n,
 //   state  (Hv, DK, dv) fp32, updated in place
 //   out    (S, Hv, dv) fp32
 //
-// Grid (Hv, dv / VT), block VT threads: thread j owns state column
-// S[:, j] of its head in registers (DK floats), so the token loop needs
-// no global state traffic; q/k rows are staged in shared memory once per
-// token for all threads of the block.
+// Grid (Hv, dv / VT), block VT * RS threads. A state column S[:, j] is
+// split over RS adjacent lanes (lane % RS = r owns rows m * RS + r, so
+// the shared-memory reads of the RS lanes hit distinct banks): the
+// token's two 128-long dependent FMA chains become DK / RS long, the
+// partial sums meet in a shuffle. The scan is latency-bound (one token's
+// chain is ~1 us at DK = 128 on a single thread per column, and only 48
+// blocks of two warps exist per GPU), not throughput-bound.
+//
+// Tokens are processed in tiles of AMP_GDN_TB: the next tile's q / k /
+// v / g / beta are copied to the other half of a double buffer with
+// cp.async while the current one computes, so the per-token loop has
+// no global loads and no barriers (one pair per tile).
 // ---------------------------------------------------------------------------
 
-#define AMP_GDN_VT 64
+#define AMP_GDN_TB 16        /* tokens per staged tile */
 
-template <int DK>
-__global__ __launch_bounds__(AMP_GDN_VT)
+__device__ __forceinline__ void amp_cp_async16(void *dst, const void *src)
+{
+	unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+
+	asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(d), "l"(src));
+}
+
+__device__ __forceinline__ void amp_cp_async4(void *dst, const void *src)
+{
+	unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+
+	asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(d), "l"(src));
+}
+
+template <int DK, int VT, int RS>
+__global__ __launch_bounds__(VT * RS)
 void amp_gdn_scan_kernel(const float *__restrict__ q, const float *__restrict__ k,
                         const float *__restrict__ v, const float *__restrict__ beta,
                         const float *__restrict__ gexp, float *__restrict__ state,
                         float *__restrict__ out, int S, int Hk, int Hv, int dv,
                         float scale, float *__restrict__ states_out, int n_out)
 {
+	constexpr int NT = VT * RS;
+	constexpr int RPT = DK / RS;                 // state rows per thread
+	constexpr int TB = AMP_GDN_TB;
+	constexpr int BUF = TB * (2 * DK + VT + 2);  // floats per tile buffer
+
 	const int h = blockIdx.x;
-	const int j = blockIdx.y * AMP_GDN_VT + threadIdx.x;
+	const int r = threadIdx.x % RS;
+	const int jl = threadIdx.x / RS;
+	const int j0 = blockIdx.y * VT;
+	const int j = j0 + jl;
 	const int hk = h / (Hv / Hk);
 
-	__shared__ float sq[DK];
-	__shared__ float sk[DK];
+	// tile buffer: q[TB][DK] | k[TB][DK] | v[TB][VT] | g[TB] | beta[TB]
+	__shared__ __align__(16) float sbuf[2 * BUF];
 
-	float st[DK];
+	float st[RPT];
 	float *sp = state + (size_t)h * DK * dv + j;
 
 #pragma unroll
-	for (int i = 0; i < DK; i++)
-		st[i] = sp[(size_t)i * dv];
+	for (int m = 0; m < RPT; m++)
+		st[m] = sp[(size_t)(m * RS + r) * dv];
 
-	for (int t = 0; t < S; t++) {
-		const float *qt = q + ((size_t)t * Hk + hk) * DK;
-		const float *kt = k + ((size_t)t * Hk + hk) * DK;
+	const int ntiles = (S + TB - 1) / TB;
 
-		for (int i = threadIdx.x; i < DK; i += AMP_GDN_VT) {
-			sq[i] = qt[i];
-			sk[i] = kt[i];
+	// stage tile `tile` into buffer `bi`: one async-copy group
+	auto stage = [&](int tile, int bi) {
+		float *bq = sbuf + bi * BUF;
+		float *bk = bq + TB * DK;
+		float *bv = bk + TB * DK;
+		float *bg = bv + TB * VT;
+		float *bb = bg + TB;
+		const int t0 = tile * TB;
+		const int n = min(TB, S - t0);
+
+		for (int c = threadIdx.x; c < n * (DK / 4); c += NT) {
+			int tt = c / (DK / 4), x = c % (DK / 4);
+			size_t go = ((size_t)(t0 + tt) * Hk + hk) * DK + x * 4;
+
+			amp_cp_async16(bq + tt * DK + x * 4, q + go);
+			amp_cp_async16(bk + tt * DK + x * 4, k + go);
 		}
+
+		for (int c = threadIdx.x; c < n * (VT / 4); c += NT) {
+			int tt = c / (VT / 4), x = c % (VT / 4);
+
+			amp_cp_async16(bv + tt * VT + x * 4,
+				v + ((size_t)(t0 + tt) * Hv + h) * dv + j0 + x * 4);
+		}
+
+		for (int tt = threadIdx.x; tt < n; tt += NT) {
+			amp_cp_async4(bg + tt, gexp + (size_t)(t0 + tt) * Hv + h);
+			amp_cp_async4(bb + tt, beta + (size_t)(t0 + tt) * Hv + h);
+		}
+
+		asm volatile("cp.async.commit_group;\n" ::);
+	};
+
+	stage(0, 0);
+
+	for (int tile = 0; tile < ntiles; tile++) {
+		if (tile + 1 < ntiles) {
+			stage(tile + 1, (tile + 1) & 1);
+			asm volatile("cp.async.wait_group 1;\n" ::);
+		}
+		else
+			asm volatile("cp.async.wait_group 0;\n" ::);
 
 		__syncthreads();
 
-		const float g = gexp[(size_t)t * Hv + h];
-		const float b = beta[(size_t)t * Hv + h];
+		const float *bq = sbuf + (tile & 1) * BUF;
+		const float *bk = bq + TB * DK;
+		const float *bv = bk + TB * DK;
+		const float *bg = bv + TB * VT;
+		const float *bb = bg + TB;
+		const int t0 = tile * TB;
+		const int n = min(TB, S - t0);
 
-		float kv = 0.0f;
+		for (int tt = 0; tt < n; tt++) {
+			const int t = t0 + tt;
+			const float *skb = bk + tt * DK, *sqb = bq + tt * DK;
+			const float g = bg[tt], b = bb[tt], vt = bv[tt * VT + jl];
+
+			float kv0 = 0.0f, kv1 = 0.0f;
 
 #pragma unroll
-		for (int i = 0; i < DK; i++)
-			kv = fmaf(st[i], sk[i], kv);
+			for (int m = 0; m < RPT; m += 2) {
+				kv0 = fmaf(st[m], skb[m * RS + r], kv0);
+				kv1 = fmaf(st[m + 1], skb[(m + 1) * RS + r], kv1);
+			}
 
-		const float vn = b * (v[((size_t)t * Hv + h) * dv + j] - g * kv);
-
-		float o = 0.0f;
+			float kv = kv0 + kv1;
 
 #pragma unroll
-		for (int i = 0; i < DK; i++) {
-			st[i] = fmaf(g, st[i], sk[i] * vn);
-			o = fmaf(st[i], sq[i], o);
+			for (int off = 1; off < RS; off <<= 1)
+				kv += __shfl_xor_sync(0xffffffffu, kv, off);
+
+			const float vn = b * (vt - g * kv);
+
+			float o0 = 0.0f, o1 = 0.0f;
+
+#pragma unroll
+			for (int m = 0; m < RPT; m += 2) {
+				st[m] = fmaf(g, st[m], skb[m * RS + r] * vn);
+				st[m + 1] = fmaf(g, st[m + 1], skb[(m + 1) * RS + r] * vn);
+				o0 = fmaf(st[m], sqb[m * RS + r], o0);
+				o1 = fmaf(st[m + 1], sqb[(m + 1) * RS + r], o1);
+			}
+
+			float o = o0 + o1;
+
+#pragma unroll
+			for (int off = 1; off < RS; off <<= 1)
+				o += __shfl_xor_sync(0xffffffffu, o, off);
+
+			if (r == 0)
+				out[((size_t)t * Hv + h) * dv + j] = o * scale;
+
+			// speculative verify: the state after token t (t < n_out),
+			// same layout as `state`, so a rejection after token t
+			// restores it with a plain copy instead of re-running the
+			// accepted tokens
+			if (t < n_out) {
+				float *so = states_out + ((size_t)t * Hv + h) * DK * dv + j;
+
+#pragma unroll
+				for (int m = 0; m < RPT; m++)
+					so[(size_t)(m * RS + r) * dv] = st[m];
+			}
 		}
 
-		out[((size_t)t * Hv + h) * dv + j] = o * scale;
-
-		// speculative verify: the state after token t (t < n_out), same
-		// layout as `state`, so a rejection after token t restores it
-		// with a plain copy instead of re-running the accepted tokens
-		if (t < n_out) {
-			float *so = states_out + ((size_t)t * Hv + h) * DK * dv + j;
-
-#pragma unroll
-			for (int i = 0; i < DK; i++)
-				so[(size_t)i * dv] = st[i];
-		}
-
-		// the next token overwrites sq/sk
+		// everyone is done with this buffer before it is restaged
 		__syncthreads();
 	}
 
 #pragma unroll
-	for (int i = 0; i < DK; i++)
-		sp[(size_t)i * dv] = st[i];
+	for (int m = 0; m < RPT; m++)
+		sp[(size_t)(m * RS + r) * dv] = st[m];
+}
+
+// Register-blocked variant for DK = 128: a thread owns C = 4 adjacent
+// columns x DK / RS contiguous rows of the state, so each k / q value it
+// reads from shared memory (one 128-bit load per four rows) serves four
+// columns. The scan is bound by shared-memory instruction throughput,
+// not by FMAs: the per-column form needs ~1500 LDS wavefronts per token
+// per head. Rows of the staged q / k are padded by 4 floats per RS-th so
+// the RS row blocks read from distinct bank quads.
+#define AMP_GDN_CB_C 4
+#define AMP_GDN_CB_DEFAULT 11
+
+template <int DK, int VT, int RS>
+__global__ __launch_bounds__((VT / AMP_GDN_CB_C) * RS)
+void amp_gdn_scan_cb_kernel(const float *__restrict__ q, const float *__restrict__ k,
+                           const float *__restrict__ v, const float *__restrict__ beta,
+                           const float *__restrict__ gexp, float *__restrict__ state,
+                           float *__restrict__ out, int S, int Hk, int Hv, int dv,
+                           float scale, float *__restrict__ states_out, int n_out)
+{
+	constexpr int C = AMP_GDN_CB_C;
+	constexpr int NT = (VT / C) * RS;
+	constexpr int RPT = DK / RS;                  // rows per thread
+	constexpr int DKP = RS * (RPT + 4);           // padded staged row
+	constexpr int TB = AMP_GDN_TB;
+	constexpr int BUF = TB * (2 * DKP + VT + 2);
+
+	const int h = blockIdx.x;
+	const int r = threadIdx.x % RS;
+	const int cg = threadIdx.x / RS;              // column group
+	const int j0 = blockIdx.y * VT;
+	const int jc = j0 + cg * C;
+	const int hk = h / (Hv / Hk);
+
+	__shared__ __align__(16) float sbuf[2 * BUF];
+
+	float st[C][RPT];
+	const float *sp = state + (size_t)h * DK * dv + jc;
+
+#pragma unroll
+	for (int m = 0; m < RPT; m++) {
+		float4 x = *(const float4 *)(sp + (size_t)(r * RPT + m) * dv);
+
+		st[0][m] = x.x;
+		st[1][m] = x.y;
+		st[2][m] = x.z;
+		st[3][m] = x.w;
+	}
+
+	const int ntiles = (S + TB - 1) / TB;
+
+	auto stage = [&](int tile, int bi) {
+		float *bq = sbuf + bi * BUF;
+		float *bk = bq + TB * DKP;
+		float *bv = bk + TB * DKP;
+		float *bg = bv + TB * VT;
+		float *bb = bg + TB;
+		const int t0 = tile * TB;
+		const int n = min(TB, S - t0);
+
+		for (int c = threadIdx.x; c < n * (DK / 4); c += NT) {
+			int tt = c / (DK / 4), x = c % (DK / 4);
+			int i = x * 4;
+			int dst = tt * DKP + (i / RPT) * (RPT + 4) + (i % RPT);
+			size_t go = ((size_t)(t0 + tt) * Hk + hk) * DK + i;
+
+			amp_cp_async16(bq + dst, q + go);
+			amp_cp_async16(bk + dst, k + go);
+		}
+
+		for (int c = threadIdx.x; c < n * (VT / 4); c += NT) {
+			int tt = c / (VT / 4), x = c % (VT / 4);
+
+			amp_cp_async16(bv + tt * VT + x * 4,
+				v + ((size_t)(t0 + tt) * Hv + h) * dv + j0 + x * 4);
+		}
+
+		for (int tt = threadIdx.x; tt < n; tt += NT) {
+			amp_cp_async4(bg + tt, gexp + (size_t)(t0 + tt) * Hv + h);
+			amp_cp_async4(bb + tt, beta + (size_t)(t0 + tt) * Hv + h);
+		}
+
+		asm volatile("cp.async.commit_group;\n" ::);
+	};
+
+	stage(0, 0);
+
+	for (int tile = 0; tile < ntiles; tile++) {
+		if (tile + 1 < ntiles) {
+			stage(tile + 1, (tile + 1) & 1);
+			asm volatile("cp.async.wait_group 1;\n" ::);
+		}
+		else
+			asm volatile("cp.async.wait_group 0;\n" ::);
+
+		__syncthreads();
+
+		const float *bq = sbuf + (tile & 1) * BUF;
+		const float *bk = bq + TB * DKP;
+		const float *bv = bk + TB * DKP;
+		const float *bg = bv + TB * VT;
+		const float *bb = bg + TB;
+		const int t0 = tile * TB;
+		const int n = min(TB, S - t0);
+
+		for (int tt = 0; tt < n; tt++) {
+			const int t = t0 + tt;
+			const float4 *skb = (const float4 *)(bk + tt * DKP + r * (RPT + 4));
+			const float4 *sqb = (const float4 *)(bq + tt * DKP + r * (RPT + 4));
+			const float g = bg[tt], b = bb[tt];
+			const float4 vv = *(const float4 *)(bv + tt * VT + cg * C);
+
+			float kva[C], kvb[C];
+
+#pragma unroll
+			for (int c = 0; c < C; c++) {
+				kva[c] = 0.0f;
+				kvb[c] = 0.0f;
+			}
+
+#pragma unroll
+			for (int m4 = 0; m4 < RPT / 4; m4++) {
+				float4 a = skb[m4];
+
+#pragma unroll
+				for (int c = 0; c < C; c++) {
+					kva[c] = fmaf(st[c][4 * m4], a.x, kva[c]);
+					kvb[c] = fmaf(st[c][4 * m4 + 1], a.y, kvb[c]);
+					kva[c] = fmaf(st[c][4 * m4 + 2], a.z, kva[c]);
+					kvb[c] = fmaf(st[c][4 * m4 + 3], a.w, kvb[c]);
+				}
+			}
+
+			float vn[C];
+			const float vtv[C] = { vv.x, vv.y, vv.z, vv.w };
+
+#pragma unroll
+			for (int c = 0; c < C; c++) {
+				float kv = kva[c] + kvb[c];
+
+#pragma unroll
+				for (int off = 1; off < RS; off <<= 1)
+					kv += __shfl_xor_sync(0xffffffffu, kv, off);
+
+				vn[c] = b * (vtv[c] - g * kv);
+			}
+
+			float oa[C], ob[C];
+
+#pragma unroll
+			for (int c = 0; c < C; c++) {
+				oa[c] = 0.0f;
+				ob[c] = 0.0f;
+			}
+
+#pragma unroll
+			for (int m4 = 0; m4 < RPT / 4; m4++) {
+				float4 a = skb[m4];
+				float4 e = sqb[m4];
+
+#pragma unroll
+				for (int c = 0; c < C; c++) {
+					st[c][4 * m4] = fmaf(g, st[c][4 * m4], a.x * vn[c]);
+					st[c][4 * m4 + 1] = fmaf(g, st[c][4 * m4 + 1], a.y * vn[c]);
+					st[c][4 * m4 + 2] = fmaf(g, st[c][4 * m4 + 2], a.z * vn[c]);
+					st[c][4 * m4 + 3] = fmaf(g, st[c][4 * m4 + 3], a.w * vn[c]);
+					oa[c] = fmaf(st[c][4 * m4], e.x, oa[c]);
+					ob[c] = fmaf(st[c][4 * m4 + 1], e.y, ob[c]);
+					oa[c] = fmaf(st[c][4 * m4 + 2], e.z, oa[c]);
+					ob[c] = fmaf(st[c][4 * m4 + 3], e.w, ob[c]);
+				}
+			}
+
+			float o[C];
+
+#pragma unroll
+			for (int c = 0; c < C; c++) {
+				o[c] = oa[c] + ob[c];
+
+#pragma unroll
+				for (int off = 1; off < RS; off <<= 1)
+					o[c] += __shfl_xor_sync(0xffffffffu, o[c], off);
+			}
+
+			if (r == 0)
+				*(float4 *)(out + ((size_t)t * Hv + h) * dv + jc) =
+					make_float4(o[0] * scale, o[1] * scale, o[2] * scale,
+						o[3] * scale);
+
+			// state after token t for the speculative verify rollback
+			if (t < n_out) {
+				float *so = states_out + ((size_t)t * Hv + h) * DK * dv + jc;
+
+#pragma unroll
+				for (int m = 0; m < RPT; m++)
+					*(float4 *)(so + (size_t)(r * RPT + m) * dv) =
+						make_float4(st[0][m], st[1][m], st[2][m], st[3][m]);
+			}
+		}
+
+		__syncthreads();
+	}
+
+	float *wp = state + (size_t)h * DK * dv + jc;
+
+#pragma unroll
+	for (int m = 0; m < RPT; m++)
+		*(float4 *)(wp + (size_t)(r * RPT + m) * dv) =
+			make_float4(st[0][m], st[1][m], st[2][m], st[3][m]);
+}
+
+/* AMP_GDN_SCAN_CFG = VT*100 + RS, e.g. 3204 (32 columns x 4 lanes);
+ * default below */
+static int amp_gdn_scan_cfg(void)
+{
+	static int cfg = -1;
+
+	if (cfg < 0) {
+		const char *e = getenv("AMP_GDN_SCAN_CFG");
+
+		cfg = e ? atoi(e) : 0;
+	}
+
+	return cfg;
 }
 
 extern "C" int
@@ -989,35 +1392,86 @@ amp_gdn_scan_f32(const void *q, const void *k, const void *v, const void *beta,
 	if (S <= 0)
 		return 0;
 
-	if (Hk <= 0 || Hv % Hk != 0 || dv % AMP_GDN_VT != 0) {
+	int cfg = amp_gdn_scan_cfg();
+
+	/* default: the register-blocked kernel (DK = 128; cfg 0 = the
+	 * default shape, 10 .. 13 select another for experiments) */
+	if ((cfg == 0 || (cfg >= 10 && cfg <= 13)) && dk == 128 && Hk > 0 &&
+	    Hv % Hk == 0 && dv % 4 == 0) {
+		int c = (cfg == 0) ? AMP_GDN_CB_DEFAULT : cfg;
+
+#define AMP_CB(VT_, RS_) do { \
+	if (dv % (VT_) == 0) { \
+		dim3 g(Hv, dv / (VT_)); \
+		amp_gdn_scan_cb_kernel<128, VT_, RS_><<<g, ((VT_) / AMP_GDN_CB_C) * (RS_), \
+			0, stream>>>((const float *)q, (const float *)k, (const float *)v, \
+			(const float *)beta, (const float *)gexp, (float *)state, \
+			(float *)out, S, Hk, Hv, dv, scale, (float *)states_out, n_out); \
+		return (int)cudaGetLastError(); \
+	} } while (0)
+
+		switch (c) {
+		case 10: AMP_CB(32, 4); break;
+		case 11: AMP_CB(32, 8); break;
+		case 12: AMP_CB(16, 8); break;
+		case 13: AMP_CB(16, 4); break;
+		}
+#undef AMP_CB
+	}
+
+	if (cfg == 0)
+		cfg = 3204;
+
+	int VT = cfg / 100, RS = cfg % 100;
+
+	if (Hk <= 0 || Hv % Hk != 0 || dv % VT != 0) {
 		fprintf(stderr, "amp_gdn_scan: unsupported heads/dims (Hk %d, Hv %d, dv %d)\n",
 			Hk, Hv, dv);
 		return -1;
 	}
 
-	dim3 grid(Hv, dv / AMP_GDN_VT);
+	dim3 grid(Hv, dv / VT);
 
-	switch (dk) {
-	case 64:
-		amp_gdn_scan_kernel<64><<<grid, AMP_GDN_VT, 0, stream>>>(
-			(const float *)q, (const float *)k, (const float *)v,
-			(const float *)beta, (const float *)gexp, (float *)state,
-			(float *)out, S, Hk, Hv, dv, scale, (float *)states_out, n_out);
-		break;
+#define AMP_GS(DK, VT_, RS_) do { \
+	amp_gdn_scan_kernel<DK, VT_, RS_><<<grid, (VT_) * (RS_), 0, stream>>>( \
+		(const float *)q, (const float *)k, (const float *)v, \
+		(const float *)beta, (const float *)gexp, (float *)state, \
+		(float *)out, S, Hk, Hv, dv, scale, (float *)states_out, n_out); \
+	return (int)cudaGetLastError(); } while (0)
 
-	case 128:
-		amp_gdn_scan_kernel<128><<<grid, AMP_GDN_VT, 0, stream>>>(
-			(const float *)q, (const float *)k, (const float *)v,
-			(const float *)beta, (const float *)gexp, (float *)state,
-			(float *)out, S, Hk, Hv, dv, scale, (float *)states_out, n_out);
-		break;
-
-	default:
+	if (dk == 128) {
+		switch (cfg) {
+		case 6401: AMP_GS(128, 64, 1);
+		case 6404: AMP_GS(128, 64, 4);
+		case 3204: AMP_GS(128, 32, 4);
+		case 3208: AMP_GS(128, 32, 8);
+		case 1604: AMP_GS(128, 16, 4);
+		case 1608: AMP_GS(128, 16, 8);
+		case 3202: AMP_GS(128, 32, 2);
+		case 1616: AMP_GS(128, 16, 16);
+		}
+	}
+	else if (dk == 64) {
+		switch (cfg) {
+		case 6401: AMP_GS(64, 64, 1);
+		case 6404: AMP_GS(64, 64, 4);
+		case 3204: AMP_GS(64, 32, 4);
+		case 3208: AMP_GS(64, 32, 8);
+		case 1604: AMP_GS(64, 16, 4);
+		case 1608: AMP_GS(64, 16, 8);
+		case 3202: AMP_GS(64, 32, 2);
+		case 1616: AMP_GS(64, 16, 16);
+		}
+	}
+	else {
 		fprintf(stderr, "amp_gdn_scan: unsupported k head dim %d (64, 128)\n", dk);
 		return -1;
 	}
 
-	return (int)cudaGetLastError();
+#undef AMP_GS
+
+	fprintf(stderr, "amp_gdn_scan: unsupported AMP_GDN_SCAN_CFG %d\n", cfg);
+	return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,17 +1560,36 @@ __global__ void amp_gdn_prep_kernel(const __half *__restrict__ qkv,
 		k[((size_t)t * Hk + (hb - Hk)) * hd + e] = yn;
 }
 
+/* Per-token snapshots of the conv state for the speculative verify:
+ * snapshot t is the window of K-1 padded inputs ending at token t,
+ * (D, K-1) like the state itself. */
+#define AMP_GDN_SPEC_MAX 4
+
+struct amp_gdn_spec {
+	__half *p[AMP_GDN_SPEC_MAX];
+	int n;
+};
+
 /* conv state <- last K-1 padded inputs; per channel ascending, so a read
- * of an old state slot (S < K-1) happens before that slot is rewritten */
+ * of an old state slot (S < K-1) happens before that slot is rewritten.
+ * The snapshots read the old state too, so they are written first. */
 __global__ void amp_gdn_conv_state_kernel(const __half *__restrict__ qkv,
                                          __half *__restrict__ cs, int S, int D,
-                                         int K)
+                                         int K, amp_gdn_spec spec)
 {
 	int d = blockIdx.x * blockDim.x + threadIdx.x;
 	int km1 = K - 1;
 
 	if (d >= D)
 		return;
+
+	for (int t = 0; t < spec.n; t++)
+		for (int i = 0; i < km1; i++) {
+			int p = t + 1 + i;      // padded index of snapshot t slot i
+
+			spec.p[t][(size_t)d * km1 + i] = (p < km1) ?
+				cs[(size_t)d * km1 + p] : qkv[(size_t)(p - km1) * D + d];
+		}
 
 	for (int i = 0; i < km1; i++) {
 		int p = S + i;      // padded index of the new state slot i
@@ -1129,14 +1602,16 @@ __global__ void amp_gdn_conv_state_kernel(const __half *__restrict__ qkv,
 extern "C" int
 amp_gdn_prep_fp16(const void *qkv, void *conv_state, const void *conv_w,
                  void *q, void *k, void *v, int S, int D, int K, int Hk,
-                 int Hv, int hd, cudaStream_t stream)
+                 int Hv, int hd, void *const *spec, int nspec,
+                 cudaStream_t stream)
 {
 	if (S <= 0)
 		return 0;
 
-	if (hd > 1024 || hd % 32 != 0 || D != (2 * Hk + Hv) * hd || K < 1) {
-		fprintf(stderr, "amp_gdn_prep: unsupported dims (D %d, Hk %d, Hv %d, hd %d, K %d)\n",
-			D, Hk, Hv, hd, K);
+	if (hd > 1024 || hd % 32 != 0 || D != (2 * Hk + Hv) * hd || K < 1 ||
+	    nspec < 0 || nspec > AMP_GDN_SPEC_MAX || nspec > S) {
+		fprintf(stderr, "amp_gdn_prep: unsupported dims (D %d, Hk %d, Hv %d, hd %d, K %d, "
+			"snapshots %d)\n", D, Hk, Hv, hd, K, nspec);
 		return -1;
 	}
 
@@ -1146,9 +1621,17 @@ amp_gdn_prep_fp16(const void *qkv, void *conv_state, const void *conv_w,
 		(const __half *)conv_state, (const __half *)conv_w, (float *)q,
 		(float *)k, (float *)v, S, D, K, Hk, Hv, hd);
 
-	if (K > 1)
+	if (K > 1) {
+		amp_gdn_spec sp;
+
+		sp.n = nspec;
+
+		for (int i = 0; i < AMP_GDN_SPEC_MAX; i++)
+			sp.p[i] = (i < nspec) ? (__half *)spec[i] : NULL;
+
 		amp_gdn_conv_state_kernel<<<(D + 255) / 256, 256, 0, stream>>>(
-			(const __half *)qkv, (__half *)conv_state, S, D, K);
+			(const __half *)qkv, (__half *)conv_state, S, D, K, sp);
+	}
 
 	return (int)cudaGetLastError();
 }
@@ -1190,6 +1673,112 @@ amp_gdn_gates(const void *a, const void *b, const void *dt_bias,
 	amp_gdn_gates_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
 		(const __half *)a, (const __half *)b, (const float *)dt_bias,
 		(const float *)nea, (float *)beta, (float *)gexp, n, Hv);
+
+	return (int)cudaGetLastError();
+}
+
+// GDN gates straight from the hidden state: the in_proj_a / in_proj_b
+// products (fp16 weights, fp32 accumulation, rounded to fp16 like the
+// matmul they replace) and the gate math of amp_gdn_gates_kernel in one
+// launch, for S <= AMP_ABG_MAXS rows. One block per v head: it reads that
+// head's two weight rows once and serves every row.
+//   x (S, K) fp16; wa, wb (Hv, K) fp16; beta, gexp (S, Hv) fp32 out
+#define AMP_ABG_MAXS 8
+#define AMP_ABG_THREADS 512
+
+__global__ void amp_gdn_ab_gates_kernel(const __half *__restrict__ x,
+                                       const __half *__restrict__ wa,
+                                       const __half *__restrict__ wb,
+                                       const float *__restrict__ dt_bias,
+                                       const float *__restrict__ nea,
+                                       float *__restrict__ beta,
+                                       float *__restrict__ gexp,
+                                       int S, int K, int Hv)
+{
+	const int h = blockIdx.x;
+	const __half2 *a2 = (const __half2 *)(wa + (size_t)h * K);
+	const __half2 *b2 = (const __half2 *)(wb + (size_t)h * K);
+	const __half2 *x2 = (const __half2 *)x;
+	const int K2 = K / 2;
+
+	float accA[AMP_ABG_MAXS], accB[AMP_ABG_MAXS];
+
+	#pragma unroll
+	for (int s = 0; s < AMP_ABG_MAXS; s++) {
+		accA[s] = 0.0f;
+		accB[s] = 0.0f;
+	}
+
+	for (int k = threadIdx.x; k < K2; k += AMP_ABG_THREADS) {
+		float2 wav = __half22float2(a2[k]);
+		float2 wbv = __half22float2(b2[k]);
+
+		#pragma unroll
+		for (int s = 0; s < AMP_ABG_MAXS; s++) {
+			if (s < S) {
+				float2 xv = __half22float2(x2[(size_t)s * K2 + k]);
+
+				accA[s] = fmaf(xv.x, wav.x, fmaf(xv.y, wav.y, accA[s]));
+				accB[s] = fmaf(xv.x, wbv.x, fmaf(xv.y, wbv.y, accB[s]));
+			}
+		}
+	}
+
+	__shared__ float red[2][AMP_ABG_MAXS][AMP_ABG_THREADS / 32];
+	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+
+	#pragma unroll
+	for (int s = 0; s < AMP_ABG_MAXS; s++) {
+		float va = accA[s], vb = accB[s];
+
+		#pragma unroll
+		for (int o = 16; o > 0; o >>= 1) {
+			va += __shfl_xor_sync(0xffffffffu, va, o);
+			vb += __shfl_xor_sync(0xffffffffu, vb, o);
+		}
+
+		if (lane == 0) {
+			red[0][s][warp] = va;
+			red[1][s][warp] = vb;
+		}
+	}
+
+	__syncthreads();
+
+	if (threadIdx.x < S) {
+		const int s = threadIdx.x;
+		float va = 0.0f, vb = 0.0f;
+
+		#pragma unroll
+		for (int w = 0; w < AMP_ABG_THREADS / 32; w++) {
+			va += red[0][s][w];
+			vb += red[1][s][w];
+		}
+
+		/* the unfused path rounds both products to fp16 */
+		float bv = __half2float(__float2half(vb));
+		float av = __half2float(__float2half(va)) + dt_bias[h];
+		float sp = (av > 20.0f) ? av : log1pf(__expf(av));
+
+		beta[(size_t)s * Hv + h] = 1.0f / (1.0f + __expf(-bv));
+		gexp[(size_t)s * Hv + h] = __expf(nea[h] * sp);
+	}
+}
+
+extern "C" int
+amp_gdn_ab_gates(const void *x, const void *wa, const void *wb,
+                const void *dt_bias, const void *nea, void *beta, void *gexp,
+                int S, int K, int Hv, cudaStream_t stream)
+{
+	if (S < 1 || S > AMP_ABG_MAXS || (K & 1) || Hv < 1) {
+		fprintf(stderr, "amp_gdn_ab_gates: unsupported S %d K %d Hv %d\n", S, K, Hv);
+		return -1;
+	}
+
+	amp_gdn_ab_gates_kernel<<<Hv, AMP_ABG_THREADS, 0, stream>>>(
+		(const __half *)x, (const __half *)wa, (const __half *)wb,
+		(const float *)dt_bias, (const float *)nea, (float *)beta,
+		(float *)gexp, S, K, Hv);
 
 	return (int)cudaGetLastError();
 }
@@ -2089,6 +2678,22 @@ amp_copy_many(const void *const *src, void *const *dst, const long *bytes,
  */
 #define AMP_AD_MAXS 5
 
+/* Effective split count: a split needs at least AMP_AD_MINCHUNK keys to
+ * pay for its block and its combine row. The workspace stays laid out for
+ * the launch's `ns` splits; blocks beyond the effective count exit and the
+ * combine does not read them, so a short context costs a handful of
+ * splits instead of all of them. Derived from the device length by both
+ * kernels, so they always agree. */
+#define AMP_AD_MINCHUNK 128
+
+__device__ __forceinline__ int amp_ad_nse(int len, int ns)
+{
+	int n = (len + AMP_AD_MINCHUNK - 1) / AMP_AD_MINCHUNK;
+
+	return max(1, min(ns, n));
+}
+
+
 /* SR: the number of query rows S, a template parameter so the per-row
  * register arrays are sized exactly (a 5-row worst case cost the S = 1
  * kernel half its occupancy) */
@@ -2112,7 +2717,12 @@ amp_attn_dec_kernel(const __half *__restrict__ q, const __half *__restrict__ kc,
 
 	len = (len < 0) ? 0 : (len > max_seq ? max_seq : len);
 
-	const int chunk = (len + ns - 1) / ns;
+	const int nse = amp_ad_nse(len, ns);
+
+	if (sp >= nse)
+		return;
+
+	const int chunk = (len + nse - 1) / nse;
 	const int begin = sp * chunk;
 	const int end = min(len, begin + chunk);
 
@@ -2246,7 +2856,8 @@ amp_attn_dec_kernel(const __half *__restrict__ q, const __half *__restrict__ kc,
 template <int DPL>
 __global__ void
 amp_attn_dec_combine_kernel(const float *__restrict__ ws, __half *__restrict__ out,
-                           int S, int Hq, int Hk, int ns)
+                           int S, int Hq, int Hk, int ns,
+                           const int *__restrict__ lenp, int max_seq)
 {
 	constexpr int E = DPL * 32;
 	const int j = blockIdx.x;
@@ -2256,9 +2867,16 @@ amp_attn_dec_combine_kernel(const float *__restrict__ ws, __half *__restrict__ o
 	const int h = j * rep + g;
 	const int wsrow = 4 + E;
 
+	int len = *lenp;
+
+	len = (len < 0) ? 0 : (len > max_seq ? max_seq : len);
+
+	const int nse = amp_ad_nse(len, ns);
+
 	float m = -1e30f;
 
-	for (int sp = 0; sp < ns; sp++)
+	#pragma unroll 8
+	for (int sp = 0; sp < nse; sp++)
 		m = fmaxf(m, ws[(((size_t)j * ns + sp) * rep * S + warp) * wsrow]);
 
 	float l = 0.0f, acc[DPL];
@@ -2266,7 +2884,8 @@ amp_attn_dec_combine_kernel(const float *__restrict__ ws, __half *__restrict__ o
 	for (int i = 0; i < DPL; i++)
 		acc[i] = 0.0f;
 
-	for (int sp = 0; sp < ns; sp++) {
+	#pragma unroll 4
+	for (int sp = 0; sp < nse; sp++) {
 		const float *w = ws + (((size_t)j * ns + sp) * rep * S + warp) * wsrow;
 		float e = __expf(w[0] - m);
 
@@ -2317,7 +2936,7 @@ amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
 	default: AMP_AD_K(D, 5); break; \
 	} \
 	amp_attn_dec_combine_kernel<D><<<Hk, cblock, 0, stream>>>((const float *)ws, \
-		(__half *)out, S, Hq, Hk, ns); } while (0)
+		(__half *)out, S, Hq, Hk, ns, len, max_seq); } while (0)
 
 	if (E == 256)
 		AMP_AD_LAUNCH(8);
@@ -2350,6 +2969,9 @@ amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
 // column j of its head; the per-token q/k/decay rows go through shared
 // memory.
 // ---------------------------------------------------------------------------
+
+/* column block of the KDA scan (the GDN scan above is configurable) */
+#define AMP_GDN_VT 64
 
 template <int DK>
 __global__ __launch_bounds__(AMP_GDN_VT)
@@ -3247,7 +3869,12 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 
 	len = (len < 0) ? 0 : (len > max_seq ? max_seq : len);
 
-	const int chunk = (len + ns - 1) / ns;
+	const int nse = amp_ad_nse(len, ns);
+
+	if (sp >= nse)
+		return;
+
+	const int chunk = (len + nse - 1) / nse;
 	const int begin = sp * chunk;
 	const int end = min(len, begin + chunk);
 	const int ntiles = (end - begin + BK - 1) / BK;
@@ -3669,7 +4296,7 @@ amp_attn_dec_mma_fp16(const void *q, const void *k, const void *v,
 } while (0)
 #define AMP_ADM_C(D) \
 	amp_attn_dec_combine_kernel<D><<<Hk, cblock, 0, stream>>>( \
-		(const float *)ws, (__half *)out, S, Hq, Hk, ns)
+		(const float *)ws, (__half *)out, S, Hq, Hk, ns, len, max_seq)
 
 	if (E == 256) {
 		AMP_ADM_K(256);
