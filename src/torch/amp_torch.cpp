@@ -4220,13 +4220,17 @@ torch_silu_mul(uc_vm_t *vm, size_t nargs)
  * Fused DSA indexer scoring (amp_idx_score in src/amp_kernels.cu):
  *   out[r][p] = pool p selectable by query r (p * P + P - 1 <= pos0 + r) ?
  *       sum_h w[r][h] * scale * relu(q[r][h] . pools[p]) : -65504   (fp16)
+ * pos0: an integer, or a one-element int64 tensor on q's device (read by
+ * the kernel: CUDA-graph decode with device-side positions). Pool tiles
+ * no query can select yet are written as mask without being scored.
  * q (R, H, 128) fp16 with H a multiple of 32 (GLM 32, DeepSeek 64: the heads run in halves of
  * 32 inside one kernel, summed in fp32), pools (n_pools, 128) fp16, w (R, H) fp32, all
  * contiguous on one CUDA device; returns (R, n_pools) fp16.
  */
 extern "C" int
 amp_idx_score(const void *q, const void *pools, const void *w, void *out,
-             int R, int n_pools, float scale, int pos0, int P, int HI, cudaStream_t stream);
+             int R, int n_pools, float scale, int pos0, int P, int HI,
+             const long long *posp, cudaStream_t stream);
 
 static uc_value_t *
 torch_idx_score(uc_vm_t *vm, size_t nargs)
@@ -4242,10 +4246,22 @@ torch_idx_score(uc_vm_t *vm, size_t nargs)
 		return NULL;
 
 	uc_value_t *sv = uc_fn_arg(3), *pv = uc_fn_arg(4), *kv = uc_fn_arg(5);
+	at::Tensor *pt = NULL;
 
-	if (!sv || !pv || !kv || ucv_type(pv) != UC_INTEGER || ucv_type(kv) != UC_INTEGER ||
+	if (pv && ucv_type(pv) == UC_RESOURCE) {
+		pt = tensor_arg(vm, pv);
+
+		if (!pt)
+			return NULL;
+
+		if (pt->scalar_type() != at::kLong || pt->numel() != 1 ||
+		    pt->device() != q->device())
+			RAISE("idx_score: a pos0 tensor must be one int64 on q's device");
+	}
+
+	if (!sv || !pv || !kv || (!pt && ucv_type(pv) != UC_INTEGER) || ucv_type(kv) != UC_INTEGER ||
 	    (ucv_type(sv) != UC_DOUBLE && ucv_type(sv) != UC_INTEGER))
-		RAISE("idx_score: scale must be a number, pos0 and P integers");
+		RAISE("idx_score: scale must be a number, pos0 an integer or int64 tensor, P an integer");
 
 	if (q->scalar_type() != at::kHalf || pk->scalar_type() != at::kHalf ||
 	    w->scalar_type() != at::kFloat || q->device().type() != at::kCUDA ||
@@ -4259,7 +4275,7 @@ torch_idx_score(uc_vm_t *vm, size_t nargs)
 
 	long R = q->size(0), n = pk->size(0);
 	double scale = (ucv_type(sv) == UC_DOUBLE) ? ucv_double_get(sv) : (double)ucv_int64_get(sv);
-	int64_t pos0 = ucv_int64_get(pv), P = ucv_int64_get(kv);
+	int64_t pos0 = pt ? 0 : ucv_int64_get(pv), P = ucv_int64_get(kv);
 
 	if (P < 1 || pos0 < 0 || n > 0x7fffff00L / (P + 1))
 		RAISE("idx_score: bad pos0 / P");
@@ -4272,6 +4288,7 @@ torch_idx_score(uc_vm_t *vm, size_t nargs)
 
 		int rc = amp_idx_score(q->data_ptr(), pk->data_ptr(), w->data_ptr(), out.data_ptr(),
 			(int)R, (int)n, (float)scale, (int)pos0, (int)P, (int)q->size(1),
+			pt ? (const long long *)pt->data_ptr() : NULL,
 			c10::cuda::getCurrentCUDAStream().stream());
 
 		if (!launch_ok(vm, rc, "idx_score"))

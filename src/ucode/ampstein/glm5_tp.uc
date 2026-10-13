@@ -882,15 +882,6 @@ export function load(model_dir, opts) {
 							arT: torch.arange(P - 1, 'float32', dv)
 						};
 
-						if (sparse) {
-							let capn = 0;
-
-							for (let i = stages[sg].first; i < stages[sg].end && !capn; i++)
-								if (cfg.layer_types[i] != 'linear_attention')
-									capn = cache.layers[i][r].pools.shape()[0];
-
-							o.pend = torch.arange(capn, 'float32', dv).mul(P * 1.0).add(P - 1.0);
-						}
 
 						push(st, o);
 					}
@@ -1089,10 +1080,6 @@ export function load(model_dir, opts) {
 						arP: torch.arange(P, 'float32', dv),
 						arT: torch.arange(P - 1, 'float32', dv)
 					};
-
-					if (sparse)
-						o.pend = torch.arange(dc.layers[g].pools.shape()[0], 'float32', dv)
-							.mul(P * 1.0).add(P - 1.0);
 
 					push(st, o);
 				}

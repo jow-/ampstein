@@ -691,17 +691,15 @@ export function mla_forward_dev(cfg, A, x, cl, st) {
 	else {
 		let Hi = cfg.index_n_heads;
 		let kp = int(cfg.index_topk / P);
-		let cap = cl.pools.shape()[0];
 		let neg = torch.full([1], -65504.0, 'float16', dv);
 		let m1 = torch.full([1], -1, 'int64', dv);
 		let q_idx = A.idx_wq_b.forward(qr).view([T, Hi, D]);
 		let w = torch.matmul(x, A.idx_w_t).mul(math.pow(Hi * 1.0, -0.5));
-		let s = torch.matmul(q_idx.reshape([T * Hi, D]), cl.pools.t())
-			.view([T, Hi, cap]).mul(math.pow(D * 1.0, -0.5)).clamp(0, null);
-		let scr = torch.matmul(w.view([T, 1, Hi]), s).view([T, cap]);
-		let ok = st.pend.view([1, cap]).le(st.qpos.view([T, 1]));
-
-		scr = torch.where(ok, scr, neg);
+		// fused scoring over the pool capacity (the graph's fixed shape),
+		// masked by the device-side position; pools no query can select
+		// yet cost nothing (L134)
+		let scr = torch.idx_score(q_idx.contiguous(), cl.pools, w.to('float32').contiguous(),
+			math.pow(D * 1.0, -0.5), st.pos, P);
 
 		let tk = scr.topk(kp, -1);
 		let dead = tk.values.le(-60000.0).view([T, kp, 1]);
@@ -1607,10 +1605,6 @@ function build_mtp_graph(model, cache) {
 			arP: torch.arange(P, 'float32', dv),
 			arT: torch.arange(P - 1, 'float32', dv)
 		};
-
-		if (o.sparse)
-			o.pend = torch.arange(dc.layers[0].pools.shape()[0], 'float32', dv)
-				.mul(P * 1.0).add(P - 1.0);
 
 		let body = function () {
 			mla_dev_prepare(cfg, o, M.cdev);

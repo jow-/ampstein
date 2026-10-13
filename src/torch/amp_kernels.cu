@@ -3903,7 +3903,8 @@ amp_mma_16816(float *c, const uint32_t *a, uint32_t b0, uint32_t b1)
 __global__ void __launch_bounds__(256)
 amp_idx_score_kernel(const __half *__restrict__ q, const __half *__restrict__ pools,
                     const float *__restrict__ w, __half *__restrict__ out,
-                    int R, int n_pools, float scale, int pos0, int P, int HI)
+                    int R, int n_pools, float scale, int pos0, int P, int HI,
+                    const long long *__restrict__ posp)
 {
 	extern __shared__ __half sp[];            // IDX_TILE x IDX_STRIDE
 
@@ -3911,6 +3912,25 @@ amp_idx_score_kernel(const __half *__restrict__ q, const __half *__restrict__ po
 	const int warp = threadIdx.x >> 5;
 	const int p0 = blockIdx.x * IDX_TILE;
 	const int r = blockIdx.y * IDX_QPB + warp;
+
+	// a device-side position (CUDA-graph decode) replaces pos0
+	if (posp)
+		pos0 = (int)*posp;
+
+	// a tile no query of this block can select yet (its first pool still
+	// incomplete for the last query) is all mask: the decode graphs score
+	// the whole pool capacity, this keeps the work proportional to the
+	// context (L134)
+	if (p0 * P + P - 1 > pos0 + min(R - 1, (int)blockIdx.y * IDX_QPB + IDX_QPB - 1)) {
+		for (int i = threadIdx.x; i < IDX_QPB * IDX_TILE; i += 256) {
+			int rr = blockIdx.y * IDX_QPB + i / IDX_TILE, pa = p0 + i % IDX_TILE;
+
+			if (rr < R && pa < n_pools)
+				out[(long)rr * n_pools + pa] = __float2half(-65504.0f);
+		}
+
+		return;
+	}
 
 	for (int i = threadIdx.x; i < IDX_TILE * (IDX_D / 8); i += 256) {
 		int row = i >> 4, c = i & 15;
@@ -4032,7 +4052,8 @@ amp_idx_score_kernel(const __half *__restrict__ q, const __half *__restrict__ po
 
 extern "C" int
 amp_idx_score(const void *q, const void *pools, const void *w, void *out,
-             int R, int n_pools, float scale, int pos0, int P, int HI, cudaStream_t stream)
+             int R, int n_pools, float scale, int pos0, int P, int HI,
+             const long long *posp, cudaStream_t stream)
 {
 	if (R <= 0 || n_pools <= 0)
 		return 0;
@@ -4046,7 +4067,7 @@ amp_idx_score(const void *q, const void *pools, const void *w, void *out,
 
 	amp_idx_score_kernel<<<grid, 256, smem, stream>>>(
 		(const __half *)q, (const __half *)pools, (const float *)w,
-		(__half *)out, R, n_pools, scale, pos0, P, HI);
+		(__half *)out, R, n_pools, scale, pos0, P, HI, posp);
 
 	return (int)cudaGetLastError();
 }

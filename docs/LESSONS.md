@@ -346,6 +346,18 @@ Add new lessons at the end of the matching section.
   rank 0 had run alone (rank 1 idled ~4.7 ms per round in the next
   all-reduce).
 
+## GLM-5.3 serving (6 x A5000, TP 3 x 2)
+
+- **L134 — A captured graph scores the cache capacity, not the context.**
+  The decode graphs have fixed shapes, so the DSA indexer's composite
+  (`q_idx @ pools.t()`, scale, clamp, head-weighted sum: four ATen ops)
+  scored all 65,537 pools of a 262144-slot cache for every query and layer,
+  ~196 us per sparse layer whatever the context. `torch.idx_score` with a
+  device-side position (an int64 tensor) skips the tiles no query can see
+  and does the products, relu and head sum in one kernel: ~5% of a decode
+  round (40.1 -> 38.1 ms). Look for capacity-sized work in every graph-
+  captured op.
+
 ## Qwen3.8-Flash-Next
 
 - **L98 — Bring-up.** A partial-model mode (`layers: N`) checks blocks 0-3 in
