@@ -357,6 +357,14 @@ Add new lessons at the end of the matching section.
   and does the products, relu and head sum in one kernel: ~5% of a decode
   round (40.1 -> 38.1 ms). Look for capacity-sized work in every graph-
   captured op.
+- **L135 — Short prefills are launch-bound; replay the step graphs.** A
+  2-token tail (a re-sent prompt, a small tool result) took ~165 ms of eager
+  launches at ~12% GPU utilisation before the first token; replaying the
+  decode / verify graphs takes ~45 ms. Each replayed row costs a decode row
+  (~9-12 ms: the MoE reads grow with the rows), so the eager path wins from
+  ~16 tokens (`AMP_TAIL_GRAPH_MAX`, default 12). Prefill times in the log
+  count enqueueing: the replays' device time lands in the first decode step,
+  so compare time to first token, not the prefill column.
 
 ## Qwen3.8-Flash-Next
 

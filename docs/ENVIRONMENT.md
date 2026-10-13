@@ -122,6 +122,7 @@ Typical workflow (this is how the empty-split bug was found): run with
 | `AMP_GLM5_NO_GRAPHS` | unset | GLM-5 and Qwen4 only: disable CUDA-graph decode (graphs are on by default). Server flag equivalent for graphs is internal (`graphs: false`). Use to bisect graph-capture issues. |
 | `AMP_VIS_EMB` | unset | Debug: path to a safetensors file with an `emb` tensor that **replaces the vision tower output**, for A/B of the text side. Never set in service. |
 | `AMP_MTP_TIMING` | unset | Engine: per-phase MTP-round timings, synchronising at phase boundaries, printed per request. Skews throughput. |
+| `AMP_TAIL_GRAPH_MAX` | `12` | Engine: a prefill of at most this many new tokens (a short continuation of the live state or a snapshot) replays the captured decode / verify step graphs instead of the eager layer loop (`graph_runner`, L135). `0` disables. Not used with DFlash / DSpark, image prompts, or models with state outside the layer caches (DeepSeek-V4, Qwen3.8-Flash-Next). |
 | `PYTORCH_ALLOC_CONF` / `PYTORCH_CUDA_ALLOC_CONF` | engine sets `expandable_segments:True` | `src/torch/amp_torch.cpp` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` at module init **unless `PYTORCH_ALLOC_CONF` is set**; an explicit value wins. The launch scripts export it too. Fragmentation-free growth matters at 256k context. |
 
 ## Native kernels / comms (`src/torch/amp_torch.cpp`)

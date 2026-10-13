@@ -456,6 +456,18 @@ export function create(model, opts) {
 	// accepted tokens after it. Allocated before graph capture: the
 	// verify graph writes these buffers.
 	let spec = mtp_planned >= 2;
+
+	// graph-replayed prefill tails (graph_runner): up to TAIL_MAX new tokens
+	// through the decode / verify step graphs. A replayed row costs about
+	// what a decode row does (~9-12 ms on GLM-5.3 TP 3x2: the MoE reads grow
+	// with the rows), the eager path ~110-170 ms of launches at 18k tokens
+	// (more at depth) plus ~2 ms per token: the graphs win up to ~12 tokens
+	// (L135). Not for the drafters with their own prefill taps (DFlash,
+	// DSpark) nor for models whose state lives outside the layer caches
+	// (they hook the eager prefill)
+	const TAIL_MAX = (getenv('AMP_TAIL_GRAPH_MAX') != null) ? +getenv('AMP_TAIL_GRAPH_MAX') : 12;
+	let TAIL_OK = TAIL_MAX > 0 && opts.graphs != false && !DF && !model.dspark &&
+		!model.aux_get && !model.cache_export;
 	let rollback = [];
 
 	if (spec) {
@@ -1789,6 +1801,73 @@ export function create(model, opts) {
 			j.tsnap_hid = seed_prev.add(0.0);
 	}
 
+	/* Prefill runner over the captured step graphs (same interface as the
+	 * models' prefill_pipeline runners): the new tokens go through the
+	 * largest captured size that ends before the next snapshot cut, one
+	 * replay per step(). Per segment it seeds the draft cache from the
+	 * rows' post-norm hidden (popts.on_hidden) and takes the snapshots at
+	 * the cuts (popts.on_layer / on_aux for every layer). A 2-token tail on
+	 * GLM-5.3 TP: ~45 ms to the first token instead of ~165 ms of eager
+	 * launches (L135). The replays are only enqueued here: their device
+	 * time shows up in the first decode step. */
+	function graph_runner(j, popts) {
+		let ids_new = slice(j.ids, j.pos), total = length(ids_new);
+		let start = cache.length, done = 0, logits = null;
+		let cuts = filter(popts.cuts || [], (c) => c > start && c < start + total);
+		let sizes = sort(filter(uniq([ mtp_planned, 4, 3, 2, 1 ]), (k) => k > 0 && graph.has(k)),
+			(a, b) => b - a);
+
+		return {
+			step: function () {
+				if (done >= total)
+					return false;
+
+				let pos = start + done, lim = total - done, S = 1;
+
+				for (let c in cuts)
+					if (c > pos && c - pos < lim)
+						lim = c - pos;
+
+				for (let k in sizes)
+					if (k <= lim) {
+						S = k;
+						break;
+					}
+
+				let r = graph.run(slice(ids_new, done, done + S), pos);
+				let end = pos + S;
+
+				if (popts.hidden && popts.on_hidden)
+					popts.on_hidden(pos, cache.hidden.view([1, S, -1]));
+
+				if (index(cuts, end) >= 0) {
+					if (popts.on_layer)
+						for (let li = 0; li < cfg.num_hidden_layers; li++)
+							popts.on_layer(end, li);
+
+					if (popts.on_aux)
+						popts.on_aux(end);
+				}
+
+				done += S;
+
+				// a copy: the graph's output buffer is reused by the next replay
+				if (done >= total)
+					logits = r.logits.view([S, -1]).narrow(0, S - 1, 1).add(0.0);
+
+				return done < total;
+			},
+
+			done_tokens: function () {
+				return done;
+			},
+
+			logits: function () {
+				return logits;
+			}
+		};
+	}
+
 	/* Plan the reuse of the cache for j.ids and start the pipelined prefill
 	 * of what is new (j.runner). begin() runs it for a new job; inject()
 	 * runs it for a job whose generation is extended by forced tokens (the
@@ -1893,7 +1972,11 @@ export function create(model, opts) {
 			}
 		};
 
-		j.runner = model.prefill_pipeline ?
+		let n_new = length(j.ids) - j.pos;
+
+		j.runner = (TAIL_OK && graph && graph.run && graph.has(1) && !cache.mm &&
+			n_new > 0 && n_new <= TAIL_MAX) ? graph_runner(j, popts) :
+			model.prefill_pipeline ?
 			model.prefill_pipeline(cache, slice(j.ids, j.pos), popts) :
 			qwen35.prefill_pipeline(model, cache, slice(j.ids, j.pos), popts);
 	}
