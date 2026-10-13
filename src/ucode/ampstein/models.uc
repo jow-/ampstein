@@ -493,9 +493,14 @@ export function rows(lin, k0, klen, dev) {
 	if (k0 % 128 || klen % 128 || k0 + klen > lin.in_features)
 		die(`models.rows: range [${k0}, ${klen}] not 128-aligned/in bounds`);
 
+	// copies: a leading-dimension slice is already contiguous, so
+	// contiguous() would return a view holding the whole tensor alive
+	// on its device (every rank's rows, L133)
+	let own = (t) => torch.empty(t.shape(), t.dtype(), 'cuda:' + dev).copy_(t);
+
 	return LinearEXL3Parts({
-		trellis: lin.trellis.narrow(0, k0 / 16, klen / 16).contiguous().cuda(dev),
-		suh: lin.suh.narrow(0, k0, klen).contiguous().cuda(dev),
+		trellis: own(lin.trellis.narrow(0, k0 / 16, klen / 16)),
+		suh: own(lin.suh.narrow(0, k0, klen)),
 		svh: lin.svh.cuda(dev), K: lin.K, mul1: lin.mul1, mcg: lin.mcg,
 		dev: dev
 	});

@@ -335,6 +335,16 @@ Add new lessons at the end of the matching section.
   (code / prose). The 42-row kernel is now bound by the half-rate fp32-
   accumulate mma of GeForce Ampere (~330 us of tensor work at 200k keys
   against a 520 us load floor), not by bandwidth.
+- **L133 — A leading-dimension slice is already contiguous.**
+  `models.rows` cut row-split EXL3 weights with `narrow(0, ...)
+  .contiguous()`, which returns a view: the device that loaded a layer kept
+  the whole tensor alive for its own shard (and `.cuda()` copied the other
+  rank's half). Every TP model carried a second copy of half its row-split
+  weights: 1.2 GB per GPU on Qwen3.8-27B. Copy explicitly when a slice must
+  own its memory, and check `mem_info` allocated bytes after a load against
+  the checkpoint size. Found while sharding the DFlash drafter, which
+  rank 0 had run alone (rank 1 idled ~4.7 ms per round in the next
+  all-reduce).
 
 ## Qwen3.8-Flash-Next
 
