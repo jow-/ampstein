@@ -21,4 +21,5 @@ ucode -L build/lib -L src/ucode -ltorch=ampstein.torch examples/<script>.uc [-- 
 | `bench_glm5.uc`, `bench_prefill_glm5.uc`, `mem_glm5.uc` | GLM-5.3-Flash decode latency, prefill throughput, per-GPU memory |
 | `bench_qwen4.uc` | Qwen3.8-Flash-Next decode / prefill timing |
 | `bench_dsv4.uc` | DeepSeek-V4 prefill / decode throughput |
+| `bench_h2d.uc`, `bench_zerocopy.uc`, `trace_routing.uc` | expert streaming experiments: MoE kernel on host-resident experts, routing traces (`docs/EXPERT_STREAMING.md`) |
 | `eos_policy_agentic.uc` | an end-of-turn policy for agent harnesses (`--eos-hook`) |

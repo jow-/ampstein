@@ -449,3 +449,10 @@ Add new lessons at the end of the matching section.
 - **L116 — A premature end of turn is a model decision.** Intervene at the stop
   token (`job.on_eos`): redraw with the stop ids lowered, or force text. A stop
   accepted as a speculative draft must truncate the round and become the bonus.
+- **L139 — Expert streaming is link-bound, and a pinned pointer is a miss.** The
+  fused MoE kernels read experts through int64 pointer tables, and a table entry
+  may point at `cudaHostAlloc` memory: the kernel then runs at link speed with no
+  sync (jai: 25 ms for 8 experts at 3 GB/s, gen3 x4). Router-peek prefetch
+  (router of layer L on the hidden state of L-1) recalls 67% of the experts with
+  8 guesses, history heatmaps lose to LRU, and prefetch only pays above ~12 GB/s.
+  `docs/EXPERT_STREAMING.md`.

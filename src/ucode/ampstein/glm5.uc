@@ -730,7 +730,7 @@ export function build_moe(ws, cfg, i, dev) {
 		push(experts, build_mlp(ws, `${key}.experts.${e}`, dev));
 
 	return {
-		type: 'moe', dev: dev, experts: experts,
+		type: 'moe', dev: dev, experts: experts, layer: i,
 		gate_t: ws.gpu(key + '.gate.weight', dev).to('float32').t().contiguous(),
 		bias: ws.gpu(key + '.gate.e_score_correction_bias', dev).to('float32')
 			.reshape([1, -1]).contiguous(),
@@ -745,6 +745,14 @@ export const MM_BASE = 16777216;
  * scores + e_score_correction_bias, their weights are the UNbiased scores
  * normalised to sum 1 and scaled by routed_scaling_factor.
  * y: (T, hidden) fp16. Returns {idx (T, k) int64, w (T, k) fp32}. */
+export let TRACE = null;
+export function set_trace(f) { TRACE = f; }
+
+/* top-k expert ids the sigmoid router of M would pick for y (experiments) */
+export function route_peek(cfg, M, y, k) {
+	return mm32(y.to('float32'), M.gate_t).sigmoid().add(M.bias).topk(k, -1).indices;
+}
+
 export function moe_route(cfg, M, y) {
 	if (M.router == 'softmax') {
 		// Qwen3.8-Flash-Next ("std" router): softmax over all expert
@@ -782,6 +790,9 @@ export function moe_route(cfg, M, y) {
 	let w = scores.gather(1, idx);
 
 	w = w.div(w.sum(1, true).add(1e-20)).mul(cfg.routed_scaling_factor);
+
+	if (TRACE)
+		TRACE(cfg, M, y, idx);
 
 	return {idx: idx, w: w};
 }
