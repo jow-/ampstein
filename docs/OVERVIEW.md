@@ -265,6 +265,11 @@ reasoning, content and tool calls (Qwen XML-ish calls, GLM, DeepSeek DSML).
   its end token, whose return value lets the turn end, redraws the position
   with the stop token penalized, or forces text. Built for agent harnesses
   whose loop stops on a text-only turn.
+- **Tool-call hook** (`--call-hook`): a script run when the parser completes
+  a tool call, with the conversation's earlier calls and results. A string
+  verdict drops the call and puts that text into the model's context in its
+  place (a loop breaker for a model that resends a failing call:
+  `examples/call_policy_loop.uc`).
 
 **Safety and hygiene**
 - Taint-tracked chat template rendering (no special-token injection from
@@ -389,6 +394,7 @@ Common flags (`ampstein --help` lists them all):
 | `--slice-tokens N` | time slice length for co-generation |
 | `--reasoning-nudge X`, `--reasoning-limit Y` | reasoning budget |
 | `--eos-hook FILE`, `--eos-hook-max N` | end-of-turn policy script |
+| `--call-hook FILE`, `--call-hook-max N` | tool-call policy script (default 3 verdicts per request) |
 | `--no-vision`, `--vision-device N` | vision tower control |
 
 ### 6.3 Talk to it

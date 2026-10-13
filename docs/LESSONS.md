@@ -373,6 +373,22 @@ Add new lessons at the end of the matching section.
   The MTP window does not matter (2 / 3 / 4 drafts: 61-62.5 tok/s): every
   extra verify row costs 5-8 ms of MoE expert union.
 
+## Agent loops
+
+- **L137 — A model can loop on a call it knows is wrong.** Qwen3.8-27B
+  resent a failing `edit` ~190 times (five variants of one stale `oldText`,
+  one error), writing "I'm stuck in a loop, stopping" in its reasoning before
+  every one: with the identical failed calls in context, the next one is the
+  likeliest continuation, whatever the thinking says. Asking in the next user
+  turn works slowly. `--call-hook` consults a script when a call completes,
+  with the conversation's calls and their results; a string drops the call
+  and forces that text into the context (through `force()`, or the end-token
+  path when the stop comes first), so the model reads the objection where it
+  was about to repeat itself. Matching on the *result* (same tool, same
+  failure, in a row) catches variants that exact-argument matching misses; a
+  replay of the 876 calls of that session found one drop before the loop
+  began, a byte-identical resend.
+
 ## Qwen3.8-Flash-Next
 
 - **L98 — Bring-up.** A partial-model mode (`layers: N`) checks blocks 0-3 in

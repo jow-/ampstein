@@ -48,6 +48,7 @@ function usage() {
 	printf("  --reasoning-nudge N   after N reason tokens append soft close nudge (default 0 off)\n");
 	printf("  --reasoning-limit Y   force-close reasoning after Y tokens (default 0 off)\n");
 	printf("  --eos-hook SCRIPT     call SCRIPT when the model ends its turn\n");
+	printf("  --call-hook SCRIPT    call SCRIPT when the model completes a tool call\n");
 	printf("  --no-vision           disable image input\n");
 	printf("  --arch ARCH           force architecture: auto|qwen35|glm5|qwen4|dsv4 (default auto)\n");
 	printf("  --version             print version and exit\n");
@@ -106,6 +107,8 @@ function parse_args() {
 		reasoning_close_text: null,
 		eos_hook: null,
 		eos_hook_max: 4,
+		call_hook: null,
+		call_hook_max: 3,
 		name: null,
 		arch: 'auto',
 		vision: true,
@@ -140,6 +143,8 @@ function parse_args() {
 		case '--reasoning-limit': a.reasoning_limit = int(v); i++; break;
 		case '--eos-hook': a.eos_hook = v; i++; break;
 		case '--eos-hook-max': a.eos_hook_max = int(v); i++; break;
+		case '--call-hook': a.call_hook = v; i++; break;
+		case '--call-hook-max': a.call_hook_max = int(v); i++; break;
 		case '--cache-ram': a.cache_ram = +v; i++; break;
 		case '--slots': a.slots = (v == 'auto') ? 'auto' : int(v); i++; break;
 		case '--slot-margin': a.slot_margin = +v; i++; break;

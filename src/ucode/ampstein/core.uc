@@ -35,6 +35,7 @@ import * as dsv4_tp from './dsv4_tp.uc';
 import * as dsv4_vision from './dsv4_vision.uc';
 import * as dspark_tp from './dspark_tp.uc';
 import * as dflash from './dflash.uc';
+import { tool_history } from './toolhist.uc';
 
 // digest.so is optional (not built on every host): images are then keyed
 // by a cheap length+sample fingerprint instead of SHA-256
@@ -639,6 +640,19 @@ export function serve(args) {
 		}
 	}
 
+	// tool-call policy (--call-hook): consulted when the parser completes a tool call
+	let call_policy = null;
+
+	if (args.call_hook) {
+		try {
+			call_policy = loadfile(args.call_hook);
+		}
+		catch (e) {
+			warn(`ampstein: cannot load --call-hook ${args.call_hook}: ${e.message}\n`);
+			exit(1);
+		}
+	}
+
 	let created_at = now_s();
 
 	/* --- helpers ------------------------------------------------------------------ */
@@ -918,9 +932,19 @@ export function serve(args) {
 
 		// End-of-turn policy state: what the model produced so far (kept apart
 		// from the streamed / final buffers, which a stream does not fill)
-		let htext = eos_policy ? struct.buffer() : null;
-		let hreason = eos_policy ? struct.buffer() : null;
+		let htext = (eos_policy || call_policy) ? struct.buffer() : null;
+		let hreason = (eos_policy || call_policy) ? struct.buffer() : null;
 		let hnum = 0;
+
+		// Tool-call policy (--call-hook): a completed call is shown to the
+		// script before the client sees it. A string verdict drops the call
+		// and forces that text into the model's context instead (delivered
+		// through force() at a step boundary or, when the end token comes
+		// first, through the end-of-turn path); any other verdict lets it
+		// through. Only the first --call-hook-max verdicts of a request are
+		// consulted: a model that insists gets its call out.
+		let call_hist = call_policy ? tool_history(body.messages) : null;
+		let call_n = 0, call_note = null;
 
 		// Reasoning budget. After `nudge_at` reasoning tokens a soft nudge is
 		// appended to the model's thinking (it carries on and usually wraps up);
@@ -1004,6 +1028,37 @@ export function serve(args) {
 						}
 					};
 
+					// (a call behind a dropped one: the note is pending, drop it too)
+					if (call_note != null)
+						continue;
+
+					if (call_policy && call_n < args.call_hook_max) {
+						let v = null;
+
+						try {
+							v = call(call_policy, null, {
+								call: {name: call.function.name, arguments: call.function.arguments},
+								calls: map(calls, (c) => ({name: c.function.name, arguments: c.function.arguments})),
+								history: call_hist,
+								text: htext.slice(),
+								reasoning: hreason.slice(),
+								tools: map(body.tools || [], (t) => (t.function || t).name),
+								tokens: hnum,
+								overrides: call_n
+							});
+						}
+						catch (e) {
+							warn(`chat ${id}: call hook failed: ${e.message}\n`);
+						}
+
+						if (type(v) == 'string' && v != '') {
+							call_n++;
+							call_note = tok.encode(v, true);
+							warn(`chat ${id}: call hook: dropped ${call.function.name}, forcing ${length(call_note)} tokens (after ${hnum} tokens)\n`);
+							continue;
+						}
+					}
+
 					if (stream)
 						res.sse(chunk({tool_calls: [{index: length(calls), ...call}]}));
 
@@ -1060,9 +1115,26 @@ export function serve(args) {
 			},
 
 			// the model sampled its end token (--eos-hook): see the policy docs
-			eos_max: args.eos_hook_max,
-			on_eos: !eos_policy ? null : function (n) {
+			eos_max: (eos_policy ? args.eos_hook_max : 0) + (call_policy ? args.call_hook_max : 0),
+			on_eos: !(eos_policy || call_policy) ? null : function (n) {
 				let v = true;
+
+				// a call dropped by the call hook: its note goes in first
+				if (call_note != null) {
+					let f = call_note;
+
+					call_note = null;
+
+					for (let i = 0; i < length(f); i++)
+						emit(p.feed(dt.push(f[i])));
+
+					hnum += length(f);
+
+					return f;
+				}
+
+				if (!eos_policy)
+					return true;
 
 				try {
 					v = call(eos_policy, null, {
@@ -1105,7 +1177,20 @@ export function serve(args) {
 			},
 
 			// the engine polls this at every step boundary
-			force: !budgeted ? null : function () {
+			force: !(budgeted || call_policy) ? null : function () {
+				if (call_note != null) {
+					let f = call_note;
+
+					call_note = null;
+
+					for (let i = 0; i < length(f); i++)
+						emit(p.feed(dt.push(f[i])));
+
+					hnum += length(f);
+
+					return f;
+				}
+
 				if (pending == null)
 					return null;
 

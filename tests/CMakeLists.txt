@@ -132,6 +132,9 @@ amp_test(qwen35_tp)
 # target's own greedy continuation (needs AMP_MODEL_DFLASH)
 amp_test(dflash_draft)
 
+# call_hook: the --call-hook history extraction and the loop-breaker example policy (no model)
+amp_test(call_hook)
+
 # --- Vision
 # vision_preprocess: native image preprocessing vs the PIL oracle
 amp_test(vision_preprocess)
