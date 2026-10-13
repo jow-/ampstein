@@ -319,8 +319,22 @@ Add new lessons at the end of the matching section.
   16-row MMA tiles the verify forward stayed ~26 ms from 3 to 7 rows, so the
   window is nearly free and the drafter quality decides: MTP at 3 drafts
   accepts 2.2-2.9 tokens per round, DFlash 2 at 7 drafts 3.2-6.9. The only
-  new cost is attention for > 5 rows (two `attn_decode` row groups; the FA2
-  path sizes its work by the cache capacity, L71).
+  new cost is attention for > 5 rows (the FA2 path sizes its work by the
+  cache capacity, L71; `attn_decode` takes up to 64 rows since L132).
+- **L132 — Long-context decode was the attention's combine and its second
+  pass.** At 82k keys a DFlash round cost 47 ms against 32 ms at 1k: the
+  7-row verify ran two `attn_decode` launches (42 rows did not fit the
+  32-row tile), each reading the whole cache, and each combine kernel ran
+  one block per kv head walking 164 splits serially (170 us, ~40% of the
+  attention). A block per (row, kv head) for the combine, a 48-row tile
+  (the e-block aliased onto the fp32 score block to fit 99 KiB), a softmax
+  of 8 lanes per row instead of a warp per row, Q fragments held in
+  registers and one split per SM (a partial second wave of 1-block-per-SM
+  kernels cost up to 40%) took the 7-row attention from 877 to 343 us per
+  layer at 82k; decode at 82k went from 102 / 55 to 125 / 69 tok/s
+  (code / prose). The 42-row kernel is now bound by the half-rate fp32-
+  accumulate mma of GeForce Ampere (~330 us of tensor work at 200k keys
+  against a 520 us load floor), not by bandwidth.
 
 ## Qwen3.8-Flash-Next
 

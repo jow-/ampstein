@@ -728,37 +728,22 @@ export function attn_forward_dev(cfg, L, x, cl, st) {
 	cl.v_cache.index_copy_(2, st.pos_idx, v.transpose(1, 2));
 
 	// split-KV decode attention sized by the device-side key count
-	// (torch.attn_decode, S <= 5). FA2's varlen entry with seqused_k
-	// sizes its grid by the cache CAPACITY and does not split the keys
-	// for S > 1: with a 262144-slot cache 6 ms/token of attention at 4k
-	// keys, 217 ms per 3-row verify at 180k (docs/LESSONS.md L71). The
-	// tensor-core mma variant (2.35x faster at 180k keys, S = 3,
-	// E = 256) takes the shapes this branch admits: head_dim
-	// 64/128/256 and (nh/kvh) * S <= 32 — Qwen3.8 is rep 6, so S <= 5
-	// gives rows <= 30; anything else keeps the shuffle kernel.
+	// (torch.attn_decode). FA2's varlen entry with seqused_k sizes its
+	// grid by the cache CAPACITY and does not split the keys for S > 1:
+	// with a 262144-slot cache 6 ms/token of attention at 4k keys, 217 ms
+	// per 3-row verify at 180k (docs/LESSONS.md L71). The tensor-core mma
+	// variant takes head_dim 64/128/256 and up to 64 query rows
+	// ((nh/kvh) * S; Qwen3.8 is rep 6, so a DFlash verify window of 7 is
+	// 42 rows, one pass over the keys, L132); anything else up to 5 rows
+	// keeps the shuffle kernel.
 	let o;
+	let mma = (hd == 64 || hd == 128 || hd == 256) && (nh / kvh) * S <= 64;
 
-	if (S <= 5)
+	if (mma || S <= 5)
 		o = torch.attn_decode(q.contiguous().view([S, nh, hd]),
 			cl.k_cache.view([kvh, max_seq, hd]), cl.v_cache.view([kvh, max_seq, hd]),
-			st.seqused, 1.0 / math.sqrt(hd), null,
-			(hd == 64 || hd == 128 || hd == 256) && (nh / kvh) * S <= 32 ? 1 : 0);
+			st.seqused, 1.0 / math.sqrt(hd), null, mma ? 1 : 0);
 				// (S, nh, hd)
-	else if (S <= 10 && st.seqused_a != null && (nh / kvh) * ((S + 1) >> 1) <= 32) {
-		// 6..10 rows (a DFlash verify window): two attn_decode launches over row
-		// groups of S1 and S2 = S - S1 rows. A call's row s attends keys
-		// [0, len - Sg + s]: the second group takes the full key count, the first
-		// one (len - S2, st.seqused_a) — the same keys per row as one S-row call.
-		let S1 = S - (S >> 1), S2 = S >> 1;
-		let qc = q.contiguous().view([S, nh, hd]);
-		let kc = cl.k_cache.view([kvh, max_seq, hd]), vc = cl.v_cache.view([kvh, max_seq, hd]);
-		let sc = 1.0 / math.sqrt(hd);
-
-		o = torch.cat([
-			torch.attn_decode(qc.narrow(0, 0, S1), kc, vc, st.seqused_a, sc, null, 1),
-			torch.attn_decode(qc.narrow(0, S1, S2), kc, vc, st.seqused, sc, null, 1)
-		], 0);
-	}
 	else
 		o = torch.flash_attn_kvcache(q.view([S, nh, hd]),
 			cl.k_cache.view([kvh, max_seq, hd]).transpose(0, 1),

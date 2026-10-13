@@ -103,14 +103,14 @@ function run_case(nh, kvh, E, S, pos, CS, seed, mma) {
 
 /* Run a battery of (pos, S) cases for both kernel variants and check
  * each against the SDPA reference. */
-function battery(name, nh, kvh, E, CS, positions, Smax, seedbase) {
-	for (let mma = 0; mma <= 1; mma++) {
+function battery(name, nh, kvh, E, CS, positions, Smax, seedbase, Smin, mmas) {
+	for (let mma in (mmas || [ 0, 1 ])) {
 		let worst = 0;
 
 		for (let i = 0; i < length(positions); i++) {
 			let pos = positions[i];
 
-			for (let S = 1; S <= Smax; S++) {
+			for (let S = Smin || 1; S <= Smax; S++) {
 				if (pos + 1 < S)
 					continue;
 
@@ -134,6 +134,14 @@ battery('E=256', 24, 4, 256, 4096, [ 0, 1, 63, 1024, 4095 ], 3, 100);
 /* --- 2. head_dim 128 (llama-family shapes) --------------------------------- */
 
 battery('E=128', 32, 8, 128, 2048, [ 0, 511, 2047 ], 5, 200);
+
+/* --- 2b. 33..64 query rows, mma only (a DFlash verify window) ------------- */
+/* rep 6: S = 6..8 is the 48-row tile, S = 9, 10 the 64-row one; rep 4 at
+ * E = 128 covers both as well, and E = 64 the small head dim */
+
+battery('E=256 rows 36..60', 24, 4, 256, 4096, [ 9, 200, 4095 ], 10, 400, 6, [ 1 ]);
+battery('E=128 rows 36..64', 32, 8, 128, 2048, [ 15, 1500 ], 16, 500, 9, [ 1 ]);
+battery('E=64 rows 40..64', 16, 2, 64, 2048, [ 7, 2047 ], 8, 600, 5, [ 1 ]);
 
 /* --- 3. determinism: 100 launches at a fixed position, both variants ------ */
 

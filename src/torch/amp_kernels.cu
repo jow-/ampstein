@@ -2932,6 +2932,10 @@ amp_copy_many(const void *const *src, void *const *dst, const long *bytes,
  * kernels, so they always agree. */
 #define AMP_AD_MINCHUNK 128
 
+/* splits per kv head: the combine keeps one weight per split in shared
+ * memory */
+#define AMP_AD_MAXNS 8192
+
 __device__ __forceinline__ int amp_ad_nse(int len, int ns)
 {
 	int n = (len + AMP_AD_MINCHUNK - 1) / AMP_AD_MINCHUNK;
@@ -3099,19 +3103,29 @@ amp_attn_dec_kernel(const __half *__restrict__ q, const __half *__restrict__ kc,
 	}
 }
 
-template <int DPL>
-__global__ void
+/* Merge the splits: one block per (workspace row = s * rep + g, kv head),
+ * E / 2 threads with two dims each. The splits' maxima and weights are
+ * reduced across the block (the weights go to shared memory), then every
+ * thread sums its dims over the splits in split order (deterministic).
+ * One block per kv head with a warp per row walked all splits serially:
+ * 170 us at 82k keys and four rows, ~40% of the decode attention (L132). */
+template <int E>
+__global__ void __launch_bounds__(E / 2)
 amp_attn_dec_combine_kernel(const float *__restrict__ ws, __half *__restrict__ out,
                            int S, int Hq, int Hk, int ns,
                            const int *__restrict__ lenp, int max_seq)
 {
-	constexpr int E = DPL * 32;
-	const int j = blockIdx.x;
-	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+	constexpr int T = E / 2, NW = T / 32;
+	const int row = blockIdx.x, j = blockIdx.y;
+	const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
 	const int rep = Hq / Hk;
-	const int g = warp % rep, s = warp / rep;
+	const int g = row % rep, s = row / rep;
 	const int h = j * rep + g;
-	const int wsrow = 4 + E;
+	const size_t step = (size_t)rep * S * (4 + E);     /* next split's row */
+	const float *w0 = ws + ((size_t)j * ns * rep * S + row) * (4 + E);
+
+	extern __shared__ float amp_adc_e[];               /* ns split weights */
+	__shared__ float red[NW];
 
 	int len = *lenp;
 
@@ -3121,31 +3135,86 @@ amp_attn_dec_combine_kernel(const float *__restrict__ ws, __half *__restrict__ o
 
 	float m = -1e30f;
 
+	for (int sp = tid; sp < nse; sp += T)
+		m = fmaxf(m, w0[sp * step]);
+
+	#pragma unroll
+	for (int off = 16; off > 0; off >>= 1)
+		m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+
+	if (lane == 0)
+		red[warp] = m;
+
+	__syncthreads();
+
+	m = red[0];
+
+	#pragma unroll
+	for (int w = 1; w < NW; w++)
+		m = fmaxf(m, red[w]);
+
+	__syncthreads();
+
+	float l = 0.0f;
+
+	for (int sp = tid; sp < nse; sp += T) {
+		float e = __expf(w0[sp * step] - m);
+
+		amp_adc_e[sp] = e;
+		l += w0[sp * step + 1] * e;
+	}
+
+	#pragma unroll
+	for (int off = 16; off > 0; off >>= 1)
+		l += __shfl_xor_sync(0xffffffffu, l, off);
+
+	if (lane == 0)
+		red[warp] = l;
+
+	__syncthreads();
+
+	l = red[0];
+
+	#pragma unroll
+	for (int w = 1; w < NW; w++)
+		l += red[w];
+
+	const float2 *wp = (const float2 *)(w0 + 4) + tid;
+	const size_t step2 = step / 2;
+	float a0 = 0.0f, a1 = 0.0f;
+
 	#pragma unroll 8
-	for (int sp = 0; sp < nse; sp++)
-		m = fmaxf(m, ws[(((size_t)j * ns + sp) * rep * S + warp) * wsrow]);
-
-	float l = 0.0f, acc[DPL];
-
-	for (int i = 0; i < DPL; i++)
-		acc[i] = 0.0f;
-
-	#pragma unroll 4
 	for (int sp = 0; sp < nse; sp++) {
-		const float *w = ws + (((size_t)j * ns + sp) * rep * S + warp) * wsrow;
-		float e = __expf(w[0] - m);
+		float2 v = wp[sp * step2];
+		float e = amp_adc_e[sp];
 
-		l += w[1] * e;
-
-		for (int i = 0; i < DPL; i++)
-			acc[i] = fmaf(w[4 + lane * DPL + i], e, acc[i]);
+		a0 = fmaf(v.x, e, a0);
+		a1 = fmaf(v.y, e, a1);
 	}
 
 	float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
-	__half *o = out + ((size_t)s * Hq + h) * E + lane * DPL;
+	__half *o = out + ((size_t)s * Hq + h) * E + 2 * tid;
 
-	for (int i = 0; i < DPL; i += 2)
-		*(__half2 *)(o + i) = __floats2half2_rn(acc[i] * inv, acc[i + 1] * inv);
+	*(__half2 *)o = __floats2half2_rn(a0 * inv, a1 * inv);
+}
+
+/* the combine launch shared by both decode kernels */
+static void
+amp_attn_dec_combine(const float *ws, __half *out, int S, int Hq, int Hk, int E,
+                    int ns, const int *len, int max_seq, cudaStream_t stream)
+{
+	dim3 grid((Hq / Hk) * S, Hk);
+	size_t sm = (size_t)ns * sizeof(float);
+
+	if (E == 256)
+		amp_attn_dec_combine_kernel<256><<<grid, 128, sm, stream>>>(ws, out, S, Hq,
+			Hk, ns, len, max_seq);
+	else if (E == 128)
+		amp_attn_dec_combine_kernel<128><<<grid, 64, sm, stream>>>(ws, out, S, Hq,
+			Hk, ns, len, max_seq);
+	else
+		amp_attn_dec_combine_kernel<64><<<grid, 32, sm, stream>>>(ws, out, S, Hq,
+			Hk, ns, len, max_seq);
 }
 
 extern "C" long
@@ -3160,7 +3229,8 @@ amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
                  int max_seq, int ns, float scale, cudaStream_t stream)
 {
 	if (Hk <= 0 || Hq % Hk || S < 1 || S > AMP_AD_MAXS || Hq / Hk > 32 ||
-	    (Hq / Hk) * S > 32 || ns < 1 || (E != 64 && E != 128 && E != 256)) {
+	    (Hq / Hk) * S > 32 || ns < 1 || ns > AMP_AD_MAXNS ||
+	    (E != 64 && E != 128 && E != 256)) {
 		fprintf(stderr, "amp_attn_dec: unsupported config (S %d, Hq %d, Hk %d, E %d, ns %d)\n",
 			S, Hq, Hk, E, ns);
 		return -1;
@@ -3168,7 +3238,6 @@ amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
 
 	dim3 grid(Hk, ns);
 	int block = (Hq / Hk) * 32;            /* one warp per query head */
-	int cblock = (Hq / Hk) * S * 32;       /* combine: one warp per (row, head) */
 
 #define AMP_AD_K(D, SR) amp_attn_dec_kernel<D, SR><<<grid, block, 0, stream>>>( \
 		(const __half *)q, (const __half *)k, (const __half *)v, len, (float *)ws, \
@@ -3180,9 +3249,7 @@ amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
 	case 3: AMP_AD_K(D, 3); break; \
 	case 4: AMP_AD_K(D, 4); break; \
 	default: AMP_AD_K(D, 5); break; \
-	} \
-	amp_attn_dec_combine_kernel<D><<<Hk, cblock, 0, stream>>>((const float *)ws, \
-		(__half *)out, S, Hq, Hk, ns, len, max_seq); } while (0)
+	} } while (0)
 
 	if (E == 256)
 		AMP_AD_LAUNCH(8);
@@ -3190,6 +3257,9 @@ amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
 		AMP_AD_LAUNCH(4);
 	else
 		AMP_AD_LAUNCH(2);
+
+	amp_attn_dec_combine((const float *)ws, (__half *)out, S, Hq, Hk, E, ns, len,
+		max_seq, stream);
 
 #undef AMP_AD_LAUNCH
 #undef AMP_AD_K
@@ -4084,8 +4154,13 @@ __device__ __forceinline__ int amp_adm_swz(int row, int piece, int row_bytes)
 	((unsigned)__cvta_generic_to_shared(base) + \
 	 amp_adm_swz(row, piece, row_bytes))
 
-/* E = head dim (64 / 128 / 256); S (query rows per head) is runtime. */
-template <int E>
+/* E = head dim (64 / 128 / 256); S (query rows per head) is runtime.
+ * MT = 16-row m-tiles of the query block (rep * S <= 16 * MT), BK = keys
+ * per tile. MT = 2 and 3 with BK = 32 serve up to 32 / 48 rows (a DFlash
+ * verify window of 7 at rep 6 is 42: one pass over the keys instead of
+ * two row-group launches, L132); MT = 4 takes BK = 16 to stay under the
+ * 99 KiB shared-memory opt-in. */
+template <int E, int MT, int BK>
 __global__ void
 amp_attn_dec_mma_kernel(const __half *__restrict__ q,
                        const __half *__restrict__ kc,
@@ -4094,8 +4169,8 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
                        int S, int Hq, int Hk, int max_seq, int ns,
                        float scale)
 {
-	constexpr int BK = AMP_ADM_BK;
 	constexpr int W = AMP_ADM_WARPS;
+	constexpr int MR = 16 * MT;        /* query block rows */
 	constexpr int KS = E / 16;         /* score k-steps per (m, n) */
 	constexpr int PNT = E / 8 / W;     /* PV n-tiles per warp */
 	constexpr int PKS = BK / 16;       /* PV k-steps */
@@ -4104,6 +4179,24 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 	                                     * pieces used; the swizzle
 	                                     * needs >= 8 pieces/row) */
 	constexpr int WSROW = 4 + E;
+	/* softmax: 4 keys per lane, LPR lanes per row, RPW rows per warp
+	 * step, NIT steps cover the MR rows */
+	constexpr int LPR = BK / 4;
+	constexpr int RPW = 32 / LPR;
+	constexpr int NIT = (MR + W * RPW - 1) / (W * RPW);
+	/* at BK = 32 an fp32 score row and an fp16 e row are both 128 bytes:
+	 * the e-block overwrites the score block in place (each row is read
+	 * into registers by its own lanes before they write it) */
+	constexpr bool ALIAS = (BK * 4 == EB);
+
+	/* scores: warp w takes NPW adjacent n-tiles (8 keys each) of one
+	 * m-tile; its Q fragments are the same for every key tile and stay
+	 * in registers (one block per SM leaves ~255 per thread) */
+	constexpr int NT = BK / 8;
+	constexpr int NPW = (MT * NT + W - 1) / W;
+
+	static_assert(BK == 16 || BK == 32, "BK");
+	static_assert(NT % NPW == 0, "a warp's n-tiles share one m-tile");
 
 	const int j = blockIdx.x, sp = blockIdx.y;
 	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -4127,22 +4220,23 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 
 	extern __shared__ __half smem[];
 
-	/* Q tile (32 x E h) | K 2 x (BK x E) | V 2 x (BK x E)
-	 * | sblock (32 x BK f) | eblock (32 x 64 h, swizzled) | corr (32 f) */
+	/* Q tile (MR x E h) | K 2 x (BK x E) | V 2 x (BK x E)
+	 * | sblock (MR x BK f) | eblock (MR x 64 h, swizzled; aliases the
+	 * sblock at BK = 32) | corr (MR f) */
 	__half *qt = smem;
-	__half *kt = qt + 32 * E;
+	__half *kt = qt + MR * E;
 	__half *vt = kt + 2 * BK * E;
 	float *sblock = (float *)(vt + 2 * BK * E);
-	__half *eblock = ( __half *)(sblock + 32 * BK);
-	/* corr sits AFTER the full eblock (32 rows x EB bytes): the
+	__half *eblock = ALIAS ? (__half *)sblock : (__half *)(sblock + MR * BK);
+	/* corr sits AFTER the full eblock (MR rows x EB bytes): the
 	 * eblock rows are 64 halves wide (8 swizzle pieces), not BK —
 	 * (eblock + 32 * BK) landed on row 16 and row-16 e writes
 	 * clobbered corr[0..15], zeroing the rows 0-15 pv rescale */
-	float *corr = (float *)((char *)eblock + 32 * EB);
+	float *corr = (float *)((char *)eblock + MR * EB);
 
 	/* fill the Q tile (rows >= rows zeroed). 16-byte
 	 * pieces, swizzled stores. */
-	for (int i = threadIdx.x; i < 32 * (E / 8); i += blockDim.x) {
+	for (int i = threadIdx.x; i < MR * (E / 8); i += blockDim.x) {
 		int row = i / (E / 8), piece = i % (E / 8);
 		uint4 v = make_uint4(0u, 0u, 0u, 0u);
 
@@ -4157,14 +4251,14 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 		*(uint4 *)((char *)qt + amp_adm_swz(row, piece, RB)) = v;
 	}
 
-	/* per-warp softmax state: rows r % W == warp (<= 4 rows) */
-	float mst[4], lst[4];
-	int nown = 0;
+	/* softmax state of row it * W * RPW + warp * RPW + lane / LPR,
+	 * replicated over the row's LPR lanes */
+	float mst[NIT], lst[NIT];
 
-	for (int r = warp; r < rows; r += W) {
-		mst[nown] = -1e30f;
-		lst[nown] = 0.0f;
-		nown++;
+	#pragma unroll
+	for (int it = 0; it < NIT; it++) {
+		mst[it] = -1e30f;
+		lst[it] = 0.0f;
 	}
 
 	/* row s attends keys [0, len - S + s] (bottom-right causal) */
@@ -4192,6 +4286,18 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 	}
 
 	__syncthreads();   /* Q tile visible to all warps */
+
+	const int s_m = (warp * NPW) / NT, s_n0 = ((warp * NPW) % NT) * 8;
+	const bool s_on = s_m < MT && s_m * 16 < rows;
+	unsigned qa[KS][4];
+
+	if (s_on) {
+		#pragma unroll
+		for (int kk = 0; kk < KS; kk++)
+			amp_adm_ldsm_x4(qa[kk], AMP_ADM_ADDR(qt,
+				s_m * 16 + (lane & 7) + ((lane >> 3) & 1) * 8,
+				kk * 2 + (lane >> 4), RB));
+	}
 
 	/* prologue: stage tile 0 (K and V, one commit group). Keys
 	 * past the used window are zero-filled in smem — the K rows are
@@ -4224,12 +4330,12 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 		amp_adm_cp_commit();
 	}
 
-	float pv[PNT][2][4];
+	float pv[PNT][MT][4];
 
 	#pragma unroll
 	for (int n = 0; n < PNT; n++)
 		#pragma unroll
-		for (int m = 0; m < 2; m++)
+		for (int m = 0; m < MT; m++)
 			#pragma unroll
 			for (int i = 0; i < 4; i++)
 				pv[n][m][i] = 0.0f;
@@ -4277,117 +4383,136 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 		amp_adm_cp_wait<1>();
 		__syncthreads();
 
-		/* --- scores: warp w covers m-tile w/(BK/8) (16 rows) ----
-		 * and n-tile w%(BK/8) (8 keys); 2 x 4 = W warps cover ---
-		 * the tile ------------------------------------------------ */
-		{
-			const int mrow = (warp / (BK / 8)) * 16;
-			const int n0 = (warp % (BK / 8)) * 8;
-
-			float sc[4];
-			unsigned af[4], bf[2];
+		/* --- scores: warp w covers m-tile s_m (16 rows, Q in -----
+		 * registers) and the NPW n-tiles (8 keys) from s_n0 ------- */
+		if (s_on) {
+			const int mrow = s_m * 16;
+			float sc[NPW][4];
 
 			/* mma accumulates into sc — it must start at zero for
 			 * every tile (the pv accumulator is the opposite: it
 			 * persists across tiles and is zeroed once above) */
 			#pragma unroll
-			for (int i = 0; i < 4; i++)
-				sc[i] = 0.0f;
+			for (int nn = 0; nn < NPW; nn++)
+				#pragma unroll
+				for (int i = 0; i < 4; i++)
+					sc[nn][i] = 0.0f;
 
 			#pragma unroll
 			for (int kk = 0; kk < KS; kk++) {
-				int row = mrow + (lane & 7) + ((lane >> 3) & 1) * 8;
-				int piece = kk * 2 + (lane >> 4);
+				#pragma unroll
+				for (int nn = 0; nn < NPW; nn++) {
+					unsigned bf[2];
+					int key = s_n0 + nn * 8 + (lane & 7);
+					int piece2 = kk * 2 + ((lane >> 3) & 1);
 
-				amp_adm_ldsm_x4(af, AMP_ADM_ADDR(qt, row, piece, RB));
-
-				int key = n0 + (lane & 7);
-				int piece2 = kk * 2 + ((lane >> 3) & 1);
-
-				amp_adm_ldsm_x2(bf, AMP_ADM_ADDR(kt_s, key, piece2, RB));
-
-				amp_adm_mma(sc, af, bf);
+					amp_adm_ldsm_x2(bf, AMP_ADM_ADDR(kt_s, key, piece2, RB));
+					amp_adm_mma(sc[nn], qa[kk], bf);
+				}
 			}
 
 			/* scatter with the scale and the causal mask. C layout:
 			 * c[0..1] = row (lane>>2), cols 2*(lane&3) + {0,1};
 			 * c[2..3] = row + 8, same cols. */
 			int r0 = mrow + (lane >> 2);
-			int c0 = n0 + 2 * (lane & 3);
 
 			#pragma unroll
-			for (int half = 0; half < 2; half++) {
-				int r = r0 + 8 * half;
-
-				if (r >= rows)
-					continue;
-
-				int s = r % S;
-				int lim = min(end, lim_base + s + 1);
+			for (int nn = 0; nn < NPW; nn++) {
+				int c0 = s_n0 + nn * 8 + 2 * (lane & 3);
 
 				#pragma unroll
-				for (int i = 0; i < 2; i++) {
-					int c = c0 + i;
-					bool ok = (tb + c) < lim;
+				for (int half = 0; half < 2; half++) {
+					int r = r0 + 8 * half;
 
-					sblock[r * BK + c] =
-						ok ? scale * sc[2 * half + i]
-						   : -1e30f;
+					if (r >= rows)
+						continue;
+
+					int s = r % S;
+					int lim = min(end, lim_base + s + 1);
+
+					#pragma unroll
+					for (int i = 0; i < 2; i++) {
+						int c = c0 + i;
+						bool ok = (tb + c) < lim;
+
+						sblock[r * BK + c] =
+							ok ? scale * sc[nn][2 * half + i]
+							   : -1e30f;
+					}
 				}
 			}
 		}
 
 		__syncthreads();
 
-		/* --- softmax: warp w owns rows r % W == w ------------- */
+		/* --- softmax: LPR lanes per row, 4 keys per lane, ------
+		 * RPW rows per warp step; the row's maximum and sum are ---
+		 * reduced over its lanes ---------------------------------- */
 		{
-			int ri = 0;
+			const int sub = lane / LPR, cl = (lane % LPR) * 4;
 
-			for (int r = warp; r < rows; r += W, ri++) {
-				int s = r % S;
+			#pragma unroll
+			for (int it = 0; it < NIT; it++) {
+				int r = (it * W + warp) * RPW + sub;
+				bool live = r < rows;
+				int s = (live ? r : 0) % S;
 				int lim = min(end, lim_base + s + 1);
+				float v[4];
+
+				if (live) {
+					float4 f = *(const float4 *)&sblock[r * BK + cl];
+
+					v[0] = f.x;
+					v[1] = f.y;
+					v[2] = f.z;
+					v[3] = f.w;
+				}
+
 				float mx = -1e30f;
 
-				for (int c = lane; c < BK; c += 32) {
-					bool ok = (tb + c) < lim;
-					float v = ok ? sblock[r * BK + c]
-						: -1e30f;
+				#pragma unroll
+				for (int i = 0; i < 4; i++) {
+					if (!live || (tb + cl + i) >= lim)
+						v[i] = -1e30f;
 
-					mx = fmaxf(mx, v);
+					mx = fmaxf(mx, v[i]);
 				}
 
 				#pragma unroll
-				for (int off = 16; off > 0; off >>= 1)
+				for (int off = LPR / 2; off > 0; off >>= 1)
 					mx = fmaxf(mx, __shfl_xor_sync(
 						0xffffffffu, mx, off));
 
-				float m_new = fmaxf(mst[ri], mx);
-				float cr = __expf(mst[ri] - m_new);
-				float lsum = 0.0f;
+				float m_new = fmaxf(mst[it], mx);
+				float cr = __expf(mst[it] - m_new);
+				float lsum = 0.0f, e[4];
 
-				for (int c = lane; c < BK; c += 32) {
-					bool ok = (tb + c) < lim;
-					float v = ok ? sblock[r * BK + c]
-						: -1e30f;
-					float e = __expf(v - m_new);
-					__half eh = __float2half(e);
+				#pragma unroll
+				for (int i = 0; i < 4; i++) {
+					e[i] = __expf(v[i] - m_new);
+					lsum += ((tb + cl + i) < lim) ? e[i] : 0.0f;
+				}
 
-					/* swizzled write (the PV ldmatrix reads it swizzled) */
-					*( __half *)((char *)eblock + amp_adm_swz(r, c >> 3, EB)
-						+ (c & 7) * 2) = eh;
+				/* swizzled write (the PV ldmatrix reads it swizzled);
+				 * every lane of the row has read its scores (the
+				 * shuffles above), so the aliased write is safe */
+				if (live) {
+					__half2 eh[2] = { __floats2half2_rn(e[0], e[1]),
+						__floats2half2_rn(e[2], e[3]) };
 
-					lsum += ok ? e : 0.0f;
+					*(uint2 *)((char *)eblock + amp_adm_swz(r, cl >> 3, EB)
+						+ (cl & 7) * 2) = *(const uint2 *)eh;
 				}
 
 				#pragma unroll
-				for (int off = 16; off > 0; off >>= 1)
+				for (int off = LPR / 2; off > 0; off >>= 1)
 					lsum += __shfl_xor_sync(
 						0xffffffffu, lsum, off);
 
-				lst[ri] = lst[ri] * cr + lsum;
-				mst[ri] = m_new;
+				lst[it] = lst[it] * cr + lsum;
+				mst[it] = m_new;
 
-				if (lane == 0)
+				if (live && (lane % LPR) == 0)
 					corr[r] = cr;
 			}
 		}
@@ -4395,11 +4520,13 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 		__syncthreads();
 
 		/* --- PV: warp w covers n-tiles w, w+W, ... ------------ */
+		/* per k-step: the V fragments of the warp's n-tiles once, the
+		 * e-block fragment of each m-tile once */
 		{
-			float cr0[2], cr8[2];
+			float cr0[MT], cr8[MT];
 
 			#pragma unroll
-			for (int m = 0; m < 2; m++) {
+			for (int m = 0; m < MT; m++) {
 				int r0 = m * 16 + (lane >> 2);
 
 				cr0[m] = (r0 < rows) ? corr[r0] : 0.0f;
@@ -4407,38 +4534,48 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 			}
 
 			#pragma unroll
-			for (int n = 0; n < PNT; n++) {
-				int nt = warp + n * W;
-
+			for (int n = 0; n < PNT; n++)
 				#pragma unroll
-				for (int m = 0; m < 2; m++) {
+				for (int m = 0; m < MT; m++) {
 					pv[n][m][0] *= cr0[m];
 					pv[n][m][1] *= cr0[m];
 					pv[n][m][2] *= cr8[m];
 					pv[n][m][3] *= cr8[m];
+				}
+
+			#pragma unroll
+			for (int kk = 0; kk < PKS; kk++) {
+				unsigned bv[PNT][2];
+
+				/* B = V tile: keys kk*16 + {0..15}, dims nt*8
+				 * (one 16-B piece) */
+				#pragma unroll
+				for (int n = 0; n < PNT; n++) {
+					int vkey = kk * 16 + (lane & 7) +
+						((lane >> 3) & 1) * 8;
+
+					amp_adm_ldsm_x2_t(bv[n],
+						AMP_ADM_ADDR(vt_s, vkey, warp + n * W, RB));
+				}
+
+				#pragma unroll
+				for (int m = 0; m < MT; m++) {
+					if (m * 16 >= rows)
+						continue;
+
+					unsigned af[4];
+
+					/* A = e-block rows of m-tile m, keys kk*16 */
+					int arow = m * 16 +
+						(lane & 7) + ((lane >> 3) & 1) * 8;
+					int apiece = kk * 2 + (lane >> 4);
+
+					amp_adm_ldsm_x4(af,
+						AMP_ADM_ADDR(eblock, arow, apiece, EB));
 
 					#pragma unroll
-					for (int kk = 0; kk < PKS; kk++) {
-						unsigned af[4], bf[2];
-
-						/* A = e-block rows of m-tile m, keys kk*16 */
-						int arow = m * 16 +
-							(lane & 7) + ((lane >> 3) & 1) * 8;
-						int apiece = kk * 2 + (lane >> 4);
-
-						amp_adm_ldsm_x4(af,
-							AMP_ADM_ADDR(eblock, arow, apiece, EB));
-
-						/* B = V tile: keys kk*16 + {0..15},
-						 * dims nt*8 (one 16-B piece) */
-						int vkey = kk * 16 + (lane & 7) +
-							((lane >> 3) & 1) * 8;
-
-						amp_adm_ldsm_x2_t(bf,
-							AMP_ADM_ADDR(vt_s, vkey, nt, RB));
-
-						amp_adm_mma(pv[n][m], af, bf);
-					}
+					for (int n = 0; n < PNT; n++)
+						amp_adm_mma(pv[n][m], af, bv[n]);
 				}
 			}
 		}
@@ -4447,21 +4584,21 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 	}
 
 	/* --- workspace ------------------------------------------------ */
-	{
-		int ri = 0;
+	#pragma unroll
+	for (int it = 0; it < NIT; it++) {
+		int r = (it * W + warp) * RPW + lane / LPR;
 
-		for (int r = warp; r < rows; r += W, ri++) {
-			int s = r % S, g = r / S;
-			int lim = min(end, lim_base + s + 1);
-			bool any = begin < lim;
-			float *w = ws + (((size_t)j * ns + sp) * rep * S +
-				s * rep + g) * WSROW;
+		if (r >= rows || (lane % LPR))
+			continue;
 
-			if (lane == 0) {
-				w[0] = any ? mst[ri] : -1e30f;
-				w[1] = any ? lst[ri] : 0.0f;
-			}
-		}
+		int s = r % S, g = r / S;
+		int lim = min(end, lim_base + s + 1);
+		bool any = begin < lim;
+		float *w = ws + (((size_t)j * ns + sp) * rep * S +
+			s * rep + g) * WSROW;
+
+		w[0] = any ? mst[it] : -1e30f;
+		w[1] = any ? lst[it] : 0.0f;
 	}
 
 	/* acc dims: warp w's PV n-tiles, fragment scatter. c[0..1] =
@@ -4472,7 +4609,7 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 		int c0 = nt * 8 + 2 * (lane & 3);
 
 		#pragma unroll
-		for (int m = 0; m < 2; m++) {
+		for (int m = 0; m < MT; m++) {
 			int r0 = m * 16 + (lane >> 2);
 
 			#pragma unroll
@@ -4493,16 +4630,27 @@ amp_attn_dec_mma_kernel(const __half *__restrict__ q,
 	}
 }
 
+/* shared memory of amp_attn_dec_mma_kernel<E, MT, BK> */
+static size_t
+amp_adm_smem(int E, int MT, int BK)
+{
+	int MR = 16 * MT;
+
+	return (size_t)(MR * E * 2 +              /* Q tile */
+		2 * BK * E * 2 +                  /* K stages */
+		2 * BK * E * 2 +                  /* V stages */
+		MR * BK * 4 +                     /* sblock */
+		(BK * 4 == 128 ? 0 : MR * 128) +  /* eblock (aliases the sblock at BK = 32) */
+		MR * 4 +                          /* corr */
+		16);                              /* alignment slack */
+}
+
 extern "C" size_t
 amp_attn_dec_mma_smem(int E)
 {
-	return (size_t)(32 * E * 2 +              /* Q tile */
-		2 * AMP_ADM_BK * E * 2 +           /* K stages */
-		2 * AMP_ADM_BK * E * 2 +           /* V stages */
-		32 * AMP_ADM_BK * 4 +              /* sblock */
-		32 * 128 +                        /* eblock */
-		32 * 4 +                          /* corr */
-		16);                              /* alignment slack */
+	/* the original 32-row layout with a separate e-block: the QSA kernel's */
+	return (size_t)(32 * E * 2 + 4 * AMP_ADM_BK * E * 2 + 32 * AMP_ADM_BK * 4 +
+		32 * 128 + 32 * 4 + 16);
 }
 
 extern "C" int
@@ -4511,8 +4659,8 @@ amp_attn_dec_mma_fp16(const void *q, const void *k, const void *v,
                      int Hk, int E, int max_seq, int ns, float scale,
                      cudaStream_t stream)
 {
-	if (Hk <= 0 || Hq % Hk || S < 1 || S > 5 || Hq / Hk > 32 ||
-	    (Hq / Hk) * S > 32 || ns < 1 ||
+	if (Hk <= 0 || Hq % Hk || S < 1 || Hq / Hk > 32 ||
+	    (Hq / Hk) * S > 64 || ns < 1 || ns > AMP_AD_MAXNS ||
 	    (E != 64 && E != 128 && E != 256) || (E / 8) % AMP_ADM_WARPS) {
 		fprintf(stderr, "amp_attn_dec_mma: unsupported config "
 			"(S %d, Hq %d, Hk %d, E %d, ns %d)\n",
@@ -4522,41 +4670,44 @@ amp_attn_dec_mma_fp16(const void *q, const void *k, const void *v,
 
 	dim3 grid(Hk, ns);
 	int block = AMP_ADM_WARPS * 32;
-	int cblock = (Hq / Hk) * S * 32;
-	size_t smem = amp_attn_dec_mma_smem(E);
+	int rows = (Hq / Hk) * S;
 
-#define AMP_ADM_K(EV) do { \
+#define AMP_ADM_K(EV, MTV, BKV) do { \
 	/* the >48 KiB dynamic shared memory opt-in is per device */ \
 	static bool attr_done[64] = { false }; \
+	size_t smem = amp_adm_smem(EV, MTV, BKV); \
 	int adm_dev = 0; \
 	cudaGetDevice(&adm_dev); \
 	if (adm_dev >= 0 && adm_dev < 64 && !attr_done[adm_dev]) { \
-		cudaFuncSetAttribute(amp_attn_dec_mma_kernel<EV>, \
-			cudaFuncAttributeMaxDynamicSharedMemorySize, \
-			(int)amp_attn_dec_mma_smem(EV)); \
+		cudaFuncSetAttribute(amp_attn_dec_mma_kernel<EV, MTV, BKV>, \
+			cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem); \
 		attr_done[adm_dev] = true; \
 	} \
-	amp_attn_dec_mma_kernel<EV><<<grid, block, smem, stream>>>( \
+	amp_attn_dec_mma_kernel<EV, MTV, BKV><<<grid, block, smem, stream>>>( \
 		(const __half *)q, (const __half *)k, (const __half *)v, \
 		len, (float *)ws, S, Hq, Hk, max_seq, ns, (float)scale); \
 } while (0)
-#define AMP_ADM_C(D) \
-	amp_attn_dec_combine_kernel<D><<<Hk, cblock, 0, stream>>>( \
-		(const float *)ws, (__half *)out, S, Hq, Hk, ns, len, max_seq)
+#define AMP_ADM_E(EV) do { \
+	if (rows <= 32) \
+		AMP_ADM_K(EV, 2, AMP_ADM_BK); \
+	else if (rows <= 48) \
+		AMP_ADM_K(EV, 3, AMP_ADM_BK); \
+	else \
+		AMP_ADM_K(EV, 4, 16); \
+} while (0)
 
-	if (E == 256) {
-		AMP_ADM_K(256);
-		AMP_ADM_C(8);
-	} else if (E == 128) {
-		AMP_ADM_K(128);
-		AMP_ADM_C(4);
-	} else {
-		AMP_ADM_K(64);
-		AMP_ADM_C(2);
-	}
+	if (E == 256)
+		AMP_ADM_E(256);
+	else if (E == 128)
+		AMP_ADM_E(128);
+	else
+		AMP_ADM_E(64);
 
+#undef AMP_ADM_E
 #undef AMP_ADM_K
-#undef AMP_ADM_C
+
+	amp_attn_dec_combine((const float *)ws, (__half *)out, S, Hq, Hk, E, ns, len,
+		max_seq, stream);
 
 	return (int)cudaGetLastError();
 }

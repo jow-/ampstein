@@ -520,9 +520,6 @@ export function shard(model, opts) {
 
 						d.pos_idx = d.ramp.add(d.pos);
 						d.seqused = d.pos_idx.narrow(0, S - 1, 1).add(1).to('int32');
-						// 6..10 rows: the key count of the first row group
-						// of the split attention (qwen35.attn_forward_dev)
-						d.seqused_a = (S > 5) ? d.pos_idx.narrow(0, S - (S >> 1) - 1, 1).add(1).to('int32') : null;
 						d.rope_idx = d.ramp.add(d.rpos);
 						d.cos = d.cos_tab.index(d.rope_idx);
 						d.sin = d.sin_tab.index(d.rope_idx);

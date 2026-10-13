@@ -74,8 +74,9 @@ Per round, for the block rows `[anchor, mask x W]` at positions
 - Cache jumps (snapshot restore, fresh prefill, parked-state resume) reset
   the ring (`DF.reset()`); the context then refills from the next rounds'
   rows. Output stays lossless either way, only acceptance suffers.
-- The verify window of 7 rows needs attention beyond `attn_decode`'s 5
-  rows: `attn_forward_dev` issues two row groups (`st.seqused_a`).
+- The verify window of 7 rows is 42 query rows per kv head (rep 6):
+  `attn_decode`'s 48-row mma tile takes them in one pass over the keys
+  (L132).
 
 ## Numerics: the residual stream is fp32
 
@@ -94,6 +95,16 @@ products stay in range (the add scales back). Everything else is fp16.
 | prose (essay) | 80 | 98 (3.2) |
 | list (primes) | 102 | 214 (6.9) |
 | summary at 26k depth | 62 | 69-73 (2.8-2.9) |
+
+With the one-pass verify attention (L132), at depth (the repository's
+docs and sources as of 9e10afd cut to the depth, then a code / a summary
+request, 300 tokens):
+
+| depth | code | prose |
+|---|---|---|
+| 1k | 142 tok/s (140 before) | 99 (99) |
+| 26k | 136 (116) | 96 (82) |
+| 82k | 125 (102) | 69 (55) |
 
 A round is ~26 ms of verify (7 rows cost about what 3 do), ~5.5 ms of
 drafter (5 layers of 4-bit weights at m = 8 and the sharded head) and no

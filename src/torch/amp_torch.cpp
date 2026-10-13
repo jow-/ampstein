@@ -5775,11 +5775,12 @@ torch_attn_gate(uc_vm_t *vm, size_t nargs)
  *
  * Split-KV decode attention with a DEVICE-side key count (src/
  * amp_kernels.cu amp_attn_dec_kernel / amp_attn_dec_mma_kernel),
- * CUDA-graph-safe: q (S, Hq, E) fp16 contiguous (S <= 5,
- * (Hq/Hk) * S <= 32), k/v caches (Hk, max_seq, E) fp16 contiguous,
+ * CUDA-graph-safe: q (S, Hq, E) fp16 contiguous ((Hq/Hk) * S <= 32
+ * and S <= 5, or <= 64 rows of any S for the mma variant), k/v caches
+ * (Hk, max_seq, E) fp16 contiguous,
  * len (1) int32 on the device = keys in use (row s attends keys
- * [0, len - S + s]). splits: key splits per kv head (default:
- * 2 blocks per SM over the kv heads). mma = 1 selects the
+ * [0, len - S + s]). splits: key splits per kv head (default: 4
+ * blocks per SM over the kv heads, one per SM for mma). mma = 1 selects the
  * tensor-core (mma.sync) variant, which is ~2.2x faster at long
  * key counts (E = 64/128/256); default 0 is the shuffle kernel.
  * Returns (S, Hq, E).
@@ -5833,10 +5834,13 @@ torch_attn_decode(uc_vm_t *vm, size_t nargs)
 			int sms = 0;
 
 			C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-			/* ~4 blocks per SM over the kv heads: enough unique K/V
-			 * bytes in flight (the block's warps share rows); measured
-			 * best on a 3090 */
-			splits = std::max<int64_t>(1, (4 * (int64_t)sms + Hk - 1) / Hk);
+			/* shuffle kernel: ~4 blocks per SM over the kv heads,
+			 * enough unique K/V bytes in flight (the block's warps
+			 * share rows). The mma kernel runs one block per SM (its
+			 * shared memory): exactly one wave, a partial second wave
+			 * costs up to 40% (measured on a 3090, L132) */
+			splits = use_mma ? std::max<int64_t>(1, (int64_t)sms / Hk) :
+				std::max<int64_t>(1, (4 * (int64_t)sms + Hk - 1) / Hk);
 		}
 
 		at::Tensor ws = at::empty({ (int64_t)amp_attn_dec_ws_floats(S, Hq, Hk, E, (int)splits) },
