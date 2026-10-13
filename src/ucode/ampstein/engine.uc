@@ -39,6 +39,15 @@
 //                  force them instead (the stop is discarded and the
 //                  generation continues after them). job.eos_max (default 4)
 //                  limits the consultations per job.
+//   job.veto(prefix, id)  optional: constrained generation. A token the engine is
+//                  about to accept after the not yet reported `prefix` tokens;
+//                  return true to refuse it. It must have no side effects
+//                  (called for every token and for draft windows, so keep
+//                  it cheap). A refused token is replaced by
+//                  job.veto_force(prefix), when that returns token ids (as
+//                  for on_eos: the consumer shows them itself), or else
+//                  the position is redrawn from the same logits with the
+//                  refused tokens lowered
 //   job.on_progress(done, total)   prefill progress, return false to abort
 //   job.on_token(id)               return false to stop
 //   job.on_done(info)              {reason, prompt_tokens, cached_tokens,
@@ -2100,6 +2109,43 @@ export function create(model, opts) {
 		return draw(dist(l, s, counts_for(j, l)), null);
 	}
 
+	/* job.veto(prefix, tok): the consumer's constrained generation (--call-guard)
+	 * refuses `tok` after the pending `prefix` tokens. If job.veto_force(prefix)
+	 * then has a deterministic continuation, those tokens are forced instead (the
+	 * refused token is discarded, as for a stop id); otherwise the position is
+	 * redrawn from logits (the row `tok` was drawn from, any shape holding one
+	 * row) with the refused tokens lowered, until one passes; after 8 tries the
+	 * last draw goes through. Returns {tok} or {force}. */
+	function veto_resolve(j, prefix, tok, logits) {
+		if (!j.veto || !j.veto(prefix, tok))
+			return {tok: tok};
+
+		// a deterministic continuation: the consumer shows it and hands it back
+		if (j.veto_force) {
+			let f = j.veto_force(prefix);
+
+			if (type(f) == 'array' && length(f))
+				return {force: f};
+		}
+
+		if (logits == null)
+			return {tok: tok};
+
+		let l = logits.reshape([-1]).to('float32').add(0.0);   // a copy
+		let s = j.sampling || {};
+		let temp = (s.temperature != null) ? s.temperature : 1.0;
+
+		for (let n = 0; n < 8; n++) {
+			l.narrow(0, tok, 1).add_(-1e30);
+			tok = (temp <= 0) ? int(l.argmax().item()) : draw(dist(l, s, counts_for(j, l)), null);
+
+			if (!j.veto(prefix, tok))
+				break;
+		}
+
+		return {tok: tok};
+	}
+
 	/* Consult job.on_eos for a sampled stop token (logits: the row it was
 	 * drawn from). Returns {tok} with the token to use instead (it may
 	 * still be a stop id: the generation then ends), or {force} with
@@ -2193,7 +2239,7 @@ export function create(model, opts) {
 		// vetoes it (job.on_eos) finds the state consistent — the drafts
 		// behind it were accepted conditional on it and are dropped
 		for (let i = 1; i <= a; i++) {
-			if (index(j.stop_ids, c[i]) >= 0) {
+			if (index(j.stop_ids, c[i]) >= 0 || (j.veto && j.veto(slice(c, 1, i), c[i]))) {
 				a = i - 1;
 				bonus = c[i];
 				break;
@@ -2261,6 +2307,24 @@ export function create(model, opts) {
 
 		for (let k = 0; k < length(emit); k++) {
 			let tok = emit[k];
+
+			if (j.veto && vrows != null && k == a && k == length(emit) - 1) {
+				// the bonus: drawn from row a (the tokens before it were emitted, so the consumer's
+				// state already includes them), redrawn when the consumer refuses it
+				let vr = veto_resolve(j, [], tok, vrows.narrow(0, a, 1));
+
+				if (vr.force) {
+					if (inject(j, vr.force, true))
+						return;
+
+					return finish('stop');
+				}
+
+				if (vr.tok != tok) {
+					tok = vr.tok;
+					j.t_next = tok;
+				}
+			}
 
 			if (index(j.stop_ids, tok) >= 0) {
 				// (only the bonus can be a stop id here; row a of the verify
@@ -2546,7 +2610,7 @@ export function create(model, opts) {
 		// a stop id among the accepted drafts ends the round there and
 		// becomes its bonus token (see mtp_finish)
 		for (let i = 0; i < a; i++) {
-			if (index(j.stop_ids, dr[i]) >= 0) {
+			if (index(j.stop_ids, dr[i]) >= 0 || (j.veto && j.veto(slice(dr, 0, i), dr[i]))) {
 				a = i;
 				bonus = dr[i];
 				break;
@@ -2567,6 +2631,25 @@ export function create(model, opts) {
 		for (let k = 0; k < length(emit); k++) {
 			let tok = emit[k];
 			let stopped = null;
+
+			if (j.veto && vrows != null && k == a && k == length(emit) - 1) {
+				let vr = veto_resolve(j, [], tok, vrows.narrow(0, a, 1));
+
+				if (vr.force) {
+					// the seed and the accepted drafts are fed; the refused token is dropped
+					push(ids, ...fed);
+
+					if (inject(j, vr.force, true))
+						return;
+
+					return finish('stop');
+				}
+
+				if (vr.tok != tok) {
+					tok = vr.tok;
+					bonus = tok;
+				}
+			}
 
 			if (index(j.stop_ids, tok) >= 0) {
 				let rr = eos_resolve(j, tok, vrows ? vrows.narrow(0, a, 1) : null);
@@ -2620,6 +2703,13 @@ export function create(model, opts) {
 	 * forward (or the hand-over to the MTP phase). Runs from the
 	 * notifier callback after the sampling results arrived. */
 	function decode_after(j, tok, logits) {
+		let vr = veto_resolve(j, [], tok, logits);
+
+		if (vr.force)
+			return inject(j, vr.force, true) ? null : finish('stop');
+
+		tok = vr.tok;
+
 		if (index(j.stop_ids, tok) >= 0) {
 			let r = eos_resolve(j, tok, logits);
 

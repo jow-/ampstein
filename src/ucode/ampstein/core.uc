@@ -36,6 +36,7 @@ import * as dsv4_vision from './dsv4_vision.uc';
 import * as dspark_tp from './dspark_tp.uc';
 import * as dflash from './dflash.uc';
 import { tool_history } from './toolhist.uc';
+import { repeated as repeated_calls, clean_messages } from './callguard.uc';
 
 // digest.so is optional (not built on every host): images are then keyed
 // by a cheap length+sample fingerprint instead of SHA-256
@@ -878,8 +879,12 @@ export function serve(args) {
 			vision: (GLM || DS) && args.vision && cfg.has_vision
 		};
 
+		// --call-guard: earlier calls are shown without the arguments their tool does
+		// not declare (the model copies a stray one until it crowds the real ones out)
+		let msgs = args.call_guard ? clean_messages(body.messages, tools) : body.messages;
+
 		try {
-			r = render_prompt(body.messages, tools, ropts);
+			r = render_prompt(msgs, tools, ropts);
 		}
 		catch (e) {
 			return api_error(res, 400, e.message, 'invalid_request_error', null, 'messages');
@@ -903,7 +908,7 @@ export function serve(args) {
 
 		let gen_ids = tok.encode(r.gen, true);
 		let prefix_len = length(prefix_ids);   // BEFORE extending: ids aliases prefix_ids (L81)
-		let turn_at = turn_boundary(r, body.messages, tools, ropts, prefix_len, length(r.images) > 0);
+		let turn_at = turn_boundary(r, msgs, tools, ropts, prefix_len, length(r.images) > 0);
 		let ids = prefix_ids;     // fresh array (encode / expansion): extend in place
 
 		push(ids, ...gen_ids);
@@ -922,6 +927,35 @@ export function serve(args) {
 		let created = now_s();
 		let p = chat.parser(r.thinking, stops_of(body));
 		let dt = detok();
+
+		// Constrained tool calls (--call-guard): the guard follows the emitted text and
+		// the engine asks it about every token it is about to accept (job.veto)
+		let ban = (args.call_guard && chat.call_guard) ? repeated_calls(tool_history(msgs)) : [];
+
+		if (length(ban))
+			warn(`chat ${id}: call guard: the conversation repeats its last ${join(', ', ban)} call, ` +
+				`banning the name in this response\n`);
+
+		let guard = (args.call_guard && chat.call_guard) ? chat.call_guard(body.tools, r.thinking, ban) : null;
+		let pieces = {}, vetoes = 0;
+
+		function piece_of(t) {
+			let k = sprintf('%d', t), s = pieces[k];
+
+			if (s == null)
+				s = pieces[k] = tok.decode([t]);
+
+			return s;
+		}
+
+		function gpush(t) {
+			let s = dt.push(t);
+
+			if (guard)
+				guard.feed(s);
+
+			return s;
+		}
 
 		// non-stream only: the final JSON needs the full text; the streamed
 		// path never reads it. Buffer-backed so a long completion costs O(n)
@@ -1102,6 +1136,32 @@ export function serve(args) {
 				return res.alive();
 			},
 
+			// would this token (after the pending prefix tokens) leave the tool's schema?
+			veto: !guard ? null : function (prefix, t) {
+				return guard.veto(map(prefix, piece_of), piece_of(t));
+			},
+
+			// the text a refused position must continue with, when it is determined:
+			// shown to the client like generated text, and forced
+			veto_force: !guard ? null : function (prefix) {
+				let fix = guard.fix(map(prefix, piece_of));
+				let f = (fix != null) ? tok.encode(fix, true) : null;
+
+				if (vetoes++ < 8)
+					warn(`chat ${id}: call guard: refused a token after ${hnum} tokens` +
+						(f ? `, forcing ${sprintf('%J', fix)}` : ', redrawing') + '\n');
+
+				if (f == null || length(f) == 0)
+					return null;
+
+				for (let i = 0; i < length(f); i++)
+					emit(p.feed(gpush(f[i])));
+
+				hnum += length(f);
+
+				return f;
+			},
+
 			on_progress: function (done, total) {
 				progress(done, total);
 
@@ -1119,7 +1179,7 @@ export function serve(args) {
 				if (budgeted && p.mode() == 'reason')
 					rtoks++;
 
-				emit(p.feed(dt.push(t)));
+				emit(p.feed(gpush(t)));
 				budget_check();
 
 				if (stopped)
@@ -1140,7 +1200,7 @@ export function serve(args) {
 					call_note = null;
 
 					for (let i = 0; i < length(f) && !call_raw; i++)
-						emit(p.feed(dt.push(f[i])));
+						emit(p.feed(gpush(f[i])));
 
 					hnum += length(f);
 
@@ -1183,7 +1243,7 @@ export function serve(args) {
 
 				// show the forced text in the stream like generated text
 				for (let i = 0; i < length(f); i++)
-					emit(p.feed(dt.push(f[i])));
+					emit(p.feed(gpush(f[i])));
 
 				hnum += length(f);
 
@@ -1198,7 +1258,7 @@ export function serve(args) {
 					call_note = null;
 
 					for (let i = 0; i < length(f) && !call_raw; i++)
-						emit(p.feed(dt.push(f[i])));
+						emit(p.feed(gpush(f[i])));
 
 					hnum += length(f);
 
@@ -1221,7 +1281,7 @@ export function serve(args) {
 
 				// show the forced text in the stream like generated text
 				for (let i = 0; i < length(f); i++)
-					emit(p.feed(dt.push(f[i])));
+					emit(p.feed(gpush(f[i])));
 
 				rtoks += length(f);
 

@@ -20,6 +20,7 @@
 //   </tool_call>
 
 import * as struct from 'struct';
+import * as callguard from './callguard.uc';
 
 /* --- Python-compatible JSON (Jinja's tojson) ------------------------- */
 
@@ -379,6 +380,12 @@ export function render(messages, tools, opts) {
  * instead of being sent: the end of its turn, a tool message in the template's
  * form, and the next generation prompt. The server forces this (call hook)
  * so the model sees the objection as a tool result and answers it. */
+/* Constrained generation of this format's tool calls (--call-guard): see
+ * callguard.uc. null without tool definitions. */
+export function call_guard(tools, thinking, ban) {
+	return callguard.qwen(tools, thinking, ban);
+}
+
 export function tool_feedback(text, thinking) {
 	return '<|im_end|>\n<|im_start|>user\n<tool_response>\n' + text +
 		'\n</tool_response><|im_end|>\n<|im_start|>assistant\n' +

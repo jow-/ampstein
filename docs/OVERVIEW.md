@@ -272,6 +272,20 @@ reasoning, content and tool calls (Qwen XML-ish calls, GLM, DeepSeek DSML).
   a change of plan; the client sees only that). A loop breaker for a model
   that resends a failing call: `examples/call_policy_loop.uc`; also usable as
   a call filter / blacklist (raise `--call-hook-max`).
+- **Constrained tool calls** (`--call-guard`): the engine refuses, while
+  sampling, any token that would take a call out of its tool's schema, and
+  redraws the position from the same logits. Once `<function=NAME>` names a tool
+  of the request the guard allows only its parameters (each once), keeps the
+  bulk ones (`content`, `edits` ...) behind the short required ones (`path`
+  first), and refuses to close the call while a required parameter is missing
+  (`callguard.uc`, Qwen's XML call format). A refused position continues with the
+  determined text (forced, e.g. `path>\n`) or is redrawn. While the
+  conversation repeats its last `edit`/`write` (the same call twice, or four in
+  a row cycling between two variants, or the same content written twice to
+  nearly equal paths, or three writes of one script to numbered files) the
+  tool's name is banned for the response. Earlier calls are rendered without the arguments their tool does
+  not declare (prompt only, the client's history is untouched): a stray
+  parameter the harness ignores otherwise stays in the context as an example.
 
 **Safety and hygiene**
 - Taint-tracked chat template rendering (no special-token injection from

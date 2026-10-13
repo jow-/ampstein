@@ -468,3 +468,51 @@ Add new lessons at the end of the matching section.
   working calls that carried the junk next to a valid `path`. The call is only
   seen after the parser completes it, so the tokens of a 468-parameter call are
   still spent.
+- **L141 — Constrain the sampling, not the conversation.** Notes in the model's
+  context did not stop Qwen3.8-27B from resending a `write` without `path`
+  (plus `content2` ... `contentN`): with failing calls in its context the next
+  one is the likeliest continuation. `--call-guard` follows the generated call
+  and, once the tool is named, vetoes tokens outside its schema (unknown or
+  repeated parameter, closing with a required parameter missing, `content`
+  before `path`); the engine redraws the position from the same logits, like
+  the stop-token redraw. Speculative windows are cut at the first refused
+  draft, whose position is redrawn as the round's bonus.
+- **L142 — A loop of successes, and a model that announces one tool and emits
+  another.** After the `path` loop was fixed Qwen3.8-27B repeated one `edit` 69
+  times, each answered "Successfully replaced 1 block(s)" (the edit flipped a
+  trailing newline in and out), so no failure policy applied; its text said
+  "I'll make a bash call" in 27 of 28 turns while the call was the same `edit`
+  (the same mismatch existed before `--call-guard`: "via bash", then a
+  path-less `write`). The copy of the previous call is the likeliest
+  continuation whatever the text says, so the guard bans the repeated tool's
+  name at the sampling level (`callguard.repeated`). Two bugs of the first
+  guard worth remembering: tokens already emitted must not be passed again as
+  the window prefix (the state advanced twice, `w`+`rite` became `wwrite`), and
+  a guard must let go once it cannot be satisfied, instead of vetoing
+  everything after an invalid name.
+- **L143 — Tolerated junk is a seed.** The `write`/`path` loop of the
+  openwrt-minibuild session began as one stray `content2: ""` at 15:53:44 that
+  the model itself called "a typo ... the tool probably ignores it". The harness
+  accepted the call, so it stayed in the context as an example, and every later
+  call copied and extended it: 1 stray key, then ~9 per call (16:00), ~18
+  (16:30), ~93 (17:00) -- 351 of 1723 calls, ~120k tokens of `contentN` -- until
+  `path` was crowded out at 17:23 (0/182 writes failed before, ~85% after, at
+  every context size). Each fix after that moved the symptom (path-less `write`,
+  identical `edit` successes, numbered `/tmp/statN.sh`) because the cause is
+  upstream: the model's own tolerated output is its strongest prior. So: refuse
+  junk at the sampling (the guard), do not show it again (`clean_messages`), and
+  compaction summaries must not carry "the tool is broken" narratives
+  forward (here they did: "write tool BROKEN in this session"). A harness that
+  rejects undeclared parameters would have shown the glitch at 15:53.
+- **L144 — Identical content to a nearly equal path.** The model wrote a script
+  and, in place of running it, wrote it again (`/tmp/pyval.sh` .. `pyval6.sh`,
+  the same 842 bytes; its thinking said "let me run pyval.sh" each time): the
+  previous call is copied at the function-name position whatever the text says.
+  A cap of two consecutive writes stopped it but also blocked ~340 later writes
+  and legitimate batches; the signal is the repeat itself: byte-identical
+  content (of some size) to another file of the same directory, or short
+  contents to a name that differs only by a digit or a letter or two (`_a`,
+  `_aa`, `_a1`, `_v2`; the model's suffixes are unbounded: `_again`, `_final`) It fired 0 times on healthy work and 108 on
+  the loop. The false premise behind the write-script-then-run workflow
+  (`$p_mb_packed` read as a variable, misdiagnosed as a harness IFS/expansion
+  quirk and kept in every compaction summary) is the upstream cause.
