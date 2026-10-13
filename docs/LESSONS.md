@@ -382,9 +382,12 @@ Add new lessons at the end of the matching section.
   likeliest continuation, whatever the thinking says. Asking in the next user
   turn works slowly. `--call-hook` consults a script when a call completes,
   with the conversation's calls and their results; a string drops the call
-  and forces that text into the context (through `force()`, or the end-token
-  path when the stop comes first), so the model reads the objection where it
-  was about to repeat itself. Matching on the *result* (same tool, same
+  and answers it with that text as the call's tool result (forced through
+  `force()`, or the end-token path when the stop comes first), so the model
+  reads the objection where it was about to repeat itself and replies with a
+  corrected call. A note left inside the model's own turn was not enough: it
+  read it as the end of its turn; and the Qwen parser drops text after a call,
+  so the stream continues with a fresh parser. Matching on the *result* (same tool, same
   failure, in a row) catches variants that exact-argument matching misses; a
   replay of the 876 calls of that session found one drop before the loop
   began, a byte-identical resend.

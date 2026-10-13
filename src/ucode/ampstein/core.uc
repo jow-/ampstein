@@ -944,7 +944,7 @@ export function serve(args) {
 		// through. Only the first --call-hook-max verdicts of a request are
 		// consulted: a model that insists gets its call out.
 		let call_hist = call_policy ? tool_history(body.messages) : null;
-		let call_n = 0, call_note = null;
+		let call_n = 0, call_note = null, call_raw = false;
 
 		// Reasoning budget. After `nudge_at` reasoning tokens a soft nudge is
 		// appended to the model's thinking (it carries on and usually wraps up);
@@ -1019,7 +1019,7 @@ export function serve(args) {
 						res.sse(chunk({content: ev.text}));
 				}
 				else if (ev.type == 'tool_call') {
-					let call = {
+					let tc = {
 						id: rand_id('call_'),
 						type: 'function',
 						function: {
@@ -1037,7 +1037,7 @@ export function serve(args) {
 
 						try {
 							v = call(call_policy, null, {
-								call: {name: call.function.name, arguments: call.function.arguments},
+								call: {name: tc.function.name, arguments: tc.function.arguments},
 								calls: map(calls, (c) => ({name: c.function.name, arguments: c.function.arguments})),
 								history: call_hist,
 								text: htext.slice(),
@@ -1053,16 +1053,29 @@ export function serve(args) {
 
 						if (type(v) == 'string' && v != '') {
 							call_n++;
-							call_note = tok.encode(v, true);
-							warn(`chat ${id}: call hook: dropped ${call.function.name}, forcing ${length(call_note)} tokens (after ${hnum} tokens)\n`);
+
+							// the note as the call's tool result (the model answers it
+							// with a new call or a change of plan, nothing of it is
+							// shown to the client); a format without tool_feedback gets
+							// it as text inside its own turn
+							let fb = chat.tool_feedback ? chat.tool_feedback(v, r.thinking) : null;
+
+							call_raw = (fb != null);
+							call_note = tok.encode(fb ?? v, true);
+
+							// the parser ignores everything after a call (the format has
+							// no suffix): continue with a fresh one in the state the
+							// model is in
+							p = chat.parser(call_raw ? r.thinking : false, stops_of(body));
+							warn(`chat ${id}: call hook: dropped ${tc.function.name}, forcing ${length(call_note)} tokens (after ${hnum} tokens)\n`);
 							continue;
 						}
 					}
 
 					if (stream)
-						res.sse(chunk({tool_calls: [{index: length(calls), ...call}]}));
+						res.sse(chunk({tool_calls: [{index: length(calls), ...tc}]}));
 
-					push(calls, call);
+					push(calls, tc);
 				}
 				else if (ev.type == 'stop') {
 					stopped = true;
@@ -1125,7 +1138,7 @@ export function serve(args) {
 
 					call_note = null;
 
-					for (let i = 0; i < length(f); i++)
+					for (let i = 0; i < length(f) && !call_raw; i++)
 						emit(p.feed(dt.push(f[i])));
 
 					hnum += length(f);
@@ -1183,7 +1196,7 @@ export function serve(args) {
 
 					call_note = null;
 
-					for (let i = 0; i < length(f); i++)
+					for (let i = 0; i < length(f) && !call_raw; i++)
 						emit(p.feed(dt.push(f[i])));
 
 					hnum += length(f);

@@ -16,9 +16,12 @@
 //             calls, oldest first, with the text their tool message returned
 //             (null: unanswered)
 //   text, reasoning, tools, tokens, overrides (earlier verdicts of this request)
-// and the return value is the verdict: a string drops the call and puts that
-// text into the model's context (and the stream) in its place; anything else
-// lets the call through.
+// and the return value is the verdict: a string drops the call and answers it
+// with that text as its tool result, in the same response (formats with a
+// tool_feedback(): Qwen, GLM; others see it as text in their turn); the model
+// answers with a new call or a change of plan and the client sees only that.
+// Anything else lets the call through. Only --call-hook-max verdicts per
+// request are asked for: raise it when the script is a filter.
 //
 // Here: a call is a repeat when the immediately preceding calls to the same
 // tool (a run of at least STREAK, or ONE_SHOT when this call is byte-identical

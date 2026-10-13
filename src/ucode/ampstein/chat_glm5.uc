@@ -159,6 +159,14 @@ function tool_response(m) {
 	return '<tool_response>' + visible_text(m.content) + '</tool_response>';
 }
 
+/* The model's own tool call answered by `text` in place of the tool (the
+ * server's call hook): the observation block of the template and the next
+ * generation prompt, forced into its context. */
+export function tool_feedback(text, thinking) {
+	return '<|observation|>' + tool_response({content: text}) +
+		(thinking ? '<|assistant|><think>' : '<|assistant|><think></think>');
+}
+
 /* Render a conversation. opts:
  *   reasoning_effort  low | high (anything else: max, per the template)
  *   enable_thinking   default true; false ends the generation prompt with

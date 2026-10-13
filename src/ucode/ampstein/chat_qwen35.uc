@@ -375,6 +375,16 @@ export function render(messages, tools, opts) {
 	return {prefix: out.pull(), gen: gen, thinking: thinking, images: images};
 }
 
+/* What the model reads when a tool call of its own is answered by `text`
+ * instead of being sent: the end of its turn, a tool message in the template's
+ * form, and the next generation prompt. The server forces this (call hook)
+ * so the model sees the objection as a tool result and answers it. */
+export function tool_feedback(text, thinking) {
+	return '<|im_end|>\n<|im_start|>user\n<tool_response>\n' + text +
+		'\n</tool_response><|im_end|>\n<|im_start|>assistant\n' +
+		(thinking ? '<think>\n' : '<think>\n\n</think>\n\n');
+}
+
 /* --- output parsing ------------------------------------------------------ */
 
 const TAG_THINK_END = '</think>';

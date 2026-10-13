@@ -3,6 +3,8 @@
 // (examples/call_policy_loop.uc) on the shapes of a real session: an agent
 // resending a failing `edit` as five variants, each answered by the same error.
 import { tool_history } from 'ampstein.toolhist';
+import * as chat_qwen35 from 'ampstein.chat_qwen35';
+import * as chat_glm5 from 'ampstein.chat_glm5';
 
 let fails = 0;
 
@@ -84,6 +86,17 @@ let a = ask(c0, failed_edits(4, 1), 0), b = ask(c0, failed_edits(4, 1), 1), c = 
 
 check('escalating notes differ', a != b && b != c && a != c);
 check('the note names the tool and the error', index(a, 'edit') >= 0 && index(a, 'Could not find') >= 0, a);
+
+// --- the tool-result form of a dropped call (what the model reads instead)
+let q = chat_qwen35.tool_feedback('NOTE', false);
+
+check('qwen: ends the turn, answers as a tool message, opens the next turn',
+	q == '<|im_end|>\n<|im_start|>user\n<tool_response>\nNOTE\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n', q);
+check('qwen: thinking opens a think block', substr(chat_qwen35.tool_feedback('N', true), -8) == '<think>\n');
+check('glm: observation block and generation prompt',
+	chat_glm5.tool_feedback('NOTE', true) == '<|observation|><tool_response>NOTE</tool_response><|assistant|><think>', chat_glm5.tool_feedback('NOTE', true));
+check('glm: no thinking', substr(chat_glm5.tool_feedback('N', false), -23) == '<|assistant|><think></think>'
+	|| substr(chat_glm5.tool_feedback('N', false), -28) == '<|assistant|><think></think>', chat_glm5.tool_feedback('N', false));
 
 if (fails) {
 	warn(fails + ' failures\n');

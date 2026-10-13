@@ -267,9 +267,11 @@ reasoning, content and tool calls (Qwen XML-ish calls, GLM, DeepSeek DSML).
   whose loop stops on a text-only turn.
 - **Tool-call hook** (`--call-hook`): a script run when the parser completes
   a tool call, with the conversation's earlier calls and results. A string
-  verdict drops the call and puts that text into the model's context in its
-  place (a loop breaker for a model that resends a failing call:
-  `examples/call_policy_loop.uc`).
+  verdict drops the call and answers it with that text as the call's tool
+  result, inside the same response (the model replies with a corrected call or
+  a change of plan; the client sees only that). A loop breaker for a model
+  that resends a failing call: `examples/call_policy_loop.uc`; also usable as
+  a call filter / blacklist (raise `--call-hook-max`).
 
 **Safety and hygiene**
 - Taint-tracked chat template rendering (no special-token injection from
