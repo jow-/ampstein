@@ -365,6 +365,13 @@ Add new lessons at the end of the matching section.
   ~16 tokens (`AMP_TAIL_GRAPH_MAX`, default 12). Prefill times in the log
   count enqueueing: the replays' device time lands in the first decode step,
   so compare time to first token, not the prefill column.
+- **L136 — Stages trade decode for memory and prefill.** On this host 2 x 3
+  decodes ~15% faster than 3 x 2 (34 vs 40 ms rounds) but prefills at 870
+  instead of 1440 tok/s and does not fit a 262144-token context; TP-6 does
+  not fit 131072. A 3 x 2 round is ~3 x 11-12 ms of stages in series plus
+  ~5 ms of MTP draft chain and ~2 ms of host work, each GPU busy ~30% of it.
+  The MTP window does not matter (2 / 3 / 4 drafts: 61-62.5 tok/s): every
+  extra verify row costs 5-8 ms of MoE expert union.
 
 ## Qwen3.8-Flash-Next
 
