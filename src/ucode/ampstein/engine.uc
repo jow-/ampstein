@@ -1868,7 +1868,7 @@ export function create(model, opts) {
 			on_hidden: (j.use_mtp && !DF) ? (pos, H) => seed_chunk(j, pos, H) : null,
 			on_taps: SP ? (taps, pos) => SP.prefill_rows(taps, pos) :
 				DF ? function (taps, pos) {
-					if (pos + taps[0].shape()[1] > df_from)
+					if (pos + taps[0][0].shape()[1] > df_from)
 						DF.prefill_rows(taps, pos);
 				} : null,
 			on_layer: function (chunk_end, li) {

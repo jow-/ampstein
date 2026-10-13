@@ -21,9 +21,9 @@ ampstein --model /data/models/Qwen3.8-27B-exl3-5.00bpw --tp --ctx 262144 \
 
 `--mtp N` is the number of drafts per round (default 7 with `--dflash`, the
 drafter's block size is 8). The MTP head is not loaded in this mode. The
-drafter needs the captured verify graph (it is built after it) and costs
-~0.9 GB of weights, ~0.25 GB of selector codebooks and ~0.1 GB of ring on
-rank 0.
+drafter needs the captured verify graph (it is built after it). It is
+tensor parallel like the target (below): ~0.5 GB of weights and ring per
+rank, plus ~0.25 GB of selector codebooks on rank 0.
 
 ## Model
 
@@ -55,12 +55,26 @@ Per round, for the block rows `[anchor, mask x W]` at positions
   for p = 0 and else the token chosen at p - 1; the greedy choice is the
   argmax (`amp_dflash_select`, one block).
 
+## Tensor parallel
+
+The drafter is sharded over the target's ranks with the target's shares
+(`tp.plan.weights`, `qwen35_tp.split_n`): attention by kv-head groups (q
+follows, each rank keeps the ring of its heads), the MLP by 256-column
+ranges, `o_proj` / `down_proj` / `fc` by input rows with an all-reduce of
+the fp16 partials (11 per round). The fp32 residual stream, the norms and
+the convolutions' kernel projections are replicated; each rank scores its
+own copy of the final hidden with its vocabulary shard of the head, and
+the top-k merge and the selector run on rank 0. On rank 0 alone the
+drafter's ~4.7 ms per round left rank 1 waiting in the next all-reduce;
+sharded, a round is ~1-1.8 ms shorter (L133).
+
 ## Engine integration
 
 - `qwen35_tp.set_taps(ids)` records the residual stream after the tap
-  layers: `forward()` returns `feat` and the captured verify graphs write
-  persistent per-tap buffers (`graph.feat(S)`); `prefill_pipeline` passes
-  every chunk's taps to `opts.on_taps`.
+  layers, every rank's copy: `forward()` returns `feat` (per tap, per
+  rank) and the captured verify graphs write persistent per-tap buffers
+  (`graph.feat(S)`); `prefill_pipeline` passes every chunk's taps to
+  `opts.on_taps`.
 - `dflash.prefill_rows(feats, pos)` writes the newest ~2100 rows of a
   chunk into the ring (the engine skips chunks before the last window).
 - `mtp_round` calls `DF.draft_async` (a CUDA graph, ids land in the round
@@ -96,15 +110,16 @@ products stay in range (the add scales back). Everything else is fp16.
 | list (primes) | 102 | 214 (6.9) |
 | summary at 26k depth | 62 | 69-73 (2.8-2.9) |
 
-With the one-pass verify attention (L132), at depth (the repository's
-docs and sources as of 9e10afd cut to the depth, then a code / a summary
-request, 300 tokens):
+With the one-pass verify attention (L132) and the sharded drafter (L133),
+at depth (the repository's docs and sources as of 9e10afd cut to the
+depth, then a code / a summary request, 300 tokens):
 
-| depth | code | prose |
-|---|---|---|
-| 1k | 142 tok/s (140 before) | 99 (99) |
-| 26k | 136 (116) | 96 (82) |
-| 82k | 125 (102) | 69 (55) |
+| depth | code | prose | round |
+|---|---|---|---|
+| 1k | 152 tok/s (140 before) | 106 (99) | 30.5 ms (32.4) |
+| 26k | 140 (116) | 100 (82) | 32.6 ms (39.9) |
+| 82k | 127 (102) | 70 (55) | 36.3 ms (46.8) |
+| 199k | 96 | 61 | 44.5 ms |
 
 A round is ~26 ms of verify (7 rows cost about what 3 do), ~5.5 ms of
 drafter (5 layers of 4-bit weights at m = 8 and the sharded head) and no

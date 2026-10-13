@@ -37,7 +37,7 @@ import * as models from './models.uc';
 /* Cut `total` (a multiple of `unit`) into per-rank [start, length]
  * ranges proportional to weights w (largest remainder; a rank may get
  * nothing when there are fewer units than ranks). */
-function split_n(total, unit, w) {
+export function split_n(total, unit, w) {
 	let n = total / unit, G = length(w), sum = 0;
 
 	for (let x in w)
@@ -266,6 +266,11 @@ export function shard(model, opts) {
 		// device of the post-norm hidden handed out (the MTP block's)
 		hdev: model.mtp ? model.mtp.dev : devs[0],
 
+		/* all-reduce of per-rank fp16 partials (the drafter's) */
+		allreduce: function (p) {
+			return allreduce(this, p);
+		},
+
 		/* GDN state holders of layer i: one per rank */
 		states: function (cache, i) {
 			return cache.layers[i];
@@ -364,18 +369,18 @@ export function shard(model, opts) {
 
 			let hn = map(h, (x, g) => x.add(s[g]));
 
-			// drafter taps (DFlash): the residual stream after layer i
-			// (replicated: rank 0's copy). The tensors are fresh per
-			// layer, so holding them costs no copy.
+			// drafter taps (DFlash): the residual stream after layer i,
+			// every rank's (bit-identical) copy. The tensors are fresh
+			// per layer, so holding them costs no copy.
 			if (this.cap && this.cap.at['' + i] != null)
-				this.cap.out[this.cap.at['' + i]] = hn[0];
+				this.cap.out[this.cap.at['' + i]] = hn;
 
 			return hn;
 		},
 
 		/* Set (ids: array of layer indices) or clear (null) the drafter
-		 * taps: forward() then returns {feat: [per tap (1, S, H)]} and the
-		 * captured graphs record the taps of their rows. */
+		 * taps: forward() then returns {feat: [per tap [per rank (1, S,
+		 * H)]]} and the captured graphs record the taps of their rows. */
 		set_taps: function (ids) {
 			this.tap_ids = ids;
 			this.tap_at = {};

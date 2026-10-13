@@ -42,7 +42,7 @@ let prompt = tok.encode(r.prefix + r.gen, true);
 printf('prompt: %d tokens\n', length(prompt));
 
 // eager draft round (no graph), taps through forward()
-let zf = map(df.layer_ids, () => torch.zeros([1, W, 5120], 'float16', 'cuda:0'));
+let zf = map(df.layer_ids, () => map(tp.devs, (d) => torch.zeros([1, W, 5120], 'float16', 'cuda:' + d)));
 
 df.build(() => zf, false);
 
@@ -83,7 +83,7 @@ function check(seed, start, expect) {
 }
 
 for (let k = 0; k < length(res.feat); k++)
-	printf('tap %d absmax %.4g\n', k, res.feat[k].to('float32').abs().max().item());
+	printf('tap %d absmax %.4g\n', k, res.feat[k][0].to('float32').abs().max().item());
 
 df.reset();
 df.prefill_rows(res.feat, 0);

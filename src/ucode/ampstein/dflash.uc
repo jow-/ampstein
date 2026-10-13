@@ -32,6 +32,7 @@
 
 import * as weights from './weights.uc';
 import * as models from './models.uc';
+import * as qwen35_tp from './qwen35_tp.uc';
 import * as math from 'math';
 import { readfile } from 'fs';
 
@@ -89,6 +90,20 @@ export function load(dir, tp, opts) {
 	let dev = devs[0];
 	let dv = 'cuda:' + dev;
 	let ws = weights.open(dir);
+	let rep = nh / nkv;
+
+	// tensor parallel like the target (qwen35_tp): attention by kv-head
+	// groups (q follows), MLP by 256-column ranges, o / down / fc by rows
+	// with an all-reduce of the partials; the fp32 residual stream, the
+	// norms and the convolutions' kernel projections are replicated
+	let wts = tp.plan.weights;
+	let p_kv = qwen35_tp.split_n(nkv, 1, wts);
+	let p_mlp = qwen35_tp.split_n(cj.intermediate_size, 256, wts);
+	let p_fc = qwen35_tp.split_n(length(layer_ids) * H, 128, wts);
+
+	for (let g = 0; g < G; g++)
+		if (!p_kv[g][1] || !p_mlp[g][1] || !p_fc[g][1])
+			die(`dflash: rank ${g} gets no share of the drafter (${G} ranks)`);
 
 	let lin = (key) => models.linear(ws, key, true, dev);
 
@@ -96,39 +111,54 @@ export function load(dir, tp, opts) {
 
 	for (let i = 0; i < NL; i++) {
 		let k = `layers.${i}.`;
+		let q = lin(k + 'self_attn.q_proj'), kp = lin(k + 'self_attn.k_proj');
+		let vp = lin(k + 'self_attn.v_proj'), op = lin(k + 'self_attn.o_proj');
+		let gp = lin(k + 'mlp.gate_proj'), up = lin(k + 'mlp.up_proj');
+		let dp = lin(k + 'mlp.down_proj');
+		let R = [];
 
-		push(L, {
-			in_ln: ws.gpu16(k + 'input_layernorm.weight', dev),
-			post_ln: ws.gpu16(k + 'post_attention_layernorm.weight', dev),
-			q_proj: lin(k + 'self_attn.q_proj'),
-			k_proj: lin(k + 'self_attn.k_proj'),
-			v_proj: lin(k + 'self_attn.v_proj'),
-			o_proj: lin(k + 'self_attn.o_proj'),
-			q_norm: ws.gpu16(k + 'self_attn.q_norm.weight', dev),
-			k_norm: ws.gpu16(k + 'self_attn.k_norm.weight', dev),
-			gate_proj: lin(k + 'mlp.gate_proj'),
-			up_proj: lin(k + 'mlp.up_proj'),
-			down_proj: lin(k + 'mlp.down_proj'),
-			a_kp: lin(k + 'attention_conv.kernel_projection'),
-			a_base: ws.gpu16(k + 'attention_conv.base_kernel', dev).contiguous(),
-			m_kp: lin(k + 'mlp_conv.kernel_projection'),
-			m_base: ws.gpu16(k + 'mlp_conv.base_kernel', dev).contiguous(),
-			kc: torch.zeros([nkv, CAP, hd], 'float16', dv),
-			vc: torch.zeros([nkv, CAP, hd], 'float16', dv)
-		});
+		op.svh = op.svh.mul(1.0 / OSCALE);
+		dp.svh = dp.svh.mul(1.0 / OSCALE);
+
+		for (let g = 0; g < G; g++) {
+			let d = devs[g], kv0 = p_kv[g][0], kvn = p_kv[g][1], mi = p_mlp[g];
+
+			push(R, {
+				kvh: kvn,
+				in_ln: ws.gpu16(k + 'input_layernorm.weight', d),
+				post_ln: ws.gpu16(k + 'post_attention_layernorm.weight', d),
+				q_proj: models.cols(q, [ [ kv0 * rep * hd, kvn * rep * hd ] ], d),
+				k_proj: models.cols(kp, [ [ kv0 * hd, kvn * hd ] ], d),
+				v_proj: models.cols(vp, [ [ kv0 * hd, kvn * hd ] ], d),
+				o_proj: models.rows(op, kv0 * rep * hd, kvn * rep * hd, d),
+				q_norm: ws.gpu16(k + 'self_attn.q_norm.weight', d),
+				k_norm: ws.gpu16(k + 'self_attn.k_norm.weight', d),
+				gate_proj: models.cols(gp, [ mi ], d),
+				up_proj: models.cols(up, [ mi ], d),
+				down_proj: models.rows(dp, mi[0], mi[1], d),
+				a_kp: models.linear(ws, k + 'attention_conv.kernel_projection', true, d),
+				a_base: ws.gpu16(k + 'attention_conv.base_kernel', d).contiguous(),
+				m_kp: models.linear(ws, k + 'mlp_conv.kernel_projection', true, d),
+				m_base: ws.gpu16(k + 'mlp_conv.base_kernel', d).contiguous(),
+				kc: torch.zeros([kvn, CAP, hd], 'float16', 'cuda:' + d),
+				vc: torch.zeros([kvn, CAP, hd], 'float16', 'cuda:' + d)
+			});
+		}
+
+		push(L, R);
+		gc();
 	}
 
-	for (let l in L) {
-		l.o_proj.svh = l.o_proj.svh.mul(1.0 / OSCALE);
-		l.down_proj.svh = l.down_proj.svh.mul(1.0 / OSCALE);
-	}
-
-	let fc = lin('fc');
-	let hidden_norm = ws.gpu16('hidden_norm.weight', dev);
-	let norm = ws.gpu16('norm.weight', dev);
+	let fc_full = lin('fc');
+	let fc = map(devs, (d, g) => models.rows(fc_full, p_fc[g][0], p_fc[g][1], d));
+	let hidden_norm = map(devs, (d) => ws.gpu16('hidden_norm.weight', d));
+	let norm = map(devs, (d) => ws.gpu16('norm.weight', d));
 	let sel_hp = ws.gpu16('candidate_selector.hidden_projection.weight', dev).contiguous();
 	let sel_pred = ws.gpu16('candidate_selector.predecessor_codebook', dev).contiguous();
 	let sel_succ = ws.gpu16('candidate_selector.successor_codebook', dev).contiguous();
+
+	fc_full = null;
+	gc();
 
 	// rotary: inv_freq[i] = theta ^ (-2i / hd); cos / sin built per call
 	let half = hd / 2;
@@ -137,17 +167,19 @@ export function load(dir, tp, opts) {
 	for (let i = 0; i < half; i++)
 		push(invf, math.pow(theta, -2.0 * i / hd));
 
-	let freq = torch.from_array(invf).cuda(dev).view([1, half]);
+	let freq = map(devs, (d) => torch.from_array(invf).cuda(d).view([1, half]));
 
 	let n = W + 1;          // block rows (anchor + masks)
 	let Cn = W;             // context rows per round (the verify rows)
 
-	// persistent per-round inputs / state (graph-visible)
-	let meta = torch.zeros([2 * Cn + 2 * n + 1], 'int64', dv);
+	// persistent per-round inputs / state (graph-visible), one per rank;
+	// the host writes rank 0's meta, the round copies it to the others
+	// (in the graph, ordered with the replay)
+	let meta = map(devs, (d) => torch.zeros([2 * Cn + 2 * n + 1], 'int64', 'cuda:' + d));
 	let ids_buf = torch.full([n], mask_id, 'int64', dv);
-	let posbuf = torch.full([CAP], -1, 'int64', dv);
+	let posbuf = map(devs, (d) => torch.full([CAP], -1, 'int64', 'cuda:' + d));
 	let out = null;
-	let featf = null;       // function () -> 5 tensors (1, Cn, H) of the last verify
+	let featf = null;       // function () -> 5 x [per rank (1, Cn, H)] of the last verify
 	let graph = null;
 
 	let df = {
@@ -155,115 +187,157 @@ export function load(dir, tp, opts) {
 		end: 0           // ring is valid for the sequence up to this position
 	};
 
-	/* ring + posbuf write of rows (positions, slots) of one layer */
+	/* ring write of rows (slots) of one layer shard */
 	function ring_write(l, slots, k_rows, v_rows) {
-		// k_rows / v_rows: (R, nkv, hd) -> (nkv, R, hd)
+		// k_rows / v_rows: (R, kvh, hd) -> (kvh, R, hd)
 		l.kc.index_copy_(1, slots, k_rows.transpose(0, 1));
 		l.vc.index_copy_(1, slots, v_rows.transpose(0, 1));
 	}
 
-	function cos_sin(pos) {
-		let ang = pos.to('float32').unsqueeze(1).mul(freq);
+	function cos_sin(pos, g) {
+		let ang = pos.to('float32').unsqueeze(1).mul(freq[g]);
 
 		return [ ang.cos().contiguous(), ang.sin().contiguous() ];
 	}
 
-	/* fused context features of `feats` (5 x (1, R, H)) -> (R, H) */
+	/* fused context features of `feats` (5 x [per rank (1, R, H)]) ->
+	 * per rank (R, H): each rank multiplies its input rows of fc */
 	function fuse(feats, R) {
-		let x = torch.cat(feats, -1).view([R, length(feats) * H]);
+		let p = [];
 
-		return rms(fc.forward(x), hidden_norm, eps);
+		for (let g = 0; g < G; g++) {
+			let x = torch.cat(map(feats, (f) => f[g]), -1).view([R, length(feats) * H])
+				.narrow(1, p_fc[g][0], p_fc[g][1]).contiguous();
+
+			push(p, fc[g].forward(x));
+		}
+
+		let s = tp.allreduce(p);
+
+		return map(s, (x, g) => rms(x, hidden_norm[g], eps));
 	}
 
 	/* the draft block: ctx rows (positions ctx_pos / slots ctx_slot, fused
-	 * features f) and block rows (blk_pos / blk_slot, ids). Returns the
-	 * final-norm hidden (n, H). */
+	 * features f, per rank) and block rows (blk_pos / blk_slot, emb). The
+	 * per-rank arguments are arrays. Returns the final-norm hidden (n, H)
+	 * per rank. */
 	function forward(f, Cr, ctx_pos, ctx_slot, blk_pos, blk_slot, emb) {
-		let cs_c = cos_sin(ctx_pos), cs_b = cos_sin(blk_pos);
-
-		// positions -> ring metadata, then the visibility mask (n, CAP)
-		posbuf.index_copy_(0, ctx_slot, ctx_pos);
-		posbuf.index_copy_(0, blk_slot, blk_pos);
-
-		let diff = blk_pos.unsqueeze(1).sub(posbuf.unsqueeze(0)).abs();
-		let near = diff.le(window - 1).to('float32');
-		let written = posbuf.neg().le(0).to('float32');
-		let upto = posbuf.le(blk_pos.narrow(0, n - 1, 1)).to('float32');
-		let vis = near.mul(written.unsqueeze(0)).mul(upto.unsqueeze(0));
-		// additive, rows expanded over the query-head group (row i * rep + r)
-		let rep = nh / nkv;
-		let addm = vis.sub(1.0).mul(1e30).unsqueeze(1).expand([n, rep, CAP])
-			.reshape([n * rep, CAP]).contiguous();
+		let cs_c = [], cs_b = [], addm = [], h = [];
 		let scale = 1.0 / math.sqrt(hd);
 
-		let h = emb.to('float32').contiguous();
+		for (let g = 0; g < G; g++) {
+			push(cs_c, cos_sin(ctx_pos[g], g));
+			push(cs_b, cos_sin(blk_pos[g], g));
+
+			// positions -> ring metadata, then the visibility mask (n, CAP)
+			let pb = posbuf[g];
+
+			pb.index_copy_(0, ctx_slot[g], ctx_pos[g]);
+			pb.index_copy_(0, blk_slot[g], blk_pos[g]);
+
+			let diff = blk_pos[g].unsqueeze(1).sub(pb.unsqueeze(0)).abs();
+			let near = diff.le(window - 1).to('float32');
+			let written = pb.neg().le(0).to('float32');
+			let upto = pb.le(blk_pos[g].narrow(0, n - 1, 1)).to('float32');
+			let vis = near.mul(written.unsqueeze(0)).mul(upto.unsqueeze(0));
+
+			// additive, rows expanded over the query-head group (row i * rep + r)
+			push(addm, vis.sub(1.0).mul(1e30).unsqueeze(1).expand([n, rep, CAP])
+				.reshape([n * rep, CAP]).contiguous());
+			push(h, ((g == 0) ? emb : emb.cuda(devs[g])).to('float32').contiguous());
+		}
 
 		tr('emb', emb);
 
 		for (let li = 0; li < NL; li++) {
-			let l = L[li];
+			let o = [], dyn = [];
 
-			// ---- attention
-			let x = torch.rms_norm_f32(h, l.in_ln, eps);
-			let dyn = l.a_kp.forward(x);
-			let xc = torch.dflash_conv(x, dyn, l.a_base, 0, group);
+			// ---- attention (each rank: its kv-head group)
+			for (let g = 0; g < G; g++) {
+				let l = L[li][g], kvh = l.kvh, qh = kvh * rep;
+				let x = torch.rms_norm_f32(h[g], l.in_ln, eps);
 
-			let q = l.q_proj.forward(xc).view([1, n, nh, hd]);
-			let kn = l.k_proj.forward(xc).view([1, n, nkv, hd]);
-			let vn = l.v_proj.forward(xc).view([n, nkv, hd]);
-			let kcx = l.k_proj.forward(f).view([1, Cr, nkv, hd]);
-			let vcx = l.v_proj.forward(f).view([Cr, nkv, hd]);
+				dyn[g] = l.a_kp.forward(x);
 
-			q = torch.qk_norm_rope(q, l.q_norm, cs_b[0], cs_b[1], hd, eps);
-			kn = torch.qk_norm_rope(kn, l.k_norm, cs_b[0], cs_b[1], hd, eps);
-			kcx = torch.qk_norm_rope(kcx, l.k_norm, cs_c[0], cs_c[1], hd, eps);
+				let xc = torch.dflash_conv(x, dyn[g], l.a_base, 0, group);
+				let q = l.q_proj.forward(xc).view([1, n, qh, hd]);
+				let kn = l.k_proj.forward(xc).view([1, n, kvh, hd]);
+				let vn = l.v_proj.forward(xc).view([n, kvh, hd]);
+				let kcx = l.k_proj.forward(f[g]).view([1, Cr, kvh, hd]);
+				let vcx = l.v_proj.forward(f[g]).view([Cr, kvh, hd]);
 
-			ring_write(l, ctx_slot, kcx.view([Cr, nkv, hd]), vcx);
-			ring_write(l, blk_slot, kn.view([n, nkv, hd]), vn);
+				q = torch.qk_norm_rope(q, l.q_norm, cs_b[g][0], cs_b[g][1], hd, eps);
+				kn = torch.qk_norm_rope(kn, l.k_norm, cs_b[g][0], cs_b[g][1], hd, eps);
+				kcx = torch.qk_norm_rope(kcx, l.k_norm, cs_c[g][0], cs_c[g][1], hd, eps);
 
-			// grouped-query attention over the ring: (nkv, rep * n, hd)
-			let qg = q.view([n, nkv, rep, hd]).transpose(0, 1).contiguous()
-				.view([nkv, n * rep, hd]);
-			let sc = torch.matmul(qg, l.kc.transpose(1, 2)).to('float32')
-				.mul(scale).add(addm);
-			let p = sc.softmax(-1).to('float16');
-			let ao = torch.matmul(p, l.vc).view([nkv, n, rep, hd])
-				.transpose(0, 1).contiguous().view([n, nh * hd]);
+				ring_write(l, ctx_slot[g], kcx.view([Cr, kvh, hd]), vcx);
+				ring_write(l, blk_slot[g], kn.view([n, kvh, hd]), vn);
 
-			let o = l.o_proj.forward(ao);
+				// grouped-query attention over the ring: (kvh, rep * n, hd)
+				let qg = q.view([n, kvh, rep, hd]).transpose(0, 1).contiguous()
+					.view([kvh, n * rep, hd]);
+				let sc = torch.matmul(qg, l.kc.transpose(1, 2)).to('float32')
+					.mul(scale).add(addm[g]);
+				let p = sc.softmax(-1).to('float16');
+				let ao = torch.matmul(p, l.vc).view([kvh, n, rep, hd])
+					.transpose(0, 1).contiguous().view([n, qh * hd]);
 
-			tr(`L${li} q`, q);
-			tr(`L${li} attn`, ao);
-			tr(`L${li} o`, o);
+				if (g == 0) {
+					tr(`L${li} q`, q);
+					tr(`L${li} attn`, ao);
+				}
 
-			torch.dflash_conv_res(h, o, dyn, l.a_base, 1, group, OSCALE);
+				push(o, l.o_proj.forward(ao));
+			}
 
-			// ---- MLP
-			x = torch.rms_norm_f32(h, l.post_ln, eps);
-			dyn = l.m_kp.forward(x);
-			xc = torch.dflash_conv(x, dyn, l.m_base, 0, group);
+			o = tp.allreduce(o);
+			tr(`L${li} o`, o[0]);
 
-			let m = l.down_proj.forward(torch.silu_mul(l.gate_proj.forward(xc),
-				l.up_proj.forward(xc)));
+			for (let g = 0; g < G; g++) {
+				let l = L[li][g];
 
-			torch.dflash_conv_res(h, m, dyn, l.m_base, 1, group, OSCALE);
+				torch.dflash_conv_res(h[g], o[g], dyn[g], l.a_base, 1, group, OSCALE);
+			}
 
-			tr(`L${li} h`, h);
+			// ---- MLP (each rank: its column range)
+			let m = [];
+
+			for (let g = 0; g < G; g++) {
+				let l = L[li][g];
+				let x = torch.rms_norm_f32(h[g], l.post_ln, eps);
+
+				dyn[g] = l.m_kp.forward(x);
+
+				let xc = torch.dflash_conv(x, dyn[g], l.m_base, 0, group);
+
+				push(m, l.down_proj.forward(torch.silu_mul(l.gate_proj.forward(xc),
+					l.up_proj.forward(xc))));
+			}
+
+			m = tp.allreduce(m);
+
+			for (let g = 0; g < G; g++) {
+				let l = L[li][g];
+
+				torch.dflash_conv_res(h[g], m[g], dyn[g], l.m_base, 1, group, OSCALE);
+			}
+
+			tr(`L${li} h`, h[0]);
 		}
 
-		tr('final h', h);
+		tr('final h', h[0]);
 
-		return torch.rms_norm_f32(h, norm, eps);
+		return map(h, (x, g) => torch.rms_norm_f32(x, norm[g], eps));
 	}
 
-	/* the rest of the round after the hidden: sharded head, top-k per
-	 * shard, merge, selector walk. hn (W, H) on dev; returns ids (W). */
+	/* the rest of the round after the hidden: sharded head on every rank's
+	 * own copy of the hidden, top-k per shard, merge on rank 0, selector
+	 * walk. hn: per rank (W, H); returns ids (W) on rank 0. */
 	function propose(hn, anchor) {
 		let vals = [], idxs = [];
 
 		for (let g = 0; g < G; g++) {
-			let hl = (g == 0) ? hn : hn.cuda(devs[g]);
-			let lg = tp.lm_heads[g].forward(hl.view([1, W, H])).view([W, -1]);
+			let lg = tp.lm_heads[g].forward(hn[g].view([1, W, H])).view([W, -1]);
 			let t = lg.topk(top_k, -1);
 			let iv = t.values.to('float32');
 			let ii = t.indices.add(torch.full([1], tp.plan.vocab[g][0], 'int64', 'cuda:' + devs[g]));
@@ -277,27 +351,31 @@ export function load(dir, tp, opts) {
 		let t2 = v.topk(top_k, -1);
 		let unary = t2.values.contiguous();
 		let cand = ix.gather(1, t2.indices).contiguous();
-		let hp = torch.matmul(hn, sel_hp.t()).contiguous();
+		let hp = torch.matmul(hn[0], sel_hp.t()).contiguous();
 
 		return torch.dflash_select(unary, cand, hp, anchor, sel_pred, sel_succ);
 	}
 
 	function body() {
-		let ctx_pos = meta.narrow(0, 0, Cn);
-		let ctx_slot = meta.narrow(0, Cn, Cn);
-		let blk_pos = meta.narrow(0, 2 * Cn, n);
-		let blk_slot = meta.narrow(0, 2 * Cn + n, n);
-		let seed = meta.narrow(0, 2 * Cn + 2 * n, 1);
+		for (let g = 1; g < G; g++)
+			meta[g].copy_(meta[0]);
+
+		let part = (o, len) => map(meta, (mt) => mt.narrow(0, o, len));
+		let ctx_pos = part(0, Cn);
+		let ctx_slot = part(Cn, Cn);
+		let blk_pos = part(2 * Cn, n);
+		let blk_slot = part(2 * Cn + n, n);
+		let seed = meta[0].narrow(0, 2 * Cn + 2 * n, 1);
 
 		ids_buf.narrow(0, 0, 1).copy_(seed);
 
 		let emb = tp.embed_tokens.index(ids_buf).view([n, H]);
 		let f = fuse(featf(), Cn);
 
-		tr('ctx fused', f);
+		tr('ctx fused', f[0]);
 		let hn = forward(f, Cn, ctx_pos, ctx_slot, blk_pos, blk_slot, emb);
 
-		out = propose(hn.narrow(0, 1, W).contiguous(), seed);
+		out = propose(map(hn, (x) => x.narrow(0, 1, W).contiguous()), seed);
 	}
 
 	function set_meta(seed, p_prev, start) {
@@ -316,7 +394,7 @@ export function load(dir, tp, opts) {
 			push(v, (start + k) % CAP);
 
 		push(v, seed);
-		meta.copy_(torch.from_array(v, 'int64', dv));
+		meta[0].copy_(torch.from_array(v, 'int64', dv));
 	}
 
 	/* Capture the round. feat_of() returns the five (1, Cn, H) feature
@@ -342,7 +420,9 @@ export function load(dir, tp, opts) {
 	};
 
 	df.reset = function () {
-		posbuf.fill_(-1);
+		for (let pb in posbuf)
+			pb.fill_(-1);
+
 		df.end = 0;
 	};
 
@@ -381,16 +461,16 @@ export function load(dir, tp, opts) {
 		df.end = start;
 	};
 
-	/* Context rows of a prefill chunk (eager): feats = 5 x (1, R, H) for
-	 * positions pos .. pos + R - 1. Only the newest rows that fit the
-	 * window are written. */
+	/* Context rows of a prefill chunk (eager): feats = 5 x [per rank (1,
+	 * R, H)] for positions pos .. pos + R - 1. Only the newest rows that
+	 * fit the window are written. */
 	df.prefill_rows = function (feats, pos) {
-		let R = feats[0].shape()[1];
+		let R = feats[0][0].shape()[1];
 		let T = (R > window + 16) ? window + 16 : R;
 		let off = R - T;
 
 		if (off > 0)
-			feats = map(feats, (x) => x.narrow(1, off, T).contiguous());
+			feats = map(feats, (x) => map(x, (y) => y.narrow(1, off, T).contiguous()));
 
 		let p0 = pos + off;
 		let vp = [], vs = [];
@@ -400,21 +480,26 @@ export function load(dir, tp, opts) {
 			push(vs, (p0 + k) % CAP);
 		}
 
-		let ppos = torch.from_array(vp, 'int64', dv);
-		let slots = torch.from_array(vs, 'int64', dv);
 		let f = fuse(feats, T);
-		let cs = cos_sin(ppos);
 
-		for (let li = 0; li < NL; li++) {
-			let l = L[li];
-			let kx = l.k_proj.forward(f).view([1, T, nkv, hd]);
-			let vx = l.v_proj.forward(f).view([T, nkv, hd]);
+		for (let g = 0; g < G; g++) {
+			let d = 'cuda:' + devs[g];
+			let ppos = torch.from_array(vp, 'int64', d);
+			let slots = torch.from_array(vs, 'int64', d);
+			let cs = cos_sin(ppos, g);
 
-			kx = torch.qk_norm_rope(kx, l.k_norm, cs[0], cs[1], hd, eps);
-			ring_write(l, slots, kx.view([T, nkv, hd]), vx);
+			for (let li = 0; li < NL; li++) {
+				let l = L[li][g];
+				let kx = l.k_proj.forward(f[g]).view([1, T, l.kvh, hd]);
+				let vx = l.v_proj.forward(f[g]).view([T, l.kvh, hd]);
+
+				kx = torch.qk_norm_rope(kx, l.k_norm, cs[0], cs[1], hd, eps);
+				ring_write(l, slots, kx.view([T, l.kvh, hd]), vx);
+			}
+
+			posbuf[g].index_copy_(0, slots, ppos);
 		}
 
-		posbuf.index_copy_(0, slots, ppos);
 		df.end = pos + R;
 	};
 
