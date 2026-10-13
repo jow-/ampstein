@@ -4073,6 +4073,269 @@ amp_idx_score(const void *q, const void *pools, const void *w, void *out,
 }
 
 /* ------------------------------------------------------------------ */
+/* DSA pool selection for decode (GLM-5.3 sparse MLA layers).          */
+/*                                                                     */
+/* Per query row: the top `kp` of the complete pools of its context by */
+/* indexer score (a deterministic exact selection: score descending,   */
+/* ties to the lower pool index; fewer complete pools: all of them),   */
+/* expanded to their P member tokens, followed by the P - 1 tokens of  */
+/* the query's incomplete tail pool. Replaces torch.topk (14 kernels), */
+/* the dead-pool mask, the member expansion, the tail and the pad mask */
+/* (about 25 elementwise launches): one block per row.                 */
+/*                                                                     */
+/*   scores (T, cap) fp16: the indexer scores, -65504 for pools the    */
+/*          query cannot select (amp_idx_score)                        */
+/*   pos    (1) int64 device: position of row 0 (row r is at pos + r)  */
+/*   idx    (T, K) int64: token indices, 0 where padded                */
+/*   pad    (T, K) fp16: 0 for a token, -65504 for padding             */
+/*   K = kp * P + P - 1                                                */
+/*                                                                     */
+/* The kp-th largest key is found by a two-level (8 + 8 bit) radix    */
+/* select on the order-preserving 16-bit key of the fp16 score; the   */
+/* elements above it plus the first ties in index order are then      */
+/* written in ascending pool order (per-thread contiguous chunks and a */
+/* block scan: the output does not depend on thread timing).          */
+/* ------------------------------------------------------------------ */
+
+#define DSS_THREADS 1024
+
+__device__ __forceinline__ unsigned
+amp_dss_key(__half h)
+{
+	unsigned b = (unsigned)__half_as_ushort(h);
+
+	return (b & 0x8000u) ? (~b & 0xffffu) : (b | 0x8000u);
+}
+
+/* One histogram increment per warp and distinct bin: lanes holding the same
+ * bin elect a leader that adds the group's size (scores cluster in a few
+ * bins, a plain shared atomicAdd would serialise 1024 threads on them).
+ * All 32 lanes must execute this (uniform loop trip counts); bin 0xffff
+ * is "no element". */
+__device__ __forceinline__ void
+amp_dss_hist_add(unsigned *hist, unsigned bin, int lane)
+{
+	unsigned m = __match_any_sync(0xffffffffu, bin);
+
+	if (bin != 0xffffu && lane == (__ffs(m) - 1))
+		atomicAdd(&hist[bin], (unsigned)__popc(m));
+}
+
+/* The highest bin b of a 256-bin histogram such that the counts of the bins
+ * from 255 down to b reach `need` (need <= the total): *bin = b, *above =
+ * the count of the bins above it. Threads 0..255 scan the descending order
+ * (warp shuffles + 8 warp sums); every thread of the block must call it. */
+__device__ __forceinline__ void
+amp_dss_find_bin(const unsigned *hist, unsigned need, unsigned *wsum, unsigned *bin, unsigned *above)
+{
+	const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+	unsigned c = 0, incl = 0;
+
+	if (t < 256) {
+		c = hist[255 - t];
+		incl = c;
+
+		#pragma unroll
+		for (int o = 1; o < 32; o <<= 1) {
+			unsigned v = __shfl_up_sync(0xffffffffu, incl, o);
+
+			if (lane >= o)
+				incl += v;
+		}
+
+		if (lane == 31)
+			wsum[warp] = incl;
+	}
+
+	__syncthreads();
+
+	if (t < 256) {
+		unsigned base = 0;
+
+		for (int w = 0; w < warp; w++)
+			base += wsum[w];
+
+		incl += base;
+
+		if (incl >= need && incl - c < need) {
+			*bin = (unsigned)(255 - t);
+			*above = incl - c;
+		}
+	}
+
+	__syncthreads();
+}
+
+#define DSS_TILES 4        /* tiles of 1024 elements loaded per iteration (latency hiding) */
+
+__global__ void __launch_bounds__(DSS_THREADS)
+amp_dsa_select_kernel(const __half *__restrict__ scores, const long long *__restrict__ posp,
+                     long long *__restrict__ idx, __half *__restrict__ pad,
+                     int cap, int P, int kp)
+{
+	__shared__ unsigned hist[256];
+	__shared__ unsigned wsum[8];
+	__shared__ unsigned w_gt[2][32], w_eq[2][32];
+	__shared__ unsigned s_hi, s_above, s_lo, s_above2;
+
+	const int row = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5;
+	const int K = kp * P + P - 1;
+	const long long qpos = posp[0] + row;
+	const __half *sc = scores + (size_t)row * cap;
+
+	/* only the complete pools of the row's context can be selected: the
+	 * scan covers n of the cap pool slots (the rest is masked scores) */
+	const int n = (int)min((long long)cap, (qpos + 1) / P);
+	const int nsel = min(kp, n);
+	const int ntile = (n + DSS_THREADS - 1) / DSS_THREADS;
+
+	long long *irow = idx + (size_t)row * K;
+	__half *prow = pad + (size_t)row * K;
+	const __half NEG = __float2half(-65504.0f), ZERO = __float2half(0.0f);
+
+	unsigned thr = 0, need_eq = 0;
+
+	if (nsel > 0) {
+		/* --- level 1: high byte of the key, coalesced tiles */
+		if (t < 256)
+			hist[t] = 0;
+
+		__syncthreads();
+
+		for (int j = 0; j < ntile; j += DSS_TILES) {
+			unsigned k[DSS_TILES];
+
+			#pragma unroll
+			for (int u = 0; u < DSS_TILES; u++) {
+				int e = (j + u) * DSS_THREADS + t;
+
+				k[u] = (e < n) ? (amp_dss_key(sc[e]) >> 8) : 0xffffu;
+			}
+
+			#pragma unroll
+			for (int u = 0; u < DSS_TILES; u++)
+				amp_dss_hist_add(hist, k[u], lane);
+		}
+
+		__syncthreads();
+		amp_dss_find_bin(hist, (unsigned)nsel, wsum, &s_hi, &s_above);
+
+		const unsigned hi = s_hi, need1 = (unsigned)nsel - s_above;
+
+		/* --- level 2: low byte within that bin */
+		if (t < 256)
+			hist[t] = 0;
+
+		__syncthreads();
+
+		for (int j = 0; j < ntile; j += DSS_TILES) {
+			unsigned k[DSS_TILES];
+
+			#pragma unroll
+			for (int u = 0; u < DSS_TILES; u++) {
+				int e = (j + u) * DSS_THREADS + t;
+				unsigned key = (e < n) ? amp_dss_key(sc[e]) : 0u;
+
+				k[u] = (e < n && (key >> 8) == hi) ? (key & 0xffu) : 0xffffu;
+			}
+
+			#pragma unroll
+			for (int u = 0; u < DSS_TILES; u++)
+				amp_dss_hist_add(hist, k[u], lane);
+		}
+
+		__syncthreads();
+		amp_dss_find_bin(hist, need1, wsum, &s_lo, &s_above2);
+
+		thr = (hi << 8) | s_lo;               /* the nsel-th largest key */
+		need_eq = need1 - s_above2;           /* ties at the threshold taken */
+
+		/* --- write the selected pools in ascending order, one tile at a
+		 * time: the output position is the number of selected elements
+		 * before it (warp ballots + the warp totals; the ties taken are
+		 * the first need_eq in index order) */
+		unsigned eq_total = 0, out_base = 0;
+		const unsigned lane_lt = (1u << lane) - 1u;
+
+		for (int j = 0; j < ntile; j++) {
+			int e = j * DSS_THREADS + t;
+			bool valid = (e < n);
+			unsigned k = valid ? amp_dss_key(sc[e]) : 0u;
+			bool gt = valid && k > thr, eq = valid && k == thr;
+			unsigned bg = __ballot_sync(0xffffffffu, gt), be = __ballot_sync(0xffffffffu, eq);
+
+			if (lane == 0) {
+				w_gt[j & 1][warp] = (unsigned)__popc(bg);
+				w_eq[j & 1][warp] = (unsigned)__popc(be);
+			}
+
+			__syncthreads();
+
+			/* exclusive prefixes over the 32 warp totals, totals */
+			unsigned g = w_gt[j & 1][lane], q = w_eq[j & 1][lane];
+			unsigned ig = g, iq = q;
+
+			#pragma unroll
+			for (int o = 1; o < 32; o <<= 1) {
+				unsigned vg = __shfl_up_sync(0xffffffffu, ig, o), vq = __shfl_up_sync(0xffffffffu, iq, o);
+
+				if (lane >= o) {
+					ig += vg;
+					iq += vq;
+				}
+			}
+
+			unsigned gpre = __shfl_sync(0xffffffffu, ig - g, warp) + (unsigned)__popc(bg & lane_lt);
+			unsigned epre = __shfl_sync(0xffffffffu, iq - q, warp) + (unsigned)__popc(be & lane_lt);
+			unsigned gtot = __shfl_sync(0xffffffffu, ig, 31), etot = __shfl_sync(0xffffffffu, iq, 31);
+
+			unsigned eq_taken_before = min(eq_total, need_eq);
+
+			if (gt || (eq && eq_total + epre < need_eq)) {
+				unsigned pos = out_base + gpre + (min(eq_total + epre, need_eq) - eq_taken_before);
+
+				for (int c = 0; c < P; c++) {
+					irow[(size_t)pos * P + c] = (long long)e * P + c;
+					prow[(size_t)pos * P + c] = ZERO;
+				}
+			}
+
+			out_base += gtot + (min(eq_total + etot, need_eq) - eq_taken_before);
+			eq_total += etot;
+		}
+	}
+
+	/* --- padding up to kp pools (fewer complete pools than kp) */
+	for (int i = nsel * P + t; i < kp * P; i += DSS_THREADS) {
+		irow[i] = 0;
+		prow[i] = NEG;
+	}
+
+	/* --- the incomplete tail pool of the query: tokens start .. qpos */
+	if (t < P - 1) {
+		long long start = ((qpos + 1) / P) * P;
+		long long tf = start + t;
+		bool ok = (tf <= qpos);
+
+		irow[(size_t)kp * P + t] = ok ? tf : 0;
+		prow[(size_t)kp * P + t] = ok ? ZERO : NEG;
+	}
+}
+
+extern "C" int
+amp_dsa_select(const void *scores, const long long *posp, void *idx, void *pad,
+              int T, int cap, int P, int kp, cudaStream_t stream)
+{
+	if (T < 1 || cap < kp || kp < 1 || P < 1 || P > DSS_THREADS || kp > 4096)
+		return -1;
+
+	amp_dsa_select_kernel<<<T, DSS_THREADS, 0, stream>>>((const __half *)scores, posp,
+		(long long *)idx, (__half *)pad, cap, P, kp);
+
+	return (int)cudaGetLastError();
+}
+
+/* ------------------------------------------------------------------ */
 /* Tensor-core (mma) split-KV decode attention.                        */
 /*                                                                     */
 /* Same contract as amp_attn_dec_fp16 (grid (Hk, ns), device-side len,  */

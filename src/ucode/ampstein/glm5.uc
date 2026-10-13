@@ -691,8 +691,6 @@ export function mla_forward_dev(cfg, A, x, cl, st) {
 	else {
 		let Hi = cfg.index_n_heads;
 		let kp = int(cfg.index_topk / P);
-		let neg = torch.full([1], -65504.0, 'float16', dv);
-		let m1 = torch.full([1], -1, 'int64', dv);
 		let q_idx = A.idx_wq_b.forward(qr).view([T, Hi, D]);
 		let w = torch.matmul(x, A.idx_w_t).mul(math.pow(Hi * 1.0, -0.5));
 		// fused scoring over the pool capacity (the graph's fixed shape),
@@ -701,26 +699,17 @@ export function mla_forward_dev(cfg, A, x, cl, st) {
 		let scr = torch.idx_score(q_idx.contiguous(), cl.pools, w.to('float32').contiguous(),
 			math.pow(D * 1.0, -0.5), st.pos, P);
 
-		let tk = scr.topk(kp, -1);
-		let dead = tk.values.le(-60000.0).view([T, kp, 1]);
-		let ex = tk.indices.to('float32').view([T, kp, 1]).mul(P * 1.0).add(st.arP.view([1, 1, P]))
-			.to('int64');
-
-		ex = torch.where(dead.expand([T, kp, P]), m1, ex).view([T, kp * P]);
-
-		// the incomplete tail pool of each query, raw
-		let start = st.qpos.add(1.0).mul(1.0 / P).to('int64').to('float32').mul(P * 1.0);
-		let tf = start.view([T, 1]).add(st.arT.view([1, P - 1]));
-		let tail = torch.where(tf.le(st.qpos.view([T, 1])), tf.to('int64'), m1);
-		let idx = torch.cat([ex, tail], 1);
-		let K = idx.shape()[1];
-		let pad = idx.le(-1);
-		let safe = torch.where(pad, torch.zeros([1], 'int64', dv), idx);
-		let g = ckv_gather(cl, safe.reshape([-1])).view([T, K, dc]);
+		// the kp best pools (ties to the lower index), their tokens in
+		// ascending pool order and the query's incomplete tail pool, with
+		// an additive pad mask: one kernel instead of the topk, the dead /
+		// tail / pad composite (~40 launches per layer, L138)
+		let sel = torch.dsa_select(scr, st.pos, P, kp);
+		let K = sel[0].shape()[1];
+		let g = ckv_gather(cl, sel[0].reshape([-1])).view([T, K, dc]);
 		let ql = q_lat.transpose(0, 1).contiguous();
 		let a = torch.matmul(ql, g.transpose(1, 2)).mul(cfg.sm_scale);
 
-		a = a.add(torch.where(pad, neg, torch.zeros([1], 'float16', dv)).view([T, 1, K]));
+		a = a.add(sel[1].view([T, 1, K]));
 		a = a.softmax(-1);
 		o_lat = torch.matmul(a, g).transpose(0, 1);
 	}

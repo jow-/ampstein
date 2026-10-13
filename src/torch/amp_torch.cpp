@@ -4302,6 +4302,72 @@ torch_idx_score(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * dsa_select(scores, pos, P, kp): [idx, pad]
+ *
+ * Decode-time pool selection of the DSA sparse MLA layers (amp_dsa_select
+ * in src/torch/amp_kernels.cu): per row of scores (T, cap) fp16 the top kp
+ * pools (score descending, ties to the lower index; pools scored -65504
+ * are padding), their P member tokens in ascending pool order, then the
+ * P - 1 tokens of the row's incomplete tail pool (row r is at position
+ * pos + r, pos a one-element int64 device tensor). Returns idx (T, K)
+ * int64 (0 where padded) and pad (T, K) fp16 (0 / -65504), K = kp * P + P - 1.
+ */
+extern "C" int
+amp_dsa_select(const void *scores, const long long *posp, void *idx, void *pad,
+              int T, int cap, int P, int kp, cudaStream_t stream);
+
+static uc_value_t *
+torch_dsa_select(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 4)
+		RAISE("dsa_select: expected (scores, pos, P, kp)");
+
+	at::Tensor *sc = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *ps = sc ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	uc_value_t *pv = uc_fn_arg(2), *kv = uc_fn_arg(3);
+
+	if (!sc || !ps)
+		return NULL;
+
+	if (!pv || !kv || ucv_type(pv) != UC_INTEGER || ucv_type(kv) != UC_INTEGER)
+		RAISE("dsa_select: P and kp must be integers");
+
+	int64_t P = ucv_int64_get(pv), kp = ucv_int64_get(kv);
+
+	if (sc->scalar_type() != at::kHalf || sc->device().type() != at::kCUDA || sc->dim() != 2 ||
+	    !sc->is_contiguous() || ps->scalar_type() != at::kLong || ps->numel() != 1 ||
+	    ps->device() != sc->device() || P < 1 || P > 1024 || kp < 1 || kp > 4096 ||
+	    sc->size(1) < kp || sc->size(0) < 1 || sc->size(0) > 1024)
+		RAISE("dsa_select: scores (T, cap >= kp) fp16 contiguous on CUDA, pos one int64 on the same "
+		      "device, 1 <= P <= 1024, 1 <= kp <= 4096");
+
+	TensorDeviceGuard dg(*sc);
+
+	try {
+		int64_t T = sc->size(0), K = kp * P + P - 1;
+		at::Tensor idx = at::empty({ T, K }, at::TensorOptions().dtype(at::kLong).device(sc->device()));
+		at::Tensor pad = at::empty({ T, K }, at::TensorOptions().dtype(at::kHalf).device(sc->device()));
+
+		int rc = amp_dsa_select(sc->data_ptr(), (const long long *)ps->data_ptr(), idx.data_ptr(),
+			pad.data_ptr(), (int)T, (int)sc->size(1), (int)P, (int)kp,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "dsa_select"))
+			return NULL;
+
+		uc_value_t *out = ucv_array_new(vm);
+
+		ucv_array_push(out, tensor_wrap(vm, std::move(idx), 0));
+		ucv_array_push(out, tensor_wrap(vm, std::move(pad), 0));
+
+		return out;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
  * mem_info(dev): [allocated, reserved, free, total] bytes of CUDA device
  * `dev` — what the caching allocator hands to tensors, what it holds from
  * the driver, and the driver's view (cudaMemGetInfo, i.e. including the
@@ -9117,6 +9183,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "rope",	torch_rope },
 	{ "silu_mul",	torch_silu_mul },
 	{ "idx_score",	torch_idx_score },
+	{ "dsa_select",	torch_dsa_select },
 	{ "mem_info",	torch_mem_info },
 	{ "kv_q8_put",	torch_kv_q8_put },
 	{ "kv_q8_get",	torch_kv_q8_get },

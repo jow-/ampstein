@@ -150,6 +150,9 @@ amp_test(qwen35_vision)
 amp_test(kv_q8)
 # idx_score: fused DSA indexer scoring kernel
 amp_test(idx_score)
+
+# dsa_select: decode-time DSA pool selection (top-kp, member / tail tokens, pad mask)
+amp_test(dsa_select)
 # skinny: deterministic split-K fp32 product, 1..8 rows
 amp_test(skinny)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)

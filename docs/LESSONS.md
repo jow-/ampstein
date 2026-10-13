@@ -372,6 +372,19 @@ Add new lessons at the end of the matching section.
   ~5 ms of MTP draft chain and ~2 ms of host work, each GPU busy ~30% of it.
   The MTP window does not matter (2 / 3 / 4 drafts: 61-62.5 tok/s): every
   extra verify row costs 5-8 ms of MoE expert union.
+- **L138 — Selection after a scorer is launch-bound too.** With the indexer
+  scoring in one kernel, the decode graphs still spent ~40 launches per
+  sparse layer between the scores and the gather: `torch.topk` (14 kernels),
+  the dead-pool mask, the member expansion, the tail pool, the pad mask.
+  `torch.dsa_select` does them in one block per row: a two-level radix select
+  of the kp-th key over the complete pools of the row's context only (the
+  score array has 65k slots at 262144 tokens, an 87k context has 22k
+  complete pools), ties to the lower pool, tiles in index order so the output does not
+  depend on thread timing. A first version that read every slot with shared
+  atomics took 91 us, no better than the composite (and not visible
+  end to end); warp-aggregated histograms (scores cluster in a few bins),
+  coalesced tiles and the visible-pools-only scan brought it to 15-47 us at
+  3k-87k context: 38.1 -> 37.2 ms per round.
 
 ## Agent loops
 
