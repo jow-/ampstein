@@ -131,6 +131,50 @@ for (let c in ['sleep 120', 'sleep 2m', 'sleep 30; tail log', 'sleep 1', 'sleep 
 		'sleepy 600', 'my-sleep 600', './sleep 600', 'grep sleep 600 notes.txt', 'ls', 'sleep $N'])
 	check(`sleep let through: ${c}`, ask(bash(c), [], 0) === true);
 
+// sleeps hidden in scripts the conversation wrote, and inside bash -c
+function ask_h(call_, hist) {
+	return call(policy, null, {call: call_, calls: [], history: hist, text: '', reasoning: '',
+		tools: ['bash', 'write'], tool_defs: [], tokens: 10, overrides: 0});
+}
+
+let sw = (path, content) => ({name: 'write', arguments: sprintf('%J', {path: path, content: content}), result: 'Successfully wrote'});
+
+check('script with a long sleep, run by path: dropped',
+	type(ask_h(bash('bash /tmp/wait.sh 2>&1'), [sw('/tmp/wait.sh', '#!/bin/bash\ncd /x\nsleep 420\necho done\n')])) == 'string');
+check('...the note names the script', index(ask_h(bash('bash /tmp/wait.sh'),
+	[sw('/tmp/wait.sh', 'sleep 420\n')]), '/tmp/wait.sh') >= 0);
+check('script with a short sleep: let through',
+	ask_h(bash('bash /tmp/wait.sh'), [sw('/tmp/wait.sh', 'sleep 60\n')]) === true);
+check('the newest version of the script is the one judged',
+	ask_h(bash('bash /tmp/wait.sh'), [sw('/tmp/wait.sh', 'sleep 420\n'), sw('/tmp/wait.sh', 'sleep 30\n')]) === true);
+check('a script the conversation did not write: let through', ask_h(bash('bash /tmp/other.sh'), [sw('/tmp/wait.sh', 'sleep 420\n')]) === true);
+check('relative path to the script', type(ask_h(bash('cd /tmp && ./wait.sh'), [sw('/tmp/wait.sh', 'sleep 9m\n')])) == 'string');
+check('bash -c with a long sleep: dropped', type(ask(bash("bash -c 'cd /x; sleep 300; tail log'"), [], 0)) == 'string');
+check('bash -c with a short sleep: let through', ask(bash("bash -c 'sleep 5; tail log'"), [], 0) === true);
+check('echo of the word is not a sleep', ask(bash('echo "sleep 600"'), [], 0) === true);
+
+// the same content written again under another name
+const BODY = '#!/bin/bash\ncd /home/x || exit 1\ngrep -n foo bar | head\necho done\n';
+let wh2 = [sw('/tmp/poll.sh', BODY)];
+let wcall = (p, c) => ({name: 'write', arguments: sprintf('%J', {path: p, content: c})});
+
+check('same content, new name in the directory: dropped', type(ask_h(wcall('/tmp/poll2.sh', BODY), wh2)) == 'string');
+check('...the note names the existing file', index(ask_h(wcall('/tmp/poll2.sh', BODY), wh2), '/tmp/poll.sh') >= 0);
+check('same content, any other name in the directory: dropped', type(ask_h(wcall('/tmp/verify.sh', BODY), wh2)) == 'string');
+check('different content: let through', ask_h(wcall('/tmp/poll2.sh', BODY + 'echo more\n'), wh2) === true);
+check('the same path again: let through', ask_h(wcall('/tmp/poll.sh', BODY), wh2) === true);
+check('another directory: let through', ask_h(wcall('/var/poll2.sh', BODY), wh2) === true);
+check('short content: let through', ask_h(wcall('/tmp/b.txt', 'x\n'), [sw('/tmp/a.txt', 'x\n')]) === true);
+check('a write that failed did not create the file',
+	ask_h(wcall('/tmp/poll2.sh', BODY), [{name: 'write', arguments: sprintf('%J', {path: '/tmp/poll.sh', content: BODY}),
+		result: 'Validation failed for tool "write"'}]) === true);
+let far = [sw('/tmp/poll.sh', BODY)];
+
+for (let i = 0; i < 7; i++)
+	push(far, {name: 'bash', arguments: '{"command": "ls"}', result: 'ok'});
+
+check('long ago: let through', ask_h(wcall('/tmp/poll2.sh', BODY), far) === true);
+
 check('the sleep note says to poll', index(ask(bash('sleep 600'), [], 0), 'Poll') >= 0);
 check('another tool with a sleep is not touched', ask({name: 'write', arguments: '{"content": "sleep 600"}'}, [], 0) === true);
 

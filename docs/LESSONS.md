@@ -516,3 +516,19 @@ Add new lessons at the end of the matching section.
   the loop. The false premise behind the write-script-then-run workflow
   (`$p_mb_packed` read as a variable, misdiagnosed as a harness IFS/expansion
   quirk and kept in every compaction summary) is the upstream cause.
+- **L145 — A rule on the command line misses what the command runs.** The
+  long-sleep rejection never fired in the openwrt-minibuild session: the model
+  wrote `sleep 330` / `420` into `/tmp/frr6poll.sh` .. `frr9poll.sh` (called
+  "poll" scripts) and ran `bash /tmp/frr6poll.sh`, and the command line shows no
+  sleep. The policy now also judges `bash -c '...'` and the newest `write` to
+  each `*.sh` the command names (the conversation's own history, so it works for
+  remote clients). Replay: 14 sleeping bash calls dropped, 5 of them through a
+  script.
+- **L146 — Block the second copy where the content is known.** The sampling ban
+  needs two similar writes before it stops a third, so `/tmp/frr5poll.sh`
+  followed 3 s later by `/tmp/frr5poll2.sh` (same 240-s sleep script) always got
+  through. At the name position the content is not there yet; the call hook sees
+  the completed call, so it drops a `write` whose content a write in the last 6
+  calls put into another file of the same directory (>= 24 chars; the same path
+  again is harmless and allowed). Replay: 0 drops in the 182 writes before the
+  loop, 170 of 548 afterwards.

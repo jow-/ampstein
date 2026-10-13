@@ -38,9 +38,13 @@
 // reaches `path`) the note says so. Extra parameters alone are harmless and
 // pass; so do calls of tools the request does not define.
 //
+// Also: a `write` of what a recent `write` just put into another file of the same
+// directory is dropped (the copy under a new name changes nothing).
+//
 // A third one: a `bash` call that sleeps longer than SLEEP_MAX seconds
-// (`sleep 600`, `sleep 5m`, `sleep 1h 30m`, `sleep infinity`) is dropped, with a note
-// to poll for long waits instead: a blocked call holds the whole conversation
+// (`sleep 600`, `sleep 5m`, `sleep 1h 30m`, `sleep infinity`; also inside `bash -c '...'`
+// and in a script the conversation wrote with `write` and now runs) is dropped, with a
+// note to poll for long waits instead: a blocked call holds the whole conversation
 // (and usually the harness's own timeout) for nothing.
 
 const STREAK = 3;        // same tool, same failure, in a row (variants of the call)
@@ -183,6 +187,65 @@ function longest_sleep(cmd) {
 	return longest;
 }
 
+// The sleeps of a command line: its own, those inside `sh -c '...'`, and those of
+// the scripts it runs that the conversation itself wrote (`bash /tmp/wait.sh`,
+// the content of the newest `write` to that path). The model hides a `sleep 420`
+// in a script and runs the script; the command line alone shows nothing.
+function command_sleep(cmd) {
+	let longest = longest_sleep(cmd), from = null;
+
+	if (type(cmd) != 'string')
+		return [0, null];
+
+	// bash -c '...' / sh -c "..."
+	let m = match(cmd, /(^|[[:space:]])(ba|z|da)?sh[[:space:]]+-[a-z]*c[[:space:]]+['"](.*)$/s);
+
+	if (m) {
+		let t = longest_sleep(m[3]);
+
+		if (t > longest)
+			longest = t;
+	}
+
+	if (longest > SLEEP_MAX)
+		return [longest, null];
+
+	for (let w in split(cmd, /[[:space:];&|()<>'"`]+/)) {
+		if (!match(w, /\.sh$/))
+			continue;
+
+		w = replace(w, /^\.\//, '');
+
+		for (let i = length(history) - 1; i >= 0; i--) {
+			let h = history[i], a = null;
+
+			if (h.name != 'write')
+				continue;
+
+			try {
+				a = json(h.arguments);
+			}
+			catch (e) {
+				continue;
+			}
+
+			if (type(a?.path) != 'string' || (a.path != w && substr(a.path, -(length(w) + 1)) != '/' + w))
+				continue;
+
+			let t = longest_sleep(a.content);
+
+			if (t > longest) {
+				longest = t;
+				from = a.path;
+			}
+
+			break;      // (the newest version of the script is the one that runs)
+		}
+	}
+
+	return [longest, from];
+}
+
 if (call.name == 'bash') {
 	let a = null;
 
@@ -193,16 +256,77 @@ if (call.name == 'bash') {
 		a = null;
 	}
 
-	let t = (type(a) == 'object') ? longest_sleep(a.command ?? a.cmd) : 0;
+	let r = (type(a) == 'object') ? command_sleep(a.command ?? a.cmd) : [0, null];
+	let t = r[0];
 
 	if (t > SLEEP_MAX) {
 		let shown = (t >= 1e18) ? 'forever' : sprintf('%d s', t);
+		let who = r[1] ? `the script ${r[1]} it runs sleeps for ${shown}` : `it sleeps for ${shown}`;
 
-		return `\n[call guard] That \`bash\` call was not sent: it sleeps for ${shown}, ` +
+		return `\n[call guard] That \`bash\` call was not sent: ${who}, ` +
 			`and a call that long blocks the conversation (and the harness's timeout may kill it). ` +
 			`Do not wait with long sleeps. Poll instead: check the state now (log tail, process, ` +
 			`exit status), sleep at most ${SLEEP_MAX} s or not at all, and come back with another ` +
 			`call; a long wait is several short polls.\n`;
+	}
+}
+
+// A `write` of content that one of the last REWRITE_WINDOW calls just wrote to
+// another file of the same directory (`/tmp/poll.sh`, then `/tmp/poll2.sh`, the
+// same script three seconds later): the second copy changes nothing, the model
+// meant to run the first. The two-writes ban of --call-guard only stops the third.
+const REWRITE_WINDOW = 6;
+const REWRITE_MIN = 24;       // characters of content below which equal files are normal
+
+function dir_of(p) {
+	let m = match(p, /^(.*\/)?/);
+
+	return m ? (m[0] ?? '') : '';
+}
+
+if (call.name == 'write') {
+	let a = null;
+
+	try {
+		a = json(call.arguments);
+	}
+	catch (e) {
+		a = null;
+	}
+
+	if (type(a) == 'object' && type(a.path) == 'string' && type(a.content) == 'string' &&
+	    length(rtrim(a.content)) >= REWRITE_MIN) {
+		let lo = length(history) - REWRITE_WINDOW;
+
+		for (let i = length(history) - 1; i >= 0 && i >= lo; i--) {
+			let h = history[i], b = null;
+
+			if (h.name != 'write')
+				continue;
+
+			try {
+				b = json(h.arguments);
+			}
+			catch (e) {
+				continue;
+			}
+
+			if (type(b?.path) != 'string' || type(b?.content) != 'string' ||
+			    rtrim(b.content) != rtrim(a.content) || dir_of(b.path) != dir_of(a.path))
+				continue;
+
+			// (the same path again is a harmless rewrite, it may even restore a file)
+			if (b.path == a.path)
+				continue;
+
+			// (a write that failed did not create the file)
+			if (h.result != null && match(h.result, FAILED))
+				continue;
+
+			return `\n[call guard] That \`write\` call was not sent: ${b.path} already holds exactly this ` +
+				`content (written ${length(history) - i} call(s) ago). Writing it again under another ` +
+				`name changes nothing. Use that file: run it, or read it, and go on from there.\n`;
+		}
 	}
 }
 
