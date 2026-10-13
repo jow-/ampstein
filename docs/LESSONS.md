@@ -456,3 +456,15 @@ Add new lessons at the end of the matching section.
   (router of layer L on the hidden state of L-1) recalls 67% of the experts with
   8 guesses, history heatmaps lose to LRU, and prefetch only pays above ~12 GB/s.
   `docs/EXPERT_STREAMING.md`.
+- **L140 — Match failures by signature, and validate before the history.** The
+  openwrt-minibuild session (Qwen3.8-27B, 1421 calls) sent 205 `write` calls
+  without `path`, each carrying `content2` ... `content468` (the model
+  enumerates parameter names and never reaches `path`). The loop breaker saw
+  nothing: the validation error echoes the received arguments, a different
+  script every time, so "same failure text" never held (replay: 0 drops, longest
+  streak 1). The policy now compares the failure's first paragraph and drops a
+  call missing a required parameter at once (`tool_defs` global, from the
+  request's tools). Dropping on numbered copies alone would have killed 103
+  working calls that carried the junk next to a valid `path`. The call is only
+  seen after the parser completes it, so the tokens of a 468-parameter call are
+  still spent.

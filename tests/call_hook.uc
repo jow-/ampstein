@@ -54,9 +54,9 @@ function failed_edits(n, variants) {
 	return hh;
 }
 
-function ask(call_, hist, ov) {
+function ask(call_, hist, ov, defs) {
 	return call(policy, null, {call: call_, calls: [], history: hist, text: '', reasoning: '',
-		tools: ['edit', 'bash'], tokens: 10, overrides: ov ?? 0});
+		tools: ['edit', 'bash'], tool_defs: defs ?? [], tokens: 10, overrides: ov ?? 0});
 }
 
 let c0 = {name: 'edit', arguments: '{"v": 0}'};
@@ -86,6 +86,53 @@ let a = ask(c0, failed_edits(4, 1), 0), b = ask(c0, failed_edits(4, 1), 1), c = 
 
 check('escalating notes differ', a != b && b != c && a != c);
 check('the note names the tool and the error', index(a, 'edit') >= 0 && index(a, 'Could not find') >= 0, a);
+
+// --- the pi `write` loop (2026-10-13): no `path`, `content2` ... copies, and a validation
+// error that echoes the (different every time) payload
+function echo_fail(i) {
+	return {name: 'write', arguments: sprintf('{"content": "script %d"}', i),
+		result: sprintf('Validation failed for tool "write":\n  - path: must have required properties path\n\n' +
+			'Received arguments:\n{\n  "content": "script %d"\n}', i)};
+}
+
+let wh = [];
+
+for (let i = 0; i < 3; i++)
+	push(wh, echo_fail(i));
+
+let wc = {name: 'write', arguments: '{"content": "script 9"}'};
+
+check('echoed-payload failures: same failure, new variant: dropped', type(ask(wc, wh, 0)) == 'string');
+check('echoed-payload failures: two are not yet a streak', ask(wc, slice(wh, 0, 2), 0) === true);
+
+const DEFS = [{type: 'function', function: {name: 'write', parameters: {type: 'object',
+	properties: {path: {type: 'string'}, content: {type: 'string'}}, required: ['path', 'content']}}}];
+let numbered = {name: 'write', arguments: '{"content": "x", "content2": "", "content3": ""}'};
+let with_path = {name: 'write', arguments: '{"path": "/p", "content": "x", "content2": ""}'};
+
+check('missing required parameter: dropped without history', type(ask(numbered, [], 0, DEFS)) == 'string');
+check('...the note names it and the copies', index(ask(numbered, [], 0, DEFS), '`path`') >= 0 &&
+	index(ask(numbered, [], 0, DEFS), 'content2') >= 0);
+check('extra numbered parameters with the required ones present: let through', ask(with_path, [], 0, DEFS) === true);
+check('a tool the request does not define: let through', ask({name: 'nope', arguments: '{}'}, [], 0, DEFS) === true);
+check('no definitions, three copies: let through', ask(numbered, [], 0) === true);
+
+check('distinct parameters ending in digits are fine',
+	ask({name: 'bash', arguments: '{"command": "ls", "line2": 1}'}, [], 0) === true);
+
+// --- long sleeps in bash
+function bash(cmd) { return {name: 'bash', arguments: sprintf('%J', {command: cmd})}; }
+
+for (let c in ['sleep 600', 'sleep 5m', 'cd /x && make; sleep 130', 'sleep 1h 30m', 'sleep infinity',
+		'while true; do tail -1 log; sleep 300; done', 'sleep 2.5m', 'x | y && sleep 0.5 && sleep 121'])
+	check(`sleep dropped: ${c}`, type(ask(bash(c), [], 0)) == 'string');
+
+for (let c in ['sleep 120', 'sleep 2m', 'sleep 30; tail log', 'sleep 1', 'sleep 0.5', 'echo "sleeping 600"',
+		'sleepy 600', 'my-sleep 600', './sleep 600', 'grep sleep 600 notes.txt', 'ls', 'sleep $N'])
+	check(`sleep let through: ${c}`, ask(bash(c), [], 0) === true);
+
+check('the sleep note says to poll', index(ask(bash('sleep 600'), [], 0), 'Poll') >= 0);
+check('another tool with a sleep is not touched', ask({name: 'write', arguments: '{"content": "sleep 600"}'}, [], 0) === true);
 
 // --- the tool-result form of a dropped call (what the model reads instead)
 let q = chat_qwen35.tool_feedback('NOTE', false);

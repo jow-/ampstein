@@ -1043,6 +1043,7 @@ export function serve(args) {
 								text: htext.slice(),
 								reasoning: hreason.slice(),
 								tools: map(body.tools || [], (t) => (t.function || t).name),
+								tool_defs: body.tools || [],
 								tokens: hnum,
 								overrides: call_n
 							});

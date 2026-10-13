@@ -25,10 +25,29 @@
 //
 // Here: a call is a repeat when the immediately preceding calls to the same
 // tool (a run of at least STREAK, or ONE_SHOT when this call is byte-identical
-// to the last one) all got the same failure text.
+// to the last one) all got the same failure. "The same failure" compares the
+// failure's signature, not its bytes: a validation error echoes the arguments it
+// received (a different script each time), and Qwen3.8-27B sent 205 `write`
+// calls without `path` that way, each answered by an error that differed only
+// in that echo.
+//
+// A second check needs no history: a call that lacks a parameter its tool
+// requires (tool_defs, the request's tool definitions) is dropped at once, and
+// when it carries numbered copies of its own parameters (`content`, `content2`,
+// ... `content468`: the model keeps enumerating parameter names and never
+// reaches `path`) the note says so. Extra parameters alone are harmless and
+// pass; so do calls of tools the request does not define.
+//
+// A third one: a `bash` call that sleeps longer than SLEEP_MAX seconds
+// (`sleep 600`, `sleep 5m`, `sleep 1h 30m`, `sleep infinity`) is dropped, with a note
+// to poll for long waits instead: a blocked call holds the whole conversation
+// (and usually the harness's own timeout) for nothing.
 
 const STREAK = 3;        // same tool, same failure, in a row (variants of the call)
 const ONE_SHOT = 1;      // the call is identical to a failed call just before it
+const SIG_MAX = 200;     // characters of a failure that identify it
+
+const SLEEP_MAX = 120;   // seconds a single `sleep` in a bash command may last
 
 const FAILED = /(could not|couldn't|cannot|can't|failed|failure|error|not found|no such|invalid|denied|refused|exited with code [1-9]|rc=[1-9])/i;
 
@@ -37,6 +56,154 @@ function head(s, n) {
 	s = replace(s, /[\r\n]+/g, ' ');
 
 	return (length(s) > n) ? substr(s, 0, n) + '...' : s;
+}
+
+// The failure with its echoed payload removed: the first paragraph, capped.
+function sig(s) {
+	s = trim(s ?? '');
+
+	let k = index(s, '\n\n');
+
+	if (k >= 0)
+		s = substr(s, 0, k);
+
+	return (length(s) > SIG_MAX) ? substr(s, 0, SIG_MAX) : s;
+}
+
+// Parameter names that are another parameter's name plus a number.
+function numbered_copies(arguments) {
+	let a = null;
+
+	try {
+		a = json(arguments);
+	}
+	catch (e) {
+		return [];
+	}
+
+	if (type(a) != 'object')
+		return [];
+
+	let seen = {}, out = [];
+
+	for (let k in keys(a))
+		seen[k] = true;
+
+	for (let k in keys(a)) {
+		let m = match(k, /^(.*[^0-9])([0-9]+)$/);
+
+		if (m && seen[m[1]])
+			push(out, k);
+	}
+
+	return out;
+}
+
+// Required parameters of the called tool that the call does not carry.
+function missing_params(call, defs) {
+	let a = null;
+
+	try {
+		a = json(call.arguments);
+	}
+	catch (e) {
+		return null;
+	}
+
+	if (type(a) != 'object' || type(defs) != 'array')
+		return null;
+
+	for (let d in defs) {
+		let f = d.function ?? d;
+
+		if (f.name != call.name)
+			continue;
+
+		let req = f.parameters?.required;
+
+		if (type(req) != 'array')
+			return [];
+
+		return filter(req, (k) => a[k] == null);
+	}
+
+	return null;
+}
+
+let dup = numbered_copies(call.arguments);
+let miss = missing_params(call, tool_defs);
+
+if (miss != null && length(miss) > 0) {
+	let why = `is missing the required parameter(s) \`${join('`, `', miss)}\``;
+	let extra = length(dup) ? ` It carried ${length(dup)} parameters named like copies of another one ` +
+		`(\`${join('`, `', slice(dup, 0, 3))}\`${length(dup) > 3 ? ', ...' : ''}).` : '';
+
+	return `\n[call guard] That \`${call.name}\` call was not sent: it ${why}.${extra} ` +
+		`Send the tool's own parameters, each exactly once, with their real names.\n`;
+}
+
+// Longest `sleep` (seconds) in a shell command line; 0 when there is none.
+// `sleep` in command position (after the start, `;`, `&`, `|`, `(`, `{`, a backtick,
+// a newline or a keyword such as `do`), GNU arguments: numbers with an optional
+// s/m/h/d suffix, summed; `infinity`. A `sleep` inside a quoted string after `echo`
+// is not told apart from a command.
+const SLEEP_RE = regexp('(^|[;&|({`\n]|[[:space:]](do|then|else|elif|time|exec|nohup|sudo|xargs|!))' +
+	'[[:space:]]*sleep[[:space:]]+([^;&|)\n]*)');
+const DUR_RE = regexp('^([0-9]+\\.?[0-9]*|\\.[0-9]+)([smhd]?)$');
+const UNIT = { s: 1, m: 60, h: 3600, d: 86400, '': 1 };
+
+function longest_sleep(cmd) {
+	let longest = 0, m;
+
+	while (type(cmd) == 'string' && (m = match(cmd, SLEEP_RE))) {
+		let at = index(cmd, m[0]);
+		let total = 0, any = false;
+
+		for (let w in split(trim(m[3]), /[[:space:]]+/)) {
+			let d = match(w, DUR_RE);
+
+			if (w == 'infinity' || w == 'inf') {
+				total = 1e18;
+				any = true;
+			}
+			else if (d) {
+				total += (+d[1]) * UNIT[d[2]];
+				any = true;
+			}
+			else
+				break;
+		}
+
+		if (any && total > longest)
+			longest = total;
+
+		cmd = substr(cmd, at + length(m[0]));
+	}
+
+	return longest;
+}
+
+if (call.name == 'bash') {
+	let a = null;
+
+	try {
+		a = json(call.arguments);
+	}
+	catch (e) {
+		a = null;
+	}
+
+	let t = (type(a) == 'object') ? longest_sleep(a.command ?? a.cmd) : 0;
+
+	if (t > SLEEP_MAX) {
+		let shown = (t >= 1e18) ? 'forever' : sprintf('%d s', t);
+
+		return `\n[call guard] That \`bash\` call was not sent: it sleeps for ${shown}, ` +
+			`and a call that long blocks the conversation (and the harness's timeout may kill it). ` +
+			`Do not wait with long sleeps. Poll instead: check the state now (log tail, process, ` +
+			`exit status), sleep at most ${SLEEP_MAX} s or not at all, and come back with another ` +
+			`call; a long wait is several short polls.\n`;
+	}
 }
 
 let n = 0, last = null, same_call = false;
@@ -48,8 +215,8 @@ for (let i = length(history) - 1; i >= 0; i--) {
 		break;
 
 	if (last == null)
-		last = h.result;
-	else if (h.result != last)
+		last = sig(h.result);
+	else if (sig(h.result) != last)
 		break;
 
 	if (n == 0)
