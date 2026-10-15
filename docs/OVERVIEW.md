@@ -258,7 +258,7 @@ reasoning, content and tool calls (Qwen XML-ish calls, GLM, DeepSeek DSML).
 - Prompt-cache store: resident device slots and pinned host RAM, tiered
   quantization by age, prefix reuse with divergence logging.
 - Time-sliced co-generation so side requests don't starve behind a long one.
-- Hot reload: the KV state survives a server restart.
+- Hot reload: the KV state survives a server restart (Qwen3.5 family, GLM-5.3).
 - Reasoning budget: soft nudge after X reasoning tokens, forced close after
   Y (`--reasoning-nudge`, `--reasoning-limit`, per request too).
 - **End-of-turn hook** (`--eos-hook`): a script run when the model samples

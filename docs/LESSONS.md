@@ -555,3 +555,11 @@ Add new lessons at the end of the matching section.
   oracle battery and the 1.4 MB session text). The ucode side matters too: a
   per-token `push` loop costs more than the encode (400k ids: 203 ms vs 15 ms
   for `push(ids, ...part)`).
+- **L149 — Hot reload rides on the store's entry, not on a second layout.** The
+  dense `save_state` (Qwen: per-layer KV rows + GDN states) knows nothing of
+  MLA latent rows, indexer planes, pools or KDA states, and a second
+  serializer would have to track every change of the store. Saving is one
+  `store_put()` with the budget and device slots borrowed (the entry lands in
+  host RAM whatever `--cache-ram` / `--slots` say), flattened to tensors +
+  a JSON tree; restoring is `store_restore(e, e.n)`. Caveat: the file goes to
+  `/tmp`, which is often tmpfs (RAM): a 262k-token GLM state is several GB.

@@ -302,12 +302,13 @@ export function serve(args) {
 	 * The port-qualified path keeps concurrent servers apart. */
 	const CACHE_ST = `/tmp/Ampstein-cache-${args.port}.safetensors`;
 	const CACHE_META = `${CACHE_ST}.json`;
+	const layout = GLM ? {gpus: args.gpus, tp: !!args.tp, stages: args.stages ?? 0, kv_bits: kv_bits ?? 0} : {};
 
 	(function restore_cache() {
 		let meta;
 
-		if (GLM || Q4 || DS)
-			return;     // the cache-state file format is Qwen-specific for now
+		if (Q4 || DS)
+			return;     // no cache-state file for these architectures yet
 
 		try {
 			meta = json(readfile(CACHE_META));
@@ -321,6 +322,13 @@ export function serve(args) {
 				'(model or format changed)\n');
 			return;
 		}
+
+		// the layout of a GLM entry follows the placement (stages, KV form)
+		for (let k in ['gpus', 'tp', 'stages', 'kv_bits'])
+			if (exists(meta, k) && meta[k] != layout[k]) {
+				warn(`ampstein: ignoring saved cache state (${k} ${meta[k]} -> ${layout[k]})\n`);
+				return;
+			}
 
 		try {
 			let n = eng.restore_state(CACHE_ST);
@@ -1643,14 +1651,14 @@ export function serve(args) {
 		shutting_down = true;
 
 		try {
-			if (GLM || Q4 || DS)
+			if (Q4 || DS)
 				die('not supported for this architecture yet');
 
 			let n = eng.save_state(CACHE_ST);
 
 			writefile(CACHE_META, sprintf('%J', {
 				format: 1, model: args.model, tokens: n,
-				max_ctx: eng.max_ctx, mtp: eng.mtp_window}));
+				max_ctx: eng.max_ctx, mtp: eng.mtp_window, ...layout}));
 
 			warn(`ampstein: saved ${n} cached tokens to ${CACHE_ST}\n`);
 		}

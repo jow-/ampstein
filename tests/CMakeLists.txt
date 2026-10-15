@@ -199,6 +199,8 @@ amp_test(engine_turn)
 amp_test(engine_store_quant)
 # engine_store_glm5: host-RAM store for GLM-5.3 (MLA latent rows, KDA states, MTP draft cache)
 amp_test(engine_store_glm5)
+# engine_state_glm5: hot reload (save_state / restore_state) of GLM-5.3 live state + snapshot
+amp_test(engine_state_glm5)
 # the TP tests again as a pipeline of three 2-rank stages
 amp_test(glm5_tp_stages SCRIPT glm5_tp ENV AMP_GLM5_STAGES=3)
 amp_test(glm5_tp_graph_stages SCRIPT glm5_tp_graph ENV AMP_GLM5_STAGES=3)

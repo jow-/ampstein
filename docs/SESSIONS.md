@@ -86,7 +86,21 @@ through RAM for a few thousand tokens of dense KV).
 
 `save_state` / `restore_state` write the live state to a safetensors file
 and read it back, so a server restart (a code change, a model reload)
-continues the conversation without prefill.
+continues the conversation without prefill. The server saves on SIGINT /
+SIGTERM to `/tmp/Ampstein-cache-PORT.safetensors` (+ `.json`, and `.tree` for
+the entry form) and restores at the next start; the saved placement (GPUs,
+TP, stages, KV form) must match.
+
+- **Qwen3.5 family:** the dense form: token ids, attention KV (used part),
+  GDN states, draft cache, last hidden. The prompt snapshot is not saved.
+- **GLM-5.3 (and any model with the store's entry layout):** the state the
+  host-RAM store would hold, exactly: MLA latent rows (age-tiered like a
+  stored entry), indexer planes and pools, KDA states, the MTP draft cache,
+  and the snapshot / turn checkpoint, so a first prompt that diverges after the
+  restart still rewinds instead of prefilling. The entry's tensors are the
+  file, its structure `.tree` (JSON); restoring is the store's own swap-in.
+  States below 2048 tokens are not saved. DeepSeek-V4 and Qwen4 are not wired
+  into the server yet.
 
 ## 3. What a cache entry is on a hybrid model
 

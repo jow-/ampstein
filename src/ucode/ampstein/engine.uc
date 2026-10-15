@@ -57,6 +57,7 @@
 import * as qwen35 from './qwen35.uc';
 import * as uloop from 'uloop';
 import * as math from 'math';
+import { readfile, writefile } from 'fs';
 import * as sampler from './sampler.uc';
 import * as models from './models.uc';
 import * as qgraph from './qwen35_graph.uc';
@@ -3097,7 +3098,7 @@ export function create(model, opts) {
 	 * prefill instead of a snapshot rewind). Refuses while a job is
 	 * running (mid-job cache contents are inconsistent with ids).
 	 * Returns the number of tokens saved. */
-	function save_state(path) {
+	function save_state_dense(path) {
 		if (job)
 			die('engine.save_state: a job is running');
 
@@ -3147,7 +3148,7 @@ export function create(model, opts) {
 	 * history. Missing optional entries (draft, last_hidden) skip
 	 * gracefully; shape mismatches raise (the caller decides whether
 	 * to continue fresh). Must run before any job is submitted. */
-	function restore_state(path) {
+	function restore_state_dense(path) {
 		if (job)
 			die('engine.restore_state: a job is running');
 
@@ -3208,6 +3209,153 @@ export function create(model, opts) {
 			last_hidden = st.tensor('last_hidden').cuda(M.dev);
 
 		return N;
+	}
+
+	/* Hot reload through the cache store's entry layout. Models whose cache is
+	 * not plain KV + GDN rows (GLM-5.3's MLA latent rows, indexer planes and
+	 * pools, KDA states, the MTP draft cache; DeepSeek-V4's own export) are
+	 * written as the host-RAM store entry the live state would become: the
+	 * entry's tensors go to `path` (safetensors, named t0, t1, ...), its
+	 * structure (arrays / objects / numbers / tensor references) to
+	 * `path.tree`. The entry carries the snapshot and turn checkpoint, so a
+	 * divergent first prompt after the restart still rewinds instead of
+	 * prefilling. Restoring is the store's own swap-in. */
+	function tree_pack(v, ents) {
+		if (v == null)
+			return null;
+
+		let t = type(v);
+
+		if (t == 'array')
+			return map(v, (x) => tree_pack(x, ents));
+
+		if (t == 'object') {
+			let o = {};
+
+			for (let k in v)
+				o[k] = tree_pack(v[k], ents);
+
+			return o;
+		}
+
+		if (t != 'resource')
+			return v;
+
+		let r = {'$t': length(ents), shape: v.shape(), dtype: v.dtype()};
+
+		// an empty tensor has no bytes to store: shape and dtype recreate it
+		if (v.numel() > 0)
+			push(ents, ['t' + length(ents), v]);
+		else
+			r['$t'] = -1;
+
+		return r;
+	}
+
+	function tree_unpack(v, st) {
+		let t = type(v);
+
+		if (t == 'array')
+			return map(v, (x) => tree_unpack(x, st));
+
+		if (t != 'object')
+			return v;
+
+		if (exists(v, '$t'))
+			return (v['$t'] < 0) ? torch.empty(v.shape, v.dtype) : st.tensor('t' + v['$t']);
+
+		let o = {};
+
+		for (let k in v)
+			o[k] = tree_unpack(v[k], st);
+
+		return o;
+	}
+
+	function entry_state() {
+		return !!(mla_store || model.cache_export);
+	}
+
+	function save_state(path) {
+		if (!entry_state())
+			return save_state_dense(path);
+
+		if (job)
+			die('engine.save_state: a job is running');
+
+		if (length(ids) < STORE_MIN_TOKENS)
+			die('engine.save_state: no cached state worth saving');
+
+		// the entry the live state would become, in host RAM whatever the store's
+		// budget and device slots are: borrow the store for one put
+		let sb = store_budget, sf = slots_free, stot = slots_total;
+		let before = length(store), ok = false;
+
+		store_budget = 1 << 50;
+		slots_free = [];
+		slots_total = 0;
+
+		try {
+			ok = store_put();
+		}
+		catch (e) {
+			store_budget = sb;
+			slots_free = sf;
+			slots_total = stot;
+
+			die(`engine.save_state: ${e.message}`);
+		}
+
+		store_budget = sb;
+		slots_free = sf;
+		slots_total = stot;
+
+		if (!ok || length(store) <= before)
+			die('engine.save_state: the cache entry could not be exported');
+
+		let e = pop(store);
+
+		store_bytes -= e.bytes;
+
+		let ents = [];
+		let tree = tree_pack({...e, slot: null}, ents);
+
+		torch.st_save(path, ents);
+		writefile(path + '.tree', sprintf('%J', tree));
+
+		return e.n;
+	}
+
+	function restore_state(path) {
+		let tree;
+
+		try {
+			tree = readfile(path + '.tree');
+		}
+		catch (e) {
+			tree = null;
+		}
+
+		if (!entry_state() || tree == null)
+			return restore_state_dense(path);
+
+		if (job)
+			die('engine.restore_state: a job is running');
+
+		let e = tree_unpack(json(tree), torch.st(path));
+
+		if (type(e) != 'object' || type(e.ids) != 'array' || !(e.n > 0))
+			die('engine.restore_state: malformed entry');
+
+		if (e.n > cache.max_seq)
+			die(`engine.restore_state: ${e.n} tokens exceed the cache capacity (${cache.max_seq})`);
+
+		e.slot = null;
+		e.owner = null;
+		e.bytes = 0;
+		store_restore(e, e.n);
+
+		return e.n;
 	}
 
 	/* Startup warm-up (as exllamav3's "Warming up"): run the worst-case
