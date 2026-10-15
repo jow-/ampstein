@@ -104,3 +104,23 @@ if (stat(PF_FIXTURE)) {
 else
 	warn('tokenizer: pair-form fixture missing, skipping ' +
 		'(regenerate with tests/oracle/make_tokenizer_oracle.py)\n');
+/* Encoding is linear in the text: PCRE2 validated the whole subject on every
+ * match (quadratic; 400 KB took ~8 s, 1.4 MB ~100 s). Loose bound, not a
+ * benchmark. */
+{
+	let unit = 'The quick brown fox, 12345 jumps over the lazy dog; ünïcödé 日本語! ';
+	let text = '';
+
+	while (length(text) < 400000)
+		text += unit;
+
+	let t0 = clock(true);
+	let ids = t.encode(text, true);
+	let t1 = clock(true);
+	let secs = (t1[0] - t0[0]) + (t1[1] - t0[1]) / 1000000000.0;
+
+	assert(length(ids) > 100000, `unexpected id count ${length(ids)}`);
+	assert(secs < 2.0, `encoding ${length(text)} bytes took ${secs} s (quadratic?)`);
+	assert(t.decode(ids) == text, 'long text roundtrip');
+	printf('tokenizer: %d bytes encoded in %.0f ms\n', length(text), secs * 1000);
+}

@@ -546,3 +546,12 @@ Add new lessons at the end of the matching section.
   results and leaves out the oldest entries (the real session: 1.44M -> 0.35M
   characters). Separate pi limitation: the threshold check only runs when a run
   ends, so a 230-call run goes from 80% to 100% unchecked.
+- **L148 — PCRE2 validates the whole subject on every match.** Encoding was
+  quadratic: `pcre2_match` on a long subject re-checks all of it as UTF-8 per
+  call unless `PCRE2_NO_UTF_CHECK` is set, and stage 0 of the pre-tokenizer
+  matches the whole text once per piece. Measured (Qwen3.8 tokenizer): 10 KB
+  7 ms, 100 KB 534 ms, 1.4 MB ~100 s. Checking once per subject and JIT
+  compiling the patterns: 100 KB 10 ms, 1.4 MB 126 ms (ids identical on the
+  oracle battery and the 1.4 MB session text). The ucode side matters too: a
+  per-token `push` loop costs more than the encode (400k ids: 203 ms vs 15 ms
+  for `push(ids, ...part)`).

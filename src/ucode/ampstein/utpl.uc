@@ -323,10 +323,9 @@ export function encode_segments(tok, r) {
 		if (s.s == '')
 			continue;
 
-		let part = s.t ? tok.encode(s.s, true) : tok.encode(s.s);
-
-		for (let j = 0; j < length(part); j++)
-			push(ids, part[j]);
+		// one native call per segment (a per-token push loop cost more than
+		// the encoding itself)
+		push(ids, ...(s.t ? tok.encode(s.s, true) : tok.encode(s.s)));
 	}
 
 	return ids;

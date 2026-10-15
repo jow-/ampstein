@@ -526,6 +526,10 @@ compile_re(const char *pattern, size_t plen)
 
 	pcre2_pattern_info(re, PCRE2_INFO_SIZE, &size);
 
+	/* JIT is an optimisation only: a failed compile (unsupported platform
+	 * or pattern) leaves the interpreter in place */
+	(void)pcre2_jit_compile(re, PCRE2_JIT_COMPLETE);
+
 	return re;
 }
 
@@ -868,14 +872,21 @@ span_push(span_t **spans, size_t *nspans, size_t *cap, size_t off, size_t len)
  * Isolated: the matches and the gaps between them all become pieces),
  * appending to *spans. The regex sees the piece as its own subject. */
 static bool
-split_piece(const pcre2_code *re, pcre2_match_data *md, const char *text,
-            size_t off, size_t len, span_t **spans, size_t *nspans, size_t *cap)
+split_piece(const pcre2_code *re, pcre2_match_data *md, pcre2_match_context *mc,
+            const char *text, size_t off, size_t len, span_t **spans,
+            size_t *nspans, size_t *cap)
 {
 	const char *sub = text + off;
 	size_t start = 0;
+	uint32_t flags = 0;
 
 	while (start < len) {
-		int rc = pcre2_match(re, (PCRE2_SPTR)sub, len, start, 0, md, NULL);
+		/* PCRE2 validates the WHOLE subject on every call that lacks
+		 * NO_UTF_CHECK: one check per subject, not one per match (that is
+		 * quadratic: ~0.5 s for 100 KB of text) */
+		int rc = pcre2_match(re, (PCRE2_SPTR)sub, len, start, flags, md, mc);
+
+		flags = PCRE2_NO_UTF_CHECK;
 
 		if (rc < 0) {
 			if (rc != PCRE2_ERROR_NOMATCH)
@@ -910,22 +921,29 @@ pretokenize(const tok_t *t, const char *text, size_t len,
             span_t **out, size_t *nout)
 {
 	pcre2_match_data *md = pcre2_match_data_create(2, NULL);
+	pcre2_match_context *mc = pcre2_match_context_create(NULL);
+	pcre2_jit_stack *js = pcre2_jit_stack_create(32 * 1024, 16 * 1024 * 1024, NULL);
 	span_t *cur = NULL, *next = NULL;
 	size_t ncur = 0, ccur = 0;
 
-	if (!md)
-		return false;
+	if (!md || !mc)
+		goto err;
+
+	/* a stack for the JIT'd matcher that grows with the subject (the
+	 * default 32 KB one fails on long runs) */
+	if (js)
+		pcre2_jit_stack_assign(mc, NULL, js);
 
 	/* stage 0 splits the whole text, each later stage splits the pieces
 	 * the previous one produced */
-	if (!split_piece(t->re[0], md, text, 0, len, &cur, &ncur, &ccur))
+	if (!split_piece(t->re[0], md, mc, text, 0, len, &cur, &ncur, &ccur))
 		goto err;
 
 	for (int st = 1; st < t->nre; st++) {
 		size_t nnext = 0, cnext = 0;
 
 		for (size_t i = 0; i < ncur; i++)
-			if (!split_piece(t->re[st], md, text, cur[i].off, cur[i].len,
+			if (!split_piece(t->re[st], md, mc, text, cur[i].off, cur[i].len,
 			                 &next, &nnext, &cnext)) {
 				goto err;
 			}
@@ -938,6 +956,8 @@ pretokenize(const tok_t *t, const char *text, size_t len,
 	}
 
 	pcre2_match_data_free(md);
+	pcre2_match_context_free(mc);
+	pcre2_jit_stack_free(js);
 	*out = cur;
 	*nout = ncur;
 
@@ -945,6 +965,8 @@ pretokenize(const tok_t *t, const char *text, size_t len,
 
 err:
 	pcre2_match_data_free(md);
+	pcre2_match_context_free(mc);
+	pcre2_jit_stack_free(js);
 	free(cur);
 	free(next);
 
