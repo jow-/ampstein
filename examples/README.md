@@ -23,3 +23,5 @@ ucode -L build/lib -L src/ucode -ltorch=ampstein.torch examples/<script>.uc [-- 
 | `bench_dsv4.uc` | DeepSeek-V4 prefill / decode throughput |
 | `bench_h2d.uc`, `bench_zerocopy.uc`, `trace_routing.uc` | expert streaming experiments: MoE kernel on host-resident experts, routing traces (`docs/EXPERT_STREAMING.md`) |
 | `eos_policy_agentic.uc` | an end-of-turn policy for agent harnesses (`--eos-hook`) |
+| `call_policy_loop.uc` | tool-call loop breaker (`--call-hook`) |
+| `prompt_policy_compaction.uc` | answer pi's summarization request from a reduced copy when it does not fit (`--prompt-hook`) |

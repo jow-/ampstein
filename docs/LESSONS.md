@@ -532,3 +532,17 @@ Add new lessons at the end of the matching section.
   calls put into another file of the same directory (>= 24 chars; the same path
   again is harmless and allowed). Replay: 0 drops in the 182 writes before the
   loop, 170 of 548 afterwards.
+- **L147 — A compaction request is the one request the server may rewrite.** pi's
+  summarizer serializes the *whole* history as text, thinking blocks included
+  (tool results are cut to 2000 characters, thinking is not). The live context
+  never carries earlier turns' thinking (the chat template drops it), so a
+  262k-token session serializes to ~1.4M characters (65% thinking), the
+  summarization request overflows the same 262144 window, and compaction fails
+  on exactly the sessions that need it (j13 luci session, 2026-10-14/15). Its
+  answer replaces the client's history, so unlike rolling compaction of a live
+  conversation (no way to sync the prefix back) the server can answer from a
+  reduced copy. `--prompt-hook` shows every rendered prompt to a script (with whether it
+  fits); `examples/prompt_policy_compaction.uc` drops thinking, cuts tool
+  results and leaves out the oldest entries (the real session: 1.44M -> 0.35M
+  characters). Separate pi limitation: the threshold check only runs when a run
+  ends, so a 230-call run goes from 80% to 100% unchecked.

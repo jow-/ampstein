@@ -272,6 +272,16 @@ reasoning, content and tool calls (Qwen XML-ish calls, GLM, DeepSeek DSML).
   a change of plan; the client sees only that). A loop breaker for a model
   that resends a failing call: `examples/call_policy_loop.uc`; also usable as
   a call filter / blacklist (raise `--call-hook-max`).
+- **Prompt hook** (`--prompt-hook`): a script run for every chat request once
+  its prompt is rendered, with the messages, tools, the prompt's size and
+  whether it fits (`fits`, `limit`, `max_tokens`, `context`). An array verdict
+  (or `{messages, tools}`) replaces the request's; the prompt is rendered again
+  and the script asked again (`--prompt-hook-max`, default 3 rounds). Any other
+  verdict leaves the request alone. Rewrites the prompt only: the client sees
+  the reply to the request it sent. Uses: shrink a request that would not fit,
+  strip or add messages, filter tools. `examples/prompt_policy_compaction.uc`
+  answers pi's summarization request from a reduced copy (thinking dropped,
+  tool results cut, oldest entries left out).
 - **Constrained tool calls** (`--call-guard`): the engine refuses, while
   sampling, any token that would take a call out of its tool's schema, and
   redraws the position from the same logits. Once `<function=NAME>` names a tool
@@ -411,6 +421,7 @@ Common flags (`ampstein --help` lists them all):
 | `--reasoning-nudge X`, `--reasoning-limit Y` | reasoning budget |
 | `--eos-hook FILE`, `--eos-hook-max N` | end-of-turn policy script |
 | `--call-hook FILE`, `--call-hook-max N` | tool-call policy script (default 3 verdicts per request) |
+| `--prompt-hook FILE`, `--prompt-hook-max N` | prompt policy script (default 3 rounds per request) |
 | `--no-vision`, `--vision-device N` | vision tower control |
 
 ### 6.3 Talk to it

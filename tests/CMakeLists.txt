@@ -135,6 +135,9 @@ amp_test(dflash_draft)
 # call_hook: the --call-hook history extraction and the loop-breaker example policy (no model)
 amp_test(call_hook)
 
+# prompt_hook: the --prompt-hook compaction example policy on a pi-shaped request (no model)
+amp_test(prompt_hook)
+
 # callguard: the --call-guard constrained tool-call tracker on token streams (no model)
 amp_test(callguard)
 

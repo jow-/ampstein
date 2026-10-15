@@ -654,6 +654,19 @@ export function serve(args) {
 		}
 	}
 
+	// prompt policy (--prompt-hook): consulted for every chat request, once rendered
+	let prompt_policy = null;
+
+	if (args.prompt_hook) {
+		try {
+			prompt_policy = loadfile(args.prompt_hook);
+		}
+		catch (e) {
+			warn(`ampstein: cannot load --prompt-hook ${args.prompt_hook}: ${e.message}\n`);
+			exit(1);
+		}
+	}
+
 	let created_at = now_s();
 
 	/* --- helpers ------------------------------------------------------------------ */
@@ -883,35 +896,124 @@ export function serve(args) {
 		// not declare (the model copies a stray one until it crowds the real ones out)
 		let msgs = args.call_guard ? clean_messages(body.messages, tools) : body.messages;
 
-		try {
-			r = render_prompt(msgs, tools, ropts);
-		}
-		catch (e) {
-			return api_error(res, 400, e.message, 'invalid_request_error', null, 'messages');
-		}
+		// Prompt policy (--prompt-hook): every request is shown to the script once
+		// its prompt is rendered (with its size and whether it fits). An array
+		// verdict replaces the request's messages, {messages, tools} either of
+		// them; the prompt is rendered again and the script asked again, up to
+		// --prompt-hook-max rounds. Nothing but the prompt changes: the client sees
+		// the reply of the request it sent.
+		let want = body.max_completion_tokens || body.max_tokens;
 
-		let prefix_ids = encode_prefix(r);
-		let images = null;
+		if (want == null || want > room)
+			want = room;
 
-		if (length(r.images)) {
+		return want;
+	}
+
+	/* --- chat completions ------------------------------------------------------- */
+
+	function chat_completions(req, res, body) {
+		let kw = body.chat_template_kwargs || {};
+		let effort = body.reasoning_effort;
+		let enable_thinking = kw.enable_thinking;
+
+		if (effort != null && (lc('' + effort) == 'none' || lc('' + effort) == 'off'))
+			enable_thinking = false;
+
+		let tools = body.tools;
+
+		if (body.tool_choice == 'none')
+			tools = null;
+
+		let r;
+
+		let ropts = {
+			enable_thinking: enable_thinking,
+			reasoning_effort: kw.reasoning_effort || effort,
+			preserve_thinking: kw.preserve_thinking,
+			clear_thinking: kw.clear_thinking,
+			vision: (GLM || DS) && args.vision && cfg.has_vision
+		};
+
+		// --call-guard: earlier calls are shown without the arguments their tool does
+		// not declare (the model copies a stray one until it crowds the real ones out)
+		let msgs = args.call_guard ? clean_messages(body.messages, tools) : body.messages;
+
+		// Prompt policy (--prompt-hook): when the rendered prompt plus the room the
+		// request asks for does not fit the context, the script may answer with
+		// replacement messages (a compaction request shrunk to fit, say); the prompt
+		// is rendered again and the script asked again, up to --prompt-hook-max
+		// rounds. Nothing but the messages changes: the client sees the reply of
+		// the request it sent.
+		let want = body.max_completion_tokens || body.max_tokens || 0;
+		let prefix_ids, images, gen_ids, prefix_len, turn_at, ids;
+
+		for (let round = 0; ; round++) {
 			try {
-				let embs = map(r.images, (part) => image_embedding(part));
-				let x = expand_images(prefix_ids, prefix_pads(), embs);
-
-				prefix_ids = x.ids;
-				images = x.images;
+				r = render_prompt(msgs, tools, ropts);
 			}
 			catch (e) {
 				return api_error(res, 400, e.message, 'invalid_request_error', null, 'messages');
 			}
+
+			prefix_ids = encode_prefix(r);
+			images = null;
+
+			if (length(r.images)) {
+				try {
+					let embs = map(r.images, (part) => image_embedding(part));
+					let x = expand_images(prefix_ids, prefix_pads(), embs);
+
+					prefix_ids = x.ids;
+					images = x.images;
+				}
+				catch (e) {
+					return api_error(res, 400, e.message, 'invalid_request_error', null, 'messages');
+				}
+			}
+
+			gen_ids = tok.encode(r.gen, true);
+			prefix_len = length(prefix_ids);   // BEFORE extending: ids aliases prefix_ids (L81)
+			turn_at = turn_boundary(r, msgs, tools, ropts, prefix_len, length(r.images) > 0);
+			ids = prefix_ids;     // fresh array (encode / expansion): extend in place
+
+			push(ids, ...gen_ids);
+
+			if (!prompt_policy || round >= args.prompt_hook_max)
+				break;
+
+			let v = null;
+
+			try {
+				v = call(prompt_policy, null, {
+					messages: msgs,
+					tools: tools || [],
+					tokens: length(ids),
+					max_tokens: want,
+					context: eng.max_ctx,
+					limit: eng.max_ctx - 1 - want,   // the prompt size that leaves the asked room
+					fits: length(ids) + want < eng.max_ctx,
+					round: round
+				});
+			}
+			catch (e) {
+				warn(`prompt hook failed: ${e.message}\n`);
+			}
+
+			let nm = (type(v) == 'object') ? v.messages : v;
+
+			if (type(nm) != 'array' && !(type(v) == 'object' && type(v.tools) == 'array'))
+				break;
+
+			warn(`prompt hook: round ${round}, ${length(ids)} tokens, limit ${eng.max_ctx - 1 - want}: ` +
+				`${length(msgs)} -> ${length(nm ?? msgs)} messages\n`);
+
+			if (type(nm) == 'array')
+				msgs = nm;
+
+			if (type(v) == 'object' && type(v.tools) == 'array')
+				tools = v.tools;
 		}
-
-		let gen_ids = tok.encode(r.gen, true);
-		let prefix_len = length(prefix_ids);   // BEFORE extending: ids aliases prefix_ids (L81)
-		let turn_at = turn_boundary(r, msgs, tools, ropts, prefix_len, length(r.images) > 0);
-		let ids = prefix_ids;     // fresh array (encode / expansion): extend in place
-
-		push(ids, ...gen_ids);
 
 		if (length(ids) >= eng.max_ctx)
 			return api_error(res, 400,

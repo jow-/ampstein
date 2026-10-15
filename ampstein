@@ -49,6 +49,7 @@ function usage() {
 	printf("  --reasoning-limit Y   force-close reasoning after Y tokens (default 0 off)\n");
 	printf("  --eos-hook SCRIPT     call SCRIPT when the model ends its turn\n");
 	printf("  --call-hook SCRIPT    call SCRIPT when the model completes a tool call\n");
+	printf("  --prompt-hook SCRIPT  call SCRIPT with each request's prompt (may rewrite messages / tools)\n");
 	printf("  --call-guard          constrain tool calls to the request's tool schemas while sampling\n");
 	printf("  --no-vision           disable image input\n");
 	printf("  --arch ARCH           force architecture: auto|qwen35|glm5|qwen4|dsv4 (default auto)\n");
@@ -110,6 +111,8 @@ function parse_args() {
 		eos_hook_max: 4,
 		call_hook: null,
 		call_hook_max: 3,
+		prompt_hook: null,
+		prompt_hook_max: 3,
 		call_guard: false,
 		name: null,
 		arch: 'auto',
@@ -147,6 +150,8 @@ function parse_args() {
 		case '--eos-hook-max': a.eos_hook_max = int(v); i++; break;
 		case '--call-hook': a.call_hook = v; i++; break;
 		case '--call-hook-max': a.call_hook_max = int(v); i++; break;
+		case '--prompt-hook': a.prompt_hook = v; i++; break;
+		case '--prompt-hook-max': a.prompt_hook_max = int(v); i++; break;
 		case '--call-guard': a.call_guard = true; break;
 		case '--cache-ram': a.cache_ram = +v; i++; break;
 		case '--slots': a.slots = (v == 'auto') ? 'auto' : int(v); i++; break;
