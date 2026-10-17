@@ -1193,6 +1193,24 @@ export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last) {
 	return devs;
 }
 
+/* free / total GiB of every device in use */
+export function mem_report(devs, tag) {
+	let seen = {}, parts = [];
+
+	for (let d in devs) {
+		if (seen[d])
+			continue;
+
+		seen[d] = true;
+
+		let m = torch.mem_info(d);
+
+		push(parts, sprintf('cuda:%d %.1f/%.1f', d, m[2] / 1073741824.0, m[3] / 1073741824.0));
+	}
+
+	warn(`dsv41: ${tag}: free/total GiB ${join(', ', parts)}\n`);
+}
+
 export function load(model_dir, opts) {
 	opts = opts || {};
 
@@ -1247,6 +1265,8 @@ export function load(model_dir, opts) {
 	for (let l in cfg.engram_layers)
 		if (l < nl)
 			engrams[l] = build_engram(ws, cfg, l, devs[l]);
+
+	mem_report(devs, 'layers loaded');
 
 	let embed_t = ws.gpu16('embed.weight', first);
 
@@ -1446,6 +1466,7 @@ export function load(model_dir, opts) {
 
 			// the warm-up and the captures wrote position 0 of every cache: start from empty again
 			model.aux_reset(cache);
+			mem_report(model.devs, 'graphs captured');
 
 			function run_ids(tid, pos) {
 				let b = null;
