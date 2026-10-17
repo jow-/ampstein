@@ -320,17 +320,19 @@ function engram_rows(cfg, meta, E, li, hist_t, T) {
 		meta.pad, uids, inverse, heads);
 	let u = uids.narrow(0, 0, U).contiguous();
 	let dv = 'cuda:' + E.dev;
-	let rw = torch.pinned_empty([U, cfg.engram_dim], 'float8_e4m3fn');
-	let rsc = torch.pinned_empty([U, cfg.engram_dim / 32], 'float8_e8m0fnu');
+	let rw = torch.empty([U, cfg.engram_dim], 'float8_e4m3fn');
+	let rsc = torch.empty([U, cfg.engram_dim / 32], 'float8_e8m0fnu');
 
 	E.file.gather(E.wname, u, rw);
 	E.file.gather(E.sname, u, rsc);
 
-	let ew = rw.cuda(E.dev).to('float32').view([U, cfg.engram_dim / 32, 32]);
-	let es = rsc.cuda(E.dev).to('float32').view([U, cfg.engram_dim / 32, 1]);
+	// non-blocking copies (staged through the caching pinned allocator): the host never waits for the device,
+	// so the chunks of a prefill keep flowing through the pipeline of GPUs
+	let ew = rw.cuda(E.dev, true).to('float32').view([U, cfg.engram_dim / 32, 32]);
+	let es = rsc.cuda(E.dev, true).to('float32').view([U, cfg.engram_dim / 32, 1]);
 	let rows = ew.mul(es).view([U, cfg.engram_dim]).to('float16');
 
-	return rows.index(inverse.cuda(E.dev)).view([T, H * cfg.engram_dim]);
+	return rows.index(inverse.cuda(E.dev, true)).view([T, H * cfg.engram_dim]);
 }
 
 /* streams (T, 4, D) fp32 updated in place */
