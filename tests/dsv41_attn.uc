@@ -87,8 +87,45 @@ for (let c in CHUNKS) {
 
 let nd = total - pos;
 
+// decode steps through the device-position path (what the CUDA graphs capture), capacities of a bucket
+const DECPATH = (getenv('AMP_DSV41_DECPATH') != 0);
+let sts = {};
+
+function run_dec(pos) {
+	let ctx = {topk: null, cand: null};
+	let caps = [ 0, 2048, 1024 ];
+
+	for (let l in LAYERS) {
+		let dev = A[l].dev;
+
+		if (!sts[dev])
+			sts[dev] = dsv41.new_dec_dev(cfg, dev);
+	}
+
+	for (let d in keys(sts))
+		dsv41.dec_set_pos(cfg, sts[d], pos);
+
+	for (let l in LAYERS) {
+		let x = X[l].narrow(0, pos, 1).contiguous().cuda(A[l].dev);
+		let y = dsv41.attn_decode(cfg, A[l], ctx, cache, cache.layers[l], x, sts[A[l].dev], caps);
+
+		push(got[l], y.to('float32').cpu());
+
+		if (A[l].kv_source) {
+			let r = A[l].ratio;
+
+			cache.layers[l].n = int((pos + 1) / r);
+			dsv41.mirror_entry(cache, l, int(pos / r));
+		}
+	}
+}
+
 for (let k = 0; k < nd; k++) {
-	run(pos, 1);
+	if (DECPATH)
+		run_dec(pos);
+	else
+		run(pos, 1);
+
 	pos++;
 }
 

@@ -412,8 +412,10 @@ export function new_layer_cache(cfg, A, max_seq) {
 		cl.pool = torch.zeros([cap, cfg.head_dim], 'float16', dv);
 		cl.kidx = torch.zeros([cap, cfg.index_head_dim], 'float16', dv);
 		cl.n = 0;                       // pool entries written
-		cl.pend_kv = null;              // ratio 2: kv / gate rows of a half-built pair
-		cl.pend_g = null;
+		// ratio 2: the kv / gate rows of the first token of a half-built pair (valid while the next
+		// position is odd); persistent so that graph steps update them in place
+		cl.pk = torch.zeros([1, cfg.head_dim], 'float32', dv);
+		cl.pg = torch.zeros([1, cfg.head_dim], 'float32', dv);
 	}
 
 	return cl;
@@ -475,9 +477,9 @@ function compress_chunk(cfg, A, cl, xn, pos0) {
 		let x32 = xn.to('float32');
 		let kv = torch.matmul(x32, C.wkv), g = torch.matmul(x32, C.wgate);
 
-		if (cl.pend_kv) {
-			kv = torch.cat([cl.pend_kv, kv], 0);
-			g = torch.cat([cl.pend_g, g], 0);
+		if (pos0 % 2 == 1) {                          // the first token of the pair came with the last chunk
+			kv = torch.cat([cl.pk, kv], 0);
+			g = torch.cat([cl.pg, g], 0);
 			base = pos0 - 1;
 		}
 		else {
@@ -488,12 +490,8 @@ function compress_chunk(cfg, A, cl, xn, pos0) {
 		let usable = total - total % 2;
 
 		if (usable < total) {
-			cl.pend_kv = kv.narrow(0, usable, 1).contiguous();
-			cl.pend_g = g.narrow(0, usable, 1).contiguous();
-		}
-		else {
-			cl.pend_kv = null;
-			cl.pend_g = null;
+			cl.pk.copy_(kv.narrow(0, usable, 1));
+			cl.pg.copy_(g.narrow(0, usable, 1));
 		}
 
 		if (usable == 0)
@@ -734,6 +732,208 @@ export function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
 	let y = A.wo_a.forward(o.view([T, H * D]));
 
 	return A.wo_b.forward(y);
+}
+
+/* ------------------------------------------------------------------ */
+/* decode with device-side positions (CUDA graphs)                     */
+/*
+ * Everything that depends on the position is read from the device (st.meta), the shapes depend only on
+ * the capacities of the graph's bucket: the pool of a ratio-1 source is read up to caps[1] entries (a
+ * ratio-2 one up to caps[2]); entries past the position are masked by the indexer, the half-built pair of
+ * the ratio-2 compressors is handled without branches (the pooled row is written every step, to the slot
+ * of the pair: on even positions it is not visible yet, on odd ones it is right).
+ */
+
+export function new_dec_dev(cfg, dev) {
+	return {dev: dev, meta: torch.zeros([8], 'int64', 'cuda:' + dev)};
+}
+
+/* meta: [pos, pos % ring, pos / 2, 2 * (pos / 2), pos / candidate block, 0, 0, 0] */
+export function dec_set_pos(cfg, st, pos) {
+	st.meta.copy_(torch.from_array([pos, pos % RING, int(pos / 2), 2 * int(pos / 2),
+		int(pos / cfg.candidate_block_size), 0, 0, 0], 'int64'));
+}
+
+function meta_i(st, k) {
+	return st.meta.narrow(0, k, 1);
+}
+
+function meta_f(st, k) {
+	return st.meta.narrow(0, k, 1).to('float32');
+}
+
+/* cos / sin (1, 1, rd/2, 1) of the position pos_f (1) fp32 */
+function rope_cs_dev(inv_freq, pos_f) {
+	let h = inv_freq.shape()[0];
+	let ang = pos_f.view([1, 1]).mul(inv_freq.view([1, h]));
+
+	return [ang.cos().view([1, 1, h, 1]), ang.sin().view([1, 1, h, 1])];
+}
+
+/* the pool of source layer src on dev for graph bodies (a mirror is created by the warm-up run) */
+function pool_dec(cache, src, dev) {
+	let P = cache.pools[src];
+
+	if (P.owner.dev == dev)
+		return P.owner;
+
+	for (let m in P.mirrors)
+		if (m.dev == dev)
+			return m;
+
+	return pool_for(cache, src, dev);
+}
+
+/* host side, between graph replays: bring the entry j of the owner's pool and index keys to the mirrors */
+export function mirror_entry(cache, src, j) {
+	let P = cache.pools[src], cl = P.owner;
+
+	for (let m in P.mirrors) {
+		m.pool.narrow(0, j, 1).copy_(cl.pool.narrow(0, j, 1));
+		m.kidx.narrow(0, j, 1).copy_(cl.kidx.narrow(0, j, 1));
+	}
+}
+
+/* one token into the compressor of a kv source layer; writes the pool and index key of its slot */
+function comp_decode(cfg, A, cl, xn, st) {
+	let C = A.comp, ratio = A.ratio;
+	let rd = cfg.rope_dim, eps = cfg.rms_norm_eps;
+	let lat, posf, slot;
+
+	if (ratio == 1) {
+		lat = torch.rms_norm(torch.matmul(xn, C.wkv16), C.norm, eps);
+		posf = meta_f(st, 0);
+		slot = meta_i(st, 0);
+	}
+	else {
+		let x32 = xn.to('float32');
+		let kv = torch.matmul(x32, C.wkv), g = torch.matmul(x32, C.wgate);
+		let m = torch.cat([cl.pg, g], 0).max(0, true);
+		let e0 = cl.pg.sub(m).exp(), e1 = g.sub(m).exp();
+		let pooled = cl.pk.mul(e0).add(kv.mul(e1)).div(e0.add(e1));
+
+		cl.pk.copy_(kv);
+		cl.pg.copy_(g);
+		lat = torch.rms_norm(pooled.to('float16').contiguous(), C.norm, eps);
+		posf = meta_f(st, 3);
+		slot = meta_i(st, 2);
+	}
+
+	let cs = rope_cs_dev(A.inv_freq, posf);
+	let I = A.indexer;
+
+	if (I && I.owns_k) {
+		let k = torch.rms_norm(torch.matmul(lat, I.wk_t), I.k_norm, eps);
+
+		cl.kidx.index_copy_(0, slot, rope_il(k.to('float32').view([1, 1, cfg.index_head_dim]), cs, rd).to('float16')
+			.view([1, cfg.index_head_dim]));
+	}
+
+	cl.pool.index_copy_(0, slot, rope_il(lat.to('float32').view([1, 1, cfg.head_dim]), cs, rd).to('float16')
+		.view([1, cfg.head_dim]));
+}
+
+/* the picks of the indexer for the one token: (1, k) int32 over the first Scap pool entries */
+function index_picks_dec(cfg, A, ctx, cache, xn, qr, st, Scap, src) {
+	let I = A.indexer, ratio = A.ratio;
+	let dv = 'cuda:' + A.dev;
+	let Hi = cfg.index_n_heads, Di = cfg.index_head_dim, rd = cfg.rope_dim;
+	let pc = pool_dec(cache, src, A.dev);
+	let qi = I.wq_b.forward(qr).view([1, Hi, Di]);
+	let cs = rope_cs_dev(A.inv_freq, meta_f(st, 0));
+	let q16 = rope_il(qi.to('float32'), cs, rd).to('float16').contiguous();
+	let w = torch.matmul(xn.to('float32'), I.w_t).contiguous();
+	let sc = torch.idx_score(q16, pc.kidx.narrow(0, 0, Scap), w, math.pow(Di * 1.0, -0.5) * math.pow(Hi * 1.0, -0.5),
+		meta_i(st, 0), ratio);
+	let bs = cfg.candidate_block_size;
+
+	if (Scap > cfg.candidate_blocks * bs && cfg.candidate_source >= 0) {
+		let nb = int((Scap + bs - 1) / bs);
+
+		if (A.idx == cfg.candidate_source) {
+			let pad = nb * bs - Scap;
+			let s2 = (pad > 0) ? torch.cat([sc, torch.full([1, pad], NEGH, 'float16', dv)], 1) : sc;
+			let bsc = s2.view([1, nb, bs]).max(2).to('float32');
+			let hit = torch.arange(nb, 'int64', dv).view([1, nb]).le(meta_i(st, 4).view([1, 1])).to('int32')
+				.mul(meta_i(st, 4).view([1, 1]).le(torch.arange(nb, 'int64', dv).view([1, nb])).to('int32'));
+
+			bsc = torch.where(hit.le(0), bsc, torch.full([1], 1.0e30, 'float32', dv));
+
+			let top = bsc.topk(min(cfg.candidate_blocks, nb), -1);
+
+			ctx.cand = {dev: A.dev,
+				src: torch.where(top.values.le(NEGH), torch.full([1], -1, 'int64', dv), top.indices)};
+		}
+		else if (A.idx > cfg.candidate_source && ctx.cand) {
+			let ck = 'd' + A.dev;
+			let cb = ctx.cand[ck];
+
+			if (cb == null)
+				cb = ctx.cand[ck] = (ctx.cand.dev == A.dev) ? ctx.cand.src : ctx.cand.src.cuda(A.dev);
+
+			let k = cb.shape()[1];
+			let flat = torch.where(cb.le(-1), torch.full([1], nb, 'int64', dv), cb).reshape([-1]);
+			let m = torch.zeros([nb + 1], 'float16', dv);
+
+			m.index_copy_(0, flat, torch.ones([k], 'float16', dv));
+
+			let mm = m.narrow(0, 0, nb).view([nb, 1]).expand([nb, bs]).reshape([1, nb * bs]).narrow(1, 0, Scap);
+
+			sc = torch.where(mm.le(0.0), torch.full([1], NEGH, 'float16', dv), sc);
+		}
+	}
+
+	let tk = sc.topk(min(cfg.index_topk, Scap), -1);
+
+	return torch.where(tk.values.le(NEGH), torch.full([1], -1, 'int64', dv), tk.indices).to('int32');
+}
+
+/* attention of one token at the device position; xn (1, D) fp16 */
+export function attn_decode(cfg, A, ctx, cache, cl, xn, st, caps) {
+	let H = cfg.num_q_heads, D = cfg.head_dim, rd = cfg.rope_dim;
+	let eps = cfg.rms_norm_eps;
+	let dev = A.dev;
+	let ratio = A.ratio;
+
+	let qr = torch.rms_norm(A.q_a.forward(xn), A.q_norm, eps);
+	let q = A.q_b.forward(qr).view([1, H, D]);
+	let cs = rope_cs_dev(A.inv_freq, meta_f(st, 0));
+	let q16 = rope_il(q.to('float32'), cs, rd).to('float16').contiguous();
+	let kv = torch.rms_norm(A.wkv.forward(xn), A.kv_norm, eps);
+	let kv16 = rope_il(kv.to('float32').view([1, 1, D]), cs, rd).to('float16').view([1, D]).contiguous();
+
+	cl.ring.index_copy_(0, meta_i(st, 1), kv16);
+
+	let pool = null, idx = null;
+
+	if (ratio > 0) {
+		let src = cfg.src[A.idx];
+		let Scap = caps[ratio];
+
+		if (A.kv_source)
+			comp_decode(cfg, A, cl, xn, st);
+
+		if (A.idx_source) {
+			idx = index_picks_dec(cfg, A, ctx, cache, xn, qr, st, Scap, src);
+			ctx.topk = {dev: dev, t: idx};
+		}
+		else if (ctx.topk) {
+			let ck = 'd' + dev;
+
+			if (ctx.topk[ck] == null)
+				ctx.topk[ck] = (ctx.topk.dev == dev) ? ctx.topk.t : ctx.topk.t.cuda(dev);
+
+			idx = ctx.topk[ck];
+		}
+
+		if (idx)
+			pool = pool_dec(cache, src, dev).pool.narrow(0, 0, Scap);
+	}
+
+	let o = torch.v41_attn(q16, cl.ring, 0, pool, idx, A.sinks, A.inv_freq, 0, cfg.sm_scale, cfg.window, 0,
+		meta_i(st, 0), RING);
+
+	return A.wo_b.forward(A.wo_a.forward(o.view([1, H * D])));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1068,7 +1268,8 @@ export function load(model_dir, opts) {
 			for (let cl in cache.layers) {
 				let n = min(cache.length, W);
 
-				push(out, {n: cl.n, pk: cl.pend_kv, pg: cl.pend_g,
+				push(out, {n: cl.n, pk: (cl.pk && cache.length % 2 == 1) ? cl.pk.add(0.0) : null,
+					pg: (cl.pk && cache.length % 2 == 1) ? cl.pg.add(0.0) : null,
 					kw: n > 0 ? ring_rows(cl, cache.length - n, cache.length).add(0.0) : null});
 			}
 
@@ -1081,8 +1282,11 @@ export function load(model_dir, opts) {
 
 				if (this.layers[i].attn.kv_source) {
 					cl.n = v.n;
-					cl.pend_kv = v.pk;
-					cl.pend_g = v.pg;
+
+					if (v.pk) {
+						cl.pk.copy_(v.pk);
+						cl.pg.copy_(v.pg);
+					}
 				}
 
 				if (v.kw)
@@ -1092,10 +1296,8 @@ export function load(model_dir, opts) {
 
 		aux_reset: function (cache) {
 			for (let cl in cache.layers) {
-				if (cl.pool) {
+				if (cl.pool)
 					cl.n = 0;
-					cl.pend_kv = cl.pend_g = null;
-				}
 			}
 
 			cache.cids = [];
