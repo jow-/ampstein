@@ -129,6 +129,30 @@ export function load_config(model_dir) {
 	return cfg;
 }
 
+/* AMP_DSV41_PROF=1: accumulate the time of the phases of the eager path (synchronizes between them) */
+export let PROFILE = {};
+let prof_t = 0;
+
+function prof_now() {
+	let c = clock(true);
+
+	return c[0] * 1000.0 + c[1] / 1e6;
+}
+
+function prof(name) {
+	if (!PROF)
+		return;
+
+	torch.synchronize();
+
+	let t = prof_now();
+
+	if (name != null)
+		PROFILE[name] = (PROFILE[name] || 0) + (t - prof_t);
+
+	prof_t = t;
+}
+
 /* ------------------------------------------------------------------ */
 /* linears                                                             */
 
@@ -580,6 +604,11 @@ function pool_for(cache, src, dev) {
 /* ------------------------------------------------------------------ */
 /* indexer                                                             */
 
+/* device index of a 'cuda:N' string */
+function devidx(dv) {
+	return +substr(dv, 5);
+}
+
 /* Candidate source layer: per query keep the candidate_blocks highest-scoring blocks of
  * candidate_block_size pool rows (a block scores by its best row; the block of the newest visible
  * row is always kept). sc (R, S) fp16 for the rows pos0 .. pos0 + R - 1. Returns (R, k) int64 block
@@ -598,7 +627,7 @@ function candidate_blocks(cfg, sc, pos0, ratio, dv) {
 	for (let r = 0; r < R; r++)
 		push(lbl, int((pos0 + r) / bs));
 
-	let lb = torch.from_array(lbl, 'int64', dv).view([R, 1]);
+	let lb = torch.from_array(lbl, 'int64').cuda(devidx(dv), true).view([R, 1]);
 	let ar = torch.arange(nb, 'int64', dv).view([1, nb]);
 	let hit = ar.le(lb).to('int32').mul(lb.le(ar).to('int32'));
 
@@ -619,7 +648,7 @@ function apply_candidates(cfg, sc, blocks, dv) {
 	for (let r = 0; r < R; r++)
 		push(ro, r * nb);
 
-	let rowoff = torch.from_array(ro, 'int64', dv).view([R, 1]);
+	let rowoff = torch.from_array(ro, 'int64').cuda(devidx(dv), true).view([R, 1]);
 	let dummy = torch.full([1], R * nb, 'int64', dv);
 	let flat = torch.where(blocks.le(-1), dummy, blocks.add(rowoff)).reshape([-1]);
 	let m = torch.zeros([R * nb + 1], 'float16', dv);
@@ -695,12 +724,22 @@ export function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
 	let dev = A.dev;
 	let ratio = A.ratio;
 
+	prof(null);
+
 	let qr = torch.rms_norm(A.q_a.forward(xn), A.q_norm, eps);
 	let q = A.q_b.forward(qr).view([T, H, D]);
+
+	prof('a.qproj');
+
 	let cs = rope_cs(A.inv_freq, pos0, T, 1, dev);
 	let q16 = rope_il(q.to('float32'), cs, rd).to('float16').contiguous();
+
+	prof('b.qrope');
+
 	let kv = torch.rms_norm(A.wkv.forward(xn), A.kv_norm, eps);
 	let kv16 = rope_il(kv.to('float32').view([T, 1, D]), cs, rd).to('float16').view([T, D]).contiguous();
+
+	prof('c.kv');
 
 	// window keys: the previous (window - 1) rows from the ring plus this chunk
 	let h = min(pos0, cfg.window - 1);
@@ -716,8 +755,12 @@ export function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
 		if (A.kv_source)
 			compress_chunk(cfg, A, cl, xn, pos0);
 
+		prof('d.compress');
+
 		if (A.idx_source) {
 			idx = index_picks(cfg, A, ctx, cache, xn, qr, pos0, src);
+
+			prof('e.index');
 			ctx.topk = idx ? {dev: dev, t: idx} : null;
 		}
 		else if (ctx.topk) {
@@ -738,9 +781,18 @@ export function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
 	}
 
 	let o = torch.v41_attn(q16, kvw, pos0 - h, pool, idx, A.sinks, A.inv_freq, pos0, cfg.sm_scale, cfg.window);
+
+	prof('f.attn');
+
 	let y = A.wo_a.forward(o.view([T, H * D]));
 
-	return A.wo_b.forward(y);
+	prof('g.wo_a');
+
+	y = A.wo_b.forward(y);
+
+	prof('h.wo_b');
+
+	return y;
 }
 
 /* ------------------------------------------------------------------ */
@@ -760,7 +812,7 @@ export function new_dec_dev(cfg, dev) {
 /* meta: [pos, pos % ring, pos / 2, 2 * (pos / 2), pos / candidate block, 0, 0, 0] */
 export function dec_set_pos(cfg, st, pos) {
 	st.meta.copy_(torch.from_array([pos, pos % RING, int(pos / 2), 2 * int(pos / 2),
-		int(pos / cfg.candidate_block_size), 0, 0, 0], 'int64'));
+		int(pos / cfg.candidate_block_size), 0, 0, 0], 'int64').cuda(st.dev, true));
 }
 
 function meta_i(st, k) {
@@ -1510,7 +1562,7 @@ export function load(model_dir, opts) {
 
 				push(cache.cids, cn);
 
-				let h = model.embed_tokens.index(torch.from_array([ tid ], 'int64', 'cuda:' + first)).to('float32')
+				let h = model.embed_tokens.index(torch.from_array([ tid ], 'int64').cuda(first, true)).to('float32')
 					.reshape([1, 1, H]).expand([1, 4, H]).contiguous();
 				let pre = null, logits = null;
 
