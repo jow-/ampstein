@@ -1234,11 +1234,8 @@ export function pool_bytes(cfg, src, max_seq) {
 	return (int(max_seq / cfg.ratios[src]) + 2) * (cfg.head_dim + cfg.index_head_dim) * 2;
 }
 
-/* Contiguous layer ranges for ngpu devices that minimize the fullest device: checkpoint bytes of the
- * layers (the embedding on the first device, the head on the last) plus the pools it must hold (its
- * own source layers' and a mirror of every pool its layers read from another device). Returns the
- * per-layer device array. */
-export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last) {
+/* checkpoint bytes of every layer (the Engram tables excluded) */
+function layer_bytes(ws, cfg) {
 	let nl = cfg.num_hidden_layers;
 	let bytes = [];
 
@@ -1254,27 +1251,44 @@ export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last) {
 		}
 	}
 
-	function cost(a, b) {                            // layers [a, b) on one device
-		let c = 0, own = {}, mir = {};
+	return bytes;
+}
 
-		for (let i = a; i < b; i++) {
-			c += bytes[i];
+/* bytes of layers [a, b) on one device: weights, the pools of its source layers and a mirror of every pool
+ * its layers read from another device */
+function seg_cost(cfg, bytes, a, b, max_seq) {
+	let c = 0, own = {}, mir = {};
 
-			if (index(cfg.kv_sources, i) >= 0)
-				own[i] = true;
-		}
+	for (let i = a; i < b; i++) {
+		c += bytes[i];
 
-		for (let i = a; i < b; i++)
-			if (cfg.src[i] >= 0 && !own[cfg.src[i]])
-				mir[cfg.src[i]] = true;
+		if (index(cfg.kv_sources, i) >= 0)
+			own[i] = true;
+	}
 
-		for (let k in keys(own))
-			c += pool_bytes(cfg, +k, max_seq);
+	for (let i = a; i < b; i++)
+		if (cfg.src[i] >= 0 && !own[cfg.src[i]])
+			mir[cfg.src[i]] = true;
 
-		for (let k in keys(mir))
-			c += pool_bytes(cfg, +k, max_seq);
+	for (let k in keys(own))
+		c += pool_bytes(cfg, +k, max_seq);
 
-		return c + (a == 0 ? (extra_first || 0) : 0) + (b == nl ? (extra_last || 0) : 0);
+	for (let k in keys(mir))
+		c += pool_bytes(cfg, +k, max_seq);
+
+	return c;
+}
+
+/* Contiguous layer ranges for ngpu devices that minimize the fullest device: checkpoint bytes of the
+ * layers (the head on the last device, extra_last for its working set) plus the pools it must hold. The
+ * embedding table goes to the least loaded device afterwards (embed_device). Returns the per-layer
+ * device array. */
+export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last) {
+	let nl = cfg.num_hidden_layers;
+	let bytes = layer_bytes(ws, cfg);
+
+	function cost(a, b) {
+		return seg_cost(cfg, bytes, a, b, max_seq) + (a == 0 ? (extra_first || 0) : 0) + (b == nl ? (extra_last || 0) : 0);
 	}
 
 	// best[d][i]: smallest possible maximum over d devices holding the first i layers
@@ -1321,6 +1335,34 @@ export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last) {
 	return devs;
 }
 
+/* the device with the fewest bytes planned (weights + pools; the head's device counts its head): where the
+ * embedding table lives. The lookup is one row per token, wherever it is. */
+export function embed_device(ws, cfg, devs, max_seq, head_bytes) {
+	let bytes = layer_bytes(ws, cfg);
+	let nl = cfg.num_hidden_layers;
+	let load = {}, best = devs[0], bl = 1e30;
+
+	for (let i = 0; i < nl; i++) {
+		let a = i;
+
+		while (a > 0 && devs[a - 1] == devs[i])
+			a--;
+
+		if (a == i)
+			load[devs[i]] = seg_cost(cfg, bytes, i, (function () { let e = i; while (e < nl && devs[e] == devs[i]) e++; return e; })(), max_seq);
+	}
+
+	load[devs[nl - 1]] += head_bytes || 0;
+
+	for (let d in keys(load))
+		if (load[d] < bl) {
+			bl = load[d];
+			best = +d;
+		}
+
+	return best;
+}
+
 /* free / total GiB of every device in use */
 export function mem_report(devs, tag) {
 	let seen = {}, parts = [];
@@ -1356,9 +1398,10 @@ export function load(model_dir, opts) {
 	}
 
 	if (type(devs) != 'array')
-		devs = plan_devices(ws, cfg, devs, opts.max_seq || 262144, 1400000000, 2000000000);
+		devs = plan_devices(ws, cfg, devs, opts.max_seq || 262144, 0, 2000000000);
 
 	let first = devs[0], last = devs[nl - 1];
+	let ed = (opts.embed_dev != null) ? opts.embed_dev : embed_device(ws, cfg, devs, opts.max_seq || 262144, 1300000000);
 
 	glm5.set_fused_rows(max(256, opts.prefill_rows || 1024));
 
@@ -1375,7 +1418,7 @@ export function load(model_dir, opts) {
 		}
 
 		if (key == 'embed.weight')
-			return first;
+			return ed;
 
 		if (key == 'head.weight' || key == 'norm.weight')
 			return last;
@@ -1396,16 +1439,16 @@ export function load(model_dir, opts) {
 
 	mem_report(devs, 'layers loaded');
 
-	let embed_t = ws.gpu16('embed.weight', first);
+	let embed_t = ws.gpu16('embed.weight', ed);
 
-	ws.release('embed.weight', first);
+	ws.release('embed.weight', ed);
 
 	let lm_head = models.linear(ws, 'head', false, last);
 
 	ws.release('head.weight', last);               // lm_head holds the fp16 copy
 
 	let model = {
-		cfg: cfg, devs: devs, ws: ws, layers: layers, engrams: engrams, meta: meta, embed_tokens: embed_t,
+		cfg: cfg, devs: devs, ws: ws, layers: layers, engrams: engrams, meta: meta, embed_tokens: embed_t, embed_dev: ed,
 		norm: ws.gpu16('norm.weight', last),
 		lm_head: lm_head,
 
@@ -1451,8 +1494,12 @@ export function load(model_dir, opts) {
 			for (let c in cn)
 				push(cache.cids, c);
 
-			let h = this.embed_tokens.index(idt.cuda(first, true)).to('float32')
-				.reshape([T, 1, H]).expand([T, 4, H]).contiguous();
+			let h = this.embed_tokens.index(idt.cuda(ed, true));
+
+			if (ed != first)
+				h = h.cuda(first);
+
+			h = h.to('float32').reshape([T, 1, H]).expand([T, 4, H]).contiguous();
 			let pre = torch.zeros([T, 4], 'float32', 'cuda:' + first);
 
 			pre.narrow(1, 0, 1).fill_(1.0);
@@ -1672,8 +1719,12 @@ export function load(model_dir, opts) {
 				if (PROF)
 					PROFILE['dec.engram_host'] = (PROFILE['dec.engram_host'] || 0) + prof_now() - tpp;
 
-				let h = model.embed_tokens.index(torch.from_array([ tid ], 'int64').cuda(first, true)).to('float32')
-					.reshape([1, 1, H]).expand([1, 4, H]).contiguous();
+				let h = model.embed_tokens.index(torch.from_array([ tid ], 'int64').cuda(ed, true));
+
+				if (ed != first)
+					h = h.cuda(first);
+
+				h = h.to('float32').reshape([1, 1, H]).expand([1, 4, H]).contiguous();
 				let pre = null, logits = null;
 
 				let tp0 = PROF ? prof_now() : 0;
