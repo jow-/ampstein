@@ -165,6 +165,8 @@ amp_test(skinny)
 amp_test(fp8_ops)
 # v41_attn: DeepSeek-V4.1 sparse MQA attention kernel
 amp_test(v41_attn)
+# moe_mixed: fused decode MoE with mixed bit widths per expert
+amp_test(moe_mixed)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)
 amp_test(glm5_chat)
 # glm5_blocks: mHC dense blocks vs the oracle

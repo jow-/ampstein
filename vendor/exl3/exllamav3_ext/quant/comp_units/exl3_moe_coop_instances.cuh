@@ -26,6 +26,10 @@ EXL3_MOE_COOP_INST_DECL(8)
 
 #undef EXL3_MOE_COOP_INST_DECL
 
+// Dynamic bit widths (exl3_moe_coop_inst_dyn.cu, ampstein patch), mul1 codebook only
+MoeCoopKernel exl3_moe_coop_kernel_a_dyn(int Hi, bool wide);
+MoeCoopKernel exl3_moe_coop_kernel_b_dyn(bool wide);
+
 // Half-integer rates K + 0.5 (exl3_moe_coop_inst_h{K}.cu), mul1 codebook only
 #define EXL3_MOE_COOP_INST_DECL_H(K) \
     MoeCoopKernel exl3_moe_coop_kernel_a_h##K(int Hi, bool wide); \

@@ -13,3 +13,10 @@ invariant 3). Re-apply after any vendor refresh.
 2. `exllamav3_ext/ngram.cu`, `ple.cu` — removed the pybind11 include, the
    `namespace py = pybind11;` alias and the `py::gil_scoped_release`
    statements (no Python in the host process; math untouched).
+
+3. `exllamav3_ext/quant/exl3_moe_coop*.cu*`, `comp_units/exl3_moe_coop_inst_dyn.cu` — mixed bit widths per
+   expert for the fused decode MoE (the DeepSeek-V4.1 SAGE packs mix K = 1..6 inside one layer).
+   `MoeCoopParams` gets `g_bits / u_bits / d_bits` (uint8, one entry per local expert); when all three are
+   set the launcher picks the `bits == 0` kernel instances, whose blocks switch on the expert's width and
+   run the unchanged static `gemv_tile<K, mul1, WIDE>` body of that width. The static-K kernels and
+   their numerics are untouched; `exl3_moe_coop` takes the three tables as optional trailing arguments.

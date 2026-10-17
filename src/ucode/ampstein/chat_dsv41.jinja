@@ -1,0 +1,112 @@
+{#- DeepSeek-V4.1 chat template for ampstein's transpiler: the rendering half of DeepSeek's
+    encoding/encoding.py. chat_dsv41.uc (prepare) normalizes the messages first: tool results are merged
+    into user turns as content_blocks (ordered by the tool calls), top-level tools are attached to the
+    leading system message (a new empty one when there is none).
+    Options: thinking_mode "thinking" | "chat" (or enable_thinking), drop_thinking (default true),
+    reasoning_effort (int in [1, 100], or "low" / "medium" / "high" / "max"; default "high"). -#}
+{%- set IMG = "<｜deepseek_image｜>" -%}
+{%- set DSML = "｜DSML｜" -%}
+{%- if thinking_mode is defined -%}
+  {%- set mode = thinking_mode -%}
+{%- elif enable_thinking is defined and enable_thinking is not none and not enable_thinking -%}
+  {%- set mode = "chat" -%}
+{%- else -%}
+  {%- set mode = "thinking" -%}
+{%- endif -%}
+{%- if mode not in ["chat", "thinking"] -%}{{- raise_exception("thinking_mode must be \"chat\" or \"thinking\"") -}}{%- endif -%}
+{%- set drop = drop_thinking if drop_thinking is defined else true -%}
+{%- set effort = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else "high" -%}
+{%- set effort_map = {"low": 50, "medium": 62, "high": 75, "max": 100} -%}
+{%- if effort is string and effort in effort_map -%}
+  {%- set budget = effort_map[effort] -%}
+{%- elif effort is integer and effort >= 1 and effort <= 100 -%}
+  {%- set budget = effort -%}
+{%- else -%}
+  {{- raise_exception("Invalid reasoning effort, should be an int within [1,100] or one of low, medium, high, max") -}}
+{%- endif -%}
+{%- set thinking = mode == "thinking" -%}
+
+{%- macro render_tools(tool_list) -%}
+  {{- "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n" -}}
+  {%- for tool in tool_list -%}
+    {%- if tool.function is defined -%}
+      {{- tool.function | tojson -}}
+    {%- else -%}
+      {{- tool | tojson -}}
+    {%- endif -%}
+    {%- if not loop.last -%}{{- "\n" -}}{%- endif -%}
+  {%- endfor -%}
+  {{- "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n" -}}
+{%- endmacro -%}
+
+{#- Mid-conversation system messages count as user turns. Tools anywhere disable drop_thinking. -#}
+{%- set state = namespace(last_user=-1, has_tools=false) -%}
+{%- for m in messages -%}
+  {%- if m.role == "user" or (m.role == "system" and loop.index0 > 0) -%}{%- set state.last_user = loop.index0 -%}{%- endif -%}
+  {%- if m.tools is defined and m.tools -%}{%- set state.has_tools = true -%}{%- endif -%}
+{%- endfor -%}
+{%- set effective_drop = drop and not state.has_tools -%}
+
+{{- "<｜begin▁of▁sentence｜>" -}}
+{%- for m in messages -%}
+  {%- set idx = loop.index0 -%}
+  {%- if idx == 0 -%}
+    {%- if thinking or m.role == "system" -%}{{- "<｜System｜>" -}}{%- endif -%}
+    {%- if thinking -%}{{- "Reasoning Effort: " ~ budget ~ " (range 1-100, the higher the value, the more thorough the reasoning)\n\n" -}}{%- endif -%}
+  {%- endif -%}
+
+  {%- if m.role == "system" -%}
+    {%- if idx > 0 -%}{{- "<｜System｜>" -}}{%- endif -%}
+    {{- m.content | default("", true) -}}
+    {%- if m.tools is defined and m.tools -%}{{- "\n\n" ~ render_tools(m.tools) -}}{%- endif -%}
+
+  {%- elif m.role == "user" -%}
+    {{- "<｜User｜>" -}}
+    {%- set up = namespace(s="", n=0) -%}
+    {%- for b in m.content_blocks -%}
+      {%- if b.type == "text" -%}
+        {%- set up.s = up.s ~ ("\n\n" if up.n > 0 else "") ~ b.text -%}
+        {%- set up.n = up.n + 1 -%}
+      {%- elif b.type == "image" -%}
+        {%- set up.s = up.s ~ ("\n\n" if up.n > 0 else "") ~ IMG -%}
+        {%- set up.n = up.n + 1 -%}
+      {%- elif b.type == "tool_result" -%}
+        {%- set up.s = up.s ~ ("\n\n" if up.n > 0 else "") ~ "<tool_result>" ~ b.content ~ "</tool_result>" -%}
+        {%- set up.n = up.n + 1 -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {{- up.s -}}
+
+  {%- elif m.role == "assistant" -%}
+    {%- if thinking and (not effective_drop or idx > state.last_user) -%}
+      {{- (m.reasoning_content if m.reasoning_content is defined and m.reasoning_content is not none else (m.thinking | default("", true))) ~ "</think>" -}}
+    {%- endif -%}
+    {{- m.content | default("", true) -}}
+    {%- if m.tool_calls is defined and m.tool_calls -%}
+      {{- "\n\n<" ~ DSML ~ " calls>\n" -}}
+      {%- for tc in m.tool_calls -%}
+        {%- set fn = tc.function -%}
+        {{- "<" ~ DSML ~ " invoke name=\"" ~ fn.name ~ "\">\n" -}}
+        {%- if fn.arguments is mapping -%}
+          {%- for k, v in fn.arguments.items() -%}
+            {{- "<" ~ DSML ~ " parameter name=\"" ~ k ~ "\" string=\"" ~ ("true" if v is string else "false") ~ "\">" ~ (v if v is string else v | tojson) ~ "</" ~ DSML ~ " parameter>\n" -}}
+          {%- endfor -%}
+        {%- else -%}
+          {{- "<" ~ DSML ~ " parameter name=\"arguments\" string=\"true\">" ~ fn.arguments ~ "</" ~ DSML ~ " parameter>\n" -}}
+        {%- endif -%}
+        {{- "</" ~ DSML ~ " invoke>" -}}
+        {%- if not loop.last -%}{{- "\n" -}}{%- endif -%}
+      {%- endfor -%}
+      {{- "\n</" ~ DSML ~ " calls>" -}}
+    {%- endif -%}
+    {{- "<｜end▁of▁sentence｜>" -}}
+
+  {%- else -%}
+    {{- raise_exception("Unknown role: " ~ m.role) -}}
+  {%- endif -%}
+
+  {#- the transition into the next assistant turn, when one follows (the driver appends the final one) -#}
+  {%- if not loop.last and messages[idx + 1].role == "assistant" and (m.role == "user" or (m.role == "system" and idx > 0)) -%}
+    {{- "<｜Assistant｜>" ~ ("<think>" if thinking and (not effective_drop or idx >= state.last_user) else "</think>") -}}
+  {%- endif -%}
+{%- endfor -%}

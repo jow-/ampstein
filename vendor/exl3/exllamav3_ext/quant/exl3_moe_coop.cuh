@@ -39,6 +39,11 @@ struct MoeCoopParams
     const int64_t* g_trellis;   const int64_t* g_suh;   const int64_t* g_svh;
     const int64_t* u_trellis;   const int64_t* u_suh;   const int64_t* u_svh;
     const int64_t* d_trellis;   const int64_t* d_suh;   const int64_t* d_svh;
+    // Per-expert bit widths (uint8 device arrays indexed by local expert; ampstein patch): when set the
+    // dynamic-K kernels run and every matrix is decoded at its own width (mixed-K packs)
+    const uint8_t* g_bits;
+    const uint8_t* u_bits;
+    const uint8_t* d_bits;
     const int64_t* g_bias;      // nullable
     const int64_t* u_bias;
     const int64_t* d_bias;
@@ -148,7 +153,10 @@ void exl3_moe_coop
     at::Tensor& ctr,
     at::Tensor& out,
     const c10::optional<at::Tensor>& sh_out,
-    const c10::optional<at::Tensor>& sh_gate_w
+    const c10::optional<at::Tensor>& sh_gate_w,
+    const c10::optional<at::Tensor>& bits_g = c10::nullopt,
+    const c10::optional<at::Tensor>& bits_u = c10::nullopt,
+    const c10::optional<at::Tensor>& bits_d = c10::nullopt
 );
 
 // Length of the int32 scratch for a module: completion counters + run table (slots_max =

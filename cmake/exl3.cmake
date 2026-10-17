@@ -69,6 +69,8 @@ foreach(h RANGE 1 3)
     list(APPEND EXL3_KERNEL_SRCS
         ${EXL3_DIR}/quant/comp_units/exl3_moe_coop_inst_h${h}.cu)
 endforeach()
+# mixed bit widths per expert (ampstein patch, see vendor/exl3/PATCHES.md)
+list(APPEND EXL3_KERNEL_SRCS ${EXL3_DIR}/quant/comp_units/exl3_moe_coop_inst_dyn.cu)
 
 # --- mHC mixing (GLM-5.3)
 list(APPEND EXL3_KERNEL_SRCS ${EXL3_DIR}/hc_mix.cu)

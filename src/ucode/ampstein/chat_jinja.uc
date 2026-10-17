@@ -158,6 +158,15 @@ export function make_renderer(tpl, opts) {
 			}
 		}
 
+		/* model-specific normalization of the message list (DeepSeek-V4.1 merges tool results into
+		 * user turns) */
+		if (opts.prepare) {
+			let pr = opts.prepare(msgs, tools, ropts);
+
+			msgs = pr.messages;
+			tools = pr.tools;
+		}
+
 		let ctx = {messages: msgs, tools: tools, add_generation_prompt: false};
 
 		/* the template reads its knobs as context roots; absent options

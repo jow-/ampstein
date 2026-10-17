@@ -543,6 +543,39 @@ __device__ __forceinline__ void gemv_tile
     __syncthreads();
 }
 
+// Dynamic bit width (template bits == 0): the block's matrix is decoded at its own width, picked by a
+// block-uniform switch over the instantiations (ampstein patch; the math of each case is the static kernel's)
+template <int cb, bool WIDE>
+__device__ __forceinline__ void gemv_tile_dyn
+(
+    int kbits,
+    const uint32_t* __restrict__ B32,
+    const half2* __restrict__ A2,
+    size_t a_stride2,
+    const int* __restrict__ rows,
+    int nrows,
+    void* __restrict__ C,
+    size_t c_stride,
+    bool c_f32,
+    int k_begin,
+    int k_end,
+    int ntiles,
+    int group,
+    float* __restrict__ sh_red,
+    uint32_t* __restrict__ sh_stage
+)
+{
+    switch (kbits)
+    {
+        case 1: gemv_tile<1, cb, WIDE>(B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, k_begin, k_end, ntiles, group, sh_red, sh_stage); break;
+        case 2: gemv_tile<2, cb, WIDE>(B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, k_begin, k_end, ntiles, group, sh_red, sh_stage); break;
+        case 3: gemv_tile<3, cb, WIDE>(B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, k_begin, k_end, ntiles, group, sh_red, sh_stage); break;
+        case 4: gemv_tile<4, cb, WIDE>(B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, k_begin, k_end, ntiles, group, sh_red, sh_stage); break;
+        case 5: gemv_tile<5, cb, WIDE>(B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, k_begin, k_end, ntiles, group, sh_red, sh_stage); break;
+        default: gemv_tile<6, cb, WIDE>(B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, k_begin, k_end, ntiles, group, sh_red, sh_stage); break;
+    }
+}
+
 // Completion counter: every thread fences its own stores, then one thread arrives. Returns true
 // (block-uniform) for the last arriving block, which may then read the other blocks' results
 // through L2 (load_*_cg)
@@ -748,7 +781,10 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        if constexpr (bits == 0)
+            gemv_tile_dyn<cb, WIDE>(is_gate ? p.g_bits[local] : p.u_bits[local], B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        else
+            gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -849,8 +885,12 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     {
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
-        gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
-                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
+        if constexpr (bits == 0)
+            gemv_tile_dyn<cb, WIDE>(p.d_bits[local], B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+                                    k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
+        else
+            gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+                                      k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
     }
 
     for (int r = 0; r < nrows; ++r)

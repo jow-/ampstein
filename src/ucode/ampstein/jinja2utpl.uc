@@ -39,6 +39,9 @@ import * as struct from 'struct';
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */
 
+/* set while a `for` header is parsed: `seq if cond` is a loop filter there */
+let FOR_FILTER = false;
+
 function is_digit(c) {
 	return c >= '0' && c <= '9';
 }
@@ -516,6 +519,11 @@ export function jinja_expr(s) {
 		if (t != null && t.k == 'name' && t.v == 'if') {
 			P.next();
 			let cond = P.parse_or();
+
+			// `for x in seq if cond`: a loop filter, not a conditional expression
+			if (FOR_FILTER && (P.peek() == null || P.peek().k != 'name' || P.peek().v != 'else'))
+				return {t: 'forfilter', a: a, cond: cond};
+
 			P.expect_name('else');
 			let b = P.parse_ternary();
 
@@ -569,7 +577,21 @@ export function jinja_expr(s) {
 		if (t.k == 'op' && (t.v == '==' || t.v == '!=' || t.v == '<' ||
 		    t.v == '>' || t.v == '<=' || t.v == '>=')) {
 			P.next();
-			return {t: 'bin', op: t.v, l: e, r: P.parse_add()};
+
+			let r = P.parse_add();
+			let res = {t: 'bin', op: t.v, l: e, r: r};
+
+			// chained comparison: a <= b <= c is (a <= b) and (b <= c)
+			while (P.peek() != null && P.peek().k == 'op' && (P.peek().v == '==' || P.peek().v == '!=' ||
+			       P.peek().v == '<' || P.peek().v == '>' || P.peek().v == '<=' || P.peek().v == '>=')) {
+				let op2 = P.next();
+				let r2 = P.parse_add();
+
+				res = {t: 'bin', op: 'and', l: res, r: {t: 'bin', op: op2.v, l: r, r: r2}};
+				r = r2;
+			}
+
+			return res;
 		}
 
 		// membership: x in y / x not in y
@@ -990,7 +1012,16 @@ function parse_for_head(s) {
 	i = expect_word(rest, i, 'in', 'for statement');
 	i = skip_ws(rest, i);
 
-	return {targets: targets, seq: jinja_expr(substr(rest, i))};
+	FOR_FILTER = true;
+
+	let seq = jinja_expr(substr(rest, i));
+
+	FOR_FILTER = false;
+
+	if (type(seq) == 'object' && seq.t == 'forfilter')
+		return {targets: targets, seq: seq.a, filter: seq.cond};
+
+	return {targets: targets, seq: seq};
 }
 
 function parse_set_head(s) {
@@ -1197,10 +1228,15 @@ export function jinja_parse(src) {
 				pos++;
 				let m = parse_for_head(tk.s);
 				let r = parse_program(['endfor']);
+				let fbody = r.nodes;
+
+				if (m.filter)
+					fbody = [{t: 'if', open: {dl: false, dr: false}, cond: m.filter, body: r.nodes,
+					          branches: [], close: {dl: false, dr: false}}];
 
 				push(nodes, {t: 'for',
 				           open: {dl: tk.dl, dr: tk.dr}, targets: m.targets,
-				           seq: m.seq, body: r.nodes,
+				           seq: m.seq, body: fbody,
 				           close: {dl: toks[r.stop].dl, dr: toks[r.stop].dr}});
 				pos = r.stop + 1;
 			}

@@ -126,8 +126,10 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
 
     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
     const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
-    MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
-    MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
+    const bool dyn = p.g_bits && p.u_bits && p.d_bits;
+    TORCH_CHECK(!dyn || cb == 2, "exl3_moe_coop: mixed bit widths require the mul1 codebook");
+    MoeCoopKernel ka = dyn ? exl3_moe_coop_kernel_a_dyn(p.Hi, wide_a) : moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
+    MoeCoopKernel kb = dyn ? exl3_moe_coop_kernel_b_dyn(wide_b) : moe_coop_kernel_b(K_d, cb, wide_b);
     moe_coop_smem_optin(ka.kernel, ka.smem);
     moe_coop_smem_optin(kb.kernel, kb.smem);
 
@@ -332,7 +334,10 @@ void exl3_moe_coop
     at::Tensor& ctr,
     at::Tensor& out,
     const c10::optional<at::Tensor>& sh_out,
-    const c10::optional<at::Tensor>& sh_gate_w
+    const c10::optional<at::Tensor>& sh_gate_w,
+    const c10::optional<at::Tensor>& bits_g,
+    const c10::optional<at::Tensor>& bits_u,
+    const c10::optional<at::Tensor>& bits_d
 )
 {
     TORCH_CHECK_DTYPE(x, kHalf);
@@ -352,5 +357,15 @@ void exl3_moe_coop
                                             had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out, sh_gate_w, K_gu, K_d, cb);
     p.min_expert = min_expert;
     p.max_expert = max_expert;
+    if (bits_g || bits_u || bits_d)
+    {
+        TORCH_CHECK(bits_g && bits_u && bits_d, "exl3_moe_coop: give all three bit width tables or none");
+        for (const at::Tensor* t : { &bits_g.value(), &bits_u.value(), &bits_d.value() })
+            TORCH_CHECK(t->scalar_type() == at::kByte && t->is_contiguous() && t->numel() >= u_trellis.size(0),
+                        "exl3_moe_coop: bit width tables must be contiguous uint8, one entry per expert");
+        p.g_bits = (const uint8_t*) bits_g->data_ptr();
+        p.u_bits = (const uint8_t*) bits_u->data_ptr();
+        p.d_bits = (const uint8_t*) bits_d->data_ptr();
+    }
     exl3_moe_coop_run(p, K_gu, K_d, cb, x, sel, rw, sh_out);
 }

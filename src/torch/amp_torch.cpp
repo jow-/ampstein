@@ -3551,7 +3551,10 @@ void exl3_moe_coop
     at::Tensor& ctr,
     at::Tensor& out,
     const c10::optional<at::Tensor>& sh_out,
-    const c10::optional<at::Tensor>& sh_gate_w
+    const c10::optional<at::Tensor>& sh_gate_w,
+    const c10::optional<at::Tensor>& bits_g,
+    const c10::optional<at::Tensor>& bits_u,
+    const c10::optional<at::Tensor>& bits_d
 );
 
 // Upstream signatures (global namespace, from quant/exl3_gemm.cuh and
@@ -6448,6 +6451,18 @@ torch_moe_coop(uc_vm_t *vm, size_t nargs)
 		sh = *s;
 	}
 
+	/* mixed bit widths (DeepSeek-V4.1 packs): uint8 tables g_bits / u_bits / d_bits, one entry per expert */
+	c10::optional<at::Tensor> bg, bu, bd;
+	{
+		at::Tensor *tg = tensor_arg_opt(vm, ucv_object_get(cfg, "g_bits", NULL));
+		at::Tensor *tu = tensor_arg_opt(vm, ucv_object_get(cfg, "u_bits", NULL));
+		at::Tensor *td = tensor_arg_opt(vm, ucv_object_get(cfg, "d_bits", NULL));
+
+		if (tg) bg = *tg;
+		if (tu) bu = *tu;
+		if (td) bd = *td;
+	}
+
 	try {
 		exl3_moe_coop(*x, *sel, *rw, (int)num("min_expert", -1), (int)num("max_expert", -1),
 			(int)num("Hi", 0),
@@ -6460,7 +6475,7 @@ torch_moe_coop(uc_vm_t *vm, size_t nargs)
 			(float)num("act_limit", 0), true,
 			*t["had_g"], *t["had_u"], *t["gu_g"], *t["gu_u"],
 			*t["act_out"], *t["d_out"], *t["ctr"], *t["out"],
-			sh, c10::nullopt);
+			sh, c10::nullopt, bg, bu, bd);
 	}
 	catch (const std::exception &e) {
 		RAISE(e.what());

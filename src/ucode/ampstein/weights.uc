@@ -186,6 +186,20 @@ export function open(model_dir, only_file) {
 			return index(keylist, key) >= 0;
 		},
 
+		/* the stfile resource holding `key` (row gathers straight from the file) */
+		file: function (key) {
+			if (map) {
+				let shard = map[key];
+
+				if (!shard)
+					die(`weights: unknown key '${key}'`);
+
+				return st_for(shard);
+			}
+
+			return single;
+		},
+
 		/* CPU tensor view for `key` (zero-copy mmap view). */
 		tensor: function (key) {
 			return tensor_for(key);
