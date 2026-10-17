@@ -51,3 +51,13 @@ if (dsv41.PROFILE) {
 	for (let k in sort(keys(dsv41.PROFILE)))
 		printf('  %-14s %8.0f ms  %4.1f%%\n', k, dsv41.PROFILE[k], 100.0 * dsv41.PROFILE[k] / tot);
 }
+
+if (dsv41.HOSTPROF) {
+	let per = {};
+
+	for (let e in dsv41.HOSTPROF)
+		per[e[0]] = (per[e[0]] || 0) + e[1];
+
+	for (let l in sort(keys(per), (a, b) => a - b))
+		printf('  layer %2d host %.0f ms\n', l, per[l]);
+}

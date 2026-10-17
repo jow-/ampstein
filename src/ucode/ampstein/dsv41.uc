@@ -131,6 +131,7 @@ export function load_config(model_dir) {
 
 /* AMP_DSV41_PROF=1: accumulate the time of the phases of the eager path (synchronizes between them) */
 export let PROFILE = {};
+export let HOSTPROF = getenv('AMP_DSV41_HOSTPROF') ? [] : null;
 let prof_t = 0;
 
 function prof_now() {
@@ -1468,7 +1469,12 @@ export function load(model_dir, opts) {
 					prof('n.engram_apply');
 				}
 
+				let th0 = HOSTPROF ? prof_now() : 0;
+
 				pre = block_forward(cfg, L, ctx, cache, cache.layers[i], h, pre, pos0);
+
+				if (HOSTPROF)
+					push(HOSTPROF, [i, prof_now() - th0]);
 			}
 
 			cache.length = pos0 + T;
