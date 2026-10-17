@@ -64,6 +64,7 @@ export function load_config(model_dir) {
 		rope_scaling: t.rope_scaling,
 
 		ratios: slice(ratios, 0, nl),
+		layer_types: map(slice(ratios, 0, nl), (r) => r ? 'compressed' : 'sliding'),
 		kv_sources: t.kv_source_layer_ids,
 		index_sources: t.index_source_layer_ids,
 		candidate_source: (t.candidate_source_layer_id != null) ? t.candidate_source_layer_id : -1,

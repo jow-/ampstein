@@ -180,6 +180,11 @@ export function serve(args) {
 		D41 ? dsv41.load_config(args.model) :
 		Q4 ? qwen4.load_config(args.model) : qwen35.load_config(args.model);
 
+	// DeepSeek-V4.1 packs ship no generation_config.json: end of sentence is token 1 (config.json), and
+	// DeepSeek recommends temperature 1.0 / top_p 0.95
+	if (D41 && gen_cfg.eos_token_id == null)
+		gen_cfg = {eos_token_id: cfg.eos_token_id, temperature: 1.0, top_p: 0.95, ...gen_cfg};
+
 	/* The transpiled chat template: chat_template.jinja -> jinja2utpl ->
 	   loadstring, compiled ONCE here; this closure is invoked for every
 	   chat request. User content lands in tainted segments, so a user
