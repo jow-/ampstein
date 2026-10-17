@@ -504,6 +504,9 @@ dtype_name(at::ScalarType t)
 	case at::kUInt32:   return "uint32";
 	case at::kUInt64:   return "uint64";
 	case at::kBool:     return "bool";
+	case at::kFloat8_e4m3fn:  return "float8_e4m3fn";
+	case at::kFloat8_e5m2:    return "float8_e5m2";
+	case at::kFloat8_e8m0fnu: return "float8_e8m0fnu";
 	default:            return "unknown";
 	}
 }
@@ -531,6 +534,9 @@ dtype_from_name(const char *name, at::ScalarType *out)
 	if (!strcmp(name, "uint32"))  { *out = at::kUInt32;   return true; }
 	if (!strcmp(name, "uint64"))  { *out = at::kUInt64;   return true; }
 	if (!strcmp(name, "bool"))    { *out = at::kBool;     return true; }
+	if (!strcmp(name, "float8_e4m3fn"))  { *out = at::kFloat8_e4m3fn;  return true; }
+	if (!strcmp(name, "float8_e5m2"))    { *out = at::kFloat8_e5m2;    return true; }
+	if (!strcmp(name, "float8_e8m0fnu")) { *out = at::kFloat8_e8m0fnu; return true; }
 
 	return false;
 }
@@ -3237,6 +3243,9 @@ st_dtype_to_at(const char *dt, at::ScalarType *out)
 	if (!strcmp(dt, "U32"))  { *out = at::kUInt32;  return true; }
 	if (!strcmp(dt, "U64"))  { *out = at::kUInt64;  return true; }
 	if (!strcmp(dt, "BOOL")) { *out = at::kBool;     return true; }
+	if (!strcmp(dt, "F8_E4M3")) { *out = at::kFloat8_e4m3fn;  return true; }
+	if (!strcmp(dt, "F8_E5M2")) { *out = at::kFloat8_e5m2;    return true; }
+	if (!strcmp(dt, "F8_E8M0")) { *out = at::kFloat8_e8m0fnu; return true; }
 
 	return false;
 }
@@ -3260,6 +3269,9 @@ at_to_st_dtype(at::ScalarType t)
 	case at::kUInt32:	return "U32";
 	case at::kUInt64:	return "U64";
 	case at::kBool:		return "BOOL";
+	case at::kFloat8_e4m3fn:	return "F8_E4M3";
+	case at::kFloat8_e5m2:		return "F8_E5M2";
+	case at::kFloat8_e8m0fnu:	return "F8_E8M0";
 	default:		return NULL;
 	}
 }
@@ -6457,6 +6469,92 @@ torch_moe_coop(uc_vm_t *vm, size_t nargs)
 	return NULL;
 }
 
+extern "C" int amp_fp8_gemv(const void *x, const void *w, const void *s, void *out, int M, int K,
+                            int N, cudaStream_t stream);
+extern "C" int amp_fp8_dequant(const void *w, const void *s, void *out, int N, int K,
+                               cudaStream_t stream);
+
+static bool
+fp8_args_ok(at::Tensor *w, at::Tensor *s)
+{
+	return w->dim() == 2 && s->dim() == 2 && w->scalar_type() == at::kFloat8_e4m3fn &&
+	       s->scalar_type() == at::kFloat8_e8m0fnu && w->is_contiguous() && s->is_contiguous() &&
+	       w->size(0) % 32 == 0 && w->size(1) % 32 == 0 &&
+	       s->size(0) == w->size(0) / 32 && s->size(1) == w->size(1) / 32 &&
+	       w->get_device() == s->get_device();
+}
+
+/* torch.fp8_gemv(x, w, s): x (M<=8, K) fp16, w (N, K) float8_e4m3fn, s (N/32, K/32)
+ * float8_e8m0fnu -> (M, N) fp16 (x @ w^T with the block scales applied). */
+static uc_value_t *
+torch_fp8_gemv(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *x, *w, *s;
+
+	if (nargs != 3 || !(x = tensor_arg(vm, uc_fn_arg(0))) || !(w = tensor_arg(vm, uc_fn_arg(1))) ||
+	    !(s = tensor_arg(vm, uc_fn_arg(2))))
+		return NULL;
+
+	if (!fp8_args_ok(w, s) || x->dim() != 2 || x->scalar_type() != at::kHalf || !x->is_contiguous() ||
+	    x->size(1) != w->size(1) || x->size(0) < 1 || x->size(0) > 8 || x->get_device() != w->get_device() ||
+	    w->size(1) % 32 != 0)
+		RAISE("fp8_gemv: x (M<=8, K) fp16, w (N, K) e4m3, s (N/32, K/32) e8m0, one device");
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		at::Tensor out = at::empty({ x->size(0), w->size(0) }, x->options());
+		int rc = amp_fp8_gemv(x->data_ptr(), w->data_ptr(), s->data_ptr(), out.data_ptr(),
+			(int)x->size(0), (int)w->size(1), (int)w->size(0),
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "fp8_gemv"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/* torch.fp8_dequant(w, s, out?): the fp16 (N, K) matrix of a block-scaled fp8 weight */
+static uc_value_t *
+torch_fp8_dequant(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *w, *s, *o = NULL;
+
+	if (nargs < 2 || nargs > 3 || !(w = tensor_arg(vm, uc_fn_arg(0))) || !(s = tensor_arg(vm, uc_fn_arg(1))))
+		return NULL;
+
+	if (nargs == 3 && !(o = tensor_arg_opt(vm, uc_fn_arg(2))) && ucv_type(uc_fn_arg(2)) != UC_NULL)
+		return NULL;
+
+	if (!fp8_args_ok(w, s) || (w->size(1) % 32) != 0)
+		RAISE("fp8_dequant: w (N, K) e4m3, s (N/32, K/32) e8m0, contiguous, one device");
+
+	if (o && (o->scalar_type() != at::kHalf || !o->is_contiguous() || o->numel() < w->numel() ||
+	          o->get_device() != w->get_device()))
+		RAISE("fp8_dequant: out must be a contiguous fp16 tensor of at least N*K elements");
+
+	TensorDeviceGuard dg(*w);
+
+	try {
+		at::Tensor out = o ? o->view({ -1 }).narrow(0, 0, w->numel()).view({ w->size(0), w->size(1) }) :
+			at::empty({ w->size(0), w->size(1) }, w->options().dtype(at::kHalf));
+		int rc = amp_fp8_dequant(w->data_ptr(), s->data_ptr(), out.data_ptr(), (int)w->size(0),
+			(int)w->size(1), c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "fp8_dequant"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 extern "C" int
 amp_skinny_f32(const float *x, const float *w, float *out, float *part, int *cnt,
               int M, int K, int N, long part_floats, int cnt_len, cudaStream_t stream);
@@ -9210,6 +9308,8 @@ static const uc_function_list_t torch_fns[] = {
 	{ "copy_async",	torch_copy_async },
 	{ "moe_coop",	torch_moe_coop },
 	{ "skinny",	torch_skinny },
+	{ "fp8_gemv",	torch_fp8_gemv },
+	{ "fp8_dequant",	torch_fp8_dequant },
 	{ "stream_side",	torch_stream_side },
 	{ "stream_main",	torch_stream_main },
 	{ "stream_wait",	torch_stream_wait },

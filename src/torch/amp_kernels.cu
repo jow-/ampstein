@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -5397,6 +5398,166 @@ amp_qsa_attn_fp16(const void *q, const void *kc, const void *vc, const int *idx,
 		AMP_QSA_K(64);
 
 #undef AMP_QSA_K
+
+	return (int)cudaGetLastError();
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Block-scaled FP8 weights (DeepSeek-V4.1 checkpoints)                */
+/*
+ * w (N, K) float8_e4m3fn, s (N/32, K/32) float8_e8m0fnu: one power-of-two scale per 32x32
+ * weight block, value = 2^(e - 127).
+ */
+
+static __device__ __forceinline__ float
+amp_e8m0(uint8_t e)
+{
+	return __uint_as_float((uint32_t)e << 23);
+}
+
+static __device__ __forceinline__ void
+amp_fp8x16_to_f32(const uint4 &v, float *f)
+{
+	const uint32_t u[4] = { v.x, v.y, v.z, v.w };
+
+#pragma unroll
+	for (int i = 0; i < 4; i++) {
+		__half2_raw lo = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(u[i] & 0xffff), __NV_E4M3);
+		__half2_raw hi = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(u[i] >> 16), __NV_E4M3);
+		float2 a = __half22float2(__half2(lo)), b = __half22float2(__half2(hi));
+
+		f[4 * i + 0] = a.x;
+		f[4 * i + 1] = a.y;
+		f[4 * i + 2] = b.x;
+		f[4 * i + 3] = b.y;
+	}
+}
+
+/* One warp per output row; each lane takes 16 consecutive k per step. M <= 8 rows of x (fp16). */
+template <int M>
+__global__ void amp_fp8_gemv_kernel(const __half *__restrict__ x, const uint8_t *__restrict__ w,
+                                    const uint8_t *__restrict__ s, __half *__restrict__ out,
+                                    int K, int N)
+{
+	const int lane = threadIdx.x & 31;
+	const int n = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+
+	if (n >= N)
+		return;
+
+	const uint8_t *wr = w + (size_t)n * K;
+	const uint8_t *sr = s + (size_t)(n >> 5) * (K >> 5);
+	float acc[M];
+
+#pragma unroll
+	for (int m = 0; m < M; m++)
+		acc[m] = 0.0f;
+
+	for (int k = lane * 16; k < K; k += 512) {
+		uint4 wv = *(const uint4 *)(wr + k);
+		float wf[16];
+
+		amp_fp8x16_to_f32(wv, wf);
+
+		const float sc = amp_e8m0(sr[k >> 5]);
+
+#pragma unroll
+		for (int m = 0; m < M; m++) {
+			const uint4 *xp = (const uint4 *)(x + (size_t)m * K + k);
+			uint4 x0 = xp[0], x1 = xp[1];
+			const __half2 *h0 = (const __half2 *)&x0, *h1 = (const __half2 *)&x1;
+			float d = 0.0f;
+
+#pragma unroll
+			for (int i = 0; i < 4; i++) {
+				float2 a = __half22float2(h0[i]), b = __half22float2(h1[i]);
+
+				d += wf[2 * i] * a.x + wf[2 * i + 1] * a.y;
+				d += wf[8 + 2 * i] * b.x + wf[8 + 2 * i + 1] * b.y;
+			}
+
+			acc[m] += d * sc;
+		}
+	}
+
+#pragma unroll
+	for (int m = 0; m < M; m++) {
+		float v = acc[m];
+
+#pragma unroll
+		for (int o = 16; o > 0; o >>= 1)
+			v += __shfl_xor_sync(0xffffffffu, v, o);
+
+		if (lane == 0)
+			out[(size_t)m * N + n] = __float2half(v);
+	}
+}
+
+extern "C" int
+amp_fp8_gemv(const void *x, const void *w, const void *s, void *out, int M, int K, int N,
+             cudaStream_t stream)
+{
+	if (M < 1 || M > 8 || K < 32 || (K % 32) || N < 1)
+		return (int)cudaErrorInvalidValue;
+
+	dim3 grid((N + 7) / 8), block(256);
+
+#define AMP_FP8G(MM) amp_fp8_gemv_kernel<MM><<<grid, block, 0, stream>>>((const __half *)x, \
+	(const uint8_t *)w, (const uint8_t *)s, (__half *)out, K, N); break
+
+	switch (M) {
+	case 1: AMP_FP8G(1);
+	case 2: AMP_FP8G(2);
+	case 3: AMP_FP8G(3);
+	case 4: AMP_FP8G(4);
+	case 5: AMP_FP8G(5);
+	case 6: AMP_FP8G(6);
+	case 7: AMP_FP8G(7);
+	default: AMP_FP8G(8);
+	}
+
+#undef AMP_FP8G
+
+	return (int)cudaGetLastError();
+}
+
+__global__ void amp_fp8_dequant_kernel(const uint8_t *__restrict__ w, const uint8_t *__restrict__ s,
+                                       __half *__restrict__ out, int K, long n16)
+{
+	long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i >= n16)
+		return;
+
+	long e = i * 16;
+	int n = (int)(e / K), k = (int)(e % K);
+	uint4 wv = *(const uint4 *)(w + e);
+	float wf[16];
+
+	amp_fp8x16_to_f32(wv, wf);
+
+	const float sc = amp_e8m0(s[(size_t)(n >> 5) * (K >> 5) + (k >> 5)]);
+	__half r[16];
+
+#pragma unroll
+	for (int j = 0; j < 16; j++)
+		r[j] = __float2half(wf[j] * sc);
+
+	*(uint4 *)(out + e) = *(uint4 *)r;
+	*(uint4 *)(out + e + 8) = *(uint4 *)(r + 8);
+}
+
+extern "C" int
+amp_fp8_dequant(const void *w, const void *s, void *out, int N, int K, cudaStream_t stream)
+{
+	if (N < 1 || K < 32 || (K % 32))
+		return (int)cudaErrorInvalidValue;
+
+	long n16 = (long)N * K / 16;
+
+	amp_fp8_dequant_kernel<<<(unsigned)((n16 + 255) / 256), 256, 0, stream>>>((const uint8_t *)w,
+		(const uint8_t *)s, (__half *)out, K, n16);
 
 	return (int)cudaGetLastError();
 }

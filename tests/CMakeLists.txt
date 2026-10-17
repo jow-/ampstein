@@ -161,6 +161,8 @@ amp_test(idx_score)
 amp_test(dsa_select)
 # skinny: deterministic split-K fp32 product, 1..8 rows
 amp_test(skinny)
+# fp8_ops: block-scaled FP8 weights (DeepSeek-V4.1)
+amp_test(fp8_ops)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)
 amp_test(glm5_chat)
 # glm5_blocks: mHC dense blocks vs the oracle
