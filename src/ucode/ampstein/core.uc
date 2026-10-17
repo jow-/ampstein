@@ -981,6 +981,9 @@ export function serve(args) {
 			prefix_ids = encode_prefix(r);
 			images = null;
 
+			if (getenv('AMP_DEBUG_PROMPT'))
+				warn(`prompt: ${length(prefix_ids)} prefix ids, text ${sprintf('%J', r.text)}, ${length(msgs)} messages\n`);
+
 			if (length(r.images)) {
 				try {
 					let embs = map(r.images, (part) => image_embedding(part));
