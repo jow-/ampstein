@@ -6555,6 +6555,86 @@ torch_fp8_dequant(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+extern "C" long amp_v41_attn_ws_floats(int T, int H, int nsplit);
+extern "C" int amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc, int Nc,
+                            const void *idx, int Kc, const float *sinks, const float *inv_freq, void *out,
+                            float *ws, int T, int H, int W, int nsplit, float scale, long pos0,
+                            cudaStream_t stream);
+
+/* torch.v41_attn(q, kvw, wbase, kvc|null, idx|null, sinks, inv_freq, pos0, scale, W, nsplit?):
+ * DeepSeek-V4.1 sparse MQA attention (see amp_kernels.cu). q (T, H, 512) fp16; kvw (Nw, 512) fp16
+ * window rows, row r = absolute position wbase + r; kvc (Nc, 512) fp16 and idx (T, Kc) int32 the
+ * compressed picks; sinks (H) fp32; inv_freq (32) fp32 (the rope slice of the output is rotated back
+ * by pos0 + t). Returns (T, H, 512) fp16. */
+static uc_value_t *
+torch_v41_attn(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs < 10 || nargs > 11) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (q, kvw, wbase, kvc, idx, sinks, inv_freq, pos0, scale, W, nsplit?)");
+		return NULL;
+	}
+
+	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *kvw = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	int64_t wbase, pos0, W, nsplit = 0;
+	double scale;
+
+	if (!kvw)
+		return NULL;
+
+	at::Tensor *kvc = tensor_arg_opt(vm, uc_fn_arg(3));
+	at::Tensor *idx = tensor_arg_opt(vm, uc_fn_arg(4));
+	at::Tensor *sinks = tensor_arg(vm, uc_fn_arg(5));
+	at::Tensor *fr = sinks ? tensor_arg(vm, uc_fn_arg(6)) : NULL;
+
+	if (!fr || !arg_int(vm, uc_fn_arg(2), &wbase) || !arg_int(vm, uc_fn_arg(7), &pos0) ||
+	    !arg_number(vm, uc_fn_arg(8), &scale) || !arg_int(vm, uc_fn_arg(9), &W) ||
+	    (nargs == 11 && !arg_int(vm, uc_fn_arg(10), &nsplit)))
+		return NULL;
+
+	if (q->dim() != 3 || q->size(2) != 512 || q->scalar_type() != at::kHalf || !q->is_contiguous() ||
+	    kvw->dim() != 2 || kvw->size(1) != 512 || kvw->scalar_type() != at::kHalf || !kvw->is_contiguous() ||
+	    sinks->scalar_type() != at::kFloat || sinks->numel() != q->size(1) || !sinks->is_contiguous() ||
+	    fr->scalar_type() != at::kFloat || fr->numel() != 32 || !fr->is_contiguous() || (!kvc != !idx) ||
+	    (kvc && (kvc->dim() != 2 || kvc->size(1) != 512 || kvc->scalar_type() != at::kHalf ||
+	             !kvc->is_contiguous())) ||
+	    (idx && (idx->dim() != 2 || idx->size(0) != q->size(0) || idx->scalar_type() != at::kInt ||
+	             !idx->is_contiguous())) ||
+	    q->size(1) % 8 || W < 1)
+		RAISE("v41_attn: q (T,H,512) fp16, kvw (Nw,512) fp16, kvc (Nc,512) fp16 + idx (T,Kc) int32, sinks (H) fp32, inv_freq (32) fp32");
+
+	int T = (int)q->size(0), H = (int)q->size(1), Kc = idx ? (int)idx->size(1) : 0;
+
+	if (nsplit <= 0)
+		nsplit = (T >= 64) ? 1 : (T >= 16) ? 2 : (T >= 4) ? 4 : 8;
+
+	int total = (int)W + Kc;
+
+	if (nsplit > (total + 15) / 16)
+		nsplit = (total + 15) / 16;
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		at::Tensor out = at::empty_like(*q);
+		at::Tensor ws = at::empty({ amp_v41_attn_ws_floats(T, H, (int)nsplit) }, q->options().dtype(at::kFloat));
+		int rc = amp_v41_attn(q->data_ptr(), kvw->data_ptr(), (long)wbase, (int)kvw->size(0),
+			kvc ? kvc->data_ptr() : NULL, kvc ? (int)kvc->size(0) : 0, idx ? idx->data_ptr() : NULL, Kc,
+			(const float *)sinks->data_ptr(), (const float *)fr->data_ptr(), out.data_ptr(),
+			(float *)ws.data_ptr(), T, H, (int)W, (int)nsplit, (float)scale, (long)pos0,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "v41_attn"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 extern "C" int
 amp_skinny_f32(const float *x, const float *w, float *out, float *part, int *cnt,
               int M, int K, int N, long part_floats, int cnt_len, cudaStream_t stream);
@@ -8327,9 +8407,12 @@ stfile_free_method(uc_vm_t *vm, size_t nargs)
 	return NULL;
 }
 
+static uc_value_t *torch_st_gather(uc_vm_t *vm, size_t nargs);
+
 static const uc_function_list_t stfile_methods[] = {
 	{ "list",	torch_st_list },
 	{ "info",	torch_st_info },
+	{ "gather",	torch_st_gather },
 	{ "tensor",	torch_st_tensor },
 	{ "free",	stfile_free_method },
 };
@@ -8701,6 +8784,12 @@ int64_t ngram_hash_cpu
 	int64_t eos_token, at::Tensor uids, at::Tensor inverse, at::Tensor heads
 );
 
+void ngram_gather_cpu
+(
+	int64_t fd, int64_t base_offset, int64_t row_bytes, const at::Tensor& uids,
+	int64_t uid_base, at::Tensor out
+);
+
 void ngram_dequant
 (
 	const at::Tensor& packed, int64_t K, const at::Tensor& heads,
@@ -8760,6 +8849,73 @@ torch_ngram_hash(uc_vm_t *vm, size_t nargs)
 	catch (const std::exception &e) {
 		RAISE(e.what());
 	}
+}
+
+/*
+ * stfile.gather(name, rows, out): out
+ *
+ * Read the rows of tensor `name` (row-major, first dimension = row) listed in `rows` (int64 CPU,
+ * ascending) with threaded preads from the file itself into out (len(rows), row bytes) CPU
+ * tensor. For tables far larger than RAM (the DeepSeek-V4.1 Engram embeddings): the page
+ * cache holds the hot rows, cold ones cost one disk read each, all in flight together.
+ */
+static uc_value_t *
+torch_st_gather(uc_vm_t *vm, size_t nargs)
+{
+	st_file_t *f = stfile_this(vm);
+	uc_value_t *name = uc_fn_arg(0);
+	const char *dtype;
+	int64_t *shape;
+	size_t ndim, offset, nbytes;
+
+	if (!f)
+		return NULL;
+
+	if (nargs != 3 || ucv_type(name) != UC_STRING) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (name, rows, out)");
+		return NULL;
+	}
+
+	at::Tensor *rows = tensor_arg(vm, uc_fn_arg(1));
+	at::Tensor *out = rows ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+
+	if (!out)
+		return NULL;
+
+	if (st_lookup(f, ucv_string_get(name), &dtype, &shape, &ndim, &offset, &nbytes) == ST_NOT_FOUND) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, "no such tensor");
+		return NULL;
+	}
+
+	int64_t nrows = ndim ? shape[0] : 0;
+
+	free(shape);
+
+	if (nrows < 1 || nbytes % (size_t)nrows)
+		RAISE("gather: not a row-major table");
+
+	int64_t row_bytes = (int64_t)(nbytes / (size_t)nrows);
+
+	if (rows->scalar_type() != at::kLong || rows->is_cuda() || !rows->is_contiguous() ||
+	    out->is_cuda() || !out->is_contiguous() || out->dim() != 2 || out->size(0) < rows->numel() ||
+	    out->size(1) * out->element_size() != row_bytes)
+		RAISE("gather: rows must be contiguous int64 CPU, out a contiguous CPU (n, row bytes) tensor");
+
+	if (rows->numel() > 0) {
+		int64_t lo = rows->min().item<int64_t>(), hi = rows->max().item<int64_t>();
+
+		if (lo < 0 || hi >= nrows)
+			RAISE("gather: row index out of range");
+	}
+
+	try {
+		ngram_gather_cpu(f->fd, (int64_t)(f->data_off + offset), row_bytes, *rows, 0, *out);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return ucv_get(uc_fn_arg(2));
 }
 
 /*
@@ -9309,6 +9465,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "moe_coop",	torch_moe_coop },
 	{ "skinny",	torch_skinny },
 	{ "fp8_gemv",	torch_fp8_gemv },
+	{ "v41_attn",	torch_v41_attn },
 	{ "fp8_dequant",	torch_fp8_dequant },
 	{ "stream_side",	torch_stream_side },
 	{ "stream_main",	torch_stream_main },

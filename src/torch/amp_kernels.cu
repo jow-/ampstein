@@ -5561,3 +5561,282 @@ amp_fp8_dequant(const void *w, const void *s, void *out, int N, int K, cudaStrea
 
 	return (int)cudaGetLastError();
 }
+
+
+/* ------------------------------------------------------------------ */
+/* DeepSeek-V4.1 sparse MQA attention                                  */
+/*
+ * One shared key/value head of 512 dims (V = K), H query heads, a per-head sink logit.
+ * The keys of query t (absolute position p = pos0 + t):
+ *   - its sliding window: positions p-W+1 .. p, read from the window rows kvw (row r holds
+ *     position wbase + r)
+ *   - Kc compressed rows picked by idx[t][k] into kvc (negative = none)
+ * Two kernels: partial results per key split (online softmax state + weighted sum), then a
+ * combine that adds the sink, normalizes, and rotates the rope slice back by the position.
+ */
+
+#define V41_D 512
+#define V41_HG 8                /* heads per block (one warp each) */
+#define V41_TILE 16             /* keys per smem tile */
+
+__global__ void __launch_bounds__(256)
+amp_v41_partial_kernel(const __half *__restrict__ q, const __half *__restrict__ kvw, long wbase, int Nw,
+                       const __half *__restrict__ kvc, int Nc, const int *__restrict__ idx, int Kc,
+                       float *__restrict__ ws_m, float *__restrict__ ws_l, float *__restrict__ ws_o,
+                       int H, int W, int nsplit, float scale, long pos0)
+{
+	extern __shared__ uint4 v41_sm[];                 /* V41_TILE rows x 64 uint4 */
+	__shared__ const __half *row_ptr[V41_TILE];
+
+	const int t = blockIdx.x, hg = blockIdx.y, sp = blockIdx.z;
+	const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+	const int hh = hg * V41_HG + warp;
+	const long p = pos0 + t;
+	const int total = W + Kc;
+	int per = (total + nsplit - 1) / nsplit;
+
+	per = (per + V41_TILE - 1) / V41_TILE * V41_TILE;
+
+	const int j0 = sp * per;
+	const int j1 = min(total, j0 + per);
+
+	float qf[16];
+	{
+		const uint4 *qp = (const uint4 *)(q + ((size_t)t * H + hh) * V41_D + lane * 16);
+		uint4 a = qp[0], b = qp[1];
+		const __half2 *h0 = (const __half2 *)&a, *h1 = (const __half2 *)&b;
+
+#pragma unroll
+		for (int i = 0; i < 4; i++) {
+			float2 x = __half22float2(h0[i]), y = __half22float2(h1[i]);
+
+			qf[2 * i] = x.x * scale;
+			qf[2 * i + 1] = x.y * scale;
+			qf[8 + 2 * i] = y.x * scale;
+			qf[8 + 2 * i + 1] = y.y * scale;
+		}
+	}
+
+	float m_run = -INFINITY, l_run = 0.0f, o[16];
+
+#pragma unroll
+	for (int i = 0; i < 16; i++)
+		o[i] = 0.0f;
+
+	for (int jt = j0; jt < j1; jt += V41_TILE) {
+		__syncthreads();
+
+		if (threadIdx.x < V41_TILE) {
+			int j = jt + threadIdx.x;
+			const __half *rp = NULL;
+
+			if (j < j1) {
+				if (j < W) {
+					long r = p - W + 1 + j - wbase;
+
+					if (p - W + 1 + j >= 0 && r >= 0 && r < Nw)
+						rp = kvw + (size_t)r * V41_D;
+				}
+				else {
+					int c = idx[(size_t)t * Kc + (j - W)];
+
+					if (c >= 0 && c < Nc)
+						rp = kvc + (size_t)c * V41_D;
+				}
+			}
+
+			row_ptr[threadIdx.x] = rp;
+		}
+
+		__syncthreads();
+
+		for (int c = threadIdx.x; c < V41_TILE * 64; c += 256) {
+			const __half *rp = row_ptr[c >> 6];
+
+			if (rp)
+				v41_sm[c] = ((const uint4 *)rp)[c & 63];
+		}
+
+		__syncthreads();
+
+		float sc[V41_TILE];
+
+#pragma unroll
+		for (int i = 0; i < V41_TILE; i++) {
+			float d = 0.0f;
+
+			if (row_ptr[i]) {
+				const uint4 *kp = v41_sm + i * 64 + lane * 2;
+				uint4 a = kp[0], b = kp[1];
+				const __half2 *h0 = (const __half2 *)&a, *h1 = (const __half2 *)&b;
+
+#pragma unroll
+				for (int k = 0; k < 4; k++) {
+					float2 x = __half22float2(h0[k]), y = __half22float2(h1[k]);
+
+					d += qf[2 * k] * x.x + qf[2 * k + 1] * x.y;
+					d += qf[8 + 2 * k] * y.x + qf[8 + 2 * k + 1] * y.y;
+				}
+			}
+
+#pragma unroll
+			for (int o2 = 16; o2 > 0; o2 >>= 1)
+				d += __shfl_xor_sync(0xffffffffu, d, o2);
+
+			sc[i] = row_ptr[i] ? d : -INFINITY;
+		}
+
+		float mt = sc[0];
+
+#pragma unroll
+		for (int i = 1; i < V41_TILE; i++)
+			mt = fmaxf(mt, sc[i]);
+
+		const float mn = fmaxf(m_run, mt);
+
+		if (mn == -INFINITY)
+			continue;
+
+		const float alpha = (m_run == -INFINITY) ? 0.0f : __expf(m_run - mn);
+
+		l_run *= alpha;
+
+#pragma unroll
+		for (int k = 0; k < 16; k++)
+			o[k] *= alpha;
+
+#pragma unroll
+		for (int i = 0; i < V41_TILE; i++) {
+			if (!row_ptr[i])
+				continue;
+
+			const float pw = __expf(sc[i] - mn);
+			const uint4 *kp = v41_sm + i * 64 + lane * 2;
+			uint4 a = kp[0], b = kp[1];
+			const __half2 *h0 = (const __half2 *)&a, *h1 = (const __half2 *)&b;
+
+			l_run += pw;
+
+#pragma unroll
+			for (int k = 0; k < 4; k++) {
+				float2 x = __half22float2(h0[k]), y = __half22float2(h1[k]);
+
+				o[2 * k] += pw * x.x;
+				o[2 * k + 1] += pw * x.y;
+				o[8 + 2 * k] += pw * y.x;
+				o[8 + 2 * k + 1] += pw * y.y;
+			}
+		}
+
+		m_run = mn;
+	}
+
+	const size_t wi = ((size_t)t * H + hh) * nsplit + sp;
+
+	if (lane == 0) {
+		ws_m[wi] = m_run;
+		ws_l[wi] = l_run;
+	}
+
+	float4 *op = (float4 *)(ws_o + wi * V41_D + lane * 16);
+
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		op[i] = make_float4(o[4 * i], o[4 * i + 1], o[4 * i + 2], o[4 * i + 3]);
+}
+
+__global__ void __launch_bounds__(64)
+amp_v41_combine_kernel(const float *__restrict__ ws_m, const float *__restrict__ ws_l,
+                       const float *__restrict__ ws_o, const float *__restrict__ sinks,
+                       const float *__restrict__ inv_freq, __half *__restrict__ out,
+                       int H, int nsplit, long pos0, int rd)
+{
+	const int t = blockIdx.x, hh = blockIdx.y, d0 = threadIdx.x * 8;
+	const size_t base = ((size_t)t * H + hh) * nsplit;
+	const float sink = sinks[hh];
+	float M = sink;
+
+	for (int s = 0; s < nsplit; s++)
+		M = fmaxf(M, ws_m[base + s]);
+
+	float L = __expf(sink - M), o[8];
+
+#pragma unroll
+	for (int i = 0; i < 8; i++)
+		o[i] = 0.0f;
+
+	for (int s = 0; s < nsplit; s++) {
+		float ms = ws_m[base + s];
+
+		if (ms == -INFINITY)
+			continue;
+
+		const float w = __expf(ms - M);
+
+		L += w * ws_l[base + s];
+
+		const float4 *op = (const float4 *)(ws_o + (base + s) * V41_D + d0);
+		float4 a = op[0], b = op[1];
+
+		o[0] += w * a.x; o[1] += w * a.y; o[2] += w * a.z; o[3] += w * a.w;
+		o[4] += w * b.x; o[5] += w * b.y; o[6] += w * b.z; o[7] += w * b.w;
+	}
+
+	const float inv = 1.0f / L;
+
+#pragma unroll
+	for (int i = 0; i < 8; i++)
+		o[i] *= inv;
+
+	if (d0 >= V41_D - rd) {                       /* rotate the rope slice back by the position */
+		const float pos = (float)(pos0 + t);
+
+#pragma unroll
+		for (int i = 0; i < 4; i++) {
+			const float ang = pos * inv_freq[(d0 - (V41_D - rd)) / 2 + i];
+			float sn, cs;
+
+			sincosf(ang, &sn, &cs);
+
+			const float a = o[2 * i], b = o[2 * i + 1];
+
+			o[2 * i] = a * cs + b * sn;
+			o[2 * i + 1] = b * cs - a * sn;
+		}
+	}
+
+	__half *op = out + ((size_t)t * H + hh) * V41_D + d0;
+	__half2 r[4];
+
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		r[i] = __floats2half2_rn(o[2 * i], o[2 * i + 1]);
+
+	*(uint4 *)op = *(uint4 *)r;
+}
+
+extern "C" long
+amp_v41_attn_ws_floats(int T, int H, int nsplit)
+{
+	return (long)T * H * nsplit * (V41_D + 2);
+}
+
+extern "C" int
+amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc, int Nc, const void *idx,
+             int Kc, const float *sinks, const float *inv_freq, void *out, float *ws, int T, int H, int W,
+             int nsplit, float scale, long pos0, cudaStream_t stream)
+{
+	if (T < 1 || H % V41_HG || nsplit < 1 || W < 1 || (Kc > 0 && !(kvc && idx)))
+		return (int)cudaErrorInvalidValue;
+
+	float *ws_m = ws, *ws_l = ws + (size_t)T * H * nsplit, *ws_o = ws_l + (size_t)T * H * nsplit;
+	dim3 grid(T, H / V41_HG, nsplit);
+	size_t smem = (size_t)V41_TILE * 64 * sizeof(uint4);
+
+	amp_v41_partial_kernel<<<grid, 256, smem, stream>>>((const __half *)q, (const __half *)kvw, wbase, Nw,
+		(const __half *)kvc, Nc, (const int *)idx, Kc, ws_m, ws_l, ws_o, H, W, nsplit, scale, pos0);
+	amp_v41_combine_kernel<<<dim3(T, H), 64, 0, stream>>>(ws_m, ws_l, ws_o, sinks, inv_freq,
+		(__half *)out, H, nsplit, pos0, 64);
+
+	return (int)cudaGetLastError();
+}

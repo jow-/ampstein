@@ -163,6 +163,8 @@ amp_test(dsa_select)
 amp_test(skinny)
 # fp8_ops: block-scaled FP8 weights (DeepSeek-V4.1)
 amp_test(fp8_ops)
+# v41_attn: DeepSeek-V4.1 sparse MQA attention kernel
+amp_test(v41_attn)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)
 amp_test(glm5_chat)
 # glm5_blocks: mHC dense blocks vs the oracle
