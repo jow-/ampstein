@@ -1325,7 +1325,7 @@ export function load(model_dir, opts) {
 			for (let c in cn)
 				push(cache.cids, c);
 
-			let h = this.embed_tokens.index(torch.from_array(token_ids, 'int64', 'cuda:' + first)).to('float32')
+			let h = this.embed_tokens.index(idt.cuda(first, true)).to('float32')
 				.reshape([T, 1, H]).expand([T, 4, H]).contiguous();
 			let pre = torch.zeros([T, 4], 'float32', 'cuda:' + first);
 
