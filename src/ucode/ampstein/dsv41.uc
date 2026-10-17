@@ -227,7 +227,11 @@ export function lin8g(ws, key, G, dev) {
 
 /* bf16 / fp32 matrix used in fp32: x (M, K) -> (M, N) fp32 */
 function mat32(ws, key, dev) {
-	return ws.gpu(key + '.weight', dev).to('float32').t().contiguous();
+	let m = ws.gpu(key + '.weight', dev).to('float32').t().contiguous();
+
+	ws.release(key + '.weight', dev);            // the bf16 upload is not needed any more
+
+	return m;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1089,7 +1093,7 @@ export function build_moe(ws, cfg, i, dev) {
 
 	let M = {
 		type: 'moe', dev: dev, experts: experts, router: 'sqrtsp',
-		gate_t: ws.gpu(key + '.gate.weight', dev).to('float32').t().contiguous(),
+		gate_t: mat32(ws, key + '.gate', dev),
 		bias: ws.gpu(key + '.gate.bias', dev).to('float32').reshape([1, -1]).contiguous(),
 		bias_vl: null, tid2eid: null, ids: null, vlon: false, async_moe: true,
 		shared: build_mlp8(ws, key + '.shared_experts', dev)
@@ -1327,10 +1331,14 @@ export function load(model_dir, opts) {
 
 	ws.release('embed.weight', first);
 
+	let lm_head = models.linear(ws, 'head', false, last);
+
+	ws.release('head.weight', last);               // lm_head holds the fp16 copy
+
 	let model = {
 		cfg: cfg, devs: devs, ws: ws, layers: layers, engrams: engrams, meta: meta, embed_tokens: embed_t,
 		norm: ws.gpu16('norm.weight', last),
-		lm_head: models.linear(ws, 'head', false, last),
+		lm_head: lm_head,
 
 		new_cache: function (max_seq) {
 			let cache = {max_seq: max_seq, length: 0, layers: [], pools: {}, cids: [], toks: []};
