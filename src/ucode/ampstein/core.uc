@@ -230,7 +230,7 @@ export function serve(args) {
 			dsv4.load(args.model, {devices: args.gpus});
 	}
 	else if (D41) {
-		model = dsv41.load(args.model, {devices: args.gpus, ctx: args.ctx});
+		model = dsv41.load(args.model, {devices: args.gpus, max_seq: args.ctx, prefill_rows: args.chunk});
 	}
 	else if (Q4) {
 		model = args.tp ? qwen4_tp.load(args.model, {devices: args.gpus, mtp: args.mtp > 0,

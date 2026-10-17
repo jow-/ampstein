@@ -1096,8 +1096,16 @@ export function block_decode(cfg, L, ctx, cache, cl, streams, pre, st, caps) {
 /* ------------------------------------------------------------------ */
 /* planner + model                                                     */
 
-/* contiguous layer ranges balanced by checkpoint bytes; embedding on the first device, head on the last */
-export function plan_devices(ws, cfg, ngpu, extra_first, extra_last) {
+/* Bytes of the pool (compressed rows + index keys) of kv source layer src for max_seq positions */
+export function pool_bytes(cfg, src, max_seq) {
+	return (int(max_seq / cfg.ratios[src]) + 2) * (cfg.head_dim + cfg.index_head_dim) * 2;
+}
+
+/* Contiguous layer ranges for ngpu devices that minimize the fullest device: checkpoint bytes of the
+ * layers (the embedding on the first device, the head on the last) plus the pools it must hold (its
+ * own source layers' and a mirror of every pool its layers read from another device). Returns the
+ * per-layer device array. */
+export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last) {
 	let nl = cfg.num_hidden_layers;
 	let bytes = [];
 
@@ -1113,24 +1121,68 @@ export function plan_devices(ws, cfg, ngpu, extra_first, extra_last) {
 		}
 	}
 
-	let total = (extra_first || 0) + (extra_last || 0);
+	function cost(a, b) {                            // layers [a, b) on one device
+		let c = 0, own = {}, mir = {};
 
-	for (let b in bytes)
-		total += b;
+		for (let i = a; i < b; i++) {
+			c += bytes[i];
 
-	let target = total / ngpu;
-	let devs = [], d = 0, acc = extra_first || 0;
-
-	for (let i = 0; i < nl; i++) {
-		let need = bytes[i] + ((i == nl - 1) ? (extra_last || 0) : 0);
-
-		if (d < ngpu - 1 && acc > 0 && acc + need / 2 > target && (nl - i) > (ngpu - 1 - d)) {
-			d++;
-			acc = 0;
+			if (index(cfg.kv_sources, i) >= 0)
+				own[i] = true;
 		}
 
-		push(devs, d);
-		acc += need;
+		for (let i = a; i < b; i++)
+			if (cfg.src[i] >= 0 && !own[cfg.src[i]])
+				mir[cfg.src[i]] = true;
+
+		for (let k in keys(own))
+			c += pool_bytes(cfg, +k, max_seq);
+
+		for (let k in keys(mir))
+			c += pool_bytes(cfg, +k, max_seq);
+
+		return c + (a == 0 ? (extra_first || 0) : 0) + (b == nl ? (extra_last || 0) : 0);
+	}
+
+	// best[d][i]: smallest possible maximum over d devices holding the first i layers
+	let best = [], from = [];
+
+	for (let d = 0; d <= ngpu; d++) {
+		push(best, []);
+		push(from, []);
+
+		for (let i = 0; i <= nl; i++) {
+			push(best[d], (d == 0 && i == 0) ? 0 : 1e30);
+			push(from[d], -1);
+		}
+	}
+
+	for (let d = 1; d <= ngpu; d++)
+		for (let i = 1; i <= nl; i++)
+			for (let a = d - 1; a < i; a++) {
+				if (best[d - 1][a] >= 1e30)
+					continue;
+
+				let m = max(best[d - 1][a], cost(a, i));
+
+				if (m < best[d][i]) {
+					best[d][i] = m;
+					from[d][i] = a;
+				}
+			}
+
+	let devs = [];
+
+	for (let i = 0; i < nl; i++)
+		push(devs, 0);
+
+	for (let d = ngpu, i = nl; d >= 1; d--) {
+		let a = from[d][i];
+
+		for (let j = a; j < i; j++)
+			devs[j] = d - 1;
+
+		i = a;
 	}
 
 	return devs;
@@ -1153,7 +1205,7 @@ export function load(model_dir, opts) {
 	}
 
 	if (type(devs) != 'array')
-		devs = plan_devices(ws, cfg, devs, 1400000000, 1400000000);
+		devs = plan_devices(ws, cfg, devs, opts.max_seq || 262144, 1400000000, 1400000000);
 
 	let first = devs[0], last = devs[nl - 1];
 
