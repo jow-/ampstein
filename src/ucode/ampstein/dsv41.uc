@@ -273,8 +273,9 @@ export function build_engram_meta(ws_dir, cfg) {
 
 	let st = torch.st(path);
 	let M = {
-		token_map: st.tensor('token_map').to('int64'),
+		token_map: st.tensor('token_map').to('int64').view([-1, 1]),
 		pad: st.tensor('pad').to('int64').tolist()[0],
+		keep: st,                           // the tensors below may view its mapping
 		mult: [], offs: [], sizes: []
 	};
 	let mult = st.tensor('multipliers').to('int64'), offs = st.tensor('offsets').to('int64');
@@ -398,7 +399,7 @@ export function build_attn(ws, cfg, i, dev) {
 /* cache                                                               */
 
 /* per-layer window ring + (for kv sources) the pool, index keys and the half-built pair */
-function new_layer_cache(cfg, A, max_seq) {
+export function new_layer_cache(cfg, A, max_seq) {
 	let dv = 'cuda:' + A.dev;
 	let cl = {
 		dev: A.dev,
@@ -572,59 +573,6 @@ function pool_for(cache, src, dev) {
 /* ------------------------------------------------------------------ */
 /* indexer                                                             */
 
-/* top-k picks of the layer's indexer: (T, k) int32 (negative = none) or null when the pool is empty.
- * xn (T, D) fp16, qr (T, 1280) fp16 (normed q latent). ctx.cand holds the candidate blocks of layer 20. */
-function index_picks(cfg, A, ctx, cache, xn, qr, pos0, src) {
-	let I = A.indexer, ratio = A.ratio;
-	let T = xn.shape()[0];
-	let dv = 'cuda:' + A.dev;
-	let Hi = cfg.index_n_heads, Di = cfg.index_head_dim, rd = cfg.rope_dim;
-	let S = int((pos0 + T) / ratio);
-
-	if (S <= 0)
-		return null;
-
-	let pc = pool_for(cache, src, A.dev);
-	let qi = I.wq_b.forward(qr).view([T, Hi, Di]);
-	let cs = rope_cs(A.inv_freq, pos0, T, 1, A.dev);
-	let q16 = rope_il(qi.to('float32'), cs, rd).to('float16').contiguous();
-	let w = torch.matmul(xn.to('float32'), I.w_t).contiguous();
-	let kk = pc.kidx.narrow(0, 0, S);
-	let scale = math.pow(Di * 1.0, -0.5) * math.pow(Hi * 1.0, -0.5);
-	let K = min(cfg.index_topk, S);
-	let SLAB = max(1, int(96 * 1024 * 1024 / S));
-	let outs = [], cand_new = [];
-
-	for (let r0 = 0; r0 < T; r0 += SLAB) {
-		let R = min(SLAB, T - r0);
-		let sc = torch.idx_score(q16.narrow(0, r0, R).contiguous(), kk, w.narrow(0, r0, R).contiguous(), scale,
-			pos0 + r0, ratio);
-
-		if (S > cfg.candidate_blocks * cfg.candidate_block_size && cfg.candidate_source >= 0) {
-			if (A.idx == cfg.candidate_source) {
-				push(cand_new, candidate_blocks(cfg, sc, pos0 + r0, ratio, dv));
-			}
-			else if (A.idx > cfg.candidate_source && ctx.cand) {
-				let cb = ctx.cand[A.dev];
-
-				if (cb == null)
-					cb = ctx.cand[A.dev] = ctx.cand.src.cuda(A.dev);
-
-				sc = apply_candidates(cfg, sc, cb.narrow(0, r0, R), dv);
-			}
-		}
-
-		let tk = sc.topk(K, -1);
-
-		push(outs, torch.where(tk.values.le(NEGH), torch.full([1], -1, 'int64', dv), tk.indices).to('int32'));
-	}
-
-	if (length(cand_new))
-		ctx.cand = {src: (length(cand_new) == 1) ? cand_new[0] : torch.cat(cand_new, 0)};
-
-	return (length(outs) == 1) ? outs[0] : torch.cat(outs, 0);
-}
-
 /* Candidate source layer: per query keep the candidate_blocks highest-scoring blocks of
  * candidate_block_size pool rows (a block scores by its best row; the block of the newest visible
  * row is always kept). sc (R, S) fp16 for the rows pos0 .. pos0 + R - 1. Returns (R, k) int64 block
@@ -659,7 +607,12 @@ function apply_candidates(cfg, sc, blocks, dv) {
 	let bs = cfg.candidate_block_size;
 	let R = sc.shape()[0], S = sc.shape()[1];
 	let nb = int((S + bs - 1) / bs), k = blocks.shape()[1];
-	let rowoff = torch.arange(R, 'int64', dv).mul(nb).view([R, 1]);
+	let ro = [];
+
+	for (let r = 0; r < R; r++)
+		push(ro, r * nb);
+
+	let rowoff = torch.from_array(ro, 'int64', dv).view([R, 1]);
 	let dummy = torch.full([1], R * nb, 'int64', dv);
 	let flat = torch.where(blocks.le(-1), dummy, blocks.add(rowoff)).reshape([-1]);
 	let m = torch.zeros([R * nb + 1], 'float16', dv);
@@ -671,10 +624,64 @@ function apply_candidates(cfg, sc, blocks, dv) {
 	return torch.where(mm.le(0.0), torch.full([1], NEGH, 'float16', dv), sc);
 }
 
+/* top-k picks of the layer's indexer: (T, k) int32 (negative = none) or null when the pool is empty.
+ * xn (T, D) fp16, qr (T, 1280) fp16 (normed q latent). ctx.cand holds the candidate blocks of layer 20. */
+function index_picks(cfg, A, ctx, cache, xn, qr, pos0, src) {
+	let I = A.indexer, ratio = A.ratio;
+	let T = xn.shape()[0];
+	let dv = 'cuda:' + A.dev;
+	let Hi = cfg.index_n_heads, Di = cfg.index_head_dim, rd = cfg.rope_dim;
+	let S = int((pos0 + T) / ratio);
+
+	if (S <= 0)
+		return null;
+
+	let pc = pool_for(cache, src, A.dev);
+	let qi = I.wq_b.forward(qr).view([T, Hi, Di]);
+	let cs = rope_cs(A.inv_freq, pos0, T, 1, A.dev);
+	let q16 = rope_il(qi.to('float32'), cs, rd).to('float16').contiguous();
+	let w = torch.matmul(xn.to('float32'), I.w_t).contiguous();
+	let kk = pc.kidx.narrow(0, 0, S);
+	let scale = math.pow(Di * 1.0, -0.5) * math.pow(Hi * 1.0, -0.5);
+	let K = min(cfg.index_topk, S);
+	let SLAB = max(1, int(96 * 1024 * 1024 / S));
+	let outs = [], cand_new = [];
+
+	for (let r0 = 0; r0 < T; r0 += SLAB) {
+		let R = min(SLAB, T - r0);
+		let sc = torch.idx_score(q16.narrow(0, r0, R).contiguous(), kk, w.narrow(0, r0, R).contiguous(), scale,
+			pos0 + r0, ratio);
+
+		if (S > cfg.candidate_blocks * cfg.candidate_block_size && cfg.candidate_source >= 0) {
+			if (A.idx == cfg.candidate_source) {
+				push(cand_new, candidate_blocks(cfg, sc, pos0 + r0, ratio, dv));
+			}
+			else if (A.idx > cfg.candidate_source && ctx.cand) {
+				let ck = 'd' + A.dev;
+				let cb = ctx.cand[ck];
+
+				if (cb == null)
+					cb = ctx.cand[ck] = (ctx.cand.dev == A.dev) ? ctx.cand.src : ctx.cand.src.cuda(A.dev);
+
+				sc = apply_candidates(cfg, sc, cb.narrow(0, r0, R), dv);
+			}
+		}
+
+		let tk = sc.topk(K, -1);
+
+		push(outs, torch.where(tk.values.le(NEGH), torch.full([1], -1, 'int64', dv), tk.indices).to('int32'));
+	}
+
+	if (length(cand_new))
+		ctx.cand = {dev: A.dev, src: (length(cand_new) == 1) ? cand_new[0] : torch.cat(cand_new, 0)};
+
+	return (length(outs) == 1) ? outs[0] : torch.cat(outs, 0);
+}
+
 /* ------------------------------------------------------------------ */
 /* attention forward                                                   */
 
-function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
+export function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
 	let T = xn.shape()[0];
 	let H = cfg.num_q_heads, D = cfg.head_dim, rd = cfg.rope_dim;
 	let eps = cfg.rms_norm_eps;
@@ -704,10 +711,15 @@ function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
 
 		if (A.idx_source) {
 			idx = index_picks(cfg, A, ctx, cache, xn, qr, pos0, src);
-			ctx.topk = idx;
+			ctx.topk = idx ? {dev: dev, t: idx} : null;
 		}
-		else {
-			idx = ctx.topk ? ((ctx.topk.device() == 'cuda:' + dev) ? ctx.topk : ctx.topk.cuda(dev)) : null;
+		else if (ctx.topk) {
+			let ck = 'd' + dev;
+
+			if (ctx.topk[ck] == null)
+				ctx.topk[ck] = (ctx.topk.dev == dev) ? ctx.topk.t : ctx.topk.t.cuda(dev);
+
+			idx = ctx.topk[ck];
 		}
 
 		if (idx) {
@@ -741,28 +753,6 @@ function build_expert(ws, key, dev) {
 		up: models.linear(ws, key + '.w3', false, dev),
 		down: models.linear(ws, key + '.w2', false, dev)
 	};
-}
-
-export function build_moe(ws, cfg, i, dev) {
-	let key = `layers.${i}.ffn`;
-	let experts = [];
-
-	for (let e = 0; e < cfg.n_routed_experts; e++)
-		push(experts, build_expert(ws, `${key}.experts.${e}`, dev));
-
-	let M = {
-		type: 'moe', dev: dev, experts: experts, router: 'sqrtsp',
-		gate_t: ws.gpu(key + '.gate.weight', dev).to('float32').t().contiguous(),
-		bias: ws.gpu(key + '.gate.bias', dev).to('float32').reshape([1, -1]).contiguous(),
-		bias_vl: null, tid2eid: null, ids: null, vlon: false, async_moe: true,
-		shared: build_mlp8(ws, key + '.shared_experts', dev)
-	};
-
-	// glm5.moe_forward then runs the fused decode kernel (<= 8 rows) and the token-sorted fused kernel
-	// (prefill chunks) with the per-expert bit widths
-	M.coop = (getenv('AMP_DSV41_NO_COOP') ? null : build_coop(cfg, M)) || false;
-
-	return M;
 }
 
 /* Fused decode state (torch.moe_coop) for experts of mixed bit widths: pointer tables of the experts'
@@ -816,6 +806,28 @@ export function build_coop(cfg, M) {
 		out: torch.zeros([COOP_ROWS, cfg.hidden_size], 'float32', dv),
 		Hi: Hi, Kg: 1, Ku: 1, Kd: 1, mcg: false, mul1: true, act: 0, act_limit: cfg.swiglu_limit + 0.0
 	};
+}
+
+export function build_moe(ws, cfg, i, dev) {
+	let key = `layers.${i}.ffn`;
+	let experts = [];
+
+	for (let e = 0; e < cfg.n_routed_experts; e++)
+		push(experts, build_expert(ws, `${key}.experts.${e}`, dev));
+
+	let M = {
+		type: 'moe', dev: dev, experts: experts, router: 'sqrtsp',
+		gate_t: ws.gpu(key + '.gate.weight', dev).to('float32').t().contiguous(),
+		bias: ws.gpu(key + '.gate.bias', dev).to('float32').reshape([1, -1]).contiguous(),
+		bias_vl: null, tid2eid: null, ids: null, vlon: false, async_moe: true,
+		shared: build_mlp8(ws, key + '.shared_experts', dev)
+	};
+
+	// glm5.moe_forward then runs the fused decode kernel (<= 8 rows) and the token-sorted fused kernel
+	// (prefill chunks) with the per-expert bit widths
+	M.coop = (getenv('AMP_DSV41_NO_COOP') ? null : build_coop(cfg, M)) || false;
+
+	return M;
 }
 
 export function build_layer(ws, cfg, i, dev) {
@@ -989,7 +1001,7 @@ export function load(model_dir, opts) {
 				splice(cache.cids, pos0, length(cache.cids) - pos0);
 
 			let idt = torch.from_array(token_ids, 'int64');
-			let cn = this.meta.token_map.index(idt).tolist();
+			let cn = this.meta.token_map.index(idt).view([-1]).tolist();
 			let hist = [];
 
 			for (let k = 3; k >= 1; k--)

@@ -167,6 +167,10 @@ amp_test(fp8_ops)
 amp_test(v41_attn)
 # moe_mixed: fused decode MoE with mixed bit widths per expert
 amp_test(moe_mixed)
+# dsv41_attn: V4.1 attention layers vs the reference run on the CPU
+amp_test(dsv41_attn)
+# dsv41_engram: Engram hashing vs engram.py
+amp_test(dsv41_engram)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)
 amp_test(glm5_chat)
 # glm5_blocks: mHC dense blocks vs the oracle
