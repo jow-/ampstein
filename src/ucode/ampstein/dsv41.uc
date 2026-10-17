@@ -1356,7 +1356,7 @@ export function load(model_dir, opts) {
 	}
 
 	if (type(devs) != 'array')
-		devs = plan_devices(ws, cfg, devs, opts.max_seq || 262144, 1400000000, 1400000000);
+		devs = plan_devices(ws, cfg, devs, opts.max_seq || 262144, 1400000000, 2000000000);
 
 	let first = devs[0], last = devs[nl - 1];
 
