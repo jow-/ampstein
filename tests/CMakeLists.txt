@@ -177,6 +177,8 @@ amp_test(dsv41_hc)
 amp_test(dsv41_engram_apply)
 # dsv41_graph: CUDA-graph decode vs eager (needs the model)
 amp_test(dsv41_graph)
+# dsv41_pipeline: wavefront prefill vs sequential (needs the model)
+amp_test(dsv41_pipeline)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)
 amp_test(glm5_chat)
 # chat_dsv41: DeepSeek-V4.1 chat format vs encoding.py

@@ -1406,16 +1406,12 @@ export function load(model_dir, opts) {
 			return cache;
 		},
 
-		/* Run token ids (array) appended to the cache. Returns logits (rows, vocab) fp16 for the last
-		 * `rows` positions (default 1), or null for rows == 0. */
-		forward_chunk: function (token_ids, cache, rows) {
+		/* A chunk in flight: its token ids embedded, the Engram history, the mHC state. */
+		chunk_begin: function (token_ids, cache) {
 			let cfg = this.cfg;
 			let T = length(token_ids);
 			let pos0 = cache.length;
 			let H = cfg.hidden_size;
-
-			if (rows == null)
-				rows = 1;
 
 			// token history for the engram n-grams (a rollback truncates it)
 			if (length(cache.cids) > pos0)
@@ -1434,8 +1430,6 @@ export function load(model_dir, opts) {
 			for (let c in cn)
 				push(hist, c);
 
-			let hist_t = torch.from_array(hist, 'int64').view([1, -1]);
-
 			for (let c in cn)
 				push(cache.cids, c);
 
@@ -1444,15 +1438,23 @@ export function load(model_dir, opts) {
 			let pre = torch.zeros([T, 4], 'float32', 'cuda:' + first);
 
 			pre.narrow(1, 0, 1).fill_(1.0);
+			cache.length = pos0 + T;
 
-			let ctx = {topk: null, cand: null};
+			return {T: T, pos0: pos0, end: pos0 + T, dev: first, hist_t: torch.from_array(hist, 'int64').view([1, -1]),
+				h: h, pre: pre, ctx: {topk: null, cand: null}};
+		},
 
-			for (let i = 0; i < nl; i++) {
+		/* layers [first, end) of the chunk (all on one device) */
+		chunk_layers: function (c, cache, l0, l1) {
+			let cfg = this.cfg;
+
+			for (let i = l0; i < l1; i++) {
 				let L = this.layers[i];
 
-				if (i > 0 && L.dev != this.layers[i - 1].dev) {
-					h = h.cuda(L.dev);
-					pre = pre.cuda(L.dev);
+				if (c.dev != L.dev) {
+					c.h = c.h.cuda(L.dev);
+					c.pre = c.pre.cuda(L.dev);
+					c.dev = L.dev;
 				}
 
 				let li = index(cfg.engram_layers, i);
@@ -1462,34 +1464,44 @@ export function load(model_dir, opts) {
 
 					prof(null);
 
-					let emb = engram_rows(cfg, this.meta, E, li, hist_t, T);
+					let emb = engram_rows(cfg, this.meta, E, li, c.hist_t, c.T);
 
 					prof('m.engram_rows');
-					engram_apply(cfg, E, h, emb);
+					engram_apply(cfg, E, c.h, emb);
 					prof('n.engram_apply');
 				}
 
 				let th0 = HOSTPROF ? prof_now() : 0;
 
-				pre = block_forward(cfg, L, ctx, cache, cache.layers[i], h, pre, pos0);
+				c.pre = block_forward(cfg, L, c.ctx, cache, cache.layers[i], c.h, c.pre, c.pos0);
 
 				if (HOSTPROF)
 					push(HOSTPROF, [i, prof_now() - th0]);
 			}
+		},
 
-			cache.length = pos0 + T;
+		/* the head over the last `rows` rows of a finished chunk */
+		chunk_head: function (c, rows) {
+			let cfg = this.cfg;
+			let x = torch.rms_norm(hc_collapse(c.h, c.pre), this.norm, cfg.rms_norm_eps);
 
-			if (rows == 0)
-				return null;
-
-			let x = hc_collapse(h, pre);
-
-			x = torch.rms_norm(x, this.norm, cfg.rms_norm_eps);
-
-			if (rows < T)
-				x = x.narrow(0, T - rows, rows).contiguous();
+			if (rows < c.T)
+				x = x.narrow(0, c.T - rows, rows).contiguous();
 
 			return this.lm_head.forward(x);
+		},
+
+		/* Run token ids (array) appended to the cache. Returns logits (rows, vocab) fp16 for the last
+		 * `rows` positions (default 1), or null for rows == 0. */
+		forward_chunk: function (token_ids, cache, rows) {
+			if (rows == null)
+				rows = 1;
+
+			let c = this.chunk_begin(token_ids, cache);
+
+			this.chunk_layers(c, cache, 0, nl);
+
+			return (rows == 0) ? null : this.chunk_head(c, rows);
 		},
 
 		/* CUDA-graph decode (engine interface, as glm5.graphs): one graph per run of layers on a device and
@@ -1737,8 +1749,13 @@ export function load(model_dir, opts) {
 			cache.cids = [];
 		},
 
-		/* Engine interface (as dsv4.prefill_pipeline): chunked prefill of ids at cache.length, one chunk per
-		 * round. opts: chunk, cuts (extra chunk boundaries), on_aux(chunk_end) after every chunk. */
+		/* Engine interface (as dsv4.prefill_pipeline): chunked prefill of ids at cache.length as a wavefront over
+		 * the device stages: one stage per chunk per round, so every GPU works on a different chunk (a layer
+		 * sees its chunks in order, which is all the window ring, the pools and the pairs need). The host issues
+		 * the work of all stages in a round before it can block on a full launch queue. opts: chunk, cuts (extra
+		 * chunk boundaries), on_aux(chunk_end) when a chunk left the last stage. A snapshot boundary
+		 * (cuts[0]) holds the next chunk back until the pipeline has drained, so the layer state of that
+		 * moment is the state at the boundary. */
 		prefill_pipeline: function (cache, ids, opts) {
 			let model = this;
 			let chunk = opts.chunk || 512;
@@ -1755,29 +1772,98 @@ export function load(model_dir, opts) {
 			bounds = sort(bounds, (a, b) => a - b);
 			push(bounds, start + total);
 
-			let next = 0, done = 0, result = null;
+			let stages = [];
+
+			for (let i = 0; i < nl; i++) {
+				if (!length(stages) || stages[length(stages) - 1].dev != this.layers[i].dev)
+					push(stages, {first: i, end: i + 1, dev: this.layers[i].dev});
+				else
+					stages[length(stages) - 1].end = i + 1;
+			}
+
+			let ns = length(stages);
+			let active = [];
+			let next = 0, prev_end = start, done = 0, result = null;
+			let snap_at = (opts.cuts && length(opts.cuts)) ? opts.cuts[0] : 0;
+
+			for (let s = 0; s < ns; s++)
+				push(active, null);
 
 			if (!NO_ENGRAM)
 				engram_prefetch(model.cfg, model.meta, model.engrams, cache, ids, start);
 
-			return {
-				step: function (rounds) {
-					for (let r = 0; r < (rounds || 1) && next < length(bounds); r++) {
-						let end = bounds[next++];
-						let pos = cache.length;
-						let last = (end == start + total);
-						let lg = model.forward_chunk(slice(ids, pos - start, end - start), cache, last ? 1 : 0);
+			function admit() {
+				if (active[0] != null || next >= length(bounds))
+					return;
 
-						if (last)
-							result = lg;
+				if (snap_at && prev_end == snap_at) {
+					for (let c in active)
+						if (c)
+							return;
+				}
 
-						done = end - start;
+				let end = bounds[next++];
+				let last = (end == start + total);
+				let c = model.chunk_begin(slice(ids, prev_end - start, end - start), cache);
+
+				c.stage = 0;
+				c.last = last;
+				prev_end = end;
+				active[0] = c;
+			}
+
+			function round() {
+				for (let s = ns - 1; s >= 0; s--) {
+					let c = active[s];
+
+					if (!c)
+						continue;
+
+					model.chunk_layers(c, cache, stages[s].first, stages[s].end);
+
+					if (s == ns - 1) {
+						if (c.last)
+							result = model.chunk_head(c, 1);
+
+						done = c.end - start;
+						active[s] = null;
 
 						if (opts.on_aux)
-							opts.on_aux(end);
+							opts.on_aux(c.end);
+					}
+					else {
+						active[s + 1] = c;
+						active[s] = null;
+					}
+				}
+
+				admit();
+			}
+
+			admit();
+
+			return {
+				step: function (rounds) {
+					for (let r = 0; r < (rounds || 1); r++) {
+						let busy = (next < length(bounds));
+
+						for (let c in active)
+							if (c)
+								busy = true;
+
+						if (!busy)
+							break;
+
+						round();
 					}
 
-					return next < length(bounds);
+					let more = (next < length(bounds));
+
+					for (let c in active)
+						if (c)
+							more = true;
+
+					return more;
 				},
 
 				done_tokens: function () {return done;},
