@@ -544,6 +544,18 @@ function ring_put(cl, pos0, rows) {
 /* ------------------------------------------------------------------ */
 /* compressor (kv source layers)                                       */
 
+/* The entry count of a source layer's pool moves (a reset, a rewind, new writes from entry n on): the mirrors
+ * must forget what they hold from n on, they would otherwise keep the rows of the previous sequence. */
+export function set_pool_n(cache, src, n) {
+	let P = cache.pools[src];
+
+	P.owner.n = n;
+
+	for (let m in P.mirrors)
+		if (m.n > n)
+			m.n = n;
+}
+
 /* Feed the chunk (xn (T, D) fp16 at absolute pos0) to the layer's compressor: appends the completed
  * pool entries (rope'd) and index keys. Returns the number of new entries. */
 function compress_chunk(cfg, A, cache, cl, xn, pos0) {
@@ -610,18 +622,6 @@ function compress_chunk(cfg, A, cache, cl, xn, pos0) {
 	cl.n = e0 + n;
 
 	return n;
-}
-
-/* The entry count of a source layer's pool moves (a reset, a rewind, new writes from entry n on): the mirrors
- * must forget what they hold from n on, they would otherwise keep the rows of the previous sequence. */
-export function set_pool_n(cache, src, n) {
-	let P = cache.pools[src];
-
-	P.owner.n = n;
-
-	for (let m in P.mirrors)
-		if (m.n > n)
-			m.n = n;
 }
 
 /* the pool / index keys of source layer `src` as seen from device dev (a mirror on other devices,
