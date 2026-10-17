@@ -32,9 +32,13 @@ let run = m.prefill_pipeline(cache, ids, {chunk: chunk});
 
 while (run.step(1)) {}
 
+let th = now() - t0;
+
 torch.synchronize();
 
 let dt = now() - t0;
+
+printf('host issue time %.1f s\n', th);
 
 printf('%d tokens, chunk %d: %.1f s, %.0f tok/s\n', n, chunk, dt, n / dt);
 
