@@ -546,7 +546,7 @@ function ring_put(cl, pos0, rows) {
 
 /* Feed the chunk (xn (T, D) fp16 at absolute pos0) to the layer's compressor: appends the completed
  * pool entries (rope'd) and index keys. Returns the number of new entries. */
-function compress_chunk(cfg, A, cl, xn, pos0) {
+function compress_chunk(cfg, A, cache, cl, xn, pos0) {
 	let C = A.comp, ratio = A.ratio;
 	let dv = 'cuda:' + A.dev;
 	let rd = cfg.rope_dim, eps = cfg.rms_norm_eps;
@@ -594,7 +594,7 @@ function compress_chunk(cfg, A, cl, xn, pos0) {
 
 	// a rewind (or the engine's warm-up, which jumps to the end of the context) leaves the count elsewhere:
 	// the entries from e0 on are written from here
-	cl.n = e0;
+	set_pool_n(cache, A.idx, e0);
 
 	// index key: k_norm(wk(latent)), rope at the entry's position
 	let I = A.indexer;
@@ -610,6 +610,18 @@ function compress_chunk(cfg, A, cl, xn, pos0) {
 	cl.n = e0 + n;
 
 	return n;
+}
+
+/* The entry count of a source layer's pool moves (a reset, a rewind, new writes from entry n on): the mirrors
+ * must forget what they hold from n on, they would otherwise keep the rows of the previous sequence. */
+export function set_pool_n(cache, src, n) {
+	let P = cache.pools[src];
+
+	P.owner.n = n;
+
+	for (let m in P.mirrors)
+		if (m.n > n)
+			m.n = n;
 }
 
 /* the pool / index keys of source layer `src` as seen from device dev (a mirror on other devices,
@@ -639,9 +651,6 @@ function pool_for(cache, src, dev) {
 
 		push(P.mirrors, m);
 	}
-
-	if (m.n > cl.n)
-		m.n = cl.n;
 
 	if (m.n < cl.n) {
 		let k = cl.n - m.n;
@@ -806,7 +815,7 @@ export function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
 		let src = cfg.src[A.idx];
 
 		if (A.kv_source)
-			compress_chunk(cfg, A, cl, xn, pos0);
+			compress_chunk(cfg, A, cache, cl, xn, pos0);
 
 		prof('d.compress');
 
@@ -1770,7 +1779,7 @@ export function load(model_dir, opts) {
 					let A = model.layers[i].attn;
 
 					if (A.kv_source)
-						cache.layers[i].n = int((pos + 1) / A.ratio);
+						set_pool_n(cache, i, int((pos + 1) / A.ratio));        // mirror_entry copied the new entry
 				}
 
 				cache.length = pos + 1;
@@ -1815,7 +1824,7 @@ export function load(model_dir, opts) {
 				let cl = cache.layers[i], v = snap[i];
 
 				if (this.layers[i].attn.kv_source) {
-					cl.n = v.n;
+					set_pool_n(cache, i, v.n);
 
 					if (v.pk) {
 						cl.pk.copy_(v.pk);
@@ -1829,10 +1838,9 @@ export function load(model_dir, opts) {
 		},
 
 		aux_reset: function (cache) {
-			for (let cl in cache.layers) {
-				if (cl.pool)
-					cl.n = 0;
-			}
+			for (let i = 0; i < length(cache.layers); i++)
+				if (cache.layers[i].pool)
+					set_pool_n(cache, i, 0);
 
 			cache.cids = [];
 		},

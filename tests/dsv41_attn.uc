@@ -78,6 +78,7 @@ function run(pos0, n) {
 	}
 }
 
+function pass(tag) {
 let pos = 0;
 
 for (let c in CHUNKS) {
@@ -114,7 +115,7 @@ function run_dec(pos) {
 		if (A[l].kv_source) {
 			let r = A[l].ratio;
 
-			cache.layers[l].n = int((pos + 1) / r);
+			dsv41.set_pool_n(cache, l, int((pos + 1) / r));
 			dsv41.mirror_entry(cache, l, int(pos / r));
 		}
 	}
@@ -174,5 +175,20 @@ for (let l in LAYERS) {
 
 	assert(pre < tol && dec < tol, `layer ${l} differs from the reference`);
 }
+
+}
+
+pass('first');
+
+// the same caches again after a reset (a new conversation): the mirrors must not keep the old rows
+for (let l in LAYERS) {
+	got[l] = [];
+
+	if (A[l].kv_source)
+		dsv41.set_pool_n(cache, l, 0);
+}
+
+cand_got = null;
+pass('after a reset');
 
 printf('dsv41_attn: all ok\n');

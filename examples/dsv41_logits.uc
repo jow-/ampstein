@@ -4,7 +4,7 @@ import * as dsv41 from 'ampstein.dsv41';
 
 let dir = ARGV[0], out = ARGV[1], spec = ARGV[2], n = +(ARGV[3] || 600);
 let devs = (index(spec, ',') >= 0) ? map(split(spec, ','), (x) => +x) : +spec;
-let m = dsv41.load(dir, {devices: devs, max_seq: 8192, prefill_rows: 512});
+let m = dsv41.load(dir, {devices: devs, max_seq: 8192, prefill_rows: 512, embed_dev: getenv('AMP_DSV41_EMBED_DEV') != null ? +getenv('AMP_DSV41_EMBED_DEV') : null});
 let ids = [ 0 ], x = 99;
 
 for (let i = 1; i < n; i++) {
