@@ -32,6 +32,7 @@ const NEGH = -60000.0;
 const RING = +(getenv('AMP_DSV41_RING') || 8192);          // raw window rows kept per layer (rollback span)
 const SCRATCH_ELEMS = 32 * 1024 * 1024;                    // fp8 -> fp16 dequant slice, elements
 const PROF = getenv('AMP_DSV41_PROF') != null;
+const NO_ENGRAM = getenv('AMP_DSV41_NO_ENGRAM') != null;
 
 /* ------------------------------------------------------------------ */
 /* config                                                              */
@@ -308,6 +309,10 @@ export function build_engram(ws, cfg, i, dev) {
  * dequantized: (T, heads * 3 * dim) fp16 on E.dev. cids: compressed ids of [3 history tokens, chunk]. */
 function engram_rows(cfg, meta, E, li, hist_t, T) {
 	let H = (cfg.engram_ngram - 1) * cfg.engram_heads;
+
+	if (NO_ENGRAM)                                 // tests without the 200 GB tables
+		return torch.zeros([T, H * cfg.engram_dim], 'float16', 'cuda:' + E.dev);
+
 	let n = T * H;
 	let uids = torch.zeros([n], 'int64'), inverse = torch.zeros([n], 'int64'), heads = torch.zeros([n], 'int32');
 	let U = torch.ngram_hash(hist_t, T, meta.mult[li], meta.offs[li], meta.sizes[li], cfg.engram_heads,

@@ -175,6 +175,8 @@ amp_test(dsv41_engram)
 amp_test(dsv41_hc)
 # dsv41_engram_apply: Engram gate vs the reference
 amp_test(dsv41_engram_apply)
+# dsv41_graph: CUDA-graph decode vs eager (needs the model)
+amp_test(dsv41_graph)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)
 amp_test(glm5_chat)
 # glm5_blocks: mHC dense blocks vs the oracle
