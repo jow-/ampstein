@@ -6577,19 +6577,21 @@ extern "C" long amp_v41_attn_ws_floats(int T, int H, int nsplit);
 extern "C" int amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc, int Nc,
                             const void *idx, int Kc, const float *sinks, const float *inv_freq, void *out,
                             float *ws, int T, int H, int W, int nsplit, float scale, long pos0,
-                            cudaStream_t stream);
+                            const long long *pos_ptr, int ring, cudaStream_t stream);
 
-/* torch.v41_attn(q, kvw, wbase, kvc|null, idx|null, sinks, inv_freq, pos0, scale, W, nsplit?):
+/* torch.v41_attn(q, kvw, wbase, kvc|null, idx|null, sinks, inv_freq, pos0, scale, W, nsplit?, pos_t?, ring?):
  * DeepSeek-V4.1 sparse MQA attention (see amp_kernels.cu). q (T, H, 512) fp16; kvw (Nw, 512) fp16
  * window rows, row r = absolute position wbase + r; kvc (Nc, 512) fp16 and idx (T, Kc) int32 the
  * compressed picks; sinks (H) fp32; inv_freq (32) fp32 (the rope slice of the output is rotated back
- * by pos0 + t). Returns (T, H, 512) fp16. */
+ * by pos0 + t). pos_t: optional one-element int64 device tensor holding pos0 (read by the kernels:
+ * CUDA-graph decode); ring: when > 0, kvw is a ring of that many rows holding position a at row a % ring
+ * (the window then needs no gathering). Returns (T, H, 512) fp16. */
 static uc_value_t *
 torch_v41_attn(uc_vm_t *vm, size_t nargs)
 {
-	if (nargs < 10 || nargs > 11) {
+	if (nargs < 10 || nargs > 13) {
 		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
-			"expected (q, kvw, wbase, kvc, idx, sinks, inv_freq, pos0, scale, W, nsplit?)");
+			"expected (q, kvw, wbase, kvc, idx, sinks, inv_freq, pos0, scale, W, nsplit?, pos_t?, ring?)");
 		return NULL;
 	}
 
@@ -6608,8 +6610,21 @@ torch_v41_attn(uc_vm_t *vm, size_t nargs)
 
 	if (!fr || !arg_int(vm, uc_fn_arg(2), &wbase) || !arg_int(vm, uc_fn_arg(7), &pos0) ||
 	    !arg_number(vm, uc_fn_arg(8), &scale) || !arg_int(vm, uc_fn_arg(9), &W) ||
-	    (nargs == 11 && !arg_int(vm, uc_fn_arg(10), &nsplit)))
+	    (nargs >= 11 && !arg_int(vm, uc_fn_arg(10), &nsplit)))
 		return NULL;
+
+	at::Tensor *pos_t = (nargs >= 12) ? tensor_arg_opt(vm, uc_fn_arg(11)) : NULL;
+	int64_t ring = 0;
+
+	if (nargs >= 13 && !arg_int(vm, uc_fn_arg(12), &ring))
+		return NULL;
+
+	if (pos_t && (pos_t->scalar_type() != at::kLong || pos_t->numel() != 1 || !pos_t->is_cuda() ||
+	              pos_t->get_device() != q->get_device()))
+		RAISE("v41_attn: pos_t must be a one-element int64 tensor on q's device");
+
+	if (ring < 0 || (ring > 0 && ring < W))
+		RAISE("v41_attn: ring must be 0 or at least the window");
 
 	if (q->dim() != 3 || q->size(2) != 512 || q->scalar_type() != at::kHalf || !q->is_contiguous() ||
 	    kvw->dim() != 2 || kvw->size(1) != 512 || kvw->scalar_type() != at::kHalf || !kvw->is_contiguous() ||
@@ -6641,6 +6656,7 @@ torch_v41_attn(uc_vm_t *vm, size_t nargs)
 			kvc ? kvc->data_ptr() : NULL, kvc ? (int)kvc->size(0) : 0, idx ? idx->data_ptr() : NULL, Kc,
 			(const float *)sinks->data_ptr(), (const float *)fr->data_ptr(), out.data_ptr(),
 			(float *)ws.data_ptr(), T, H, (int)W, (int)nsplit, (float)scale, (long)pos0,
+			pos_t ? (const long long *)pos_t->data_ptr() : NULL, (int)ring,
 			c10::cuda::getCurrentCUDAStream().stream());
 
 		if (!launch_ok(vm, rc, "v41_attn"))

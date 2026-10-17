@@ -74,6 +74,22 @@ function run(T, H, pos0, Nc, Kc, nsplit) {
 	}
 
 	let rr = torch.cat(ref, 0);
+	// the same through a window ring and a device-side position
+	let RING = 1024, slots = [];
+
+	for (let r = 0; r < Nw; r++)
+		push(slots, (wbase + r) % RING);
+
+	let ringt = torch.zeros([RING, D], 'float16', dv);
+
+	ringt.index_copy_(0, torch.from_array(slots, 'int64', dv), kvw);
+
+	let pt = torch.from_array([ pos0 ], 'int64', dv);
+	let o2 = torch.v41_attn(q, ringt, 0, kvc, ix, sinks, inv, 0, scale, W, nsplit, pt, RING);
+	let er = rel_rms(o2, o);
+
+	assert(er < 1e-6, `ring / device position: rel rms ${er}`);
+
 	let e = rel_rms(o, rr);
 
 	assert(e < 3e-3, `T=${T} pos0=${pos0} Nc=${Nc} Kc=${Kc} nsplit=${nsplit}: rel rms ${e}`);

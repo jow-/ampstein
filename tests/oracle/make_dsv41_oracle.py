@@ -56,8 +56,56 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
     return o
 
 
-kernel.act_quant = ident
-kernel.fp4_act_quant = ident
+import os
+
+QUANT = os.environ.get("DSV41_QUANT") == "1"      # emulate the reference's activation / KV quantizers
+
+
+def fp8_fake(x, block=32):
+    """act_quant(..., inplace=True) with power-of-two scales: fp8 e4m3 per block, dequantized."""
+    sh = x.shape
+    z = x.float().reshape(-1, block)
+    amax = z.abs().amax(-1, keepdim=True).clamp(min=1e-4)
+    sc = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+    return ((z / sc).clamp(-448, 448).to(torch.float8_e4m3fn).float() * sc).reshape(sh)
+
+
+def fp4_round(v):
+    a = v.abs()
+    r = torch.zeros_like(a)
+    for thr, val, strict in ((0.25, 0.5, True), (0.75, 1.0, False), (1.25, 1.5, True), (1.75, 2.0, False),
+                             (2.5, 3.0, True), (3.5, 4.0, False), (5.0, 6.0, True)):
+        r = torch.where((a > thr) if strict else (a >= thr), torch.full_like(a, val), r)
+    return torch.sign(v) * r
+
+
+def fp4_fake(x, block=32, scale_dtype=torch.float8_e8m0fnu):
+    sh = x.shape
+    z = x.float().reshape(-1, block)
+    amax = z.abs().amax(-1, keepdim=True)
+    if scale_dtype == torch.float8_e4m3fn:
+        amax = amax.clamp(min=6 * 2 ** -9)
+        sc = (amax / 6.0).to(torch.float8_e4m3fn).float()
+    else:
+        amax = amax.clamp(min=6 * 2 ** -126)
+        sc = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0)))
+    return (fp4_round((z / sc).clamp(-6, 6)) * sc).reshape(sh)
+
+
+def q_act_quant(x, block, scale_fmt, scale_dtype, inplace=False):
+    if QUANT:
+        x.copy_(fp8_fake(x, block))
+    return x
+
+
+def q_fp4_act_quant(x, block_size=32, inplace=False, scale_dtype=torch.float8_e8m0fnu):
+    if QUANT:
+        x.copy_(fp4_fake(x, block_size, scale_dtype))
+    return x
+
+
+kernel.act_quant = q_act_quant
+kernel.fp4_act_quant = q_fp4_act_quant
 kernel.fp4_gemm = None
 kernel.fp8_gemm = None
 kernel.hc_split_sinkhorn = None
@@ -80,6 +128,8 @@ def e8m0(t):
 
 
 def linear(x, weight, bias=None):
+    if QUANT and weight.dtype == torch.float8_e4m3fn:
+        x = fp8_fake(x)
     if weight.dtype == torch.float8_e4m3fn:
         n, k = weight.shape
         s = e8m0(weight.scale)

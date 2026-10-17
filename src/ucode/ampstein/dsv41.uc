@@ -1057,6 +1057,50 @@ export function load(model_dir, opts) {
 			return this.lm_head.forward(x);
 		},
 
+		/* Recurrent state outside the KV rows, for the engine's prompt snapshots: per layer the pool entry
+		 * count, the half-built pair of the ratio-2 compressors (the state objects are replaced, never
+		 * mutated in place, so holding the references is a snapshot) and a copy of the window rows (the
+		 * ring is overwritten by later tokens). */
+		aux_get: function (cache) {
+			let out = [];
+			let W = this.cfg.window - 1;
+
+			for (let cl in cache.layers) {
+				let n = min(cache.length, W);
+
+				push(out, {n: cl.n, pk: cl.pend_kv, pg: cl.pend_g,
+					kw: n > 0 ? ring_rows(cl, cache.length - n, cache.length).add(0.0) : null});
+			}
+
+			return out;
+		},
+
+		aux_set: function (cache, snap) {
+			for (let i = 0; i < length(cache.layers); i++) {
+				let cl = cache.layers[i], v = snap[i];
+
+				if (this.layers[i].attn.kv_source) {
+					cl.n = v.n;
+					cl.pend_kv = v.pk;
+					cl.pend_g = v.pg;
+				}
+
+				if (v.kw)
+					ring_put(cl, cache.length - v.kw.shape()[0], v.kw);
+			}
+		},
+
+		aux_reset: function (cache) {
+			for (let cl in cache.layers) {
+				if (cl.pool) {
+					cl.n = 0;
+					cl.pend_kv = cl.pend_g = null;
+				}
+			}
+
+			cache.cids = [];
+		},
+
 		/* Prefill ids in chunks of `chunk` tokens (default 512). */
 		prefill: function (token_ids, cache, chunk, rows) {
 			let n = length(token_ids);

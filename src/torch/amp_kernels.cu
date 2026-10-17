@@ -5583,8 +5583,11 @@ __global__ void __launch_bounds__(256)
 amp_v41_partial_kernel(const __half *__restrict__ q, const __half *__restrict__ kvw, long wbase, int Nw,
                        const __half *__restrict__ kvc, int Nc, const int *__restrict__ idx, int Kc,
                        float *__restrict__ ws_m, float *__restrict__ ws_l, float *__restrict__ ws_o,
-                       int H, int W, int nsplit, float scale, long pos0)
+                       int H, int W, int nsplit, float scale, long pos0, const long long *pos_ptr, int ring)
 {
+	if (pos_ptr)
+		pos0 = *pos_ptr;
+
 	extern __shared__ uint4 v41_sm[];                 /* V41_TILE rows x 64 uint4 */
 	__shared__ const __half *row_ptr[V41_TILE];
 
@@ -5632,10 +5635,18 @@ amp_v41_partial_kernel(const __half *__restrict__ q, const __half *__restrict__ 
 
 			if (j < j1) {
 				if (j < W) {
-					long r = p - W + 1 + j - wbase;
+					long a = p - W + 1 + j;
 
-					if (p - W + 1 + j >= 0 && r >= 0 && r < Nw)
-						rp = kvw + (size_t)r * V41_D;
+					if (ring > 0) {                      /* window rows live in a ring: position a at a % ring */
+						if (a >= 0)
+							rp = kvw + (size_t)(a % ring) * V41_D;
+					}
+					else {
+						long r = a - wbase;
+
+						if (a >= 0 && r >= 0 && r < Nw)
+							rp = kvw + (size_t)r * V41_D;
+					}
 				}
 				else {
 					int c = idx[(size_t)t * Kc + (j - W)];
@@ -5749,8 +5760,11 @@ __global__ void __launch_bounds__(64)
 amp_v41_combine_kernel(const float *__restrict__ ws_m, const float *__restrict__ ws_l,
                        const float *__restrict__ ws_o, const float *__restrict__ sinks,
                        const float *__restrict__ inv_freq, __half *__restrict__ out,
-                       int H, int nsplit, long pos0, int rd)
+                       int H, int nsplit, long pos0, int rd, const long long *pos_ptr)
 {
+	if (pos_ptr)
+		pos0 = *pos_ptr;
+
 	const int t = blockIdx.x, hh = blockIdx.y, d0 = threadIdx.x * 8;
 	const size_t base = ((size_t)t * H + hh) * nsplit;
 	const float sink = sinks[hh];
@@ -5824,7 +5838,7 @@ amp_v41_attn_ws_floats(int T, int H, int nsplit)
 extern "C" int
 amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc, int Nc, const void *idx,
              int Kc, const float *sinks, const float *inv_freq, void *out, float *ws, int T, int H, int W,
-             int nsplit, float scale, long pos0, cudaStream_t stream)
+             int nsplit, float scale, long pos0, const long long *pos_ptr, int ring, cudaStream_t stream)
 {
 	if (T < 1 || H % V41_HG || nsplit < 1 || W < 1 || (Kc > 0 && !(kvc && idx)))
 		return (int)cudaErrorInvalidValue;
@@ -5834,9 +5848,9 @@ amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc
 	size_t smem = (size_t)V41_TILE * 64 * sizeof(uint4);
 
 	amp_v41_partial_kernel<<<grid, 256, smem, stream>>>((const __half *)q, (const __half *)kvw, wbase, Nw,
-		(const __half *)kvc, Nc, (const int *)idx, Kc, ws_m, ws_l, ws_o, H, W, nsplit, scale, pos0);
+		(const __half *)kvc, Nc, (const int *)idx, Kc, ws_m, ws_l, ws_o, H, W, nsplit, scale, pos0, pos_ptr, ring);
 	amp_v41_combine_kernel<<<dim3(T, H), 64, 0, stream>>>(ws_m, ws_l, ws_o, sinks, inv_freq,
-		(__half *)out, H, nsplit, pos0, 64);
+		(__half *)out, H, nsplit, pos0, 64, pos_ptr);
 
 	return (int)cudaGetLastError();
 }
