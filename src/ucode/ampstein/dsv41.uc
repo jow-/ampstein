@@ -733,7 +733,7 @@ function index_picks(cfg, A, ctx, cache, xn, qr, pos0, src) {
 	let kk = pc.kidx.narrow(0, 0, S);
 	let scale = math.pow(Di * 1.0, -0.5) * math.pow(Hi * 1.0, -0.5);
 	let K = min(cfg.index_topk, S);
-	let SLAB = max(1, int(96 * 1024 * 1024 / S));
+	let SLAB = max(1, int(32 * 1024 * 1024 / S));
 	let outs = [], cand_new = [];
 
 	for (let r0 = 0; r0 < T; r0 += SLAB) {
