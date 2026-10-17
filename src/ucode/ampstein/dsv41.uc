@@ -1129,35 +1129,33 @@ export function build_layer(ws, cfg, i, dev) {
  * block's attention input. Returns the pre of the next block's attention input. */
 function block_forward(cfg, L, ctx, cache, cl, streams, pre, pos0) {
 	let eps = cfg.rms_norm_eps;
+
+	prof(null);
+
 	let am = hc_mixes(cfg, L.hc_attn, streams);
 	let xn = torch.rms_norm(hc_collapse(streams, pre), L.attn_norm, eps);
+
+	prof('0.hc_attn');
+
 	let y = attn_forward(cfg, L.attn, ctx, cache, cl, xn, pos0);
 
 	glm5.hc_apply(streams, y, am.post, am.comb);
 
-	let fm = hc_mixes(cfg, L.hc_ffn, streams);
-
-	xn = torch.rms_norm(hc_collapse(streams, am.pre), L.ffn_norm, eps);
-	y = glm5.moe_forward(cfg, L.moe, xn);
-	glm5.hc_apply(streams, y, fm.post, fm.comb);
-
-	return fm.pre;
-}
-
-/* One block on the one token (device position); streams (1, 4, D) fp32 updated in place. */
-export function block_decode(cfg, L, ctx, cache, cl, streams, pre, st, caps) {
-	let eps = cfg.rms_norm_eps;
-	let am = hc_mixes(cfg, L.hc_attn, streams);
-	let xn = torch.rms_norm(hc_collapse(streams, pre), L.attn_norm, eps);
-	let y = attn_decode(cfg, L.attn, ctx, cache, cl, xn, st, caps);
-
-	glm5.hc_apply(streams, y, am.post, am.comb);
+	prof('i.hc_apply');
 
 	let fm = hc_mixes(cfg, L.hc_ffn, streams);
 
 	xn = torch.rms_norm(hc_collapse(streams, am.pre), L.ffn_norm, eps);
+
+	prof('j.hc_ffn');
+
 	y = glm5.moe_forward(cfg, L.moe, xn);
+
+	prof('k.moe');
+
 	glm5.hc_apply(streams, y, fm.post, fm.comb);
+
+	prof('l.hc_apply2');
 
 	return fm.pre;
 }
@@ -1414,7 +1412,13 @@ export function load(model_dir, opts) {
 				if (li >= 0) {
 					let E = this.engrams[i];
 
-					engram_apply(cfg, E, h, engram_rows(cfg, this.meta, E, li, hist_t, T));
+					prof(null);
+
+					let emb = engram_rows(cfg, this.meta, E, li, hist_t, T);
+
+					prof('m.engram_rows');
+					engram_apply(cfg, E, h, emb);
+					prof('n.engram_apply');
 				}
 
 				pre = block_forward(cfg, L, ctx, cache, cache.layers[i], h, pre, pos0);
