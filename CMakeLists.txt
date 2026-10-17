@@ -145,7 +145,7 @@ install(CODE "
 install(PROGRAMS ampstein DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS ucode_torch LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/ampstein)
 install(DIRECTORY src/ucode/ampstein DESTINATION ${CMAKE_INSTALL_DATADIR}
-    FILES_MATCHING PATTERN "*.uc")
+    FILES_MATCHING PATTERN "*.uc" PATTERN "*.jinja")
 
 # The runtime libraries only: shared objects (and their SONAME symlinks), no
 # python glue (libtorch_python.so, __init__.py), headers, static / bitcode

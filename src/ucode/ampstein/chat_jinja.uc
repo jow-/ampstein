@@ -87,6 +87,9 @@ export function make_renderer(tpl, opts) {
 
 	let src = readfile(index(tpl, '.jinja') >= 0 ? tpl
 	                                             : tpl + '/chat_template.jinja');
+	if (src == null)
+		die(`chat_jinja: cannot read the chat template of ${tpl}`);
+
 	let t = utpl.load(src);
 
 	return function(messages, tools, ropts) {
