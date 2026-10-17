@@ -155,6 +155,7 @@ no CUDA-less mode — and no Python exists at runtime; Python appears only in
 | Qwen3.8-Flash-Next | `qwen4.uc`, `qwen4_tp.uc` | MoE, gated-residual hyper-connections, n-gram PLE; `docs/QWEN4.md` |
 | GLM-5.3-Flash | `glm5.uc`, `glm5_tp.uc`, `glm5_vision.uc` | MLA, sparse indexer, MoE, MTP; `docs/GLM5.md` |
 | DeepSeek-V4-Flash | `dsv4.uc`, `dsv4_tp.uc`, `dsv4_vision.uc` | compressed sparse attention, mHC, MoE, DSpark drafter; `docs/DSV4.md` |
+| DeepSeek-V4.1-Flash | `dsv41.uc`, `chat_dsv41.uc` | shared compressed pools, lightning indexer, Engram (disk-streamed tables), FP8 + mixed-K EXL3; `docs/DSV41.md` |
 
 The families are checked against exllamav3's own implementation by oracle
 tests (`tests/oracle/`).
@@ -493,6 +494,6 @@ that are not busy serving; many skip (exit 125) when they can't run.
 | `docs/MEMORY.md` | memory model: no late allocations, KV growth |
 | `docs/PARALLEL.md` | multi-GPU placement over slow links |
 | `docs/SESSIONS.md` | session parking, RAM store, slicing |
-| `docs/QWEN4.md`, `docs/GLM5.md`, `docs/DSV4.md`, `docs/DFLASH.md` | model families, the DFlash drafter |
+| `docs/QWEN4.md`, `docs/GLM5.md`, `docs/DSV4.md`, `docs/DSV41.md`, `docs/DFLASH.md` | model families, the DFlash drafter |
 | `docs/TELEMETRY.md` | statistics collection (proposal) |
 | `LESSONS.md`, `ENVIRONMENT.md`, `../AGENTS.md` | lessons, environment variables, operating guide |

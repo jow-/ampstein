@@ -33,6 +33,7 @@ GPUs from ucode scripts, with no Python in the loop.
 | GLM-5.3-Flash | `glm5.uc` | MLA + KDA hybrid, MoE, DSA indexer, MTP, tensor / expert parallel stages, vision |
 | Qwen3.8-Flash-Next | `qwen4.uc` | sparse attention (QSA), per-layer embeddings, MoE, MTP, tensor / expert parallel |
 | DeepSeek-V4-Flash | `dsv4.uc` | mHC, CSA / HCA attention, sqrtsp + hash MoE, DSpark drafter, vision |
+| DeepSeek-V4.1-Flash | `dsv41.uc` | shared compressed pools + lightning indexer + candidate blocks, FP8 dense weights, mixed-K EXL3 experts, Engram tables streamed from disk; `docs/DSV41.md` |
 
 Engine features:
 
