@@ -544,8 +544,9 @@ function compress_chunk(cfg, A, cl, xn, pos0) {
 	let n = lat.shape()[0];
 	let e0 = int(base / ratio);                       // index of the first new entry
 
-	if (e0 != cl.n)
-		die(`dsv41: compressor of layer ${A.idx} out of step (${e0} != ${cl.n})`);
+	// a rewind (or the engine's warm-up, which jumps to the end of the context) leaves the count elsewhere:
+	// the entries from e0 on are written from here
+	cl.n = e0;
 
 	// index key: k_norm(wk(latent)), rope at the entry's position
 	let I = A.indexer;
@@ -1374,6 +1375,9 @@ export function load(model_dir, opts) {
 			if (length(cache.cids) > pos0)
 				splice(cache.cids, pos0, length(cache.cids) - pos0);
 
+			while (length(cache.cids) < pos0)             // history that was never fed (warm-up): neutral ids
+				push(cache.cids, this.meta.pad);
+
 			let idt = torch.from_array(token_ids, 'int64');
 			let cn = this.meta.token_map.index(idt).view([-1]).tolist();
 			let hist = [];
@@ -1547,6 +1551,9 @@ export function load(model_dir, opts) {
 
 				if (length(cache.cids) > pos)
 					splice(cache.cids, pos, length(cache.cids) - pos);
+
+				while (length(cache.cids) < pos)
+					push(cache.cids, model.meta.pad);
 
 				for (let sg in segs)
 					dec_set_pos(cfg, sts[sg.dev], pos);
