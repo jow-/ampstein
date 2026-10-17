@@ -3,7 +3,7 @@
 import * as dsv41 from 'ampstein.dsv41';
 
 let dir = ARGV[0], ctxn = +ARGV[1], steps = +ARGV[2], gpus = +(ARGV[3] || 6), ctx = +(ARGV[4] || 65536);
-let m = dsv41.load(dir, {devices: gpus, max_seq: ctx, prefill_rows: 1024});
+let m = dsv41.load(dir, {devices: gpus, max_seq: ctx, prefill_rows: 1024, layers: +(getenv('AMP_DSV41_LAYERS') || 0) || null});
 let cache = m.new_cache(ctx);
 let g = m.graphs(cache, [ 1 ]);
 let ids = [], x = 7;
