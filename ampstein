@@ -52,7 +52,7 @@ function usage() {
 	printf("  --prompt-hook SCRIPT  call SCRIPT with each request's prompt (may rewrite messages / tools)\n");
 	printf("  --call-guard          constrain tool calls to the request's tool schemas while sampling\n");
 	printf("  --no-vision           disable image input\n");
-	printf("  --arch ARCH           force architecture: auto|qwen35|glm5|qwen4|dsv4 (default auto)\n");
+	printf("  --arch ARCH           force architecture: auto|qwen35|glm5|qwen4|dsv4|dsv41 (default auto)\n");
 	printf("  --version             print version and exit\n");
 	printf("  --help                print this help and exit\n");
 }
