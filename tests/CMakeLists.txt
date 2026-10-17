@@ -173,6 +173,8 @@ amp_test(dsv41_attn)
 amp_test(dsv41_engram)
 # dsv41_hc: hyper-connection mixes vs the reference
 amp_test(dsv41_hc)
+# dsv41_engram_apply: Engram gate vs the reference
+amp_test(dsv41_engram_apply)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)
 amp_test(glm5_chat)
 # glm5_blocks: mHC dense blocks vs the oracle

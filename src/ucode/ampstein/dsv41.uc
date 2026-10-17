@@ -297,7 +297,7 @@ export function build_engram(ws, cfg, i, dev) {
 		layer: i, dev: dev, key: key,
 		wkv: lin8(ws, key + '.wkv', dev),
 		weight: ws.gpu(key + '.q_weight', dev).to('float32').mul(ws.gpu(key + '.k_weight', dev).to('float32')).contiguous(),
-		file: ws.file(key + '.embed.weight'),
+		file: ws.has(key + '.embed.weight') ? ws.file(key + '.embed.weight') : null,
 		wname: key + '.embed.weight',
 		sname: key + '.embed.scale'
 	};
@@ -327,7 +327,7 @@ function engram_rows(cfg, meta, E, li, hist_t, T) {
 }
 
 /* streams (T, 4, D) fp32 updated in place */
-function engram_apply(cfg, E, streams, emb) {
+export function engram_apply(cfg, E, streams, emb) {
 	let T = streams.shape()[0], D = cfg.hidden_size;
 	let kv = E.wkv.forward(emb);
 	let key = kv.narrow(1, 0, 4 * D).to('float32').view([T, 4, D]);
