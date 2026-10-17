@@ -5756,6 +5756,230 @@ amp_v41_partial_kernel(const __half *__restrict__ q, const __half *__restrict__ 
 		op[i] = make_float4(o[4 * i], o[4 * i + 1], o[4 * i + 2], o[4 * i + 3]);
 }
 
+
+/* Tensor-core variant (prefill chunks): one block per (token, 16 heads, key split). The 16 keys of a tile are
+ * staged in shared memory; QK^T runs as m16n8k16 mma with the head rows as M (k split over four warp pairs,
+ * partial sums reduced through shared memory), the online softmax is done by 16 threads, P V as mma with the
+ * 512 value dims spread over the 8 warps (64 each, 32 accumulator registers per thread). The state of a split
+ * (m, l, O) is written to the same workspace as the CUDA-core kernel, so the combine kernel is shared. */
+
+#define V41T_QS 520              /* halves per smem row: 512 + 8 (bank-conflict free fragment loads) */
+#define V41T_PS 24
+
+__device__ __forceinline__ void
+v41t_mma(float &c0, float &c1, float &c2, float &c3, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+         uint32_t b0, uint32_t b1)
+{
+	asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+	             "{%0,%1,%2,%3};\n" : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+	             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__global__ void __launch_bounds__(256)
+amp_v41_tc_kernel(const __half *__restrict__ q, const __half *__restrict__ kvw, long wbase, int Nw,
+                  const __half *__restrict__ kvc, int Nc, const int *__restrict__ idx, int Kc,
+                  float *__restrict__ ws_m, float *__restrict__ ws_l, float *__restrict__ ws_o,
+                  int H, int W, int nsplit, float scale, long pos0, const long long *pos_ptr, int ring)
+{
+	extern __shared__ __align__(16) unsigned char v41t_sm[];
+	__half *sQ = (__half *)v41t_sm;                                   /* 16 x QS */
+	__half *sK = sQ + 16 * V41T_QS;                                   /* 16 x QS */
+	float *sPart = (float *)(sK + 16 * V41T_QS);                      /* 4 x 16 x 16 */
+	__half *sP = (__half *)(sPart + 4 * 16 * 16);                     /* 16 x PS */
+	float *sAlpha = (float *)(sP + 16 * V41T_PS);                     /* 16 */
+	__shared__ const __half *row_ptr[16];
+
+	if (pos_ptr)
+		pos0 = *pos_ptr;
+
+	const int t = blockIdx.x, hg = blockIdx.y, sp = blockIdx.z;
+	const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+	const int g = lane >> 2, tid4 = lane & 3;
+	const long p = pos0 + t;
+	const int total = W + Kc;
+	int per = (total + nsplit - 1) / nsplit;
+
+	per = (per + 15) / 16 * 16;
+
+	const int j0 = sp * per, j1 = min(total, j0 + per);
+
+	/* Q of the 16 heads */
+	for (int c = tid; c < 16 * 64; c += 256) {
+		const int r = c >> 6, col = c & 63;
+
+		*(uint4 *)(sQ + r * V41T_QS + col * 8) =
+			((const uint4 *)(q + ((size_t)t * H + hg * 16 + r) * V41_D))[col];
+	}
+
+	float o[8][4];
+
+#pragma unroll
+	for (int n = 0; n < 8; n++)
+		o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+
+	float m_run = -INFINITY, l_run = 0.0f;                           /* of row tid, tid < 16 */
+
+	for (int jt = j0; jt < j1; jt += 16) {
+		__syncthreads();                                              /* sK / sP free again */
+
+		if (tid < 16) {
+			int j = jt + tid;
+			const __half *rp = NULL;
+
+			if (j < j1) {
+				if (j < W) {
+					long a = p - W + 1 + j;
+
+					if (ring > 0) {
+						if (a >= 0)
+							rp = kvw + (size_t)(a % ring) * V41_D;
+					}
+					else {
+						long r = a - wbase;
+
+						if (a >= 0 && r >= 0 && r < Nw)
+							rp = kvw + (size_t)r * V41_D;
+					}
+				}
+				else {
+					int c = idx[(size_t)t * Kc + (j - W)];
+
+					if (c >= 0 && c < Nc)
+						rp = kvc + (size_t)c * V41_D;
+				}
+			}
+
+			row_ptr[tid] = rp;
+		}
+
+		__syncthreads();
+
+		for (int c = tid; c < 16 * 64; c += 256) {
+			const int r = c >> 6, col = c & 63;
+			const __half *rp = row_ptr[r];
+
+			*(uint4 *)(sK + r * V41T_QS + col * 8) = rp ? ((const uint4 *)rp)[col] : make_uint4(0, 0, 0, 0);
+		}
+
+		__syncthreads();
+
+		/* S = Q K^T, partial over a quarter of the dims per warp pair */
+		{
+			const int nt = warp & 1, kq = warp >> 1;
+			float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+
+#pragma unroll
+			for (int ks = 0; ks < 8; ks++) {
+				const int kk = kq * 8 + ks;
+				const __half *qa = sQ + g * V41T_QS + kk * 16 + 2 * tid4;
+				const __half *kb = sK + (nt * 8 + g) * V41T_QS + kk * 16 + 2 * tid4;
+				const uint32_t a0 = *(const uint32_t *)qa, a1 = *(const uint32_t *)(qa + 8 * V41T_QS);
+				const uint32_t a2 = *(const uint32_t *)(qa + 8), a3 = *(const uint32_t *)(qa + 8 * V41T_QS + 8);
+				const uint32_t b0 = *(const uint32_t *)kb, b1 = *(const uint32_t *)(kb + 8);
+
+				v41t_mma(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+			}
+
+			float *dst = sPart + kq * 256;
+
+			dst[g * 16 + nt * 8 + 2 * tid4] = c0;
+			dst[g * 16 + nt * 8 + 2 * tid4 + 1] = c1;
+			dst[(g + 8) * 16 + nt * 8 + 2 * tid4] = c2;
+			dst[(g + 8) * 16 + nt * 8 + 2 * tid4 + 1] = c3;
+		}
+
+		__syncthreads();
+
+		/* online softmax of the 16 head rows (one thread each) */
+		if (tid < 16) {
+			float sc[16], mt = -INFINITY;
+
+#pragma unroll
+			for (int k = 0; k < 16; k++) {
+				float v = (sPart[tid * 16 + k] + sPart[256 + tid * 16 + k] + sPart[512 + tid * 16 + k] +
+				           sPart[768 + tid * 16 + k]) * scale;
+
+				sc[k] = row_ptr[k] ? v : -INFINITY;
+				mt = fmaxf(mt, sc[k]);
+			}
+
+			const float mn = fmaxf(m_run, mt);
+			float alpha = 1.0f, ls = 0.0f;
+
+			if (mn != -INFINITY) {
+				alpha = (m_run == -INFINITY) ? 0.0f : __expf(m_run - mn);
+
+#pragma unroll
+				for (int k = 0; k < 16; k++) {
+					const float pw = (sc[k] == -INFINITY) ? 0.0f : __expf(sc[k] - mn);
+
+					ls += pw;
+					sP[tid * V41T_PS + k] = __float2half_rn(pw);
+				}
+
+				l_run = l_run * alpha + ls;
+				m_run = mn;
+			}
+			else {
+#pragma unroll
+				for (int k = 0; k < 16; k++)
+					sP[tid * V41T_PS + k] = __float2half_rn(0.0f);
+			}
+
+			sAlpha[tid] = alpha;
+		}
+
+		__syncthreads();
+
+		/* O = alpha O + P V over this warp's 64 dims */
+		{
+			const float al0 = sAlpha[g], al1 = sAlpha[g + 8];
+			const __half *pa = sP + g * V41T_PS + 2 * tid4;
+			const uint32_t a0 = *(const uint32_t *)pa, a1 = *(const uint32_t *)(pa + 8 * V41T_PS);
+			const uint32_t a2 = *(const uint32_t *)(pa + 8), a3 = *(const uint32_t *)(pa + 8 * V41T_PS + 8);
+			const int mi = lane >> 3, rr = lane & 7;
+
+#pragma unroll
+			for (int n = 0; n < 8; n += 2) {
+				const int d0 = warp * 64 + n * 8;
+				const __half *src = sK + ((mi & 1) * 8 + rr) * V41T_QS + d0 + (mi >> 1) * 8;
+				uint32_t b0, b1, b2, b3;
+
+				asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+				             : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
+				             : "r"((uint32_t)__cvta_generic_to_shared(src)));
+
+				o[n][0] *= al0; o[n][1] *= al0; o[n][2] *= al1; o[n][3] *= al1;
+				o[n + 1][0] *= al0; o[n + 1][1] *= al0; o[n + 1][2] *= al1; o[n + 1][3] *= al1;
+				v41t_mma(o[n][0], o[n][1], o[n][2], o[n][3], a0, a1, a2, a3, b0, b1);
+				v41t_mma(o[n + 1][0], o[n + 1][1], o[n + 1][2], o[n + 1][3], a0, a1, a2, a3, b2, b3);
+			}
+		}
+	}
+
+	/* the state of this split: head rows hg * 16 + row */
+	if (tid < 16) {
+		const size_t wi = ((size_t)t * H + hg * 16 + tid) * nsplit + sp;
+
+		ws_m[wi] = m_run;
+		ws_l[wi] = l_run;
+	}
+
+#pragma unroll
+	for (int n = 0; n < 8; n++) {
+		const int d = warp * 64 + n * 8 + 2 * tid4;
+		const size_t w0 = (((size_t)t * H + hg * 16 + g) * nsplit + sp) * V41_D + d;
+		const size_t w1 = (((size_t)t * H + hg * 16 + g + 8) * nsplit + sp) * V41_D + d;
+
+		ws_o[w0] = o[n][0];
+		ws_o[w0 + 1] = o[n][1];
+		ws_o[w1] = o[n][2];
+		ws_o[w1 + 1] = o[n][3];
+	}
+}
+
+#define V41T_SMEM ((size_t)(2 * 16 * V41T_QS * 2 + 4 * 16 * 16 * 4 + 16 * V41T_PS * 2 + 16 * 4))
+
 __global__ void __launch_bounds__(64)
 amp_v41_combine_kernel(const float *__restrict__ ws_m, const float *__restrict__ ws_l,
                        const float *__restrict__ ws_o, const float *__restrict__ sinks,
@@ -5847,8 +6071,26 @@ amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc
 	dim3 grid(T, H / V41_HG, nsplit);
 	size_t smem = (size_t)V41_TILE * 64 * sizeof(uint4);
 
-	amp_v41_partial_kernel<<<grid, 256, smem, stream>>>((const __half *)q, (const __half *)kvw, wbase, Nw,
-		(const __half *)kvc, Nc, (const int *)idx, Kc, ws_m, ws_l, ws_o, H, W, nsplit, scale, pos0, pos_ptr, ring);
+	static const bool tc_off = getenv("AMP_V41_NO_TC") != NULL;
+
+	if (!tc_off && T >= 8 && H % 16 == 0) {
+		static bool attr_set[64] = { false };
+		int qdev = 0;
+
+		cudaGetDevice(&qdev);
+
+		if (qdev >= 0 && qdev < 64 && !attr_set[qdev]) {
+			cudaFuncSetAttribute(amp_v41_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)V41T_SMEM);
+			attr_set[qdev] = true;
+		}
+
+		amp_v41_tc_kernel<<<dim3(T, H / 16, nsplit), 256, V41T_SMEM, stream>>>((const __half *)q,
+			(const __half *)kvw, wbase, Nw, (const __half *)kvc, Nc, (const int *)idx, Kc, ws_m, ws_l, ws_o, H, W,
+			nsplit, scale, pos0, pos_ptr, ring);
+	}
+	else
+		amp_v41_partial_kernel<<<grid, 256, smem, stream>>>((const __half *)q, (const __half *)kvw, wbase, Nw,
+			(const __half *)kvc, Nc, (const int *)idx, Kc, ws_m, ws_l, ws_o, H, W, nsplit, scale, pos0, pos_ptr, ring);
 	amp_v41_combine_kernel<<<dim3(T, H), 64, 0, stream>>>(ws_m, ws_l, ws_o, sinks, inv_freq,
 		(__half *)out, H, nsplit, pos0, 64, pos_ptr);
 
