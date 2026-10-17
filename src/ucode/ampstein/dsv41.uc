@@ -298,6 +298,7 @@ export function build_engram(ws, cfg, i, dev) {
 		wkv: lin8(ws, key + '.wkv', dev),
 		weight: ws.gpu(key + '.q_weight', dev).to('float32').mul(ws.gpu(key + '.k_weight', dev).to('float32')).contiguous(),
 		file: ws.has(key + '.embed.weight') ? ws.file(key + '.embed.weight') : null,
+		emb_buf: torch.zeros([1, (cfg.engram_ngram - 1) * cfg.engram_heads * cfg.engram_dim], 'float16', 'cuda:' + dev),
 		wname: key + '.embed.weight',
 		sname: key + '.embed.scale'
 	};
@@ -833,6 +834,27 @@ function comp_decode(cfg, A, cl, xn, st) {
 		.view([1, cfg.head_dim]));
 }
 
+/* A tensor a graph body shares with a later one: the producer's tensor on its own device, and on another
+ * device a persistent copy that the host refreshes between replays (ctx.links). h: {dev, t | key}. */
+function remote(ctx, h, dev, key) {
+	key = key || 't';
+
+	if (h.dev == dev)
+		return h[key];
+
+	if (ctx.links == null)
+		ctx.links = [];
+
+	let ck = 'd' + dev + key;
+
+	if (h[ck] == null) {
+		h[ck] = h[key].cuda(dev);
+		push(ctx.links, {src: h[key], dst: h[ck]});
+	}
+
+	return h[ck];
+}
+
 /* the picks of the indexer for the one token: (1, k) int32 over the first Scap pool entries */
 function index_picks_dec(cfg, A, ctx, cache, xn, qr, st, Scap, src) {
 	let I = A.indexer, ratio = A.ratio;
@@ -865,12 +887,7 @@ function index_picks_dec(cfg, A, ctx, cache, xn, qr, st, Scap, src) {
 				src: torch.where(top.values.le(NEGH), torch.full([1], -1, 'int64', dv), top.indices)};
 		}
 		else if (A.idx > cfg.candidate_source && ctx.cand) {
-			let ck = 'd' + A.dev;
-			let cb = ctx.cand[ck];
-
-			if (cb == null)
-				cb = ctx.cand[ck] = (ctx.cand.dev == A.dev) ? ctx.cand.src : ctx.cand.src.cuda(A.dev);
-
+			let cb = remote(ctx, ctx.cand, A.dev, 'src');
 			let k = cb.shape()[1];
 			let flat = torch.where(cb.le(-1), torch.full([1], nb, 'int64', dv), cb).reshape([-1]);
 			let m = torch.zeros([nb + 1], 'float16', dv);
@@ -918,12 +935,7 @@ export function attn_decode(cfg, A, ctx, cache, cl, xn, st, caps) {
 			ctx.topk = {dev: dev, t: idx};
 		}
 		else if (ctx.topk) {
-			let ck = 'd' + dev;
-
-			if (ctx.topk[ck] == null)
-				ctx.topk[ck] = (ctx.topk.dev == dev) ? ctx.topk.t : ctx.topk.t.cuda(dev);
-
-			idx = ctx.topk[ck];
+			idx = remote(ctx, ctx.topk, dev);
 		}
 
 		if (idx)
@@ -1051,6 +1063,24 @@ function block_forward(cfg, L, ctx, cache, cl, streams, pre, pos0) {
 	let am = hc_mixes(cfg, L.hc_attn, streams);
 	let xn = torch.rms_norm(hc_collapse(streams, pre), L.attn_norm, eps);
 	let y = attn_forward(cfg, L.attn, ctx, cache, cl, xn, pos0);
+
+	glm5.hc_apply(streams, y, am.post, am.comb);
+
+	let fm = hc_mixes(cfg, L.hc_ffn, streams);
+
+	xn = torch.rms_norm(hc_collapse(streams, am.pre), L.ffn_norm, eps);
+	y = glm5.moe_forward(cfg, L.moe, xn);
+	glm5.hc_apply(streams, y, fm.post, fm.comb);
+
+	return fm.pre;
+}
+
+/* One block on the one token (device position); streams (1, 4, D) fp32 updated in place. */
+export function block_decode(cfg, L, ctx, cache, cl, streams, pre, st, caps) {
+	let eps = cfg.rms_norm_eps;
+	let am = hc_mixes(cfg, L.hc_attn, streams);
+	let xn = torch.rms_norm(hc_collapse(streams, pre), L.attn_norm, eps);
+	let y = attn_decode(cfg, L.attn, ctx, cache, cl, xn, st, caps);
 
 	glm5.hc_apply(streams, y, am.post, am.comb);
 
@@ -1255,6 +1285,201 @@ export function load(model_dir, opts) {
 				x = x.narrow(0, T - rows, rows).contiguous();
 
 			return this.lm_head.forward(x);
+		},
+
+		/* CUDA-graph decode (engine interface, as glm5.graphs): one graph per run of layers on a device and
+		 * per context bucket (the capacity of the pools the graph reads), position and slots on the device.
+		 * sizes: only S = 1. */
+		graphs: function (cache, sizes) {
+			let model = this;
+			let cfg = this.cfg;
+			let H = cfg.hidden_size;
+			let segs = [];
+			let max_seq = cache.max_seq;
+
+			for (let i = 0; i < nl; i++) {
+				let L = this.layers[i];
+
+				if (length(segs) && segs[length(segs) - 1].dev == L.dev)
+					segs[length(segs) - 1].end = i + 1;
+				else
+					push(segs, {first: i, end: i + 1, dev: L.dev});
+			}
+
+			let sts = {};
+
+			for (let sg in segs)
+				if (!sts[sg.dev])
+					sts[sg.dev] = new_dec_dev(cfg, sg.dev);
+
+			// buckets: capacity (positions) of the ratio-1 pools a graph reads
+			let caps_list = [];
+
+			for (let c = 4096; c < max_seq; c *= 4)
+				push(caps_list, c);
+
+			push(caps_list, max_seq);
+
+			let gpool = {};
+			let buckets = [];
+
+			for (let c1 in caps_list) {
+				let caps = [ 0, c1, int((c1 + 1) / 2) ];
+				let ctx = {topk: null, cand: null, links: []};
+				let items = [];
+
+				for (let sg in segs) {
+					let dv = 'cuda:' + sg.dev;
+					let it = {first: sg.first, end: sg.end, dev: sg.dev,
+						h_in: torch.zeros([1, 4, H], 'float32', dv), pre_in: torch.zeros([1, 4], 'float32', dv),
+						logits: null, last: (sg.end == nl)};
+
+					it.pre_in.narrow(1, 0, 1).fill_(1.0);
+					push(items, it);
+				}
+
+				function body(it) {
+					let h = it.h_in, pre = it.pre_in;
+
+					for (let i = it.first; i < it.end; i++) {
+						let li = index(cfg.engram_layers, i);
+
+						if (li >= 0) {
+							let E = model.engrams[i];
+
+							engram_apply(cfg, E, h, E.emb_buf);
+						}
+
+						pre = block_decode(cfg, model.layers[i], ctx, cache, cache.layers[i], h, pre, sts[it.dev], caps);
+					}
+
+					it.pre_out = pre;
+
+					if (it.last) {
+						let x = torch.rms_norm(hc_collapse(h, pre), model.norm, cfg.rms_norm_eps);
+
+						it.logits = model.lm_head.forward(x);
+					}
+
+					it.h_out = h;
+				}
+
+				for (let sg in segs)
+					dec_set_pos(cfg, sts[sg.dev], 0);
+
+				// eager warm-up (also creates the mirrors and the remote copies), then capture
+				for (let it in items) {
+					body(it);
+					torch.synchronize();
+				}
+
+				for (let it in items) {
+					it.graph = torch.graph();
+					it.graph.capture_begin(it.dev, null, gpool[it.dev]);
+					body(it);
+					it.graph.capture_end();
+
+					if (!gpool[it.dev])
+						gpool[it.dev] = it.graph.pool();
+				}
+
+				torch.synchronize();
+				push(buckets, {c1: c1, items: items, ctx: ctx});
+			}
+
+			// the warm-up and the captures wrote position 0 of every cache: start from empty again
+			model.aux_reset(cache);
+
+			function run_ids(tid, pos) {
+				let b = null;
+
+				for (let x in buckets)
+					if (x.c1 > pos && !b)
+						b = x;
+
+				if (!b)
+					die(`dsv41: position ${pos} is past the context of ${max_seq}`);
+
+				if (length(cache.cids) > pos)
+					splice(cache.cids, pos, length(cache.cids) - pos);
+
+				for (let sg in segs)
+					dec_set_pos(cfg, sts[sg.dev], pos);
+
+				// Engram rows of the token: hashed on the host, gathered from the table, into the layers' buffers
+				let cn = model.meta.token_map.index(torch.from_array([ tid ], 'int64')).view([-1]).tolist()[0];
+				let hist = [];
+
+				for (let k = 3; k >= 1; k--)
+					push(hist, (pos - k >= 0) ? cache.cids[pos - k] : model.meta.pad);
+
+				push(hist, cn);
+
+				let hist_t = torch.from_array(hist, 'int64').view([1, -1]);
+
+				for (let li = 0; li < length(cfg.engram_layers); li++) {
+					let l = cfg.engram_layers[li];
+
+					if (l < nl) {
+						let E = model.engrams[l];
+
+						E.emb_buf.copy_(engram_rows(cfg, model.meta, E, li, hist_t, 1));
+					}
+				}
+
+				push(cache.cids, cn);
+
+				let h = model.embed_tokens.index(torch.from_array([ tid ], 'int64', 'cuda:' + first)).to('float32')
+					.reshape([1, 1, H]).expand([1, 4, H]).contiguous();
+				let pre = null, logits = null;
+
+				for (let it in b.items) {
+					it.h_in.copy_(h);
+
+					if (pre)
+						it.pre_in.copy_(pre);
+
+					it.graph.replay();
+					h = it.h_out;
+					pre = it.pre_out;
+
+					for (let lk in b.ctx.links)
+						lk.dst.copy_(lk.src);
+
+					for (let i = it.first; i < it.end; i++) {
+						let A = model.layers[i].attn;
+
+						if (A.kv_source)
+							mirror_entry(cache, i, int(pos / A.ratio));
+					}
+
+					if (it.last)
+						logits = it.logits;
+				}
+
+				for (let i = 0; i < nl; i++) {
+					let A = model.layers[i].attn;
+
+					if (A.kv_source)
+						cache.layers[i].n = int((pos + 1) / A.ratio);
+				}
+
+				cache.length = pos + 1;
+
+				return {logits: logits, hidden: null};
+			}
+
+			return {
+				has: function (S) {return S == 1;},
+
+				run: function (ids, pos) {
+					return run_ids(ids[0], pos);
+				},
+
+				run_dev: function (ids_dev, pos) {
+					return run_ids(ids_dev.view([1]).tolist()[0], pos);
+				}
+			};
 		},
 
 		/* Recurrent state outside the KV rows, for the engine's prompt snapshots: per layer the pool entry
