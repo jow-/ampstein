@@ -563,3 +563,33 @@ Add new lessons at the end of the matching section.
   host RAM whatever `--cache-ram` / `--slots` say), flattened to tensors +
   a JSON tree; restoring is `store_restore(e, e.n)`. Caveat: the file goes to
   `/tmp`, which is often tmpfs (RAM): a 262k-token GLM state is several GB.
+- **L150 — A per-expert bit width is a kernel problem, not a loader problem.** The SAGE packs mix K = 1..6 per
+  matrix inside a layer (15 distinct (w1, w3, w2) triples per layer), and the vendored MoE kernels take one K per
+  launch. Launching per class costs ~15 x the launches; padding to the widest K costs 4x the memory. What works:
+  a `bits == 0` instance whose block switches on its expert's width and runs the unchanged static tile (decode),
+  and the existing run-time-switch instance fed per-expert widths (prefill). Bit-identical to the static kernel
+  per width (`tests/moe_mixed.uc`). The composite M = 1 EXL3 gemv is the *noisier* path (1.3e-2 against the cuBLAS
+  reconstruction, the fused kernel 6e-3), so "fused differs from composite by 1e-2" is not a bug.
+- **L151 — When there is no oracle, run the reference.** There is no exllamav3 for V4.1; the model code is DeepSeek's
+  `inference/model.py`. Its TileLang kernels are replaced by 40 lines of plain torch (quantizers as identities,
+  sinkhorn, sparse attention) and the unmodified `Attention`, `Block.hc_mixes`, `Engram` classes run on the CPU
+  with the real weights fetched by HTTP range (a layer's attention is 140 MB). That caught the candidate-filler
+  semantics (the reference attends -inf-score fillers when fewer candidates than top-k exist: only matters with a
+  toy candidate budget) and fixed the numeric floor of the ratio-1 layers (rounding the index scores to fp16
+  moves the *reference's own* output by 1e-2).
+- **L152 — sm_86 has no fp8 conversion instruction.** `__nv_cvt_fp8x2_to_halfraw2` is ~10 ALU instructions per
+  element there: the GEMV read 217 GB/s of 674. `(b & 0x7f) << 7 | (b & 0x80) << 8` read as a half is the e4m3
+  value / 256, exactly (subnormals included); the 2^8 folds into the e8m0 block scale. 2-4x on every shape.
+- **L153 — Host-side stalls at the end of each device segment are queue back-pressure, not syncs.** Issuing a
+  prefill chunk-major (all 40 layers of chunk 0, then chunk 1) blocks the host on GPU k's full launch queue while
+  GPU 0 idles. Issue wavefront-wise (one stage per chunk per round) and the same work runs 2x faster; 5x with the
+  prefetch of L154 and the larger chunk.
+- **L154 — Hashed table rows are known before they are needed.** The Engram rows depend on the token ids only, so
+  a whole prompt can be hashed up front and `posix_fadvise(WILLNEED)`ed: the cold 3.5 s of a 4k prefill became
+  0.25 s. The blocking gather then reads warm pages.
+- **L155 — ucode details that cost an afternoon.** Functions are not visible before their definition (move
+  helpers up; `block_decode` was lost to a careless range replace); `tensor.mul(3)` on int64 yields float32
+  (build index arithmetic with `from_array`); `index()` needs a 2-D table; views of an `stfile` mapping outlive the
+  file object (keep it referenced); `git stash -u` on a checkout holding a multi-GB `dist/` is not a thing to
+  do; `install(DIRECTORY ... PATTERN "*.uc")` silently left the chat template out of the install, and
+  `readfile` of a missing file returns null (an empty template).

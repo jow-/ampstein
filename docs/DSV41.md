@@ -85,8 +85,36 @@ experts; the text model without tables, drafter and tower is 110.6 GiB.
 | `dsv41_hc` | `Block.hc_mixes` | 1e-7 |
 | `dsv41_engram` | `engram.py` hash ids (token map, multipliers, primes) | exact |
 | `dsv41_engram_apply` | `Engram.forward` with the real layer-1 projection | 5e-5 |
-| `dsv41_graph` | eager decode, same prompt | see below |
+| `dsv41_graph` | eager decode, same prompt (full model, 6 GPUs, crossing the 4096 bucket) | identical logits |
+| `dsv41_pipeline` | sequential chunked prefill | identical logits (the wavefront changes the issue order only) |
+| `chat_dsv41` | `encoding.py` on 13 conversations (tools, parallel results out of order, reasoning drop, effort, reminders) | identical strings |
 
-## Placement and memory
+## Placement and memory (jai: 6 x RTX A5000 / A5500, 23.5 GiB each)
 
-(measurements: below)
+`plan_devices` splits the 40 layers over the GPUs with a DP that minimizes the fullest device (checkpoint
+bytes of its layers, the embedding / head, the pools it owns and a mirror of every pool its layers read from
+another device). Result for any context: layers per GPU 7 / 6 / 6 / 6 / 7 / 8.
+
+| What | Per GPU after load | After cache + graphs |
+|---|---|---|
+| 110.6 GiB of weights over 6 GPUs | 3.5 - 6.2 GiB free | |
+| pools for **1,048,576 positions** (fp16 pool + index keys, owners and mirrors) | | 1.8 - 4.7 GiB free |
+| serving (`--chunk 2048`, warm-up at the end of the context) | | 0.45 GiB free on the tightest GPU |
+
+So the full native context of the model (1,048,576 tokens) fits; the pools cost ~1.28 KB per position and
+source layer (ratio 1: 1.28 GB per 1M positions, ratio 2: half). The drafter (7.4 GiB) would not fit next to it.
+
+## Speed (one request)
+
+| | |
+|---|---|
+| decode, graphs, 8k context | 38.6 ms/token (25.9 tok/s); 6 segments of 5.2 - 8.2 ms (the last one has the head) |
+| prefill, wavefront, chunk 2048 | 1130 tok/s at 24k tokens, 1060 tok/s at 100k tokens |
+| prefill, sequential (before the wavefront) | 239 - 540 tok/s |
+| prefix reuse | the 100k-token prompt of the previous request: 0.6 s |
+| load | 70 s with a warm page cache, 5 min cold (110 GB of weights) |
+
+Where the time goes: prefill is MoE bound (a 512-token chunk costs ~20 ms per layer, 2048 tokens ~50 ms: the
+fixed cost of streaming every expert once dominates, hence the large chunk); decode spends ~0.8 ms per layer, of
+which the fused MoE kernels take ~0.24 ms (mixed-width instances, 6 experts), the FP8 GEMVs ~0.3 ms (at the
+memory roofline since the conversion fix, L152) and ~100 small kernels the rest.

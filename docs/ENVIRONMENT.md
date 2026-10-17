@@ -233,3 +233,15 @@ None of these affect the server (which takes `--model`); they select inputs for
 * The attention-kernel fix that the diagnostics located is **not** a variable:
   zero-filled accumulators for empty splits in `amp_qsa_attn_kernel` and
   `amp_attn_dec_mma_kernel` (`src/torch/amp_kernels.cu`).
+
+## DeepSeek-V4.1
+
+| variable | effect |
+|---|---|
+| `AMP_DSV41_RING` | raw window rows kept per layer (rollback span), default 8192 |
+| `AMP_DSV41_NO_COOP` | do not build the fused mixed-width MoE state (composite experts; slow) |
+| `AMP_DSV41_NO_ENGRAM` | Engram contributes zeros (tests without the 200 GB tables) |
+| `AMP_DSV41_PROF` | accumulate the time of the phases (synchronizes between them; `dsv41.PROFILE`) |
+| `AMP_DSV41_HOSTPROF` | host time per layer of a prefill chunk (`dsv41.HOSTPROF`) |
+| `AMP_V41_NO_TC` | use the CUDA-core attention kernel instead of the tensor-core one for prefill chunks |
+| `AMP_DEBUG_PROMPT` | log the rendered prompt text of every chat request (all architectures) |
