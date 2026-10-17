@@ -593,3 +593,10 @@ Add new lessons at the end of the matching section.
   file object (keep it referenced); `git stash -u` on a checkout holding a multi-GB `dist/` is not a thing to
   do; `install(DIRECTORY ... PATTERN "*.uc")` silently left the chat template out of the install, and
   `readfile` of a missing file returns null (an empty template).
+- **L156 — A mirror that is only clamped keeps the last sequence.** The cross-GPU copies of a pool were brought
+  up to date from `m.n` on, and a reset lowered `m.n` to the owner's *new* count: the rows below it (the previous
+  conversation's) were never copied again. Every test builds a fresh cache, the engine's warm-up leaves the old
+  rows behind, so the first long request after a start read garbage keys through the mirrors (wrong tool names,
+  misread digits — greedy and short prompts got away with it, the first sampled long one did not).
+  `set_pool_n` now invalidates the mirrors from the first rewritten entry on; `tests/dsv41_attn.uc` runs its
+  sequence a second time on the reset caches.
