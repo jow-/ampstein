@@ -20,3 +20,7 @@ invariant 3). Re-apply after any vendor refresh.
    set the launcher picks the `bits == 0` kernel instances, whose blocks switch on the expert's width and
    run the unchanged static `gemv_tile<K, mul1, WIDE>` body of that width. The static-K kernels and
    their numerics are untouched; `exl3_moe_coop` takes the three tables as optional trailing arguments.
+
+4. `exllamav3_ext/quant/exl3_moe*.cu*` — the same for the token-sorted prefill MoE (`exl3_moe`): optional
+   `bits_g / bits_u / bits_d` tables (uint8, per expert); the K = 0 (run-time switch) instances read
+   the expert's widths from them (`k_*_e` kernel arguments). Without tables nothing changes.

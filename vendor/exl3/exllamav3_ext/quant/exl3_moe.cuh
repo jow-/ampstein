@@ -47,7 +47,10 @@ void exl3_moe
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const c10::optional<at::Tensor>& bits_g = c10::nullopt,
+    const c10::optional<at::Tensor>& bits_u = c10::nullopt,
+    const c10::optional<at::Tensor>& bits_d = c10::nullopt
 );
 
 void exl3_moe_gather

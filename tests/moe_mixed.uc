@@ -102,8 +102,33 @@ function run(T, seed) {
 	printf('ok T=%d (rel %.2e)\n', T, e);
 }
 
+// the whole MoE of a block through glm5.moe_forward (fused decode kernel, token-sorted prefill kernel)
+// against the composite path, with a random router over the 24 experts
+function full(T) {
+	let Mx = {
+		type: 'moe', dev: DEV, experts: experts, router: 'sqrtsp', async_moe: true, vlon: false, shared: null,
+		gate_t: torch.rand([H, NE], 'float32', dv).sub(0.5).mul(0.05),
+		bias: torch.rand([1, NE], 'float32', dv).mul(0.1),
+		coop: coop
+	};
+	let c2 = {hidden_size: H, num_experts_per_tok: TOPK, swiglu_limit: 10.0, n_routed_experts: NE,
+		routed_scaling_factor: 1.5};
+	let y = torch.rand([T, H], 'float16', dv).sub(0.5).mul(2.0);
+	let got = glm5.moe_forward(c2, Mx, y);
+	let ref = glm5.moe_forward_ref(c2, Mx, y);
+	let e = rel_rms(got, ref);
+
+	assert(e < 0.03, `full T=${T}: rel rms ${e}`);
+	printf('ok full T=%d (rel %.2e)\n', T, e);
+}
+
 run(1, 1);
 run(1, 5);
 run(3, 2);
 run(8, 3);
+full(1);
+full(5);
+full(20);
+full(100);
+full(300);
 printf('moe_mixed: all ok\n');

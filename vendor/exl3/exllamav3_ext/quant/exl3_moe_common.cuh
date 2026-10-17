@@ -55,6 +55,9 @@
     const int K_gate,                           \
     const int K_up,                             \
     const int K_down,                           \
+    const uint8_t* __restrict__ k_gate_e,       \
+    const uint8_t* __restrict__ k_up_e,         \
+    const uint8_t* __restrict__ k_down_e,       \
                                                 \
     int* __restrict__ locks,                    \
                                                 \

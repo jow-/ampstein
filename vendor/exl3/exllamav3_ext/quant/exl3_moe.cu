@@ -176,7 +176,10 @@ void exl3_moe
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const c10::optional<at::Tensor>& bits_g,
+    const c10::optional<at::Tensor>& bits_u,
+    const c10::optional<at::Tensor>& bits_d
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
@@ -248,6 +251,23 @@ void exl3_moe
                 "exl3_moe: half-integer bitrates require the mul1 codebook");
     int K = 0;
     if (K2_gate == K2_up && K2_up == K2_down && K2_gate % 2 == 0) K = K2_gate / 2;
+
+    // Per-expert integer bit widths (uint8, one entry per expert): the run-time-switch instances (K = 0) read them
+    const uint8_t* _k_gate_e = nullptr;
+    const uint8_t* _k_up_e = nullptr;
+    const uint8_t* _k_down_e = nullptr;
+    if (bits_g || bits_u || bits_d)
+    {
+        TORCH_CHECK(bits_g && bits_u && bits_d, "exl3_moe: give all three bit width tables or none");
+        for (const at::Tensor* t : { &bits_g.value(), &bits_u.value(), &bits_d.value() })
+            TORCH_CHECK(t->scalar_type() == at::kByte && t->is_contiguous() && t->numel() >= num_experts,
+                        "exl3_moe: bit width tables must be contiguous uint8, one entry per expert");
+        TORCH_CHECK(gate_mul1, "exl3_moe: mixed bit widths require the mul1 codebook");
+        _k_gate_e = (const uint8_t*) bits_g->data_ptr();
+        _k_up_e = (const uint8_t*) bits_u->data_ptr();
+        _k_down_e = (const uint8_t*) bits_d->data_ptr();
+        K = 0;
+    }
 
     TORCH_CHECK_DIM(gate_ptrs_trellis, 1);
     TORCH_CHECK(gate_ptrs_trellis.size(0) == num_experts, "Number of gate tensors doesn't match num_experts");
@@ -362,6 +382,9 @@ void exl3_moe
         (void*) &K2_gate,
         (void*) &K2_up,
         (void*) &K2_down,
+        (void*) &_k_gate_e,
+        (void*) &_k_up_e,
+        (void*) &_k_down_e,
         (void*) &locks,
         &_output_scratch,
         &_fused_base,

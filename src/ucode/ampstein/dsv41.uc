@@ -750,13 +750,19 @@ export function build_moe(ws, cfg, i, dev) {
 	for (let e = 0; e < cfg.n_routed_experts; e++)
 		push(experts, build_expert(ws, `${key}.experts.${e}`, dev));
 
-	return {
+	let M = {
 		type: 'moe', dev: dev, experts: experts, router: 'sqrtsp',
 		gate_t: ws.gpu(key + '.gate.weight', dev).to('float32').t().contiguous(),
 		bias: ws.gpu(key + '.gate.bias', dev).to('float32').reshape([1, -1]).contiguous(),
-		bias_vl: null, tid2eid: null, ids: null, vlon: false,
+		bias_vl: null, tid2eid: null, ids: null, vlon: false, async_moe: true,
 		shared: build_mlp8(ws, key + '.shared_experts', dev)
 	};
+
+	// glm5.moe_forward then runs the fused decode kernel (<= 8 rows) and the token-sorted fused kernel
+	// (prefill chunks) with the per-expert bit widths
+	M.coop = (getenv('AMP_DSV41_NO_COOP') ? null : build_coop(cfg, M)) || false;
+
+	return M;
 }
 
 /* Fused decode state (torch.moe_coop) for experts of mixed bit widths: pointer tables of the experts'
@@ -812,30 +818,6 @@ export function build_coop(cfg, M) {
 	};
 }
 
-/* y (T <= COOP_ROWS, hidden) fp16: routing on the device, two fused launches for the routed experts
- * (fp32 (T, hidden)); the shared expert is added by the caller */
-export function moe_coop_forward(cfg, M, y, sh) {
-	let T = y.shape()[0];
-	let r = glm5.moe_route(cfg, M, y);
-
-	torch.moe_coop(y.contiguous(), r.idx.contiguous(), r.w.to('float16').contiguous(), M.coop, sh);
-
-	return M.coop.out.narrow(0, 0, T);
-}
-
-/* The MoE of a block: fused for decode-sized inputs when the experts allow it, else the composite path */
-export function moe_forward(cfg, M, y) {
-	let T = y.shape()[0];
-
-	if (M.coop == null)
-		M.coop = (getenv('AMP_DSV41_NO_COOP') ? null : build_coop(cfg, M)) || false;
-
-	if (M.coop && T <= COOP_ROWS)
-		return moe_coop_forward(cfg, M, y, glm5.mlp_forward(cfg, M.shared, y).to('float32').contiguous());
-
-	return glm5.moe_forward_ref(cfg, M, y);
-}
-
 export function build_layer(ws, cfg, i, dev) {
 	let p = `layers.${i}`;
 
@@ -863,7 +845,7 @@ function block_forward(cfg, L, ctx, cache, cl, streams, pre, pos0) {
 	let fm = hc_mixes(cfg, L.hc_ffn, streams);
 
 	xn = torch.rms_norm(hc_collapse(streams, am.pre), L.ffn_norm, eps);
-	y = moe_forward(cfg, L.moe, xn);
+	y = glm5.moe_forward(cfg, L.moe, xn);
 	glm5.hc_apply(streams, y, fm.post, fm.comb);
 
 	return fm.pre;
@@ -932,6 +914,9 @@ export function load(model_dir, opts) {
 		devs = plan_devices(ws, cfg, devs, 1400000000, 1400000000);
 
 	let first = devs[0], last = devs[nl - 1];
+
+	glm5.set_fused_rows(max(256, opts.prefill_rows || 1024));
+
 	let meta = build_engram_meta(model_dir, cfg);
 
 	ws.upload(function (key) {

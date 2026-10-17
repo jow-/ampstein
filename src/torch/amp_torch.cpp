@@ -6386,7 +6386,10 @@ void exl3_moe
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const c10::optional<at::Tensor>& bits_g,
+    const c10::optional<at::Tensor>& bits_u,
+    const c10::optional<at::Tensor>& bits_d
 );
 
 /* torch.moe_coop(x, sel, rw, cfg, sh_out?)
@@ -6789,6 +6792,18 @@ torch_moe_fused(uc_vm_t *vm, size_t nargs)
 		return (v && ucv_type(v) == UC_INTEGER) ? (int)ucv_int64_get(v) : 0;
 	};
 
+	/* mixed bit widths: uint8 tables g_bits / u_bits / d_bits (one entry per expert) */
+	c10::optional<at::Tensor> fbg, fbu, fbd;
+	{
+		at::Tensor *tg = tensor_arg_opt(vm, ucv_object_get(cfg, "g_bits", NULL));
+		at::Tensor *tu = tensor_arg_opt(vm, ucv_object_get(cfg, "u_bits", NULL));
+		at::Tensor *td = tensor_arg_opt(vm, ucv_object_get(cfg, "d_bits", NULL));
+
+		if (tg) fbg = *tg;
+		if (tu) fbu = *tu;
+		if (td) fbd = *td;
+	}
+
 	try {
 		exl3_moe(*y, *out, *cnt, *tok, *w,
 			*t["ts_g"], *t["ts_u"], *t["ti_g"], *t["ti_u"],
@@ -6800,7 +6815,7 @@ torch_moe_fused(uc_vm_t *vm, size_t nargs)
 			(float)num("act_limit"), arg_i(6),
 			scr ? c10::optional<at::Tensor>(*scr) : c10::nullopt,
 			sbase ? c10::optional<at::Tensor>(*sbase) : c10::nullopt,
-			arg_i(7), arg_i(8), arg_i(9));
+			arg_i(7), arg_i(8), arg_i(9), fbg, fbu, fbd);
 	}
 	catch (const std::exception &e) {
 		RAISE(e.what());

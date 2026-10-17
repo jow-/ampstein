@@ -127,6 +127,12 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         const half* exp_down_suh = down_suh[expert_idx];
         const half* exp_down_svh = down_svh[expert_idx];
 
+        // Per-expert bit widths (mixed-width packs, ampstein patch; the K = 0 instances switch at run
+        // time): integer widths in the tables, half-bit units in the kernel
+        const int K2_gate_e = k_gate_e ? 2 * (int) k_gate_e[expert_idx] : K_gate;
+        const int K2_up_e = k_up_e ? 2 * (int) k_up_e[expert_idx] : K_up;
+        const int K2_down_e = k_down_e ? 2 * (int) k_down_e[expert_idx] : K_down;
+
         // Gather + input hadamard for g, u. Non-gated mode skips the g staging (and the g GEMM
         // below); the activation synthesizes the gate lane from u
         const bool gated = act_function != MOE_ACT_RELU2_NOGATE;
@@ -197,8 +203,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         };
 
         if (gated)
-            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K2_gate_e);
+        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K2_up_e);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
         // Output hadamard for g, u + activation+gate + input hadamard for d
@@ -233,7 +239,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             gemm(in_addr, out_addr, trellis, K, intermediate_dim, hidden_dim);
         };
 
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K2_down_e);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
         // Output hadamard for d + scatter add
