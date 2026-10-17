@@ -1585,6 +1585,52 @@ export function load(model_dir, opts) {
 			cache.cids = [];
 		},
 
+		/* Engine interface (as dsv4.prefill_pipeline): chunked prefill of ids at cache.length, one chunk per
+		 * round. opts: chunk, cuts (extra chunk boundaries), on_aux(chunk_end) after every chunk. */
+		prefill_pipeline: function (cache, ids, opts) {
+			let model = this;
+			let chunk = opts.chunk || 512;
+			let start = cache.length, total = length(ids);
+			let bounds = [];
+
+			for (let p = start + chunk; p < start + total; p += chunk)
+				push(bounds, p);
+
+			for (let c in (opts.cuts || []))
+				if (c > start && c < start + total && index(bounds, c) < 0)
+					push(bounds, c);
+
+			bounds = sort(bounds, (a, b) => a - b);
+			push(bounds, start + total);
+
+			let next = 0, done = 0, result = null;
+
+			return {
+				step: function (rounds) {
+					for (let r = 0; r < (rounds || 1) && next < length(bounds); r++) {
+						let end = bounds[next++];
+						let pos = cache.length;
+						let last = (end == start + total);
+						let lg = model.forward_chunk(slice(ids, pos - start, end - start), cache, last ? 1 : 0);
+
+						if (last)
+							result = lg;
+
+						done = end - start;
+
+						if (opts.on_aux)
+							opts.on_aux(end);
+					}
+
+					return next < length(bounds);
+				},
+
+				done_tokens: function () {return done;},
+				logits: function () {return result;},
+				hidden: function () {return null;}
+			};
+		},
+
 		/* Prefill ids in chunks of `chunk` tokens (default 512). */
 		prefill: function (token_ids, cache, chunk, rows) {
 			let n = length(token_ids);
