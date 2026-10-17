@@ -5410,12 +5410,18 @@ amp_qsa_attn_fp16(const void *q, const void *kc, const void *vc, const int *idx,
  * weight block, value = 2^(e - 127).
  */
 
+/* 2^(e - 127) * 256: the e4m3 -> fp16 conversion below leaves the value divided by 256 (see there) */
 static __device__ __forceinline__ float
 amp_e8m0(uint8_t e)
 {
-	return __uint_as_float((uint32_t)e << 23);
+	return __uint_as_float(((uint32_t)e + 8u) << 23);
 }
 
+/* e4m3 byte (s eeee mmm) -> fp16 bits without the exponent bias correction: (b & 0x7f) << 7 puts eeee at the
+ * low exponent bits and mmm at the top mantissa bits, so the half holds the e4m3 value / 256 -- exactly,
+ * subnormals included (the e4m3 subnormal m * 2^-9 and the half subnormal m * 2^-17 differ by 2^8 too).
+ * sm_86 has no fp8 conversion instruction; the library routine costs ~10 instructions per element and made
+ * the gemv ALU-bound at a third of the memory bandwidth. */
 static __device__ __forceinline__ void
 amp_fp8x16_to_f32(const uint4 &v, float *f)
 {
@@ -5423,9 +5429,13 @@ amp_fp8x16_to_f32(const uint4 &v, float *f)
 
 #pragma unroll
 	for (int i = 0; i < 4; i++) {
-		__half2_raw lo = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(u[i] & 0xffff), __NV_E4M3);
-		__half2_raw hi = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(u[i] >> 16), __NV_E4M3);
-		float2 a = __half22float2(__half2(lo)), b = __half22float2(__half2(hi));
+		const uint32_t w = u[i];
+		const uint32_t lo = ((w & 0x007f007fu) << 7) | ((w & 0x00800080u) << 8);       /* bytes 0 and 2 */
+		const uint32_t hi = (((w >> 8) & 0x007f007fu) << 7) | (((w >> 8) & 0x00800080u) << 8);   /* bytes 1 and 3 */
+		/* pairs (byte0, byte1) and (byte2, byte3) in element order */
+		const uint32_t p01 = (lo & 0xffffu) | (hi << 16);
+		const uint32_t p23 = (lo >> 16) | (hi & 0xffff0000u);
+		const float2 a = __half22float2(*(const __half2 *)&p01), b = __half22float2(*(const __half2 *)&p23);
 
 		f[4 * i + 0] = a.x;
 		f[4 * i + 1] = a.y;
@@ -5494,6 +5504,163 @@ __global__ void amp_fp8_gemv_kernel(const __half *__restrict__ x, const uint8_t 
 	}
 }
 
+/* Two output rows per warp, the weight loads of the next step issued before the current one is consumed
+ * (memory-level parallelism: the first version read ~300 GB/s of the ~750 GB/s of an A5000). */
+template <int M>
+__global__ void __launch_bounds__(256)
+amp_fp8_gemv2_kernel(const __half *__restrict__ x, const uint8_t *__restrict__ w, const uint8_t *__restrict__ s,
+                     __half *__restrict__ out, int K, int N)
+{
+	const int lane = threadIdx.x & 31;
+	const int n0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 2;
+
+	if (n0 >= N)
+		return;
+
+	const bool two = (n0 + 1 < N);
+	const uint8_t *wr0 = w + (size_t)n0 * K, *wr1 = two ? wr0 + K : wr0;
+	const uint8_t *sr0 = s + (size_t)(n0 >> 5) * (K >> 5), *sr1 = s + (size_t)((n0 + 1) >> 5) * (K >> 5);
+	float acc0[M], acc1[M];
+
+#pragma unroll
+	for (int m = 0; m < M; m++)
+		acc0[m] = acc1[m] = 0.0f;
+
+	int k = lane * 16;
+	uint4 wa = make_uint4(0, 0, 0, 0), wb = wa;
+
+	if (k < K) {
+		wa = *(const uint4 *)(wr0 + k);
+		wb = *(const uint4 *)(wr1 + k);
+	}
+
+	for (; k < K; k += 512) {
+		const int kn = k + 512;
+		uint4 na = make_uint4(0, 0, 0, 0), nb = na;
+
+		if (kn < K) {                                  /* prefetch the next step */
+			na = *(const uint4 *)(wr0 + kn);
+			nb = *(const uint4 *)(wr1 + kn);
+		}
+
+		const float sc0 = amp_e8m0(sr0[k >> 5]), sc1 = amp_e8m0(sr1[k >> 5]);
+		float f0[16], f1[16];
+
+		amp_fp8x16_to_f32(wa, f0);
+		amp_fp8x16_to_f32(wb, f1);
+
+#pragma unroll
+		for (int m = 0; m < M; m++) {
+			const uint4 *xp = (const uint4 *)(x + (size_t)m * K + k);
+			uint4 x0 = xp[0], x1 = xp[1];
+			const __half2 *h0 = (const __half2 *)&x0, *h1 = (const __half2 *)&x1;
+			float d0 = 0.0f, d1 = 0.0f;
+
+#pragma unroll
+			for (int i = 0; i < 4; i++) {
+				float2 a = __half22float2(h0[i]), b = __half22float2(h1[i]);
+
+				d0 += f0[2 * i] * a.x + f0[2 * i + 1] * a.y + f0[8 + 2 * i] * b.x + f0[8 + 2 * i + 1] * b.y;
+				d1 += f1[2 * i] * a.x + f1[2 * i + 1] * a.y + f1[8 + 2 * i] * b.x + f1[8 + 2 * i + 1] * b.y;
+			}
+
+			acc0[m] += d0 * sc0;
+			acc1[m] += d1 * sc1;
+		}
+
+		wa = na;
+		wb = nb;
+	}
+
+#pragma unroll
+	for (int m = 0; m < M; m++) {
+		float v0 = acc0[m], v1 = acc1[m];
+
+#pragma unroll
+		for (int o = 16; o > 0; o >>= 1) {
+			v0 += __shfl_xor_sync(0xffffffffu, v0, o);
+			v1 += __shfl_xor_sync(0xffffffffu, v1, o);
+		}
+
+		if (lane == 0) {
+			out[(size_t)m * N + n0] = __float2half(v0);
+
+			if (two)
+				out[(size_t)m * N + n0 + 1] = __float2half(v1);
+		}
+	}
+}
+
+/* M = 1: one row per warp, every load of the row issued up front (NS = ceil(K / 512) steps of 16 weights per
+ * lane): the rows are short (1.3 - 8 KB), a dependent chain of loads per row left the memory system idle. */
+template <int NS>
+__global__ void __launch_bounds__(256)
+amp_fp8_gemv3_kernel(const __half *__restrict__ x, const uint8_t *__restrict__ w, const uint8_t *__restrict__ s,
+                     __half *__restrict__ out, int K, int N)
+{
+	extern __shared__ uint4 g3_x[];                 /* the activation row, shared by the 8 rows of the block */
+
+	const int lane = threadIdx.x & 31;
+	const int n = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+	const uint8_t *wr = w + (size_t)min(n, N - 1) * K;
+	const uint8_t *sr = s + (size_t)(min(n, N - 1) >> 5) * (K >> 5);
+	uint4 wv[NS];
+	uint8_t sv[NS];
+
+	/* the weight loads first: they do not depend on x */
+#pragma unroll
+	for (int i = 0; i < NS; i++) {
+		const int k = i * 512 + lane * 16;
+
+		if (k < K) {
+			wv[i] = *(const uint4 *)(wr + k);
+			sv[i] = sr[k >> 5];
+		}
+	}
+
+	for (int c = threadIdx.x; c < K / 8; c += blockDim.x)
+		g3_x[c] = ((const uint4 *)x)[c];
+
+	__syncthreads();
+
+	if (n >= N)
+		return;
+
+	float acc = 0.0f;
+
+#pragma unroll
+	for (int i = 0; i < NS; i++) {
+		const int k = i * 512 + lane * 16;
+
+		if (k >= K)
+			continue;
+
+		float f[16];
+
+		amp_fp8x16_to_f32(wv[i], f);
+
+		const uint4 xa = g3_x[k >> 3], xb = g3_x[(k >> 3) + 1];
+		const __half2 *h0 = (const __half2 *)&xa, *h1 = (const __half2 *)&xb;
+		float d = 0.0f;
+
+#pragma unroll
+		for (int j = 0; j < 4; j++) {
+			float2 a = __half22float2(h0[j]), b = __half22float2(h1[j]);
+
+			d += f[2 * j] * a.x + f[2 * j + 1] * a.y + f[8 + 2 * j] * b.x + f[8 + 2 * j + 1] * b.y;
+		}
+
+		acc += d * amp_e8m0(sv[i]);
+	}
+
+#pragma unroll
+	for (int o = 16; o > 0; o >>= 1)
+		acc += __shfl_xor_sync(0xffffffffu, acc, o);
+
+	if (lane == 0)
+		out[n] = __float2half(acc);
+}
+
 extern "C" int
 amp_fp8_gemv(const void *x, const void *w, const void *s, void *out, int M, int K, int N,
              cudaStream_t stream)
@@ -5501,9 +5668,25 @@ amp_fp8_gemv(const void *x, const void *w, const void *s, void *out, int M, int 
 	if (M < 1 || M > 8 || K < 32 || (K % 32) || N < 1)
 		return (int)cudaErrorInvalidValue;
 
-	dim3 grid((N + 7) / 8), block(256);
+	if (M == 1 && K <= 16 * 512) {
+		const int ns = (K + 511) / 512;
+		dim3 g1((N + 7) / 8), b1(256);
 
-#define AMP_FP8G(MM) amp_fp8_gemv_kernel<MM><<<grid, block, 0, stream>>>((const __half *)x, \
+#define AMP_FP8G3(NSV) case NSV: amp_fp8_gemv3_kernel<NSV><<<g1, b1, (size_t)K * 2, stream>>>((const __half *)x, \
+	(const uint8_t *)w, (const uint8_t *)s, (__half *)out, K, N); return (int)cudaGetLastError()
+
+		switch (ns) {
+		AMP_FP8G3(1); AMP_FP8G3(2); AMP_FP8G3(3); AMP_FP8G3(4); AMP_FP8G3(5); AMP_FP8G3(6); AMP_FP8G3(7);
+		AMP_FP8G3(8); AMP_FP8G3(9); AMP_FP8G3(10); AMP_FP8G3(11); AMP_FP8G3(12); AMP_FP8G3(13); AMP_FP8G3(14);
+		AMP_FP8G3(15); AMP_FP8G3(16);
+		}
+
+#undef AMP_FP8G3
+	}
+
+	dim3 grid((N + 15) / 16), block(256);
+
+#define AMP_FP8G(MM) amp_fp8_gemv2_kernel<MM><<<grid, block, 0, stream>>>((const __half *)x, \
 	(const uint8_t *)w, (const uint8_t *)s, (__half *)out, K, N); break
 
 	switch (M) {
