@@ -48,7 +48,7 @@ experts; the text model without tables, drafter and tower is 110.6 GiB.
   per-(order, head) prime, plus the bucket offset) into 24 rows of the layer's 384M-row table, projected
   (6144 -> 5120 x 5) into one key per mHC stream and a shared value; each stream gets
   `value * sigmoid(signed_sqrt(normalized_dot(stream, key)))`.
-- DSpark block drafter (`mtp.*`, 3 stages, block 5): not implemented in ampstein yet.
+- DSpark block drafter (`mtp.*`, 3 stages, block 5, 128 FP4 experts top 3): see the DSpark section below.
 
 ## Implementation notes
 
@@ -118,3 +118,35 @@ Where the time goes: prefill is MoE bound (a 512-token chunk costs ~20 ms per la
 fixed cost of streaming every expert once dominates, hence the large chunk); decode spends ~0.8 ms per layer, of
 which the fused MoE kernels take ~0.24 ms (mixed-width instances, 6 experts), the FP8 GEMVs ~0.3 ms (at the
 memory roofline since the conversion fix, L152) and ~100 small kernels the rest.
+
+## DSpark block drafter (`dsv41_spark.uc`)
+
+Per round one forward over a block `[seed, noise x 4]` through the 3 `mtp.*` stages (plain sliding-window blocks, mHC
+one site late like the trunk, **128 FP4 experts top 3** + a shared FP8 expert), whose queries attend non-causally over
+the last 128 *main kv rows* plus the block itself. The main rows come from the target: the stream mean at the input of
+layers 37 / 38 / 39 (after the Engram), `main_norm(main_proj(cat))`, then per stage `rope(kv_norm(wkv(row)))` into a
+1024-row ring. Drafts are the greedy chain of `head(norm(state)) + markov_bias(previous token)` (the target's head,
+the markov embedding / head of rank 256); a confidence head gives each draft's acceptance estimate.
+
+- **FP4 experts** (`torch.fp4_moe_gemv`, `fp4_dequant`): e2m1 nibbles (low first) + one e8m0 per 32 values, expert
+  base addresses from device pointer tables, one warp per 4 output rows, x staged in shared memory with a pad float
+  per 32 (L158). 0.20 / 0.25 ms for 15 slots (94 MB). `tests/fp4_ops.uc`.
+- **Taps and rows.** `chunk_layers` records the taps of a chunk (prefill pipeline and graph decode alike);
+  `model.graphs(cache, [1 .. 5])` also captures S-row steps (`new_dec_rows`, `attn_decode_batch`, L161) and
+  `model.rollback(cache, L)` takes back the pool counts and the half-built compressor pairs of rejected rows.
+  `tests/dsv41_verify.uc` (rows vs eager steps, rollback, 40 layers at 17k and 65k positions).
+- **Round** (`dsv41_spark.run`): draft through 3 stage graphs + the head + a chain graph (~10 ms), pick the draft count
+  V (L160), one S = V + 1 row graph, feed the drafter the verified rows (`update_rows`), engine accepts (greedy:
+  exact match; sampled: p(x) of the one-hot draft) and rolls back. A draft needs its last 128 rows in the ring
+  (`ready`); after a prefix reuse that lost them, one plain step per round refills them.
+- **Placement.** `plan_devices(..., spark)` tries every assignment of the 3 stages to GPUs (2.6 GB each) and keeps
+  the best split; drafter stages share GPUs with trunk layers.
+
+| Verify step | 1 row | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| ms (8k context) | 36.8 | 45.2 | 54.2 | 61.3 | 67.1 |
+
+Measured with the server (256k context, chunk 1536): code, greedy 34 tok/s (2.6 tokens per round, 76 ms per round:
+draft 10, verify 64, update 1.4); the same at temperature 1.0 27.5 tok/s (2.1 per round); prose/thinking 29 - 34
+tok/s; plain decode 26 tok/s. 256k fits with ~1 GB to spare on the tightest GPU; chunk 2048 does not.
+

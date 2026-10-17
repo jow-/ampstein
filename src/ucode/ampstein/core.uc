@@ -24,6 +24,7 @@ import * as chat_glm5 from './chat_glm5.uc';
 import * as chat_dsv4 from './chat_dsv4.uc';
 import * as chat_dsv41 from './chat_dsv41.uc';
 import * as dsv41 from './dsv41.uc';
+import * as dsv41_spark from './dsv41_spark.uc';
 import * as qwen35 from './qwen35.uc';
 import * as qwen35_tp from './qwen35_tp.uc';
 import * as qwen35_vision from './qwen35_vision.uc';
@@ -158,6 +159,8 @@ export function serve(args) {
 		args.chunk = 4096;
 
 
+	const D41_MTP0 = (args.mtp_set && args.mtp == 0);                // --mtp 0: no DSpark drafter
+
 	// DeepSeek-V4: pairs of GPUs (tensor-parallel) in a pipeline of stages, with the DSpark block
 	// drafter (--mtp 0 turns it off, --dspark-window N verifies N drafts per round, default 4);
 	// --layer-split runs the plain layer split instead (no drafter)
@@ -179,6 +182,12 @@ export function serve(args) {
 	let cfg = GLM ? glm5.load_config(args.model) : DS ? dsv4.load_config(args.model) :
 		D41 ? dsv41.load_config(args.model) :
 		Q4 ? qwen4.load_config(args.model) : qwen35.load_config(args.model);
+
+	// DeepSeek-V4.1: the DSpark block drafter (mtp.* weights) unless --mtp 0
+	const D41_SPARK = D41 && !D41_MTP0 && cfg.dspark_block > 0 && cfg.num_mtp_layers > 0;
+
+	if (D41_SPARK && !args.dspark_window)
+		args.dspark_window = 4;
 
 	// DeepSeek-V4.1 packs ship no generation_config.json: end of sentence is token 1 (config.json), and
 	// DeepSeek recommends temperature 1.0 / top_p 0.95
@@ -235,7 +244,13 @@ export function serve(args) {
 			dsv4.load(args.model, {devices: args.gpus});
 	}
 	else if (D41) {
-		model = dsv41.load(args.model, {devices: args.gpus, max_seq: args.ctx, prefill_rows: args.chunk});
+		model = dsv41.load(args.model, {devices: args.gpus, max_seq: args.ctx, prefill_rows: args.chunk,
+			spark: D41_SPARK});
+
+		if (D41_SPARK) {
+			model.dspark = dsv41_spark.load(model, {devs: model.spark_devs});
+			warn(`ampstein: DSpark drafter loaded on cuda:${join(',cuda:', model.spark_devs)} (verify window ${args.dspark_window})\n`);
+		}
 	}
 	else if (Q4) {
 		model = args.tp ? qwen4_tp.load(args.model, {devices: args.gpus, mtp: args.mtp > 0,

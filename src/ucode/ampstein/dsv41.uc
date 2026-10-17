@@ -29,10 +29,14 @@ import * as dsv4 from './dsv4.uc';
 import {readfile, stat} from 'fs';
 
 const NEGH = -60000.0;
+const MAX_ROWS = 8;                       // rows of a multi-row decode step
 const RING = +(getenv('AMP_DSV41_RING') || 8192);          // raw window rows kept per layer (rollback span)
 const SCRATCH_ELEMS = 32 * 1024 * 1024;                    // fp8 -> fp16 dequant slice, elements
 const PROF = getenv('AMP_DSV41_PROF') != null;
 const NO_ENGRAM = getenv('AMP_DSV41_NO_ENGRAM') != null;
+let ROWOFF = {};
+const SKIP = getenv('AMP_DSV41_SKIP');                      // profiling: 'attn' | 'moe' skipped in multi-row steps
+const ROWLOOP = getenv('AMP_DSV41_ROWLOOP') != null;          // multi-row decode: attention row by row (reference path)
 
 /* ------------------------------------------------------------------ */
 /* config                                                              */
@@ -98,6 +102,9 @@ export function load_config(model_dir) {
 		dspark_noise_id: t.dspark_noise_token_id,
 		dspark_taps: t.dspark_target_layer_ids || [],
 		num_mtp_layers: t.num_nextn_predict_layers || 0,
+		dspark_experts: t.dspark_n_routed_experts || 0,
+		dspark_topk: t.dspark_num_experts_per_tok || 0,
+		dspark_rank: t.dspark_markov_rank || 0,
 
 		is_v41: true
 	};
@@ -227,7 +234,7 @@ export function lin8g(ws, key, G, dev) {
 }
 
 /* bf16 / fp32 matrix used in fp32: x (M, K) -> (M, N) fp32 */
-function mat32(ws, key, dev) {
+export function mat32(ws, key, dev) {
 	let m = ws.gpu(key + '.weight', dev).to('float32').t().contiguous();
 
 	ws.release(key + '.weight', dev);            // the bf16 upload is not needed any more
@@ -238,7 +245,7 @@ function mat32(ws, key, dev) {
 /* ------------------------------------------------------------------ */
 /* rope                                                                */
 
-function rope_cs(inv_freq, p0, T, step, dev) {
+export function rope_cs(inv_freq, p0, T, step, dev) {
 	let h = inv_freq.shape()[0];
 	let ang = torch.arange(T, 'float32', 'cuda:' + dev).mul(step * 1.0).add(p0 * 1.0)
 		.view([T, 1]).mul(inv_freq.view([1, h]));
@@ -247,7 +254,7 @@ function rope_cs(inv_freq, p0, T, step, dev) {
 }
 
 /* x (T, H, D) fp32: rotate the trailing rd channels pairwise (GPT-J) */
-function rope_il(x, cs, rd) {
+export function rope_il(x, cs, rd) {
 	let s = x.shape();
 	let T = s[0], H = s[1], D = s[2];
 	let tail = x.narrow(2, D - rd, rd).reshape([T, H, int(rd / 2), 2]);
@@ -330,6 +337,7 @@ export function build_engram(ws, cfg, i, dev) {
 		weight: ws.gpu(key + '.q_weight', dev).to('float32').mul(ws.gpu(key + '.k_weight', dev).to('float32')).contiguous(),
 		file: ws.has(key + '.embed.weight') ? ws.file(key + '.embed.weight') : null,
 		emb_buf: torch.zeros([1, (cfg.engram_ngram - 1) * cfg.engram_heads * cfg.engram_dim], 'float16', 'cuda:' + dev),
+		emb_bufs: {},
 		wname: key + '.embed.weight',
 		sname: key + '.embed.scale'
 	};
@@ -501,6 +509,12 @@ export function new_layer_cache(cfg, A, max_seq) {
 		// position is odd); persistent so that graph steps update them in place
 		cl.pk = torch.zeros([1, cfg.head_dim], 'float32', dv);
 		cl.pg = torch.zeros([1, cfg.head_dim], 'float32', dv);
+
+		// the half-built pair after each row of a multi-row step (speculative verify), for rollbacks
+		if (A.ratio == 2) {
+			cl.rk = torch.zeros([MAX_ROWS, cfg.head_dim], 'float32', dv);
+			cl.rg = torch.zeros([MAX_ROWS, cfg.head_dim], 'float32', dv);
+		}
 	}
 
 	return cl;
@@ -705,12 +719,18 @@ function apply_candidates(cfg, sc, blocks, dv) {
 	let bs = cfg.candidate_block_size;
 	let R = sc.shape()[0], S = sc.shape()[1];
 	let nb = int((S + bs - 1) / bs), k = blocks.shape()[1];
-	let ro = [];
+	let rk = `${dv}:${R}:${nb}`;                // row offsets: built once (the eager warm-up of a graph), then reused
 
-	for (let r = 0; r < R; r++)
-		push(ro, r * nb);
+	if (ROWOFF[rk] == null) {
+		let ro = [];
 
-	let rowoff = torch.from_array(ro, 'int64').cuda(devidx(dv), true).view([R, 1]);
+		for (let r = 0; r < R; r++)
+			push(ro, r * nb);
+
+		ROWOFF[rk] = torch.from_array(ro, 'int64').cuda(devidx(dv), true).view([R, 1]);
+	}
+
+	let rowoff = ROWOFF[rk];
 	let dummy = torch.full([1], R * nb, 'int64', dv);
 	let flat = torch.where(blocks.le(-1), dummy, blocks.add(rowoff)).reshape([-1]);
 	let m = torch.zeros([R * nb + 1], 'float16', dv);
@@ -1075,9 +1095,267 @@ export function attn_decode(cfg, A, ctx, cache, cl, xn, st, caps) {
 }
 
 /* ------------------------------------------------------------------ */
+/* multi-row decode (speculative verify)                                */
+/*
+ * S consecutive tokens at the positions pos .. pos + S - 1 in one graph. The projections, the norms, the
+ * hyper-connections and the MoE run batched (the weights are read once); the position-dependent middle of
+ * the attention (rope, ring write, compressor, indexer, the attention kernel) runs per row with that row's
+ * own device position, in order, so every row sees exactly what a single-token step at its position sees.
+ */
+
+/* S rows of device positions on dev: meta (S, 8), rows[s] = {dev, meta: view of row s} (a dec_set_pos state) */
+export function new_dec_rows(cfg, dev, S) {
+	let meta = torch.zeros([S, 8], 'int64', 'cuda:' + dev);
+	let rows = [];
+
+	for (let s = 0; s < S; s++)
+		push(rows, {dev: dev, meta: meta.narrow(0, s, 1).view([8])});
+
+	return {dev: dev, S: S, meta: meta, rows: rows};
+}
+
+export function dec_set_rows(cfg, st, pos) {
+	let a = [];
+
+	for (let s = 0; s < st.S; s++) {
+		let p = pos + s;
+
+		push(a, p, p % RING, int(p / 2), 2 * int(p / 2), int(p / cfg.candidate_block_size), (p % 2 == 1) ? int(p / 2) : -1, 0, 0);
+	}
+
+	st.meta.copy_(torch.from_array(a, 'int64').view([st.S, 8]).cuda(st.dev, true));
+}
+
+/* attention of the S rows of xn (S, D) fp16; sts: the rows' states, ctxs: one indexer context per row */
+export function attn_decode_rows(cfg, A, ctxs, cache, cl, xn, sts, caps) {
+	let S = xn.shape()[0];
+	let H = cfg.num_q_heads, D = cfg.head_dim, rd = cfg.rope_dim;
+	let eps = cfg.rms_norm_eps;
+	let dev = A.dev;
+	let ratio = A.ratio;
+	let qr = torch.rms_norm(A.q_a.forward(xn), A.q_norm, eps);
+	let q = A.q_b.forward(qr).view([S, H, D]);
+	let kvn = torch.rms_norm(A.wkv.forward(xn), A.kv_norm, eps);
+	let os = [];
+
+	for (let s = 0; s < S; s++) {
+		let st = sts[s], ctx = ctxs[s];
+		let cs = rope_cs_dev(A.inv_freq, meta_f(st, 0));
+		let q16 = rope_il(q.narrow(0, s, 1).to('float32'), cs, rd).to('float16').contiguous();
+		let kv16 = rope_il(kvn.narrow(0, s, 1).to('float32').view([1, 1, D]), cs, rd).to('float16').view([1, D]).contiguous();
+		let xs = xn.narrow(0, s, 1);
+
+		cl.ring.index_copy_(0, meta_i(st, 1), kv16);
+
+		let pool = null, idx = null;
+
+		if (ratio > 0) {
+			let src = cfg.src[A.idx];
+			let Scap = caps[ratio];
+
+			if (A.kv_source) {
+				comp_decode(cfg, A, cl, xs, st);
+
+				// the half-built pair after this row (a rollback to s + 1 rows restarts from it)
+				if (ratio == 2) {
+					cl.rk.narrow(0, s, 1).copy_(cl.pk);
+					cl.rg.narrow(0, s, 1).copy_(cl.pg);
+				}
+			}
+
+			if (A.idx_source) {
+				idx = index_picks_dec(cfg, A, ctx, cache, xs, qr.narrow(0, s, 1), st, Scap, src);
+				ctx.topk = {dev: dev, t: idx, id: 'p' + A.idx};
+			}
+			else if (ctx.topk) {
+				idx = remote(ctx, ctx.topk, dev);
+			}
+
+			if (idx)
+				pool = pool_dec(cache, src, dev).pool.narrow(0, 0, Scap);
+		}
+
+		push(os, torch.v41_attn(q16, cl.ring, 0, pool, idx, A.sinks, A.inv_freq, 0, cfg.sm_scale, cfg.window, 0,
+			meta_i(st, 0), RING));
+	}
+
+	return A.wo_b.forward(A.wo_a.forward(torch.cat(os, 0).view([S, H * D])));
+}
+
+/* cos / sin (S, 1, rd/2, 1) of S positions posf (S, 1) fp32 */
+export function rope_cs_rows(inv_freq, posf) {
+	let h = inv_freq.shape()[0];
+	let S = posf.shape()[0];
+	let ang = posf.mul(inv_freq.view([1, h]));
+
+	return [ang.cos().view([S, 1, h, 1]), ang.sin().view([S, 1, h, 1])];
+}
+
+function col_i(st, k) {
+	return st.meta.narrow(1, k, 1);                  // (S, 1) int64
+}
+
+/* the S rows into the compressor of a kv source layer (positions in st.meta), in order */
+function comp_decode_rows(cfg, A, cl, xn, st) {
+	let C = A.comp, ratio = A.ratio;
+	let rd = cfg.rope_dim, eps = cfg.rms_norm_eps;
+	let S = xn.shape()[0];
+	let dv = 'cuda:' + A.dev;
+	let lat, posf, slot;
+
+	if (ratio == 1) {
+		lat = torch.rms_norm(torch.matmul(xn, C.wkv16), C.norm, eps);
+		posf = col_i(st, 0).to('float32');
+		slot = col_i(st, 0).reshape([-1]);
+	}
+	else {
+		let x32 = xn.to('float32');
+		let kv = torch.matmul(x32, C.wkv), g = torch.matmul(x32, C.wgate);
+
+		// row s completes the pair (row s - 1, row s) when its position is odd; the partner of row 0 is the
+		// half-built pair of the cache
+		let pk = torch.cat([cl.pk, kv.narrow(0, 0, S - 1)], 0), pg = torch.cat([cl.pg, g.narrow(0, 0, S - 1)], 0);
+		let m = torch.cat([pg.view([S, 1, -1]), g.view([S, 1, -1])], 1).max(1);
+		let e0 = pg.sub(m).exp(), e1 = g.sub(m).exp();
+		let pooled = pk.mul(e0).add(kv.mul(e1)).div(e0.add(e1));
+
+		cl.rk.narrow(0, 0, S).copy_(kv);
+		cl.rg.narrow(0, 0, S).copy_(g);
+		cl.pk.copy_(kv.narrow(0, S - 1, 1));
+		cl.pg.copy_(g.narrow(0, S - 1, 1));
+		lat = torch.rms_norm(pooled.to('float16').contiguous(), C.norm, eps);
+		posf = col_i(st, 3).to('float32');
+
+		// rows that start a pair write their (unfinished) pooled value to the spare slot at the end
+		let cs_ = col_i(st, 5).reshape([-1]);
+
+		slot = torch.where(cs_.le(-1), torch.full([1], cl.pool.shape()[0] - 1, 'int64', dv), cs_);
+	}
+
+	let cs = rope_cs_rows(A.inv_freq, posf);
+	let I = A.indexer;
+
+	if (I && I.owns_k) {
+		let k = torch.rms_norm(torch.matmul(lat, I.wk_t), I.k_norm, eps);
+
+		cl.kidx.index_copy_(0, slot, rope_il(k.to('float32').view([S, 1, cfg.index_head_dim]), cs, rd).to('float16')
+			.view([S, cfg.index_head_dim]));
+	}
+
+	cl.pool.index_copy_(0, slot, rope_il(lat.to('float32').view([S, 1, cfg.head_dim]), cs, rd).to('float16')
+		.view([S, cfg.head_dim]));
+}
+
+/* the picks of the indexer for the S rows: (S, k) int32 over the first Scap pool entries */
+function index_picks_dec_rows(cfg, A, ctx, cache, xn, qr, st, Scap, src) {
+	let I = A.indexer, ratio = A.ratio;
+	let dv = 'cuda:' + A.dev;
+	let S = xn.shape()[0];
+	let Hi = cfg.index_n_heads, Di = cfg.index_head_dim, rd = cfg.rope_dim;
+	let pc = pool_dec(cache, src, A.dev);
+	let qi = I.wq_b.forward(qr).view([S, Hi, Di]);
+	let cs = rope_cs_rows(A.inv_freq, col_i(st, 0).to('float32'));
+	let q16 = rope_il(qi.to('float32'), cs, rd).to('float16').contiguous();
+	let w = torch.matmul(xn.to('float32'), I.w_t).contiguous();
+	let sc = torch.idx_score(q16, pc.kidx.narrow(0, 0, Scap), w, math.pow(Di * 1.0, -0.5) * math.pow(Hi * 1.0, -0.5),
+		st.meta.narrow(0, 0, 1).narrow(1, 0, 1), ratio);
+	let bs = cfg.candidate_block_size;
+
+	if (Scap > cfg.candidate_blocks * bs && cfg.candidate_source >= 0) {
+		let nb = int((Scap + bs - 1) / bs);
+
+		if (A.idx == cfg.candidate_source) {
+			let pad = nb * bs - Scap;
+			let s2 = (pad > 0) ? torch.cat([sc, torch.full([S, pad], NEGH, 'float16', dv)], 1) : sc;
+			let bsc = s2.view([S, nb, bs]).max(2).to('float32');
+			let lb = col_i(st, 4);
+			let ar = torch.arange(nb, 'int64', dv).view([1, nb]);
+			let hit = ar.le(lb).to('int32').mul(lb.le(ar).to('int32'));
+
+			bsc = torch.where(hit.le(0), bsc, torch.full([1], 1.0e30, 'float32', dv));
+
+			let top = bsc.topk(min(cfg.candidate_blocks, nb), -1);
+
+			ctx.cand = {dev: A.dev, id: 'c',
+				src: torch.where(top.values.le(NEGH), torch.full([1], -1, 'int64', dv), top.indices)};
+		}
+		else if (A.idx > cfg.candidate_source && ctx.cand) {
+			sc = apply_candidates(cfg, sc, remote(ctx, ctx.cand, A.dev, 'src'), dv);
+		}
+	}
+
+	let tk = sc.topk(min(cfg.index_topk, Scap), -1);
+
+	return torch.where(tk.values.le(NEGH), torch.full([1], -1, 'int64', dv), tk.indices).to('int32');
+}
+
+/* attention of the S rows of xn (S, D) fp16 at the positions of st.meta, all rows at once */
+export function attn_decode_batch(cfg, A, ctx, cache, cl, xn, st, caps) {
+	let S = xn.shape()[0];
+	let H = cfg.num_q_heads, D = cfg.head_dim, rd = cfg.rope_dim;
+	let eps = cfg.rms_norm_eps;
+	let dev = A.dev;
+	let ratio = A.ratio;
+	let qr = torch.rms_norm(A.q_a.forward(xn), A.q_norm, eps);
+	let q = A.q_b.forward(qr).view([S, H, D]);
+	let cs = rope_cs_rows(A.inv_freq, col_i(st, 0).to('float32'));
+	let q16 = rope_il(q.to('float32'), cs, rd).to('float16').contiguous();
+	let kv = torch.rms_norm(A.wkv.forward(xn), A.kv_norm, eps);
+	let kv16 = rope_il(kv.to('float32').view([S, 1, D]), cs, rd).to('float16').view([S, D]).contiguous();
+
+	cl.ring.index_copy_(0, col_i(st, 1).reshape([-1]), kv16);
+
+	let pool = null, idx = null;
+
+	if (ratio > 0) {
+		let src = cfg.src[A.idx];
+		let Scap = caps[ratio];
+
+		if (A.kv_source)
+			comp_decode_rows(cfg, A, cl, xn, st);
+
+		if (A.idx_source) {
+			idx = index_picks_dec_rows(cfg, A, ctx, cache, xn, qr, st, Scap, src);
+			ctx.topk = {dev: dev, t: idx, id: 'p' + A.idx};
+		}
+		else if (ctx.topk) {
+			idx = remote(ctx, ctx.topk, dev);
+		}
+
+		if (idx)
+			pool = pool_dec(cache, src, dev).pool.narrow(0, 0, Scap);
+	}
+
+	let o = torch.v41_attn(q16, cl.ring, 0, pool, idx, A.sinks, A.inv_freq, 0, cfg.sm_scale, cfg.window, 0,
+		st.meta.narrow(0, 0, 1).narrow(1, 0, 1), RING);
+
+	return A.wo_b.forward(A.wo_a.forward(o.view([S, H * D])));
+}
+
+/* One block on S rows; streams (S, 4, D) fp32 updated in place, pre (S, 4). Returns the next pre. */
+export function block_decode_rows(cfg, L, ctxs, cache, cl, streams, pre, st, caps) {
+	let eps = cfg.rms_norm_eps;
+	let am = hc_mixes(cfg, L.hc_attn, streams);
+	let xn = torch.rms_norm(hc_collapse(streams, pre), L.attn_norm, eps);
+	let y = SKIP == 'attn' ? torch.zeros([xn.shape()[0], cfg.hidden_size], 'float16', 'cuda:' + L.dev) :
+		ROWLOOP ? attn_decode_rows(cfg, L.attn, ctxs, cache, cl, xn, st.rows, caps) :
+		attn_decode_batch(cfg, L.attn, ctxs[0], cache, cl, xn, st, caps);
+
+	glm5.hc_apply(streams, y, am.post, am.comb);
+
+	let fm = hc_mixes(cfg, L.hc_ffn, streams);
+
+	xn = torch.rms_norm(hc_collapse(streams, am.pre), L.ffn_norm, eps);
+	y = SKIP == 'moe' ? torch.zeros([xn.shape()[0], cfg.hidden_size], 'float32', 'cuda:' + L.dev) : glm5.moe_forward(cfg, L.moe, xn);
+	glm5.hc_apply(streams, y, fm.post, fm.comb);
+
+	return fm.pre;
+}
+
+/* ------------------------------------------------------------------ */
 /* MoE                                                                 */
 
-function build_mlp8(ws, key, dev) {
+export function build_mlp8(ws, key, dev) {
 	return {
 		gate: lin8(ws, key + '.w1', dev),
 		up: lin8(ws, key + '.w3', dev),
@@ -1288,65 +1566,142 @@ function seg_cost(cfg, bytes, a, b, max_seq) {
 	return c;
 }
 
-/* Contiguous layer ranges for ngpu devices that minimize the fullest device: checkpoint bytes of the
- * layers (the head on the last device, extra_last for its working set) plus the pools it must hold. The
- * embedding table goes to the least loaded device afterwards (embed_device). Returns the per-layer
- * device array. */
-export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last) {
-	let nl = cfg.num_hidden_layers;
-	let bytes = layer_bytes(ws, cfg);
+/* checkpoint bytes of the drafter's stages (mtp.<b>.*), plus a working set */
+export function spark_stage_bytes(ws, cfg) {
+	let out = [];
 
-	function cost(a, b) {
-		return seg_cost(cfg, bytes, a, b, max_seq) + (a == 0 ? (extra_first || 0) : 0) + (b == nl ? (extra_last || 0) : 0);
-	}
+	for (let b = 0; b < cfg.num_mtp_layers; b++)
+		push(out, 400000000);
 
-	// best[d][i]: smallest possible maximum over d devices holding the first i layers
-	let best = [], from = [];
+	for (let key in ws.list()) {
+		if (index(key, 'mtp.') == 0) {
+			let b = +substr(key, 4, index(key, '.', 4) - 4);
 
-	for (let d = 0; d <= ngpu; d++) {
-		push(best, []);
-		push(from, []);
-
-		for (let i = 0; i <= nl; i++) {
-			push(best[d], (d == 0 && i == 0) ? 0 : 1e30);
-			push(from[d], -1);
+			if (b >= 0 && b < length(out))
+				out[b] += ws.info(key).nbytes;
 		}
 	}
 
-	for (let d = 1; d <= ngpu; d++)
-		for (let i = 1; i <= nl; i++)
-			for (let a = d - 1; a < i; a++) {
-				if (best[d - 1][a] >= 1e30)
-					continue;
+	return out;
+}
 
-				let m = max(best[d - 1][a], cost(a, i));
+/* The devices the drafter's stages were planned on (set by plan_devices) */
+export let SPARK_DEVS = null;
 
-				if (m < best[d][i]) {
-					best[d][i] = m;
-					from[d][i] = a;
-				}
-			}
+/* Contiguous layer ranges for ngpu devices that minimize the fullest device: checkpoint bytes of the
+ * layers (the head on the last device, extra_last for its working set) plus the pools it must hold. The
+ * embedding table goes to the least loaded device afterwards (embed_device). With `spark` (bytes of each
+ * drafter stage) every stage also takes a device of its own choosing: all assignments are tried and the
+ * best one is left in SPARK_DEVS. Returns the per-layer device array. */
+export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last, spark) {
+	let nl = cfg.num_hidden_layers;
+	let bytes = layer_bytes(ws, cfg);
+	let ct = [];
 
-	let devs = [];
+	for (let a = 0; a <= nl; a++) {
+		push(ct, []);
 
-	for (let i = 0; i < nl; i++)
-		push(devs, 0);
-
-	for (let d = ngpu, i = nl; d >= 1; d--) {
-		let a = from[d][i];
-
-		for (let j = a; j < i; j++)
-			devs[j] = d - 1;
-
-		i = a;
+		for (let b = 0; b <= nl; b++)
+			push(ct[a], (b > a) ? seg_cost(cfg, bytes, a, b, max_seq) + (a == 0 ? (extra_first || 0) : 0) +
+				(b == nl ? (extra_last || 0) : 0) : 0);
 	}
 
-	return devs;
+	// the best split for the per-device extra bytes: [fullest device, per-layer device array]
+	function dp(extra) {
+		// best[d][i]: smallest possible maximum over d devices holding the first i layers
+		let best = [], from = [];
+
+		for (let d = 0; d <= ngpu; d++) {
+			push(best, []);
+			push(from, []);
+
+			for (let i = 0; i <= nl; i++) {
+				push(best[d], (d == 0 && i == 0) ? 0 : 1e30);
+				push(from[d], -1);
+			}
+		}
+
+		for (let d = 1; d <= ngpu; d++)
+			for (let i = 1; i <= nl; i++)
+				for (let a = d - 1; a < i; a++) {
+					if (best[d - 1][a] >= 1e30)
+						continue;
+
+					let m = max(best[d - 1][a], ct[a][i] + extra[d - 1]);
+
+					if (m < best[d][i]) {
+						best[d][i] = m;
+						from[d][i] = a;
+					}
+				}
+
+		let devs = [];
+
+		for (let i = 0; i < nl; i++)
+			push(devs, 0);
+
+		for (let d = ngpu, i = nl; d >= 1; d--) {
+			let a = from[d][i];
+
+			for (let j = a; j < i; j++)
+				devs[j] = d - 1;
+
+			i = a;
+		}
+
+		return [ best[ngpu][nl], devs ];
+	}
+
+	let zero = [];
+
+	for (let d = 0; d < ngpu; d++)
+		push(zero, 0);
+
+	SPARK_DEVS = null;
+
+	if (!spark || !length(spark))
+		return dp(zero)[1];
+
+	let ns = length(spark);
+	let bestm = 1e30, bestd = null, bests = null;
+
+	function assign(stage, used) {
+		if (stage == ns) {
+			let extra = map(zero, () => 0);
+
+			for (let b = 0; b < ns; b++)
+				extra[used[b]] += spark[b];
+
+			let r = dp(extra);
+
+			if (r[0] < bestm) {
+				bestm = r[0];
+				bestd = r[1];
+				bests = slice(used);
+			}
+
+			return;
+		}
+
+		for (let d = 0; d < ngpu; d++) {
+			if (index(used, d) >= 0)
+				continue;
+
+			push(used, d);
+			assign(stage + 1, used);
+			pop(used);
+		}
+	}
+
+	assign(0, []);
+	SPARK_DEVS = bests;
+
+	return bestd;
 }
 
 /* the device with the fewest bytes planned (weights + pools; the head's device counts its head): where the
  * embedding table lives. The lookup is one row per token, wherever it is. */
-export function embed_device(ws, cfg, devs, max_seq, head_bytes) {
+export function embed_device(ws, cfg, devs, max_seq, head_bytes, extra) {
 	let bytes = layer_bytes(ws, cfg);
 	let nl = cfg.num_hidden_layers;
 	let load = {}, best = devs[0], bl = 1e30;
@@ -1362,6 +1717,10 @@ export function embed_device(ws, cfg, devs, max_seq, head_bytes) {
 	}
 
 	load[devs[nl - 1]] += head_bytes || 0;
+
+	for (let d in keys(extra || {}))
+		if (load[d] != null)
+			load[d] += extra[d];
 
 	for (let d in keys(load))
 		if (load[d] < bl) {
@@ -1406,11 +1765,20 @@ export function load(model_dir, opts) {
 		cfg.num_hidden_layers = nl;
 	}
 
-	if (type(devs) != 'array')
-		devs = plan_devices(ws, cfg, devs, opts.max_seq || 262144, 0, 2000000000);
+	let spark_devs = null, spark_load = {};
+
+	if (type(devs) != 'array') {
+		let sb = (opts.spark && cfg.dspark_block && ws.has('mtp.0.main_proj.weight')) ? spark_stage_bytes(ws, cfg) : null;
+
+		devs = plan_devices(ws, cfg, devs, opts.max_seq || 262144, 0, 2000000000, sb);
+		spark_devs = SPARK_DEVS;
+
+		for (let b = 0; spark_devs && b < length(spark_devs); b++)
+			spark_load[spark_devs[b]] = (spark_load[spark_devs[b]] || 0) + sb[b];
+	}
 
 	let first = devs[0], last = devs[nl - 1];
-	let ed = (opts.embed_dev != null) ? opts.embed_dev : embed_device(ws, cfg, devs, opts.max_seq || 262144, 1300000000);
+	let ed = (opts.embed_dev != null) ? opts.embed_dev : embed_device(ws, cfg, devs, opts.max_seq || 262144, 1300000000, spark_load);
 
 	glm5.set_fused_rows(max(256, opts.prefill_rows || 1024));
 
@@ -1446,7 +1814,13 @@ export function load(model_dir, opts) {
 		if (l < nl)
 			engrams[l] = build_engram(ws, cfg, l, devs[l]);
 
-	mem_report(devs, 'layers loaded');
+	let cnt = {};
+
+	for (let d in devs)
+		cnt[d] = (cnt[d] || 0) + 1;
+
+	warn(`dsv41: layers per device: ${join(' ', map(keys(cnt), (k) => k + ':' + cnt[k]))}\n`);
+	mem_report(devs, `layers loaded (embedding on cuda:${ed}, head on cuda:${last}, drafter on ${spark_devs ? 'cuda:' + join(',cuda:', spark_devs) : '-'})`);
 
 	let embed_t = ws.gpu16('embed.weight', ed);
 
@@ -1457,7 +1831,7 @@ export function load(model_dir, opts) {
 	ws.release('head.weight', last);               // lm_head holds the fp16 copy
 
 	let model = {
-		cfg: cfg, devs: devs, ws: ws, layers: layers, engrams: engrams, meta: meta, embed_tokens: embed_t, embed_dev: ed,
+		cfg: cfg, devs: devs, spark_devs: spark_devs, ws: ws, layers: layers, engrams: engrams, meta: meta, embed_tokens: embed_t, embed_dev: ed,
 		norm: ws.gpu16('norm.weight', last),
 		lm_head: lm_head,
 
@@ -1545,6 +1919,9 @@ export function load(model_dir, opts) {
 					prof('n.engram_apply');
 				}
 
+				if (c.taps && index(cfg.dspark_taps, i) >= 0)
+					push(c.taps, {dev: c.dev, t: c.h.mean(1)});     // the stream mean at the input of a tapped layer (T, D) fp32
+
 				let th0 = HOSTPROF ? prof_now() : 0;
 
 				c.pre = block_forward(cfg, L, c.ctx, cache, cache.layers[i], c.h, c.pre, c.pos0);
@@ -1552,6 +1929,13 @@ export function load(model_dir, opts) {
 				if (HOSTPROF)
 					push(HOSTPROF, [i, prof_now() - th0]);
 			}
+		},
+
+		/* the DSpark taps of a finished chunk: (T, 3 * D) fp32 on the first tapped layer's device */
+		chunk_taps: function (c) {
+			let dev = c.taps[0].dev;
+
+			return torch.cat(map(c.taps, (t) => (t.dev == dev) ? t.t : t.t.cuda(dev, true)), 1);
 		},
 
 		/* the head over the last `rows` rows of a finished chunk */
@@ -1567,13 +1951,19 @@ export function load(model_dir, opts) {
 
 		/* Run token ids (array) appended to the cache. Returns logits (rows, vocab) fp16 for the last
 		 * `rows` positions (default 1), or null for rows == 0. */
-		forward_chunk: function (token_ids, cache, rows) {
+		forward_chunk: function (token_ids, cache, rows, on_taps) {
 			if (rows == null)
 				rows = 1;
 
 			let c = this.chunk_begin(token_ids, cache);
 
+			if (on_taps)
+				c.taps = [];
+
 			this.chunk_layers(c, cache, 0, nl);
+
+			if (on_taps)
+				on_taps(this.chunk_taps(c), c.pos0);
 
 			return (rows == 0) ? null : this.chunk_head(c, rows);
 		},
@@ -1632,6 +2022,8 @@ export function load(model_dir, opts) {
 				function body(it) {
 					let h = it.h_in, pre = it.pre_in;
 
+					it.taps = [];
+
 					for (let i = it.first; i < it.end; i++) {
 						let li = index(cfg.engram_layers, i);
 
@@ -1640,6 +2032,9 @@ export function load(model_dir, opts) {
 
 							engram_apply(cfg, E, h, E.emb_buf);
 						}
+
+						if (index(cfg.dspark_taps, i) >= 0)
+							push(it.taps, {dev: it.dev, t: h.mean(1)});
 
 						pre = block_decode(cfg, model.layers[i], ctx, cache, cache.layers[i], h, pre, sts[it.dev], caps);
 					}
@@ -1676,6 +2071,107 @@ export function load(model_dir, opts) {
 
 				torch.synchronize();
 				push(buckets, {c1: c1, items: items, ctx: ctx});
+			}
+
+			mem_report(model.devs, 'graphs captured (1 row)');
+
+			// multi-row steps (speculative verify): S rows per replay, per S its own set of graphs
+			let rowsets = {};
+			let tap_layers = cfg.dspark_taps;
+
+			for (let S in sizes) {
+				if (S < 2)
+					continue;
+
+				if (S > MAX_ROWS)
+					die(`dsv41: at most ${MAX_ROWS} rows per step`);
+
+				let stsS = {};
+
+				for (let sg in segs)
+					stsS[sg.dev] = new_dec_rows(cfg, sg.dev, S);
+
+				let bks = [];
+
+				for (let c1 in caps_list) {
+					let caps = [ 0, c1, int((c1 + 1) / 2) ];
+					let ctxs = [];
+					let items = [];
+
+					for (let r = 0; r < S; r++)
+						push(ctxs, {topk: null, cand: null, dst: {}, lk: {}});
+
+					for (let sg in segs) {
+						let dv = 'cuda:' + sg.dev;
+						let it = {first: sg.first, end: sg.end, dev: sg.dev,
+							h_in: torch.zeros([S, 4, H], 'float32', dv), pre_in: torch.zeros([S, 4], 'float32', dv),
+							logits: null, last: (sg.end == nl), taps: []};
+
+						it.pre_in.narrow(1, 0, 1).fill_(1.0);
+						push(items, it);
+					}
+
+					function body_rows(it) {
+						let h = it.h_in, pre = it.pre_in;
+
+						it.taps = [];
+
+						for (let i = it.first; i < it.end; i++) {
+							let li = index(cfg.engram_layers, i);
+
+							if (li >= 0) {
+								let E = model.engrams[i];
+
+								engram_apply(cfg, E, h, E.emb_bufs[S]);
+							}
+
+							if (index(tap_layers, i) >= 0)
+								push(it.taps, {dev: it.dev, t: h.mean(1)});
+
+							pre = block_decode_rows(cfg, model.layers[i], ctxs, cache, cache.layers[i], h, pre,
+								stsS[it.dev], caps);
+						}
+
+						it.pre_out = pre;
+
+						if (it.last) {
+							let x = torch.rms_norm(hc_collapse(h, pre), model.norm, cfg.rms_norm_eps);
+
+							it.logits = model.lm_head.forward(x);
+							it.am = it.logits.argmax(-1);
+						}
+
+						it.h_out = h;
+					}
+
+					for (let E in values(model.engrams))
+						if (E.emb_bufs[S] == null)
+							E.emb_bufs[S] = torch.zeros([S, E.emb_buf.shape()[1]], 'float16', 'cuda:' + E.dev);
+
+					for (let sg in segs)
+						dec_set_rows(cfg, stsS[sg.dev], 0);
+
+					for (let it in items) {
+						body_rows(it);
+						torch.synchronize();
+					}
+
+					for (let it in items) {
+						it.graph = torch.graph();
+						it.graph.capture_begin(it.dev, null, gpool[it.dev]);
+						body_rows(it);
+						it.graph.capture_end();
+
+						if (!gpool[it.dev])
+							gpool[it.dev] = it.graph.pool();
+					}
+
+					torch.synchronize();
+					push(bks, {c1: c1, items: items, ctxs: ctxs});
+				}
+
+				rowsets[S] = {buckets: bks, sts: stsS};
+				mem_report(model.devs, `graphs captured (${S} rows)`);
 			}
 
 			// the warm-up and the captures wrote position 0 of every cache: start from empty again
@@ -1734,7 +2230,7 @@ export function load(model_dir, opts) {
 					h = h.cuda(first);
 
 				h = h.to('float32').reshape([1, 1, H]).expand([1, 4, H]).contiguous();
-				let pre = null, logits = null;
+				let pre = null, logits = null, taps = [];
 
 				let tp0 = PROF ? prof_now() : 0;
 
@@ -1771,6 +2267,8 @@ export function load(model_dir, opts) {
 							mirror_entry(cache, i, int(pos / A.ratio));
 					}
 
+					push(taps, ...it.taps);
+
 					if (it.last)
 						logits = it.logits;
 				}
@@ -1783,12 +2281,125 @@ export function load(model_dir, opts) {
 				}
 
 				cache.length = pos + 1;
+				model.last_rows = {pos: pos, S: 1};
 
-				return {logits: logits, hidden: null};
+				let dt = length(taps) ? taps[0].dev : 0;
+
+				return {logits: logits, hidden: null,
+					taps: length(taps) ? torch.cat(map(taps, (t) => (t.dev == dt) ? t.t : t.t.cuda(dt)), 1) : null};
+			}
+
+			/* S = length(ids) rows at pos .. pos + S - 1 through one replay chain: {logits (S, vocab), am (the
+			 * argmax of every row), taps (S, 3 * hidden) fp32}. cache.length becomes pos + S; rollback()
+			 * takes back the rows a speculation did not keep. */
+			function run_rows(ids, pos) {
+				let S = length(ids);
+				let rs = rowsets[S];
+
+				if (!rs)
+					die(`dsv41: no graph for ${S} rows`);
+
+				let b = null;
+
+				for (let x in rs.buckets)
+					if (x.c1 > pos + S - 1 && !b)
+						b = x;
+
+				if (!b)
+					die(`dsv41: position ${pos + S - 1} is past the context of ${max_seq}`);
+
+				if (length(cache.cids) > pos)
+					splice(cache.cids, pos, length(cache.cids) - pos);
+
+				while (length(cache.cids) < pos)
+					push(cache.cids, model.meta.pad);
+
+				for (let sg in segs)
+					dec_set_rows(cfg, rs.sts[sg.dev], pos);
+
+				let idt = torch.from_array(ids, 'int64');
+				let cn = model.meta.token_map.index(idt).view([-1]).tolist();
+				let hist = [];
+
+				for (let k = 3; k >= 1; k--)
+					push(hist, (pos - k >= 0) ? cache.cids[pos - k] : model.meta.pad);
+
+				for (let c in cn) {
+					push(hist, c);
+					push(cache.cids, c);
+				}
+
+				let hist_t = torch.from_array(hist, 'int64').view([1, -1]);
+
+				for (let li = 0; li < length(cfg.engram_layers); li++) {
+					let l = cfg.engram_layers[li];
+
+					if (l < nl) {
+						let E = model.engrams[l];
+
+						E.emb_bufs[S].copy_(engram_rows(cfg, model.meta, E, li, hist_t, S));
+					}
+				}
+
+				let h = model.embed_tokens.index(idt.cuda(ed, true));
+
+				if (ed != first)
+					h = h.cuda(first);
+
+				h = h.to('float32').reshape([S, 1, H]).expand([S, 4, H]).contiguous();
+
+				let pre = null, logits = null, am = null, taps = [];
+
+				for (let it in b.items) {
+					it.h_in.copy_(h);
+
+					if (pre)
+						it.pre_in.copy_(pre);
+
+					it.graph.replay();
+					h = it.h_out;
+					pre = it.pre_out;
+
+					for (let ctx in b.ctxs)
+						for (let k in keys(ctx.lk))
+							ctx.lk[k].dst.copy_(ctx.lk[k].src);
+
+					for (let i = it.first; i < it.end; i++) {
+						let A = model.layers[i].attn;
+
+						if (A.kv_source)
+							for (let j = int(pos / A.ratio); j <= int((pos + S - 1) / A.ratio); j++)
+								mirror_entry(cache, i, j);
+					}
+
+					push(taps, ...it.taps);
+
+					if (it.last) {
+						logits = it.logits;
+						am = it.am;
+					}
+				}
+
+				for (let i = 0; i < nl; i++) {
+					let A = model.layers[i].attn;
+
+					if (A.kv_source)
+						set_pool_n(cache, i, int((pos + S) / A.ratio));
+				}
+
+				cache.length = pos + S;
+				model.last_rows = {pos: pos, S: S};
+
+				let dt = length(taps) ? taps[0].dev : 0;
+
+				return {logits: logits, am: am,
+					taps: length(taps) ? torch.cat(map(taps, (t) => (t.dev == dt) ? t.t : t.t.cuda(dt)), 1) : null};
 			}
 
 			return {
-				has: function (S) {return S == 1;},
+				has: function (S) {return S == 1 || rowsets[S] != null;},
+
+				rows: run_rows,
 
 				run: function (ids, pos) {
 					return run_ids(ids[0], pos);
@@ -1798,6 +2409,34 @@ export function load(model_dir, opts) {
 					return run_ids(ids_dev.view([1]).tolist()[0], pos);
 				}
 			};
+		},
+
+		/* Take back the rows of the last multi-row step beyond the length L (p0 < L <= p0 + S): the pool entry
+		 * counts and the half-built pair of the ratio-2 compressors follow the kept rows. */
+		rollback: function (cache, L) {
+			let lr = this.last_rows;
+
+			if (!lr || L < lr.pos + 1 || L > lr.pos + lr.S)
+				die(`dsv41: rollback to ${L} is outside the last step`);
+
+			for (let i = 0; i < nl; i++) {
+				let A = this.layers[i].attn;
+
+				if (!A.kv_source)
+					continue;
+
+				set_pool_n(cache, i, int(L / A.ratio));
+
+				if (A.ratio == 2) {
+					let cl = cache.layers[i];
+
+					cl.pk.copy_(cl.rk.narrow(0, L - 1 - lr.pos, 1));
+					cl.pg.copy_(cl.rg.narrow(0, L - 1 - lr.pos, 1));
+				}
+			}
+
+			cache.length = L;
+			this.last_rows = {pos: lr.pos, S: L - lr.pos};
 		},
 
 		/* Recurrent state outside the KV rows, for the engine's prompt snapshots: per layer the pool entry
@@ -1902,6 +2541,9 @@ export function load(model_dir, opts) {
 				let last = (end == start + total);
 				let c = model.chunk_begin(slice(ids, prev_end - start, end - start), cache);
 
+				if (opts.on_taps)
+					c.taps = [];
+
 				c.stage = 0;
 				c.last = last;
 				prev_end = end;
@@ -1918,6 +2560,9 @@ export function load(model_dir, opts) {
 					model.chunk_layers(c, cache, stages[s].first, stages[s].end);
 
 					if (s == ns - 1) {
+						if (opts.on_taps)
+							opts.on_taps(model.chunk_taps(c), c.pos0);
+
 						if (c.last)
 							result = model.chunk_head(c, 1);
 

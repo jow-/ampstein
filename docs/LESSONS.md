@@ -600,3 +600,24 @@ Add new lessons at the end of the matching section.
   misread digits — greedy and short prompts got away with it, the first sampled long one did not).
   `set_pool_n` now invalidates the mirrors from the first rewritten entry on; `tests/dsv41_attn.uc` runs its
   sequence a second time on the reset caches.
+- **L157 — A body reader returning `''` is "done", not "not yet".** `httpd.uc` used `if (!r) return;` to wait for the
+  rest of a request body; a request without a body (every GET) completes with the empty string, which is falsy, so
+  `GET /v1/models` and `/health` hung forever while the POSTs (non-empty bodies) worked. Compare with `null`.
+- **L158 — Shared-memory bank conflicts hide behind "memory-bound".** The FP4 expert GEMV staged the activation row
+  in shared memory and let lane `i` read `x[i * 32 + 2j]`: the same bank for all 32 lanes, 32-way serialized, 0.41 ms
+  for 94 MB (230 GB/s). One pad float per 32 (stride 33) made it 0.20 ms (480 GB/s). A divergent `__constant__`
+  table lookup serializes the same way (use a 16-entry shared table), but that was not the bottleneck here.
+- **L159 — Cross-device copies block the host unless asked not to.** `tensor.cuda(dev)` between GPUs waits for the
+  source stream; in the wavefront prefill the drafter's tap copies made the host wait for every chunk to leave the
+  last stage (454 -> 680 tok/s with `.cuda(dev, true)`). Everything that rides along a pipelined pass must be
+  non-blocking.
+- **L160 — Speculative verify on an MoE costs ~rows.** A 5-row verify step is 67 ms against 37 ms for one row: the
+  fused MoE kernel already decodes an expert once for all rows that picked it, but 5 rows x top-6 hardly overlap, so
+  every row pays its experts (~0.12 ms per layer per row). With the drafter at ~10 ms a round of V drafts costs
+  ~47 + 8 V ms; the engine picks V per round to maximize (1 + sum of cumulative confidences) / cost.
+- **L161 — Device-side positions make multi-row decode batchable.** The single-token graph reads its position from
+  `st.meta`; giving every row its own meta row (`new_dec_rows`) lets the rope, the ring write, the compressor
+  (pair partner = the previous row, the half-built pair for row 0, rows that only open a pair write a spare slot),
+  the indexer (`idx_score` already scores R rows from a device `pos0`) and the attention kernel run once for all
+  rows: 83 -> 67 ms for 5 rows over the row-by-row loop (`AMP_DSV41_ROWLOOP=1` keeps that as the reference).
+

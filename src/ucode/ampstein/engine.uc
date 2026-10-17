@@ -1955,7 +1955,7 @@ export function create(model, opts) {
 			cuts: cuts,
 			hidden: j.use_mtp && !DF,
 			on_hidden: (j.use_mtp && !DF) ? (pos, H) => seed_chunk(j, pos, H) : null,
-			on_taps: SP ? (taps, pos) => SP.prefill_rows(taps, pos) :
+			on_taps: (SP && !getenv('AMP_DSPARK_NO_PREFILL_TAPS')) ? (taps, pos) => SP.prefill_rows(taps, pos) :
 				DF ? function (taps, pos) {
 					if (pos + taps[0][0].shape()[1] > df_from)
 						DF.prefill_rows(taps, pos);
@@ -2553,6 +2553,15 @@ export function create(model, opts) {
 		mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows);
 	}
 
+	/* a speculative round keeps the first L rows: the cache length, and the model's own state of the rows
+	 * it took back (pool counts, half-built compressor pairs) when it has any */
+	function spec_len(L) {
+		if (SP && SP.rollback)
+			SP.rollback(L);
+
+		cache.length = L;
+	}
+
 	/* One DSpark round: draft + verify through three CUDA graphs (dspark_tp), accept
 	 * by the one-hot-draft rule (exact match at temperature 0, p(x) under the
 	 * sampling distribution otherwise), roll back by resetting the cache length. */
@@ -2568,6 +2577,21 @@ export function create(model, opts) {
 			j.phase = 'decode';
 			j.use_dspark = false;
 			j.logits = step_fwd([seed]);
+			push(ids, seed);
+
+			return;
+		}
+
+		// the drafter lacks the main rows of the last window (a reused prefix whose rows were overwritten):
+		// one plain step; its taps refill the ring
+		if (SP.ready && !SP.ready(p0)) {
+			let rr = graph.run([ seed ], p0);
+
+			if (rr.taps)
+				SP.prefill_rows(rr.taps, p0);
+
+			j.phase = 'decode';
+			j.logits = rr.logits;
 			push(ids, seed);
 
 			return;
@@ -2624,7 +2648,7 @@ export function create(model, opts) {
 
 		push(emit, bonus);
 
-		cache.length = p0 + a + 1;
+		spec_len(p0 + a + 1);
 		j.rounds++;
 		j.drafted += V;
 		j.accepted += a;
@@ -2686,7 +2710,7 @@ export function create(model, opts) {
 
 			if (stopped) {
 				// rows kept: the seed and the drafts before this token
-				cache.length = p0 + k + 1;
+				spec_len(p0 + k + 1);
 				push(ids, ...slice(fed, 0, k + 1));
 
 				return finish(stopped);

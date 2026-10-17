@@ -243,5 +243,12 @@ None of these affect the server (which takes `--model`); they select inputs for
 | `AMP_DSV41_NO_ENGRAM` | Engram contributes zeros (tests without the 200 GB tables) |
 | `AMP_DSV41_PROF` | accumulate the time of the phases (synchronizes between them; `dsv41.PROFILE`) |
 | `AMP_DSV41_HOSTPROF` | host time per layer of a prefill chunk (`dsv41.HOSTPROF`) |
+| `AMP_DSV41_ROWLOOP` | multi-row (verify) decode: attention row by row instead of batched (reference path) |
+| `AMP_DSV41_SKIP` | profiling: `attn` skips the attention of multi-row steps (wrong outputs) |
+| `AMP_DSPARK_PROF` | print the drafter round phases (draft / verify / update, synchronizes) every 50 rounds |
+| `AMP_DSPARK_NO_GRAPH` | draft eagerly instead of through CUDA graphs |
+| `AMP_DSPARK_NO_PREFILL_TAPS` | do not feed the drafter during prefill (it then needs a plain step per window) |
+| `AMP_DSPARK_COSTS` | ms of a 1..6-row verify step for the choice of the draft length (default `36.8,45.2,54.2,61.3,67.1,73.0`) |
+| `AMP_DSPARK_DRAFT_MS` | drafter time added to every round's cost estimate, default 8 |
 | `AMP_V41_NO_TC` | use the CUDA-core attention kernel instead of the tensor-core one for prefill chunks |
 | `AMP_DEBUG_PROMPT` | log the rendered prompt text of every chat request (all architectures) |

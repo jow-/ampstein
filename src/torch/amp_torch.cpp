@@ -6574,6 +6574,84 @@ torch_fp8_dequant(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+extern "C" int amp_fp4_dequant(const void *w, const void *s, void *out, int N, int K, cudaStream_t stream);
+extern "C" int amp_fp4_moe_gemv(const void *x, const void *ids, const void *wp, const void *sp, void *out,
+                                int slots, int K, int N, int xdiv, cudaStream_t stream);
+
+/* torch.fp4_dequant(w, s): w (N, K/2) int8 (two e2m1 per byte, low nibble first), s (N, K/32) float8_e8m0fnu
+ * -> (N, K) fp16 */
+static uc_value_t *
+torch_fp4_dequant(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *w, *s;
+
+	if (nargs != 2 || !(w = tensor_arg(vm, uc_fn_arg(0))) || !(s = tensor_arg(vm, uc_fn_arg(1))))
+		return NULL;
+
+	if (w->dim() != 2 || s->dim() != 2 || w->scalar_type() != at::kChar ||
+	    s->scalar_type() != at::kFloat8_e8m0fnu || !w->is_contiguous() || !s->is_contiguous() ||
+	    (w->size(1) % 16) != 0 || s->size(0) != w->size(0) || s->size(1) != w->size(1) / 16 ||
+	    w->get_device() != s->get_device())
+		RAISE("fp4_dequant: w (N, K/2) int8, s (N, K/32) e8m0, contiguous, one device");
+
+	TensorDeviceGuard dg(*w);
+
+	try {
+		int N = (int)w->size(0), K = (int)w->size(1) * 2;
+		at::Tensor out = at::empty({ N, K }, w->options().dtype(at::kHalf));
+		int rc = amp_fp4_dequant(w->data_ptr(), s->data_ptr(), out.data_ptr(), N, K,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "fp4_dequant"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/* torch.fp4_moe_gemv(x, ids, wp, sp, N, xdiv): x (R, K) fp16; ids (S) int64 expert per slot; wp / sp (E) int64
+ * device addresses of each expert's (N, K/2) int8 weight and (N, K/32) e8m0 scale -> (S, N) fp32, slot s using
+ * row s / xdiv of x. */
+static uc_value_t *
+torch_fp4_moe_gemv(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *x, *ids, *wp, *sp;
+
+	if (nargs != 6 || !(x = tensor_arg(vm, uc_fn_arg(0))) || !(ids = tensor_arg(vm, uc_fn_arg(1))) ||
+	    !(wp = tensor_arg(vm, uc_fn_arg(2))) || !(sp = tensor_arg(vm, uc_fn_arg(3))) ||
+	    ucv_type(uc_fn_arg(4)) != UC_INTEGER || ucv_type(uc_fn_arg(5)) != UC_INTEGER)
+		RAISE("fp4_moe_gemv: (x, ids, wp, sp, N, xdiv)");
+
+	long N = ucv_int64_get(uc_fn_arg(4)), xdiv = ucv_int64_get(uc_fn_arg(5));
+
+	if (x->dim() != 2 || x->scalar_type() != at::kHalf || !x->is_contiguous() || ids->scalar_type() != at::kLong ||
+	    !ids->is_contiguous() || wp->scalar_type() != at::kLong || sp->scalar_type() != at::kLong ||
+	    N < 1 || xdiv < 1 || x->size(0) * xdiv < ids->numel() || (x->size(1) % 32) != 0 ||
+	    x->get_device() != ids->get_device() || x->get_device() != wp->get_device() ||
+	    x->get_device() != sp->get_device())
+		RAISE("fp4_moe_gemv: x (R, K) fp16, ids / wp / sp int64 on the same device, xdiv * R >= slots");
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		int S = (int)ids->numel(), K = (int)x->size(1);
+		at::Tensor out = at::empty({ S, N }, x->options().dtype(at::kFloat));
+		int rc = amp_fp4_moe_gemv(x->data_ptr(), ids->data_ptr(), wp->data_ptr(), sp->data_ptr(),
+			out.data_ptr(), S, K, (int)N, (int)xdiv, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "fp4_moe_gemv"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 extern "C" long amp_v41_attn_ws_floats(int T, int H, int nsplit);
 extern "C" int amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc, int Nc,
                             const void *idx, int Kc, const float *sinks, const float *inv_freq, void *out,
@@ -9573,6 +9651,8 @@ static const uc_function_list_t torch_fns[] = {
 	{ "fp8_gemv",	torch_fp8_gemv },
 	{ "v41_attn",	torch_v41_attn },
 	{ "fp8_dequant",	torch_fp8_dequant },
+	{ "fp4_dequant",	torch_fp4_dequant },
+	{ "fp4_moe_gemv",	torch_fp4_moe_gemv },
 	{ "stream_side",	torch_stream_side },
 	{ "stream_main",	torch_stream_main },
 	{ "stream_wait",	torch_stream_wait },

@@ -423,7 +423,7 @@ export function listen(host, port, handler) {
 				}
 			}
 
-			if (!r)
+			if (r == null)                    // an empty body ('' for Content-Length 0 / no body) is complete
 				return;
 
 			req.body = r;

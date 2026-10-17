@@ -5747,6 +5747,154 @@ amp_fp8_dequant(const void *w, const void *s, void *out, int N, int K, cudaStrea
 
 
 /* ------------------------------------------------------------------ */
+/* FP4 (e2m1, two per byte) block-scaled weights: the DSpark drafter's experts.
+ * w (N, K/2) bytes, low nibble = even element; s (N, K/32) e8m0, one scale per 32 values. */
+
+__constant__ float amp_fp4_lut[16] = { 0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+                                       -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f };
+
+__device__ __forceinline__ float amp_e8m0_exact(uint8_t e)
+{
+	return __uint_as_float((uint32_t)e << 23);          /* 2^(e-127); e = 0 is 2^-127 (denormal, fine) */
+}
+
+__global__ void amp_fp4_dequant_kernel(const uint8_t *__restrict__ w, const uint8_t *__restrict__ s,
+                                       __half *__restrict__ out, int K, long nblk)
+{
+	long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i >= nblk)
+		return;
+
+	uint4 wv = *(const uint4 *)(w + i * 16);
+	const uint8_t *b = (const uint8_t *)&wv;
+	const float sc = amp_e8m0_exact(s[i]);
+	__half r[32];
+
+#pragma unroll
+	for (int j = 0; j < 16; j++) {
+		r[2 * j] = __float2half(amp_fp4_lut[b[j] & 15] * sc);
+		r[2 * j + 1] = __float2half(amp_fp4_lut[b[j] >> 4] * sc);
+	}
+
+	uint4 *o = (uint4 *)(out + i * 32);
+
+	o[0] = *(uint4 *)(r);
+	o[1] = *(uint4 *)(r + 8);
+	o[2] = *(uint4 *)(r + 16);
+	o[3] = *(uint4 *)(r + 24);
+}
+
+extern "C" int
+amp_fp4_dequant(const void *w, const void *s, void *out, int N, int K, cudaStream_t stream)
+{
+	if (N < 1 || K < 32 || (K % 32))
+		return (int)cudaErrorInvalidValue;
+
+	long nblk = (long)N * (K / 32);
+
+	amp_fp4_dequant_kernel<<<(unsigned)((nblk + 255) / 256), 256, 0, stream>>>((const uint8_t *)w,
+		(const uint8_t *)s, (__half *)out, K, nblk);
+
+	return (int)cudaGetLastError();
+}
+
+/* out[slot][n] = sum_k x[slot / xdiv][k] * W[ids[slot]][n][k] (fp32 accumulate), one warp per output
+ * row n; the experts' weight / scale base addresses come from the pointer tables wp / sp. A warp
+ * lane reads 16 bytes = 32 weights = exactly one scale block. */
+#define AMP_FP4_ROWS 4        /* output rows per warp: the staged x row is reused, the loads overlap */
+
+__global__ void amp_fp4_moe_gemv_kernel(const __half *__restrict__ x, const long long *__restrict__ ids,
+                                        const long long *__restrict__ wp, const long long *__restrict__ sp,
+                                        float *__restrict__ out, int K, int N, int xdiv)
+{
+	extern __shared__ float xs[];
+	__shared__ float lut[16];
+
+	const int slot = blockIdx.y;
+	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+	const __half *xr = x + (size_t)(slot / xdiv) * K;
+
+	if (threadIdx.x < 16)
+		lut[threadIdx.x] = amp_fp4_lut[threadIdx.x];
+
+	for (int k = threadIdx.x; k < K; k += blockDim.x)
+		xs[k + (k >> 5)] = __half2float(xr[k]);              /* one pad float per 32: lanes read distinct banks */
+
+	__syncthreads();
+
+	const int n0 = (blockIdx.x * (blockDim.x >> 5) + warp) * AMP_FP4_ROWS;
+
+	if (n0 >= N)
+		return;
+
+	const long long e = ids[slot];
+	const uint8_t *wb = (const uint8_t *)wp[e] + (size_t)n0 * (K / 2);
+	const uint8_t *sb = (const uint8_t *)sp[e] + (size_t)n0 * (K / 32);
+	const int nr = min(AMP_FP4_ROWS, N - n0);
+	float acc[AMP_FP4_ROWS];
+
+#pragma unroll
+	for (int r = 0; r < AMP_FP4_ROWS; r++)
+		acc[r] = 0.f;
+
+	for (int kb = lane; kb < K / 32; kb += 32) {
+		uint4 wv[AMP_FP4_ROWS];
+		uint8_t sc[AMP_FP4_ROWS];
+
+#pragma unroll
+		for (int r = 0; r < AMP_FP4_ROWS; r++) {
+			if (r < nr) {
+				wv[r] = *(const uint4 *)(wb + (size_t)r * (K / 2) + (size_t)kb * 16);
+				sc[r] = sb[(size_t)r * (K / 32) + kb];
+			}
+		}
+
+		const float *xb = xs + kb * 33;
+
+#pragma unroll
+		for (int r = 0; r < AMP_FP4_ROWS; r++) {
+			if (r < nr) {
+				const uint8_t *b = (const uint8_t *)&wv[r];
+				float a = 0.f;
+
+#pragma unroll
+				for (int j = 0; j < 16; j++)
+					a = fmaf(lut[b[j] & 15], xb[2 * j], fmaf(lut[b[j] >> 4], xb[2 * j + 1], a));
+
+				acc[r] = fmaf(a, amp_e8m0_exact(sc[r]), acc[r]);
+			}
+		}
+	}
+
+#pragma unroll
+	for (int r = 0; r < AMP_FP4_ROWS; r++) {
+#pragma unroll
+		for (int o = 16; o > 0; o >>= 1)
+			acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], o);
+
+		if (lane == 0 && r < nr)
+			out[(size_t)slot * N + n0 + r] = acc[r];
+	}
+}
+
+extern "C" int
+amp_fp4_moe_gemv(const void *x, const void *ids, const void *wp, const void *sp, void *out, int slots,
+                 int K, int N, int xdiv, cudaStream_t stream)
+{
+	if (slots < 1 || K < 32 || (K % 32) || N < 1 || xdiv < 1)
+		return (int)cudaErrorInvalidValue;
+
+	dim3 grid((N + 8 * AMP_FP4_ROWS - 1) / (8 * AMP_FP4_ROWS), slots), block(256);
+
+	amp_fp4_moe_gemv_kernel<<<grid, block, (size_t)(K + K / 32) * 4, stream>>>((const __half *)x,
+		(const long long *)ids, (const long long *)wp, (const long long *)sp, (float *)out, K, N, xdiv);
+
+	return (int)cudaGetLastError();
+}
+
+
+/* ------------------------------------------------------------------ */
 /* DeepSeek-V4.1 sparse MQA attention                                  */
 /*
  * One shared key/value head of 512 dims (V = K), H query heads, a per-head sink logit.
