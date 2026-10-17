@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <memory>
 #include <new>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
 #include <vector>
@@ -8454,11 +8455,13 @@ stfile_free_method(uc_vm_t *vm, size_t nargs)
 }
 
 static uc_value_t *torch_st_gather(uc_vm_t *vm, size_t nargs);
+static uc_value_t *torch_st_prefetch(uc_vm_t *vm, size_t nargs);
 
 static const uc_function_list_t stfile_methods[] = {
 	{ "list",	torch_st_list },
 	{ "info",	torch_st_info },
 	{ "gather",	torch_st_gather },
+	{ "prefetch",	torch_st_prefetch },
 	{ "tensor",	torch_st_tensor },
 	{ "free",	stfile_free_method },
 };
@@ -8962,6 +8965,63 @@ torch_st_gather(uc_vm_t *vm, size_t nargs)
 	}
 
 	return ucv_get(uc_fn_arg(2));
+}
+
+/*
+ * stfile.prefetch(name, rows): null
+ *
+ * Ask the kernel to read the rows of tensor `name` (first dimension = row, int64 CPU) into the page cache
+ * (POSIX_FADV_WILLNEED); returns at once. For tables far larger than RAM whose rows are known before they
+ * are needed (the Engram hashes depend on the token ids only).
+ */
+static uc_value_t *
+torch_st_prefetch(uc_vm_t *vm, size_t nargs)
+{
+	st_file_t *f = stfile_this(vm);
+	uc_value_t *name = uc_fn_arg(0);
+	const char *dtype;
+	int64_t *shape;
+	size_t ndim, offset, nbytes;
+
+	if (!f)
+		return NULL;
+
+	if (nargs != 2 || ucv_type(name) != UC_STRING) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (name, rows)");
+		return NULL;
+	}
+
+	at::Tensor *rows = tensor_arg(vm, uc_fn_arg(1));
+
+	if (!rows)
+		return NULL;
+
+	if (st_lookup(f, ucv_string_get(name), &dtype, &shape, &ndim, &offset, &nbytes) == ST_NOT_FOUND) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, "no such tensor");
+		return NULL;
+	}
+
+	int64_t nrows = ndim ? shape[0] : 0;
+
+	free(shape);
+
+	if (nrows < 1 || nbytes % (size_t)nrows || rows->scalar_type() != at::kLong || rows->is_cuda() ||
+	    !rows->is_contiguous())
+		RAISE("prefetch: rows must be contiguous int64 CPU, the tensor a row-major table");
+
+	int64_t row_bytes = (int64_t)(nbytes / (size_t)nrows);
+	const int64_t *r = (const int64_t *)rows->data_ptr();
+	int64_t n = rows->numel();
+
+	for (int64_t i = 0; i < n; i++) {
+		if (r[i] < 0 || r[i] >= nrows)
+			continue;
+
+		posix_fadvise(f->fd, (off_t)(f->data_off + offset + (size_t)r[i] * (size_t)row_bytes), (off_t)row_bytes,
+			POSIX_FADV_WILLNEED);
+	}
+
+	return NULL;
 }
 
 /*

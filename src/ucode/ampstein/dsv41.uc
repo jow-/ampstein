@@ -363,6 +363,53 @@ function engram_rows(cfg, meta, E, li, hist_t, T) {
 	return rows.index(inverse.cuda(E.dev, true)).view([T, H * cfg.engram_dim]);
 }
 
+/* Start reading the table rows of the tokens ids (which follow the cache's history) into the page cache
+ * without waiting: the hashes depend on the token ids only, so a whole prompt can be prefetched while the
+ * first chunks compute. */
+export function engram_prefetch(cfg, meta, engrams, cache, ids, pos0) {
+	let H = (cfg.engram_ngram - 1) * cfg.engram_heads;
+	let n = length(ids);
+	let SL = 4096;
+
+	for (let a = 0; a < n; a += SL) {
+		let T = min(SL, n - a);
+		let cn = meta.token_map.index(torch.from_array(slice(ids, a, a + T), 'int64')).view([-1]).tolist();
+		let hist = [];
+
+		for (let k = 3; k >= 1; k--) {
+			let q = pos0 + a - k;
+
+			if (q < 0)
+				push(hist, meta.pad);
+			else if (q < pos0)
+				push(hist, (q < length(cache.cids)) ? cache.cids[q] : meta.pad);
+			else
+				push(hist, meta.token_map.index(torch.from_array([ ids[q - pos0] ], 'int64')).view([-1]).tolist()[0]);
+		}
+
+		for (let c in cn)
+			push(hist, c);
+
+		let hist_t = torch.from_array(hist, 'int64').view([1, -1]);
+
+		for (let li = 0; li < length(cfg.engram_layers); li++) {
+			let E = engrams[cfg.engram_layers[li]];
+
+			if (!E)
+				continue;
+
+			let nn = T * H;
+			let uids = torch.zeros([nn], 'int64'), inverse = torch.zeros([nn], 'int64'), heads = torch.zeros([nn], 'int32');
+			let U = torch.ngram_hash(hist_t, T, meta.mult[li], meta.offs[li], meta.sizes[li], cfg.engram_heads,
+				meta.pad, uids, inverse, heads);
+			let u = uids.narrow(0, 0, U).contiguous();
+
+			E.file.prefetch(E.wname, u);
+			E.file.prefetch(E.sname, u);
+		}
+	}
+}
+
 /* streams (T, 4, D) fp32 updated in place */
 export function engram_apply(cfg, E, streams, emb) {
 	let T = streams.shape()[0], D = cfg.hidden_size;
@@ -1703,6 +1750,9 @@ export function load(model_dir, opts) {
 			push(bounds, start + total);
 
 			let next = 0, done = 0, result = null;
+
+			if (!NO_ENGRAM)
+				engram_prefetch(model.cfg, model.meta, model.engrams, cache, ids, start);
 
 			return {
 				step: function (rounds) {
