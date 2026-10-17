@@ -148,5 +148,5 @@ the markov embedding / head of rank 256); a confidence head gives each draft's a
 
 Measured with the server (256k context, chunk 1536): code, greedy 34 tok/s (2.6 tokens per round, 76 ms per round:
 draft 10, verify 64, update 1.4); the same at temperature 1.0 27.5 tok/s (2.1 per round); prose/thinking 29 - 34
-tok/s; plain decode 26 tok/s. 256k fits with ~1 GB to spare on the tightest GPU; chunk 2048 does not.
+tok/s; plain decode 26 tok/s. 256k fits with chunk 2048 (the planner reserves 1 GB on the first GPU: layers 7/7/6/6/7/7, prefill ~900 tok/s, code decode 36 tok/s).
 
