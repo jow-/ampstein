@@ -179,6 +179,8 @@ amp_test(dsv41_engram_apply)
 amp_test(dsv41_graph)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)
 amp_test(glm5_chat)
+# chat_dsv41: DeepSeek-V4.1 chat format vs encoding.py
+amp_test(chat_dsv41)
 # glm5_blocks: mHC dense blocks vs the oracle
 amp_test(glm5_blocks)
 # glm5_kda: KDA layer vs the oracle

@@ -16,9 +16,14 @@
 {%- if mode not in ["chat", "thinking"] -%}{{- raise_exception("thinking_mode must be \"chat\" or \"thinking\"") -}}{%- endif -%}
 {%- set drop = drop_thinking if drop_thinking is defined else true -%}
 {%- set effort = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else "high" -%}
-{%- set effort_map = {"low": 50, "medium": 62, "high": 75, "max": 100} -%}
-{%- if effort is string and effort in effort_map -%}
-  {%- set budget = effort_map[effort] -%}
+{%- if effort == "low" -%}
+  {%- set budget = 50 -%}
+{%- elif effort == "medium" -%}
+  {%- set budget = 62 -%}
+{%- elif effort == "high" -%}
+  {%- set budget = 75 -%}
+{%- elif effort == "max" -%}
+  {%- set budget = 100 -%}
 {%- elif effort is integer and effort >= 1 and effort <= 100 -%}
   {%- set budget = effort -%}
 {%- else -%}
@@ -77,6 +82,9 @@
     {%- endfor -%}
     {{- up.s -}}
 
+  {%- elif m.role == "latest_reminder" -%}
+    {{- "<｜latest_reminder｜>" ~ (m.content | default("", true)) -}}
+
   {%- elif m.role == "assistant" -%}
     {%- if thinking and (not effective_drop or idx > state.last_user) -%}
       {{- (m.reasoning_content if m.reasoning_content is defined and m.reasoning_content is not none else (m.thinking | default("", true))) ~ "</think>" -}}
@@ -106,7 +114,7 @@
   {%- endif -%}
 
   {#- the transition into the next assistant turn, when one follows (the driver appends the final one) -#}
-  {%- if not loop.last and messages[idx + 1].role == "assistant" and (m.role == "user" or (m.role == "system" and idx > 0)) -%}
+  {%- if not loop.last and (messages[idx + 1].role == "assistant" or messages[idx + 1].role == "latest_reminder") and (m.role == "user" or (m.role == "system" and idx > 0)) -%}
     {{- "<｜Assistant｜>" ~ ("<think>" if thinking and (not effective_drop or idx >= state.last_user) else "</think>") -}}
   {%- endif -%}
 {%- endfor -%}
