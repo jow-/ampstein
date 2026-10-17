@@ -245,7 +245,7 @@ export function build_hc(ws, p, tag, dev) {
 }
 
 /* streams (T, 4, D) fp32 -> {pre (T, 4), post (T, 4), comb (T, 4, 4)} */
-function hc_mixes(cfg, hc, streams) {
+export function hc_mixes(cfg, hc, streams) {
 	let T = streams.shape()[0];
 	let r = glm5.hc_mix(cfg, hc, streams);
 	let flat = streams.reshape([T, 4 * cfg.hidden_size]);
@@ -256,7 +256,7 @@ function hc_mixes(cfg, hc, streams) {
 }
 
 /* (T, D) fp16: streams collapsed with pre, saturated to the fp16 range (massive activations) */
-function hc_collapse(streams, pre) {
+export function hc_collapse(streams, pre) {
 	let T = streams.shape()[0];
 
 	return streams.mul(pre.view([T, 4, 1])).sum(1).clamp(-65504.0, 65504.0).to('float16');

@@ -171,6 +171,8 @@ amp_test(moe_mixed)
 amp_test(dsv41_attn)
 # dsv41_engram: Engram hashing vs engram.py
 amp_test(dsv41_engram)
+# dsv41_hc: hyper-connection mixes vs the reference
+amp_test(dsv41_hc)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)
 amp_test(glm5_chat)
 # glm5_blocks: mHC dense blocks vs the oracle
