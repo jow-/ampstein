@@ -1646,6 +1646,7 @@ export function load(model_dir, opts) {
 					dec_set_pos(cfg, sts[sg.dev], pos);
 
 				// Engram rows of the token: hashed on the host, gathered from the table, into the layers' buffers
+				let tpp = PROF ? prof_now() : 0;
 				let cn = model.meta.token_map.index(torch.from_array([ tid ], 'int64')).view([-1]).tolist()[0];
 				let hist = [];
 
@@ -1668,17 +1669,35 @@ export function load(model_dir, opts) {
 
 				push(cache.cids, cn);
 
+				if (PROF)
+					PROFILE['dec.engram_host'] = (PROFILE['dec.engram_host'] || 0) + prof_now() - tpp;
+
 				let h = model.embed_tokens.index(torch.from_array([ tid ], 'int64').cuda(first, true)).to('float32')
 					.reshape([1, 1, H]).expand([1, 4, H]).contiguous();
 				let pre = null, logits = null;
 
+				let tp0 = PROF ? prof_now() : 0;
+
+				if (PROF) {
+					torch.synchronize();
+					PROFILE['dec.host_pre'] = (PROFILE['dec.host_pre'] || 0) + prof_now() - tp0;
+				}
+
 				for (let it in b.items) {
+					let ts0 = PROF ? prof_now() : 0;
+
 					it.h_in.copy_(h);
 
 					if (pre)
 						it.pre_in.copy_(pre);
 
 					it.graph.replay();
+
+					if (PROF) {
+						torch.synchronize();
+						PROFILE[`dec.seg${it.dev}`] = (PROFILE[`dec.seg${it.dev}`] || 0) + prof_now() - ts0;
+					}
+
 					h = it.h_out;
 					pre = it.pre_out;
 
