@@ -18,7 +18,7 @@ const NL = +(getenv('AMP_DSV41_LAYERS') || 8);
 const NG = +(getenv('AMP_DSV41_GPUS') || 2);
 const NP = +(getenv('AMP_DSV41_PREFILL') || 4090);
 const NS = +(getenv('AMP_DSV41_STEPS') || 12);
-const MAXSEQ = NP + NS + 64;
+const MAXSEQ = +(getenv('AMP_DSV41_MAXSEQ') || (NP + NS + 64));
 
 let m = dsv41.load(MODEL, {devices: NG, layers: NL, max_seq: MAXSEQ, prefill_rows: 512});
 let ids = [], x = 12345;

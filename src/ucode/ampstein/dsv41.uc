@@ -906,17 +906,21 @@ function remote(ctx, h, dev, key) {
 	if (h.dev == dev)
 		return h[key];
 
-	if (ctx.links == null)
-		ctx.links = [];
+	// the destination is persistent (created by the eager warm-up); every run of a body, the capture
+	// included, re-registers the producer's tensor of that run as the copy's source
+	let k = h.id + ':' + key + ':' + dev;
 
-	let ck = 'd' + dev + key;
-
-	if (h[ck] == null) {
-		h[ck] = h[key].cuda(dev);
-		push(ctx.links, {src: h[key], dst: h[ck]});
+	if (ctx.dst == null) {
+		ctx.dst = {};
+		ctx.lk = {};
 	}
 
-	return h[ck];
+	if (ctx.dst[k] == null)
+		ctx.dst[k] = h[key].cuda(dev);
+
+	ctx.lk[k] = {src: h[key], dst: ctx.dst[k]};
+
+	return ctx.dst[k];
 }
 
 /* the picks of the indexer for the one token: (1, k) int32 over the first Scap pool entries */
@@ -947,7 +951,7 @@ function index_picks_dec(cfg, A, ctx, cache, xn, qr, st, Scap, src) {
 
 			let top = bsc.topk(min(cfg.candidate_blocks, nb), -1);
 
-			ctx.cand = {dev: A.dev,
+			ctx.cand = {dev: A.dev, id: 'c',
 				src: torch.where(top.values.le(NEGH), torch.full([1], -1, 'int64', dv), top.indices)};
 		}
 		else if (A.idx > cfg.candidate_source && ctx.cand) {
@@ -996,7 +1000,7 @@ export function attn_decode(cfg, A, ctx, cache, cl, xn, st, caps) {
 
 		if (A.idx_source) {
 			idx = index_picks_dec(cfg, A, ctx, cache, xn, qr, st, Scap, src);
-			ctx.topk = {dev: dev, t: idx};
+			ctx.topk = {dev: dev, t: idx, id: 'p' + A.idx};
 		}
 		else if (ctx.topk) {
 			idx = remote(ctx, ctx.topk, dev);
@@ -1465,7 +1469,7 @@ export function load(model_dir, opts) {
 
 			for (let c1 in caps_list) {
 				let caps = [ 0, c1, int((c1 + 1) / 2) ];
-				let ctx = {topk: null, cand: null, links: []};
+				let ctx = {topk: null, cand: null, dst: {}, lk: {}};
 				let items = [];
 
 				for (let sg in segs) {
@@ -1584,8 +1588,8 @@ export function load(model_dir, opts) {
 					h = it.h_out;
 					pre = it.pre_out;
 
-					for (let lk in b.ctx.links)
-						lk.dst.copy_(lk.src);
+					for (let k in keys(b.ctx.lk))
+						b.ctx.lk[k].dst.copy_(b.ctx.lk[k].src);
 
 					for (let i = it.first; i < it.end; i++) {
 						let A = model.layers[i].attn;
