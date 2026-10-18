@@ -1097,8 +1097,16 @@ export function load(model_dir, opts) {
 				emb: torch.zeros([1, 1, D], 'float16', 'cuda:' + md[0]),
 				stack: torch.zeros([1, H, D], 'float32', 'cuda:' + md[0]),
 				dev: map(md, (d) => qwen4.dev_state(cfg, 1, cache.max_seq, d)),
-				bar: map(md, (d) => torch.zeros([1], 'float32', 'cuda:' + d))
+				bar: map(md, (d) => torch.zeros([1], 'float32', 'cuda:' + d)),
+				voff: null
 			};
+
+			let offs = [];
+
+			for (let g = 0; g < Gs; g++)
+				push(offs, [ last.plan.vocab[g][0] ]);
+
+			ent.voff = torch.from_array(offs, 'int64', 'cuda:' + md[0]);
 
 			let put = function (pos) {
 				let vals = qwen4.dev_values(ent.dev[0], pos, dc.mm);
@@ -1128,6 +1136,11 @@ export function load(model_dir, opts) {
 
 				ent.vals = torch.cat(vals, 0);
 				ent.idx = torch.cat(idxs, 0);
+
+				// the greedy token on the device too (the chain feeds it to the next step without a host read)
+				let best = ent.vals.argmax(-1).view([1]);
+
+				ent.tok = ent.voff.index(best).add(ent.idx.view([Gs, 1]).index(best)).view([1]);
 			};
 
 			put(0);
@@ -1168,6 +1181,37 @@ export function load(model_dir, opts) {
 					hidden: qwen4.flat_stack_of(tp, ent.out_stack), collapsed: ent.out_hid};
 			};
 
+			/* W greedy draft steps chained on the device: step k embeds the token step k-1 picked, nothing is read back
+			 * until the W tokens are done. hidden: the target's flattened stack (1, 1, 4D) fp16; seed: the round's
+			 * first token (host); p: the target position of the seed. Returns the W token ids. */
+			ent.chain = function (seed, hidden, p, W) {
+				let acc = torch.zeros([W], 'int64', 'cuda:' + md[0]);
+				let stack = hidden.reshape([1, H, D]).to('float32').cuda(M.dev);
+				let row = tp.embed_tokens.index(torch.from_array([ seed ], 'int64', 'cuda:' + devs[0]));
+
+				for (let k = 1; k <= W; k++) {
+					ent.emb.copy_(row.view([1, 1, D]).cuda(md[0]));
+					ent.stack.copy_(stack);
+					put(p + k);
+
+					for (let g = 1; g < Gs; g++)
+						ent.bar[g].copy_(ent.bar[0]);
+
+					ent.graph.replay();
+
+					for (let g = 1; g < Gs; g++)
+						ent.bar[g].copy_(ent.bar[0]);
+
+					acc.narrow(0, k - 1, 1).copy_(ent.tok);
+					stack = ent.out_stack;
+
+					if (k < W)
+						row = tp.embed_tokens.index(ent.tok.cuda(devs[0]));
+				}
+
+				return acc.tolist();
+			};
+
 			return ent;
 		},
 
@@ -1200,6 +1244,12 @@ export function load(model_dir, opts) {
 			}
 
 			return o;
+		},
+
+		/* the greedy draft chain of a round without host reads between the steps (engine: replaces the
+		 * step-by-step loop when present) */
+		mtp_chain: function (seed, hidden, p, W) {
+			return this.mtp_g.chain(seed, hidden, p, W);
 		},
 
 		/* greedy draft token from a collapsed hidden (1 row) */

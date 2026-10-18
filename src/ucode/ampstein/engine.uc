@@ -75,6 +75,7 @@ const PIPE_ROUNDS = 8;
 // AMP_MTP_TIMING=1: per-phase MTP round times (synchronizing at phase
 // boundaries), printed per request
 const MTP_TIMING = getenv('AMP_MTP_TIMING') != null;
+const MTP_TIMING_STEPS = getenv('AMP_MTP_NO_CHAIN') != null;     // draft step by step (a host read after each)
 
 function lcp(a, b) {
 	return torch.common_prefix(a, b);   // native: 100k+ ids per request
@@ -2487,6 +2488,8 @@ export function create(model, opts) {
 			push(c, ...DF.draft(j.t_next, df_pprev, cache.length));
 			df_pprev = cache.length;
 		}
+		else if (model.mtp_chain && sharded && !MTP_TIMING_STEPS && model.mtp_g)
+			push(c, ...model.mtp_chain(j.t_next, D, p, W));
 		else
 		for (let k = 1; k <= W; k++) {
 			let r = mtp_run([c[k - 1]], D, p + k, sharded ? null : (draft_head || model.lm_head));
