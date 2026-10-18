@@ -548,6 +548,9 @@ function dsv41_tp_methods(model) {
 
 	/* sum of one fp16 partial per rank -> per-rank sums (saturated like every fp16 hand-off of the model) */
 	function allreduce(S, p) {
+		if (getenv('AMP_DSV41_TP_NOAR'))             // experiment: the cost of the communication (wrong results)
+			return p;
+
 		return dsv4_tp.allreduce(S, p);
 	}
 
@@ -581,7 +584,11 @@ function dsv41_tp_methods(model) {
 		let h0 = e.to('float32').reshape([T, 1, H]).expand([T, 4, H]).contiguous();
 		let s0 = stages[stage_of[0]];
 		let c = {T: T, pos0: pos0, end: pos0 + T, stage: stage_of[0], h: [], pre: [], ctx: [], taps: null,
-			hist_t: torch.from_array(hist, 'int64').view([1, -1])};
+			hist_t: torch.from_array(hist, 'int64').view([1, -1]), eg: {}};
+
+		// the Engram rows are read from disk by a worker thread while the other chunks are issued
+		for (let l in keys(engrams))
+			c.eg[l] = dsv41.engram_start(cfg, meta, ENG0[l], index(cfg.engram_layers, +l), c.hist_t, T);
 
 		for (let g = 0; g < Gs; g++) {
 			let dv = 'cuda:' + s0.devs[g];
@@ -618,7 +625,9 @@ function dsv41_tp_methods(model) {
 	/* the Engram rows of the chunk for layer i on every rank */
 	function engram_chunk(i, c) {
 		let li = index(cfg.engram_layers, i);
-		let emb = dsv41.engram_rows(cfg, meta, ENG0[i], li, c.hist_t, c.T);
+		let emb = c.eg[i] ? dsv41.engram_finish(cfg, ENG0[i], c.eg[i]) : dsv41.engram_rows(cfg, meta, ENG0[i], li, c.hist_t, c.T);
+
+		c.eg[i] = null;
 
 		return map(engrams[i], (E, g) => (g == 0) ? emb : emb.cuda(E.dev, true));
 	}

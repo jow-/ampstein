@@ -407,31 +407,49 @@ export function build_engram(ws, cfg, i, dev) {
 
 /* Hash ids of the T tokens of a chunk for engram layer slot `li`, gathered from the table and
  * dequantized: (T, heads * 3 * dim) fp16 on E.dev. cids: compressed ids of [3 history tokens, chunk]. */
-export function engram_rows(cfg, meta, E, li, hist_t, T) {
+/* The rows of the T tokens of a chunk for engram layer slot `li` (history hist_t): hashes on the host, then the table
+ * rows are read from disk by a worker thread. engram_finish waits for them. */
+export function engram_start(cfg, meta, E, li, hist_t, T) {
 	let H = (cfg.engram_ngram - 1) * cfg.engram_heads;
 
 	if (NO_ENGRAM)                                 // tests without the 200 GB tables
-		return torch.zeros([T, H * cfg.engram_dim], 'float16', 'cuda:' + E.dev);
+		return {zero: true, T: T};
 
 	let n = T * H;
 	let uids = torch.zeros([n], 'int64'), inverse = torch.zeros([n], 'int64'), heads = torch.zeros([n], 'int32');
 	let U = torch.ngram_hash(hist_t, T, meta.mult[li], meta.offs[li], meta.sizes[li], cfg.engram_heads,
 		meta.pad, uids, inverse, heads);
 	let u = uids.narrow(0, 0, U).contiguous();
-	let dv = 'cuda:' + E.dev;
 	let rw = torch.empty([U, cfg.engram_dim], 'float8_e4m3fn');
 	let rsc = torch.empty([U, cfg.engram_dim / 32], 'float8_e8m0fnu');
 
-	E.file.gather(E.wname, u, rw);
-	E.file.gather(E.sname, u, rsc);
+	return {T: T, U: U, inverse: inverse, rw: rw, rsc: rsc, u: u,
+		t1: E.file.gather_async(E.wname, u, rw), t2: E.file.gather_async(E.sname, u, rsc)};
+}
+
+/* (T, heads * 3 * dim) fp16 on E.dev from a started chunk */
+export function engram_finish(cfg, E, st) {
+	let H = (cfg.engram_ngram - 1) * cfg.engram_heads;
+
+	if (st.zero)
+		return torch.zeros([st.T, H * cfg.engram_dim], 'float16', 'cuda:' + E.dev);
+
+	let U = st.U;
+
+	torch.gather_wait(st.t1);
+	torch.gather_wait(st.t2);
 
 	// non-blocking copies (staged through the caching pinned allocator): the host never waits for the device,
 	// so the chunks of a prefill keep flowing through the pipeline of GPUs
-	let ew = rw.cuda(E.dev, true).to('float32').view([U, cfg.engram_dim / 32, 32]);
-	let es = rsc.cuda(E.dev, true).to('float32').view([U, cfg.engram_dim / 32, 1]);
+	let ew = st.rw.cuda(E.dev, true).to('float32').view([U, cfg.engram_dim / 32, 32]);
+	let es = st.rsc.cuda(E.dev, true).to('float32').view([U, cfg.engram_dim / 32, 1]);
 	let rows = ew.mul(es).view([U, cfg.engram_dim]).to('float16');
 
-	return rows.index(inverse.cuda(E.dev, true)).view([T, H * cfg.engram_dim]);
+	return rows.index(st.inverse.cuda(E.dev, true)).view([st.T, H * cfg.engram_dim]);
+}
+
+export function engram_rows(cfg, meta, E, li, hist_t, T) {
+	return engram_finish(cfg, E, engram_start(cfg, meta, E, li, hist_t, T));
 }
 
 /* Start reading the table rows of the tokens ids (which follow the cache's history) into the page cache
@@ -2037,7 +2055,18 @@ export function load(model_dir, opts) {
 			pre.narrow(1, 0, 1).fill_(1.0);
 			cache.length = pos0 + T;
 
-			return {T: T, pos0: pos0, end: pos0 + T, dev: first, hist_t: torch.from_array(hist, 'int64').view([1, -1]),
+			let hist_t = torch.from_array(hist, 'int64').view([1, -1]);
+			let eg = {};
+
+			// the Engram rows are read from disk by a worker thread while the other chunks are issued
+			for (let li = 0; li < length(cfg.engram_layers); li++) {
+				let l = cfg.engram_layers[li];
+
+				if (l < nl && this.engrams[l])
+					eg[l] = engram_start(cfg, this.meta, this.engrams[l], li, hist_t, T);
+			}
+
+			return {T: T, pos0: pos0, end: pos0 + T, dev: first, hist_t: hist_t, eg: eg,
 				h: h, pre: pre, ctx: {topk: null, cand: null}};
 		},
 
@@ -2061,7 +2090,9 @@ export function load(model_dir, opts) {
 
 					prof(null);
 
-					let emb = engram_rows(cfg, this.meta, E, li, c.hist_t, c.T);
+					let emb = c.eg[i] ? engram_finish(cfg, E, c.eg[i]) : engram_rows(cfg, this.meta, E, li, c.hist_t, c.T);
+
+					c.eg[i] = null;
 
 					prof('m.engram_rows');
 					engram_apply(cfg, E, c.h, emb);

@@ -40,6 +40,15 @@
 #include <sys/eventfd.h>
 #include <vector>
 #include <map>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <memory>
+#include <functional>
 #include <optional>
 
 // ucode headers are plain C and carry no extern "C" guards; without this
@@ -8774,6 +8783,189 @@ torch_exl3_gemm(uc_vm_t *vm, size_t nargs)
 	return ucv_get(C_v);
 }
 
+void ngram_gather_cpu(int64_t fd, int64_t base_offset, int64_t row_bytes, const at::Tensor& uids,
+                      int64_t uid_base, at::Tensor out);
+
+/* async row gathers (stfile.gather_async): one worker thread, a ticket per job */
+struct gather_job {
+	int fd = -1;
+	int64_t base = 0, row_bytes = 0;
+	at::Tensor rows, out;
+	std::mutex m;
+	std::condition_variable cv;
+	bool done = false;
+	std::string err;
+};
+
+/* heap-allocated and never destroyed: the detached worker waits on them while the process exits */
+static std::mutex &g_gather_mu = *new std::mutex;      /* one gather at a time (the vendored pool is not re-entrant) */
+static std::mutex &g_gq_mu = *new std::mutex;
+static std::condition_variable &g_gq_cv = *new std::condition_variable;
+static std::queue<std::shared_ptr<gather_job>> &g_gq = *new std::queue<std::shared_ptr<gather_job>>;
+static std::map<int64_t, std::shared_ptr<gather_job>> &g_tickets = *new std::map<int64_t, std::shared_ptr<gather_job>>;
+static int64_t g_ticket_next = 1;
+static bool g_gq_started = false;
+
+/* The rows through a read-only mapping of the file: a resident page costs a memcpy, not a pread syscall (the Engram
+ * tables of a chunk are ~50k rows; a cold page faults in the worker, which is where it should wait). Several threads
+ * split the rows. */
+static void *
+gather_map(int fd, size_t *len)
+{
+	static std::map<int, std::pair<void *, size_t>> &maps = *new std::map<int, std::pair<void *, size_t>>;
+	static std::mutex &mu = *new std::mutex;
+	std::lock_guard<std::mutex> lk(mu);
+	auto it = maps.find(fd);
+
+	if (it != maps.end()) {
+		*len = it->second.second;
+		return it->second.first;
+	}
+
+	struct stat sb;
+
+	if (fstat(fd, &sb) != 0)
+		return NULL;
+
+	void *p = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
+
+	if (p == MAP_FAILED)
+		return NULL;
+
+	madvise(p, (size_t)sb.st_size, MADV_RANDOM);
+	maps[fd] = std::make_pair(p, (size_t)sb.st_size);
+	*len = (size_t)sb.st_size;
+
+	return p;
+}
+
+static void __attribute__((unused))
+gather_mmap(gather_job *job)
+{
+	size_t len = 0;
+	const unsigned char *base = (const unsigned char *)gather_map(job->fd, &len);
+
+	if (!base)
+		throw std::runtime_error("gather_async: cannot map the table file");
+
+	const int64_t *rows = (const int64_t *)job->rows.data_ptr();
+	unsigned char *out = (unsigned char *)job->out.data_ptr();
+	int64_t n = job->rows.numel(), rb = job->row_bytes;
+	int nt = (n >= 2048) ? 8 : 1;
+	std::vector<std::thread> th;
+	std::atomic<bool> bad(false);
+
+	auto part = [&](int64_t a, int64_t b) {
+		for (int64_t i = a; i < b; i++) {
+			size_t off = (size_t)job->base + (size_t)rows[i] * (size_t)rb;
+
+			if (off + (size_t)rb > len) {
+				bad = true;
+				return;
+			}
+
+			memcpy(out + (size_t)i * (size_t)rb, base + off, (size_t)rb);
+		}
+	};
+
+	for (int t = 1; t < nt; t++)
+		th.emplace_back(part, n * t / nt, n * (t + 1) / nt);
+
+	part(0, n / nt);
+
+	for (auto &x : th)
+		x.join();
+
+	if (bad)
+		throw std::runtime_error("gather_async: row out of the file");
+}
+
+static void
+gather_worker(void)
+{
+	for (;;) {
+		std::shared_ptr<gather_job> job;
+
+		{
+			std::unique_lock<std::mutex> lk(g_gq_mu);
+
+			g_gq_cv.wait(lk, [] { return !g_gq.empty(); });
+			job = g_gq.front();
+			g_gq.pop();
+		}
+
+		std::string err;
+
+		try {
+			std::lock_guard<std::mutex> lk(g_gather_mu);
+
+			// the vendored pread pool keeps many cold reads in flight; a mapping (gather_mmap) faults one page per
+			// thread at a time and is slower on a cold table
+			ngram_gather_cpu(job->fd, job->base, job->row_bytes, job->rows, 0, job->out);
+		}
+		catch (const std::exception &e) {
+			err = e.what();
+		}
+
+		{
+			std::lock_guard<std::mutex> lk(job->m);
+
+			job->err = err;
+			job->done = true;
+		}
+
+		job->cv.notify_all();
+	}
+}
+
+static int64_t
+gather_submit(std::shared_ptr<gather_job> job)
+{
+	std::lock_guard<std::mutex> lk(g_gq_mu);
+	int64_t t = g_ticket_next++;
+
+	if (!g_gq_started) {
+		g_gq_started = true;
+		std::thread(gather_worker).detach();
+	}
+
+	g_tickets[t] = job;
+	g_gq.push(job);
+	g_gq_cv.notify_one();
+
+	return t;
+}
+
+static bool
+gather_wait(int64_t t, std::string &err)
+{
+	std::shared_ptr<gather_job> job;
+
+	{
+		std::lock_guard<std::mutex> lk(g_gq_mu);
+		auto it = g_tickets.find(t);
+
+		if (it == g_tickets.end()) {
+			err = "gather_wait: unknown ticket";
+			return false;
+		}
+
+		job = it->second;
+		g_tickets.erase(it);
+	}
+
+	std::unique_lock<std::mutex> lk(job->m);
+
+	job->cv.wait(lk, [&] { return job->done; });
+
+	if (!job->err.empty()) {
+		err = job->err;
+		return false;
+	}
+
+	return true;
+}
+
 /* --- module glue -------------------------------------------------------- */
 
 static uc_value_t *
@@ -8790,12 +8982,14 @@ stfile_free_method(uc_vm_t *vm, size_t nargs)
 }
 
 static uc_value_t *torch_st_gather(uc_vm_t *vm, size_t nargs);
+static uc_value_t *torch_st_gather_async(uc_vm_t *vm, size_t nargs);
 static uc_value_t *torch_st_prefetch(uc_vm_t *vm, size_t nargs);
 
 static const uc_function_list_t stfile_methods[] = {
 	{ "list",	torch_st_list },
 	{ "info",	torch_st_info },
 	{ "gather",	torch_st_gather },
+	{ "gather_async",	torch_st_gather_async },
 	{ "prefetch",	torch_st_prefetch },
 	{ "tensor",	torch_st_tensor },
 	{ "free",	stfile_free_method },
@@ -9360,6 +9554,8 @@ torch_st_gather(uc_vm_t *vm, size_t nargs)
 	}
 
 	try {
+		std::lock_guard<std::mutex> lk(g_gather_mu);
+
 		ngram_gather_cpu(f->fd, (int64_t)(f->data_off + offset), row_bytes, *rows, 0, *out);
 	}
 	catch (const std::exception &e) {
@@ -9367,6 +9563,88 @@ torch_st_gather(uc_vm_t *vm, size_t nargs)
 	}
 
 	return ucv_get(uc_fn_arg(2));
+}
+
+/*
+ * stfile.gather_async(name, rows, out): int ticket
+ *
+ * The same read as gather(), done by a worker thread: returns at once, torch.gather_wait(ticket) blocks until the
+ * rows are in `out` (rows and out stay referenced until then). The Engram rows of a prefill chunk are known when
+ * the chunk is admitted: the reads run while the host issues the work of the other chunks.
+ */
+static uc_value_t *
+torch_st_gather_async(uc_vm_t *vm, size_t nargs)
+{
+	st_file_t *f = stfile_this(vm);
+	uc_value_t *name = uc_fn_arg(0);
+	const char *dtype;
+	int64_t *shape;
+	size_t ndim, offset, nbytes;
+
+	if (!f)
+		return NULL;
+
+	if (nargs != 3 || ucv_type(name) != UC_STRING) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (name, rows, out)");
+		return NULL;
+	}
+
+	at::Tensor *rows = tensor_arg(vm, uc_fn_arg(1));
+	at::Tensor *out = rows ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+
+	if (!out)
+		return NULL;
+
+	if (st_lookup(f, ucv_string_get(name), &dtype, &shape, &ndim, &offset, &nbytes) == ST_NOT_FOUND) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, "no such tensor");
+		return NULL;
+	}
+
+	int64_t nrows = ndim ? shape[0] : 0;
+
+	free(shape);
+
+	if (nrows < 1 || nbytes % (size_t)nrows)
+		RAISE("gather_async: not a row-major table");
+
+	int64_t row_bytes = (int64_t)(nbytes / (size_t)nrows);
+
+	if (rows->scalar_type() != at::kLong || rows->is_cuda() || !rows->is_contiguous() ||
+	    out->is_cuda() || !out->is_contiguous() || out->dim() != 2 || out->size(0) < rows->numel() ||
+	    out->size(1) * out->element_size() != row_bytes)
+		RAISE("gather_async: rows must be contiguous int64 CPU, out a contiguous CPU (n, row bytes) tensor");
+
+	if (rows->numel() > 0) {
+		int64_t lo = rows->min().item<int64_t>(), hi = rows->max().item<int64_t>();
+
+		if (lo < 0 || hi >= nrows)
+			RAISE("gather_async: row index out of range");
+	}
+
+	auto st = std::make_shared<gather_job>();
+
+	st->fd = f->fd;
+	st->base = (int64_t)(f->data_off + offset);
+	st->row_bytes = row_bytes;
+	st->rows = *rows;
+	st->out = *out;
+
+	return ucv_int64_new(gather_submit(st));
+}
+
+/* torch.gather_wait(ticket): block until the async gather finished; raises its error */
+static uc_value_t *
+torch_gather_wait(uc_vm_t *vm, size_t nargs)
+{
+	if (nargs != 1 || ucv_type(uc_fn_arg(0)) != UC_INTEGER)
+		RAISE("gather_wait: expected (ticket)");
+
+	std::string err;
+
+	if (!gather_wait(ucv_int64_get(uc_fn_arg(0)), err))
+		RAISE(err.c_str());
+
+	return NULL;
 }
 
 /*
@@ -9978,6 +10256,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "fp8_dequant",	torch_fp8_dequant },
 	{ "fp8_gemv_grouped",	torch_fp8_gemv_grouped },
 	{ "hc_mix2",	torch_hc_mix2 },
+	{ "gather_wait",	torch_gather_wait },
 	{ "v41_rope",	torch_v41_rope },
 	{ "v41_route",	torch_v41_route },
 	{ "moe_prep",	torch_moe_prep },
