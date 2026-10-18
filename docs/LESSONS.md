@@ -638,3 +638,13 @@ syscalls) before the first chunk: 7 s of host time, and the kernel's readahead q
 first chunk's real gathers. Now the calls run on a detached thread and the prompt is prefetched three chunks
 ahead (`AMP_DSV41_TP_AHEAD`). Prefill of 62k tokens: 700 -> 1416 tok/s; steady state is 0.89 s per 1536-token round
 (1725 tok/s). Always look at the time before the first kernel, not only at the kernel timeline.
+
+## L165 — Double-buffered prefill loses on PCIe x4 (DSV4.1 TP)
+
+The two ranks of a stage reduce over PCIe x4: removing the all-reduce altogether takes a 1536-token round from 0.89 s
+to 0.68 s, so it is 24% of the time. Splitting the chunk in two micro-chunks and reducing one on a side stream behind the
+other's compute (`AMP_DSV41_TP_OV=1`) made it slower: 1.04 s with the spinning P2P kernel (it slows every concurrent
+memory-bound kernel 10-20x: `hc_apply` 0.2 -> 3.9 ms), 0.96 s with copy-engine transfers (GPUs idle 40-50% waiting
+for the DMA). Kept as an opt-in experiment; the lever left is fewer bytes over the link, not more overlap.
+An early stage hand-off (126 MB of fp32 mHC state per rank, issued when the stage finishes instead of when the next
+round starts) was slower too (0.88 vs 0.84 s): the link is the bottleneck, so every byte competes with the all-reduces.

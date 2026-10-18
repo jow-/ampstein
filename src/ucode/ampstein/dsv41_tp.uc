@@ -751,6 +751,181 @@ function dsv41_tp_methods(model) {
 		}
 	}
 
+	/* ---- double-buffered prefill (opt-in, AMP_DSV41_TP_OV=1; measured slower, docs/LESSONS.md L165): the chunk travels as two micro-chunks whose all-reduces (PCIe x4: a quarter of
+	 * the round) run on side streams, one communicator each, behind the other micro-chunk's compute ---- */
+
+	let OV_COPY = getenv('AMP_DSV41_TP_OV_COPY') ? true : false;
+
+	function ar_begin(S, p, m) {
+		let xs = [], outs = [];
+
+		if (OV_COPY) {
+			// the copy engines move the partials (no spinning kernel competing with the compute for SMs and L2)
+			let tmp = [];
+
+			for (let g = 0; g < Gs; g++) {
+				push(xs, p[g].contiguous());
+				torch.stream_side(S.devs[g], 2 + m);
+			}
+
+			for (let g = 0; g < Gs; g++) {
+				let acc = xs[g].to('float32');
+
+				for (let r = 1; r < Gs; r++) {
+					let q = xs[(g + r) % Gs].cuda(S.devs[g], true);
+
+					push(tmp, q);
+					acc = acc.add(q);
+				}
+
+				push(outs, acc.clamp(-65504.0, 65504.0).to('float16'));
+			}
+
+			for (let g = 0; g < Gs; g++)
+				torch.stream_main(S.devs[g], 2 + m);
+
+			return {S: S, m: m, xs: [ xs, tmp ], outs: outs};
+		}
+
+		for (let g = 0; g < Gs; g++) {
+			push(xs, p[g].contiguous());
+			torch.stream_side(S.devs[g], 2 + m);
+			push(outs, S.comm_ov[m].allreduce(xs[g], g));
+			torch.stream_main(S.devs[g], 2 + m);
+		}
+
+		return {S: S, m: m, xs: xs, outs: outs};
+	}
+
+	// the compute stream waits for the reduction; the partials stay referenced until then
+	function ar_end(h) {
+		for (let g = 0; g < Gs; g++)
+			torch.stream_wait(h.S.devs[g], 2 + h.m);
+
+		h.xs = null;
+
+		return h.outs;
+	}
+
+	function sv(t, sb) {
+		return t.narrow(0, sb.o, sb.T);
+	}
+
+	function attn_phase(i, c, m, cache) {
+		let sb = c.sub[m], L = layers[i];
+		let am = [], at = [];
+
+		for (let g = 0; g < Gs; g++) {
+			let lane = cache.lanes[g];
+
+			am[g] = dsv41.hc_site(cg, L[g].hc_attn, sv(c.h[g], sb), sv(c.pre[g], sb));
+
+			let xn = torch.rms_norm(am[g].col, L[g].attn_norm, eps);
+
+			push(at, dsv41.attn_forward_steps(cg, L[g].attn, sb.ctx[g], lane, lane.layers[i], xn, sb.pos0));
+		}
+
+		for (let k = 0; k < length(at[0].steps); k++)
+			for (let g = 0; g < Gs; g++)
+				at[g].steps[k]();
+
+		return {am: am, p: map(at, (a) => a.out())};
+	}
+
+	function ffn_phase(i, c, m, a, s) {
+		let sb = c.sub[m], L = layers[i];
+		let fm = [], pend = [], p = [];
+
+		for (let g = 0; g < Gs; g++) {
+			glm5.hc_apply(sv(c.h[g], sb), s[g], a.am[g].post, a.am[g].comb);
+			fm[g] = dsv41.hc_site(cg, L[g].hc_ffn, sv(c.h[g], sb), a.am[g].pre);
+
+			let xn = torch.rms_norm(fm[g].col, L[g].ffn_norm, eps);
+
+			push(pend, glm5.moe_begin(cg, L[g].moe, xn));
+		}
+
+		for (let g = 0; g < Gs; g++)
+			p[g] = ffn_partial(glm5.moe_finish(cg, L[g].moe, pend[g]));
+
+		return {fm: fm, p: p};
+	}
+
+	function ffn_apply(c, m, f, s) {
+		let sb = c.sub[m];
+
+		for (let g = 0; g < Gs; g++) {
+			glm5.hc_apply(sv(c.h[g], sb), s[g], f.fm[g].post.mul(FFN_SCALE), f.fm[g].comb);
+			sv(c.pre[g], sb).copy_(f.fm[g].pre);
+		}
+	}
+
+	// the last reduction of a layer is applied after the next layer's first micro-chunk is issued
+	function flush_carry(c) {
+		if (c.carry) {
+			let f = c.carry;
+
+			c.carry = null;
+			f();
+		}
+	}
+
+	function ov_ok(c) {
+		return stages[0].comm_ov && c.T >= 256 && c.T <= 2 * stages[0].comm_ov_rows;
+	}
+
+	function layer_fwd_ov(i, c, cache) {
+		let S = stages[stage_of[i]];
+
+		if (!c.sub) {
+			let T0 = 2 * int((c.T + 3) / 4);
+
+			c.sub = [
+				{o: 0, T: T0, pos0: c.pos0, ctx: map(c.ctx, () => ({topk: null, cand: null}))},
+				{o: T0, T: c.T - T0, pos0: c.pos0 + T0, ctx: map(c.ctx, () => ({topk: null, cand: null}))}
+			];
+		}
+
+		if (engrams[i] || (c.taps && index(cfg.dspark_taps, i) >= 0)) {
+			flush_carry(c);
+
+			if (engrams[i]) {
+				let emb = engram_chunk(i, c);
+
+				for (let g = 0; g < Gs; g++)
+					dsv41.engram_apply(cfg, engrams[i][g], c.h[g], emb[g]);
+			}
+
+			if (c.taps && index(cfg.dspark_taps, i) >= 0)
+				push(c.taps, {dev: S.devs[0], t: c.h[0].mean(1)});
+		}
+
+		let a0 = attn_phase(i, c, 0, cache);
+		let r0 = ar_begin(S, a0.p, 0);
+
+		flush_carry(c);
+
+		let a1 = attn_phase(i, c, 1, cache);
+		let r1 = ar_begin(S, a1.p, 1);
+
+		let f0 = ffn_phase(i, c, 0, a0, ar_end(r0));
+		let rf0 = ar_begin(S, f0.p, 0);
+
+		let f1 = ffn_phase(i, c, 1, a1, ar_end(r1));
+		let rf1 = ar_begin(S, f1.p, 1);
+
+		ffn_apply(c, 0, f0, ar_end(rf0));
+		c.carry = () => ffn_apply(c, 1, f1, ar_end(rf1));
+	}
+
+	function layer_run(i, c, cache) {
+		if (ov_ok(c))
+			return layer_fwd_ov(i, c, cache);
+
+		flush_carry(c);
+		layer_fwd(i, c, cache);
+	}
+
 	/* the chunk through stage s: copies the streams to the stage's ranks when it comes from another stage */
 	model.chunk_stage_begin = function (c, s) {
 		let S = stages[s];
@@ -765,11 +940,20 @@ function dsv41_tp_methods(model) {
 		}
 	};
 
+	/* AMP_DSV41_TP_EARLY_HANDOFF=1: the hand-off of a finished stage is issued at once (126 MB per rank over PCIe x4, ~50 ms;
+	 * measured slower: it competes with the all-reduces for the link) */
+	model.chunk_handoff = function (c, s) {
+		if (s + 1 < NS && getenv('AMP_DSV41_TP_EARLY_HANDOFF'))
+			model.chunk_stage_begin(c, s + 1);
+	};
+
 	model.chunk_stage = function (c, cache, s) {
 		model.chunk_stage_begin(c, s);
 
 		for (let i = stages[s].first; i < stages[s].end; i++)
-			layer_fwd(i, c, cache);
+			layer_run(i, c, cache);
+
+		flush_carry(c);
 	};
 
 	/* the active chunks' stages together, layer by layer round-robin: a stage issued whole blocks the host on its
@@ -785,7 +969,12 @@ function dsv41_tp_methods(model) {
 		for (let j = 0; j < n; j++)
 			for (let e in cs)
 				if (stages[e.s].first + j < stages[e.s].end)
-					layer_fwd(stages[e.s].first + j, e.c, cache);
+					layer_run(stages[e.s].first + j, e.c, cache);
+
+		for (let e in cs) {
+			flush_carry(e.c);
+			model.chunk_handoff(e.c, e.s);
+		}
 	};
 
 	/* the DSpark taps of a finished chunk: (T, 3 * hidden) fp32 on the first tapped layer's device */
@@ -908,9 +1097,18 @@ function dsv41_tp_methods(model) {
 
 			let end = bounds[next++];
 
+			let t0 = clock(true);
+
 			prefetch(min(total, end - start + ahead * chunk));
+
+			let t1 = clock(true);
 			let last_c = (end == start + total);
 			let c = model.chunk_begin(slice(ids, prev_end - start, end - start), cache);
+			let t2 = clock(true);
+
+			if (getenv('AMP_DSV41_TP_HOSTPROF'))
+				warn(sprintf('admit: prefetch %.1f ms, chunk_begin %.1f ms\n', (t1[0] - t0[0]) * 1e3 + (t1[1] - t0[1]) / 1e6,
+					(t2[0] - t1[0]) * 1e3 + (t2[1] - t1[1]) / 1e6));
 
 			if (opts.on_taps)
 				c.taps = [];
@@ -1241,7 +1439,17 @@ export function load(model_dir, opts) {
 
 	for (let S in stages) {
 		S.comm = torch.p2p_comm(S.devs, cap);
-		S.comm_pf = torch.p2p_comm(S.devs, cap_pf);
+
+		if (!getenv('AMP_DSV41_TP_OV')) {
+			S.comm_pf = torch.p2p_comm(S.devs, cap_pf);
+		}
+		else {
+			// two half-chunk communicators for the double-buffered prefill; the first also serves the small chunks
+			S.comm_ov_rows = int(((opts.prefill_rows || 1024) + 1) / 2);
+			S.comm_ov = [ torch.p2p_comm(S.devs, S.comm_ov_rows * H), torch.p2p_comm(S.devs, S.comm_ov_rows * H) ];
+			S.comm_pf = S.comm_ov[0];
+			S.comm_pf_cap = S.comm_ov_rows * H;
+		}
 	}
 
 	let model = {
