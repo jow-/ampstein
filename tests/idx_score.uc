@@ -92,3 +92,24 @@ assert(raises(() => torch.idx_score(q, pk, w, 0.1, torch.from_array([ 5, 6 ], 'i
 assert(raises(() => torch.idx_score(noise(8 * 48, 128, -1.0, 1.0, 'float16').view([8, 48, 128]), pk, noise(8, 48, 0.0, 0.3, 'float32'), 0.1, 0, 4)), 'heads must be a multiple of 32');
 
 print('idx_score: ok\n');
+
+// a Q8 pool (codes + a scale per 32) scores bit for bit like its dequantized fp16 form
+function check_q8(R, n, pos0, P) {
+	let q = noise(R * 32, 128, -1.0, 1.0, 'float16').view([R, 32, 128]);
+	let pk = noise(n, 128, -1.0, 1.0, 'float16');
+	let w = noise(R, 32, 0.0, 0.3, 'float32');
+	let scale = math.pow(128.0, -0.5);
+	let qc = torch.zeros([n, 128], 'int8', 'cuda:' + DEV), qs = torch.zeros([n, 4], 'float16', 'cuda:' + DEV);
+
+	torch.kv_q8_put(pk, qc, qs, 0);
+
+	let a = torch.idx_score(q, torch.kv_q8_get(qc, qs, 0, n), w, scale, pos0, P);
+	let b = torch.idx_score(q, [ qc, qs ], w, scale, pos0, P);
+	let d = a.to('float32').sub(b.to('float32')).abs().max().item();
+
+	printf('Q8 pool R=%d n=%d: max |in-kernel - dequantized| %g\n', R, n, d);
+	assert(d == 0, 'Q8 pool scores differ from the dequantized pool');
+}
+
+check_q8(1, 700, 5000, 1);
+check_q8(9, 300, 100, 2);

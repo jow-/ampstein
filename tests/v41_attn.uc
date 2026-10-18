@@ -40,6 +40,23 @@ function run(T, H, pos0, Nc, Kc, nsplit) {
 	let scale = math.pow(D * 1.0, -0.5);
 	let o = torch.v41_attn(q, kvw, wbase, kvc, ix, sinks, inv, pos0, scale, W, nsplit);
 
+	// a Q8 pool (codes + a scale per 32, kv_q8_put): the kernel's in-flight dequantization must equal the dequantized
+	// fp16 pool bit for bit, and stay within quantization noise of the fp16 original
+	if (Nc) {
+		let qc = torch.zeros([Nc, D], 'int8', dv), qs = torch.zeros([Nc, D / 32], 'float16', dv);
+
+		torch.kv_q8_put(kvc, qc, qs, 0);
+
+		let kvd = torch.kv_q8_get(qc, qs, 0, Nc);
+		let od = torch.v41_attn(q, kvw, wbase, kvd, ix, sinks, inv, pos0, scale, W, nsplit);
+		let oq = torch.v41_attn(q, kvw, wbase, [ qc, qs ], ix, sinks, inv, pos0, scale, W, nsplit);
+		let e8 = rel_rms(oq, od), en = rel_rms(oq, o);
+
+		assert(e8 < 1e-6, `Q8 pool: dequantized vs in-kernel rel rms ${e8}`);
+		assert(en < 2e-2, `Q8 pool vs fp16 pool: rel rms ${en}`);
+		printf('   q8 pool: in-kernel vs dequantized %.1e, vs fp16 %.1e\n', e8, en);
+	}
+
 	// reference, query by query
 	let ref = [];
 

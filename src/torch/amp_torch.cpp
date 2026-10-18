@@ -4261,6 +4261,10 @@ torch_silu_mul(uc_vm_t *vm, size_t nargs)
  * contiguous on one CUDA device; returns (R, n_pools) fp16.
  */
 extern "C" int
+amp_idx_score_q8(const void *q, const void *pools, const void *pq, const void *ps, const void *w, void *out,
+                 int R, int n_pools, float scale, int pos0, int P, int HI,
+                 const long long *posp, cudaStream_t stream);
+extern "C" int
 amp_idx_score(const void *q, const void *pools, const void *w, void *out,
              int R, int n_pools, float scale, int pos0, int P, int HI,
              const long long *posp, cudaStream_t stream);
@@ -4272,11 +4276,27 @@ torch_idx_score(uc_vm_t *vm, size_t nargs)
 		RAISE("idx_score: expected (q, pools, w, scale, pos0, P)");
 
 	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
-	at::Tensor *pk = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *pk = NULL, *pqs = NULL;
+	uc_value_t *pa = q ? uc_fn_arg(1) : NULL;
+
+	/* pools: a (n, 128) fp16 tensor, or [codes (n, 128) int8, scales (n, 4) fp16] (a Q8 pool) */
+	if (pa && ucv_type(pa) == UC_ARRAY) {
+		if (ucv_array_length(pa) != 2 || !(pk = tensor_arg(vm, ucv_array_get(pa, 0))) ||
+		    !(pqs = tensor_arg(vm, ucv_array_get(pa, 1))))
+			return NULL;
+	}
+	else if (pa) {
+		pk = tensor_arg(vm, pa);
+	}
+
 	at::Tensor *w = pk ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
 
 	if (!q || !pk || !w)
 		return NULL;
+
+	if (pqs && (pk->scalar_type() != at::kChar || pqs->scalar_type() != at::kHalf || pqs->dim() != 2 ||
+	            pqs->size(0) != pk->size(0) || pqs->size(1) != 4 || !pqs->is_contiguous() || pqs->device() != pk->device()))
+		RAISE("idx_score: a Q8 pool is [codes (n, 128) int8, scales (n, 4) fp16]");
 
 	uc_value_t *sv = uc_fn_arg(3), *pv = uc_fn_arg(4), *kv = uc_fn_arg(5);
 	at::Tensor *pt = NULL;
@@ -4296,7 +4316,7 @@ torch_idx_score(uc_vm_t *vm, size_t nargs)
 	    (ucv_type(sv) != UC_DOUBLE && ucv_type(sv) != UC_INTEGER))
 		RAISE("idx_score: scale must be a number, pos0 an integer or int64 tensor, P an integer");
 
-	if (q->scalar_type() != at::kHalf || pk->scalar_type() != at::kHalf ||
+	if (q->scalar_type() != at::kHalf || pk->scalar_type() != (pqs ? at::kChar : at::kHalf) ||
 	    w->scalar_type() != at::kFloat || q->device().type() != at::kCUDA ||
 	    pk->device() != q->device() || w->device() != q->device() ||
 	    !q->is_contiguous() || !pk->is_contiguous() || !w->is_contiguous() ||
@@ -4319,7 +4339,8 @@ torch_idx_score(uc_vm_t *vm, size_t nargs)
 		at::Tensor out = at::empty({ R, n },
 			at::TensorOptions().dtype(at::kHalf).device(q->device()));
 
-		int rc = amp_idx_score(q->data_ptr(), pk->data_ptr(), w->data_ptr(), out.data_ptr(),
+		int rc = amp_idx_score_q8(q->data_ptr(), pqs ? NULL : pk->data_ptr(), pqs ? pk->data_ptr() : NULL,
+			pqs ? pqs->data_ptr() : NULL, w->data_ptr(), out.data_ptr(),
 			(int)R, (int)n, (float)scale, (int)pos0, (int)P, (int)q->size(1),
 			pt ? (const long long *)pt->data_ptr() : NULL,
 			c10::cuda::getCurrentCUDAStream().stream());
@@ -6874,7 +6895,8 @@ extern "C" long amp_v41_attn_ws_floats(int T, int H, int nsplit);
 extern "C" int amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc, int Nc,
                             const void *idx, int Kc, const float *sinks, const float *inv_freq, void *out,
                             float *ws, int T, int H, int W, int nsplit, float scale, long pos0,
-                            const long long *pos_ptr, int ring, cudaStream_t stream);
+                            const long long *pos_ptr, int ring, const void *kvq, const void *kvs,
+                            cudaStream_t stream);
 
 /* torch.v41_attn(q, kvw, wbase, kvc|null, idx|null, sinks, inv_freq, pos0, scale, W, nsplit?, pos_t?, ring?):
  * DeepSeek-V4.1 sparse MQA attention (see amp_kernels.cu). q (T, H, 512) fp16; kvw (Nw, 512) fp16
@@ -6900,7 +6922,19 @@ torch_v41_attn(uc_vm_t *vm, size_t nargs)
 	if (!kvw)
 		return NULL;
 
-	at::Tensor *kvc = tensor_arg_opt(vm, uc_fn_arg(3));
+	/* kvc: a (Nc, 512) fp16 tensor, or [codes (Nc, 512) int8, scales (Nc, 16) fp16] (a Q8 pool, one scale per 32) */
+	at::Tensor *kvc = NULL, *kvq = NULL, *kvs = NULL;
+	uc_value_t *kva = uc_fn_arg(3);
+
+	if (kva && ucv_type(kva) == UC_ARRAY) {
+		if (ucv_array_length(kva) != 2 || !(kvq = tensor_arg(vm, ucv_array_get(kva, 0))) ||
+		    !(kvs = tensor_arg(vm, ucv_array_get(kva, 1))))
+			return NULL;
+	}
+	else {
+		kvc = tensor_arg_opt(vm, kva);
+	}
+
 	at::Tensor *idx = tensor_arg_opt(vm, uc_fn_arg(4));
 	at::Tensor *sinks = tensor_arg(vm, uc_fn_arg(5));
 	at::Tensor *fr = sinks ? tensor_arg(vm, uc_fn_arg(6)) : NULL;
@@ -6926,9 +6960,12 @@ torch_v41_attn(uc_vm_t *vm, size_t nargs)
 	if (q->dim() != 3 || q->size(2) != 512 || q->scalar_type() != at::kHalf || !q->is_contiguous() ||
 	    kvw->dim() != 2 || kvw->size(1) != 512 || kvw->scalar_type() != at::kHalf || !kvw->is_contiguous() ||
 	    sinks->scalar_type() != at::kFloat || sinks->numel() != q->size(1) || !sinks->is_contiguous() ||
-	    fr->scalar_type() != at::kFloat || fr->numel() != 32 || !fr->is_contiguous() || (!kvc != !idx) ||
+	    fr->scalar_type() != at::kFloat || fr->numel() != 32 || !fr->is_contiguous() || ((!kvc && !kvq) != !idx) ||
 	    (kvc && (kvc->dim() != 2 || kvc->size(1) != 512 || kvc->scalar_type() != at::kHalf ||
 	             !kvc->is_contiguous())) ||
+	    (kvq && (kvq->dim() != 2 || kvq->size(1) != 512 || kvq->scalar_type() != at::kChar || !kvq->is_contiguous() ||
+	             kvs->dim() != 2 || kvs->size(0) != kvq->size(0) || kvs->size(1) != 16 ||
+	             kvs->scalar_type() != at::kHalf || !kvs->is_contiguous() || kvs->device() != kvq->device())) ||
 	    (idx && (idx->dim() != 2 || idx->size(0) != q->size(0) || idx->scalar_type() != at::kInt ||
 	             !idx->is_contiguous())) ||
 	    q->size(1) % 8 || W < 1)
@@ -6950,10 +6987,12 @@ torch_v41_attn(uc_vm_t *vm, size_t nargs)
 		at::Tensor out = at::empty_like(*q);
 		at::Tensor ws = at::empty({ amp_v41_attn_ws_floats(T, H, (int)nsplit) }, q->options().dtype(at::kFloat));
 		int rc = amp_v41_attn(q->data_ptr(), kvw->data_ptr(), (long)wbase, (int)kvw->size(0),
-			kvc ? kvc->data_ptr() : NULL, kvc ? (int)kvc->size(0) : 0, idx ? idx->data_ptr() : NULL, Kc,
+			kvc ? kvc->data_ptr() : NULL, kvc ? (int)kvc->size(0) : kvq ? (int)kvq->size(0) : 0,
+			idx ? idx->data_ptr() : NULL, Kc,
 			(const float *)sinks->data_ptr(), (const float *)fr->data_ptr(), out.data_ptr(),
 			(float *)ws.data_ptr(), T, H, (int)W, (int)nsplit, (float)scale, (long)pos0,
 			pos_t ? (const long long *)pos_t->data_ptr() : NULL, (int)ring,
+			kvq ? kvq->data_ptr() : NULL, kvs ? kvs->data_ptr() : NULL,
 			c10::cuda::getCurrentCUDAStream().stream());
 
 		if (!launch_ok(vm, rc, "v41_attn"))

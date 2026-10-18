@@ -173,6 +173,10 @@ for (let l in LAYERS) {
 	// swaps borderline picks and moves the output by ~1e-2 even in the reference itself
 	let tol = (cfg.ratios[l] == 1) ? 0.06 : 0.005;
 
+	// Q8 pools (the default): the reference reads fp16 rows, the model rows rounded to 8 bits (~1e-2 on one layer's output)
+	if ((getenv('AMP_DSV41_KV') || 'q8') != 'fp16')
+		tol *= 6;
+
 	assert(pre < tol && dec < tol, `layer ${l} differs from the reference`);
 }
 

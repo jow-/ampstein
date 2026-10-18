@@ -51,6 +51,9 @@ if (m.hostprof)
 		printf('  host %-10s %.2f s\n', k, m.hostprof[k]);
 
 for (let S = 1; S <= 5; S++) {
+	if (!g.has(S))
+		continue;
+
 	let tk = [];
 
 	for (let i = 0; i < S; i++)

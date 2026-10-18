@@ -250,5 +250,6 @@ None of these affect the server (which takes `--model`); they select inputs for
 | `AMP_DSPARK_NO_PREFILL_TAPS` | do not feed the drafter during prefill (it then needs a plain step per window) |
 | `AMP_DSPARK_COSTS` | ms of a 1..6-row verify step for the choice of the draft length (default `36.8,45.2,54.2,61.3,67.1,73.0`) |
 | `AMP_DSPARK_DRAFT_MS` | drafter time added to every round's cost estimate, default 8 |
+| `AMP_DSV41_KV` | compressed pools (rows + indexer keys): `q8` (default: int8 codes + a fp16 scale per 32), `q8pool` (rows only), `fp16` |
 | `AMP_V41_NO_TC` | use the CUDA-core attention kernel instead of the tensor-core one for prefill chunks |
 | `AMP_DEBUG_PROMPT` | log the rendered prompt text of every chat request (all architectures) |

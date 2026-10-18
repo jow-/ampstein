@@ -180,3 +180,16 @@ drafter (47 / 45 with the full graph sets and chunk 1024), against 40 / 34 / 37 
 the host issues both ranks' launches): 667 tok/s at 75k tokens (single chain 899), and it grows with the chunk, which
 the memory (drafter + graphs + replicated pools) caps at 1536.
 
+## KV cache quantization (Q8 pools, default)
+
+The compressed pools (the pooled rows and the indexer keys of the kv source layers, replicated per lane under TP) are
+stored as int8 codes plus one fp16 scale per 32 elements (`kv_q8_put`), 664 instead of 1280 bytes per entry.
+`AMP_DSV41_KV=q8pool` quantizes the rows only, `fp16` restores the old layout. The attention kernels (`v41_attn`, CUDA-core
+and tensor-core) and the indexer scoring kernel (`idx_score`) dequantize while staging the rows into shared memory
+(`amp_q8x8`): in-kernel and dequantized-then-fp16 results are bit-identical (`tests/v41_attn.uc`, `tests/idx_score.uc`); the
+window ring stays fp16. Quality (`examples/dsv41_nll.uc`, teacher-forced NLL of real text, 40k context, last 512 positions):
+fp16 0.5214, q8pool 0.5201, q8 0.5184 (top-1 436 / 437 / 438 of 512): no measurable loss. A single layer's attention output
+moves by ~1e-2 against the fp16 CPU oracle (`dsv41_attn` tolerances are x6 under Q8). Decode and prefill speed are unchanged;
+the memory saved is 0.1 - 0.3 GiB per GPU at 256k (3.7 GiB less pool in total than fp16 at 1M single-chain: the planner counts
+the smaller entries).
+
