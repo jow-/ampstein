@@ -3592,6 +3592,23 @@ void hc_mix
     at::Tensor collapsed
 );
 
+void hc_mix2
+(
+    const at::Tensor& streams,
+    const at::Tensor& fn,
+    const at::Tensor& base,
+    const at::Tensor& scale,
+    double rms_eps,
+    double hc_eps,
+    int64_t sinkhorn_iters,
+    const at::Tensor& pre_in,
+    at::Tensor partials,
+    at::Tensor post,
+    at::Tensor comb,
+    at::Tensor pre_out,
+    at::Tensor collapsed
+);
+
 void hc_apply
 (
     at::Tensor x,
@@ -6490,6 +6507,9 @@ torch_moe_coop(uc_vm_t *vm, size_t nargs)
 
 extern "C" int amp_fp8_gemv(const void *x, const void *w, const void *s, void *out, int M, int K,
                             int N, cudaStream_t stream);
+extern "C" int amp_fp8_gemv_grouped(const void *x, const void *w, const void *s, void *out, int M, int K, int N,
+                                    int G, cudaStream_t stream);
+
 extern "C" int amp_fp8_dequant(const void *w, const void *s, void *out, int N, int K,
                                cudaStream_t stream);
 
@@ -6537,6 +6557,42 @@ torch_fp8_gemv(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+/* torch.fp8_gemv_grouped(x, w, s, G): x (M<=8, G * K) fp16; w (G * N, K) e4m3, s (G * N / 32, K / 32) e8m0 -> (M, G * N)
+ * fp16, group g using columns [g K, (g + 1) K) of x and rows [g N, (g + 1) N) of w. */
+static uc_value_t *
+torch_fp8_gemv_grouped(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *x, *w, *s;
+
+	if (nargs != 4 || !(x = tensor_arg(vm, uc_fn_arg(0))) || !(w = tensor_arg(vm, uc_fn_arg(1))) ||
+	    !(s = tensor_arg(vm, uc_fn_arg(2))) || ucv_type(uc_fn_arg(3)) != UC_INTEGER)
+		RAISE("fp8_gemv_grouped: (x, w, s, G)");
+
+	long G = ucv_int64_get(uc_fn_arg(3));
+
+	if (!fp8_args_ok(w, s) || G < 1 || w->size(0) % G || (w->size(0) / G) % 32 || x->dim() != 2 ||
+	    x->scalar_type() != at::kHalf || !x->is_contiguous() || x->size(1) != G * w->size(1) ||
+	    x->size(0) < 1 || x->size(0) > 8 || x->get_device() != w->get_device())
+		RAISE("fp8_gemv_grouped: x (M<=8, G*K) fp16, w (G*N, K) e4m3, s (G*N/32, K/32) e8m0, N % 32 == 0");
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		long N = w->size(0) / G;
+		at::Tensor out = at::empty({ x->size(0), G * N }, x->options());
+		int rc = amp_fp8_gemv_grouped(x->data_ptr(), w->data_ptr(), s->data_ptr(), out.data_ptr(),
+			(int)x->size(0), (int)w->size(1), (int)N, (int)G, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "fp8_gemv_grouped"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 /* torch.fp8_dequant(w, s, out?): the fp16 (N, K) matrix of a block-scaled fp8 weight */
 static uc_value_t *
 torch_fp8_dequant(uc_vm_t *vm, size_t nargs)
@@ -6568,6 +6624,103 @@ torch_fp8_dequant(uc_vm_t *vm, size_t nargs)
 			return NULL;
 
 		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+extern "C" int amp_v41_rope(const void *x, const void *pos, int pos_f32, long pstride, const float *inv_freq,
+                            void *out, int T, int H, int D, int rd, cudaStream_t stream);
+
+/* torch.v41_rope(x, pos, inv_freq): x (T, H, D) fp16 contiguous; pos int64 or fp32 tensor of at least T elements
+ * (row t reads element t * stride(0)); inv_freq (rd / 2) fp32 -> (T, H, D) fp16 with the trailing rd = 2 * len(inv_freq)
+ * channels of every row rotated pairwise by pos * inv_freq. */
+static uc_value_t *
+torch_v41_rope(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *x, *pos, *inv;
+
+	if (nargs != 3 || !(x = tensor_arg(vm, uc_fn_arg(0))) || !(pos = tensor_arg(vm, uc_fn_arg(1))) ||
+	    !(inv = tensor_arg(vm, uc_fn_arg(2))))
+		return NULL;
+
+	bool pf = pos->scalar_type() == at::kFloat;
+
+	if (x->dim() != 3 || x->scalar_type() != at::kHalf || !x->is_contiguous() || !x->is_cuda() ||
+	    (!pf && pos->scalar_type() != at::kLong) || pos->numel() < 1 || pos->device() != x->device() ||
+	    inv->scalar_type() != at::kFloat || !inv->is_contiguous() || inv->device() != x->device() ||
+	    inv->numel() * 2 > x->size(2) || x->size(2) % 2)
+		RAISE("v41_rope: x (T, H, D) fp16, pos int64 / fp32 (one per row), inv_freq fp32, one CUDA device");
+
+	long ps = pos->numel() > 1 ? pos->stride(0) : 0;
+
+	if (pos->numel() < x->size(0) && pos->numel() != 1)
+		RAISE("v41_rope: pos has fewer elements than x has rows");
+
+	if (pos->numel() == 1 && x->size(0) != 1)
+		RAISE("v41_rope: pos has fewer elements than x has rows");
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		at::Tensor out = at::empty_like(*x);
+		int rc = amp_v41_rope(x->data_ptr(), pos->data_ptr(), pf, ps, (const float *)inv->data_ptr(), out.data_ptr(),
+			(int)x->size(0), (int)x->size(1), (int)x->size(2), (int)(inv->numel() * 2),
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "v41_rope"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+extern "C" int amp_v41_route(const float *logits, const float *bias, long long *idx, float *w, int T, int E, int k,
+                             float scale, cudaStream_t stream);
+
+/* torch.v41_route(logits, bias, k, scale): logits (T, E) fp32, bias (E) or (1, E) fp32 -> [idx (T, k) int64,
+ * w (T, k) fp32]: the sqrt(softplus) router of DeepSeek-V4 / V4.1 (top-k on affinity + bias, weights = the plain
+ * affinities normalized to sum 1, times scale). */
+static uc_value_t *
+torch_v41_route(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *lg, *bias;
+
+	if (nargs != 4 || !(lg = tensor_arg(vm, uc_fn_arg(0))) || !(bias = tensor_arg(vm, uc_fn_arg(1))) ||
+	    ucv_type(uc_fn_arg(2)) != UC_INTEGER ||
+	    (ucv_type(uc_fn_arg(3)) != UC_DOUBLE && ucv_type(uc_fn_arg(3)) != UC_INTEGER))
+		RAISE("v41_route: (logits, bias, k, scale)");
+
+	long k = ucv_int64_get(uc_fn_arg(2));
+	double scale = (ucv_type(uc_fn_arg(3)) == UC_DOUBLE) ? ucv_double_get(uc_fn_arg(3)) : (double)ucv_int64_get(uc_fn_arg(3));
+
+	if (lg->dim() != 2 || lg->scalar_type() != at::kFloat || !lg->is_contiguous() || !lg->is_cuda() ||
+	    bias->scalar_type() != at::kFloat || !bias->is_contiguous() || bias->numel() != lg->size(1) ||
+	    bias->device() != lg->device() || lg->size(1) > 512 || k < 1 || k > lg->size(1) || k > 32)
+		RAISE("v41_route: logits (T, E<=512) fp32 contiguous CUDA, bias (E) fp32, 1 <= k <= 32");
+
+	TensorDeviceGuard dg(*lg);
+
+	try {
+		at::Tensor idx = at::empty({ lg->size(0), k }, lg->options().dtype(at::kLong));
+		at::Tensor w = at::empty({ lg->size(0), k }, lg->options());
+		int rc = amp_v41_route((const float *)lg->data_ptr(), (const float *)bias->data_ptr(),
+			(long long *)idx.data_ptr(), (float *)w.data_ptr(), (int)lg->size(0), (int)lg->size(1), (int)k,
+			(float)scale, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "v41_route"))
+			return NULL;
+
+		uc_value_t *r = ucv_array_new(vm);
+
+		ucv_array_push(r, tensor_wrap(vm, std::move(idx), 0));
+		ucv_array_push(r, tensor_wrap(vm, std::move(w), 0));
+
+		return r;
 	}
 	catch (const std::exception &e) {
 		RAISE(e.what());
@@ -8848,6 +9001,73 @@ torch_hc_mix(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * hc_mix2(streams, fn, base, scale, rms_eps, hc_eps, sinkhorn_iters, pre_in): [post, comb, collapsed, pre]
+ *
+ * hc_mix for DeepSeek-V4.1's "one site late" collapse: the sublayer input is the streams collapsed with
+ * pre_in (R, 4) fp32 (the previous site's pre), clamped to the fp16 range; also returns this site's pre
+ * (R, 4) fp32 (sigmoid(...) + hc_eps) for the next collapse.
+ */
+static uc_value_t *
+torch_hc_mix2(uc_vm_t *vm, size_t nargs)
+{
+	double rms_eps, hc_eps, iters;
+
+	if (nargs != 8 || !arg_number(vm, uc_fn_arg(4), &rms_eps) ||
+	    !arg_number(vm, uc_fn_arg(5), &hc_eps) ||
+	    !arg_number(vm, uc_fn_arg(6), &iters)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (streams, fn, base, scale, rms_eps, hc_eps, sinkhorn_iters, pre_in)");
+		return NULL;
+	}
+
+	at::Tensor *st = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *fn = st ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *base = fn ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	at::Tensor *scale = base ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+	at::Tensor *pre = scale ? tensor_arg(vm, uc_fn_arg(7)) : NULL;
+
+	if (!pre)
+		return NULL;
+
+	if (st->dim() != 3 || st->size(1) != 4 || st->scalar_type() != at::kFloat ||
+	    !st->is_contiguous() || st->size(2) % 4 || !st->is_cuda())
+		RAISE("hc_mix2: streams must be a contiguous fp32 CUDA tensor (R, 4, D), D % 4 == 0");
+
+	if (fn->size(0) != 24 || fn->size(1) != 4 * st->size(2) || !fn->is_contiguous() ||
+	    base->numel() != 24 || scale->numel() != 3 || pre->scalar_type() != at::kFloat ||
+	    !pre->is_contiguous() || pre->numel() != st->size(0) * 4 || pre->device() != st->device())
+		RAISE("hc_mix2: fn must be (24, 4*D), base (24), scale (3), pre_in (R, 4) fp32 on the same device");
+
+	try {
+		TensorDeviceGuard dg(*st);
+
+		int64_t R = st->size(0), D = st->size(2);
+		int chunks = hc_mix_num_chunks((int)R, (int)(4 * D));
+		auto f32 = st->options();
+		at::Tensor partials = at::empty({ R, chunks, 24 + 1 }, f32);
+		at::Tensor post = at::empty({ R, 4 }, f32);
+		at::Tensor comb = at::empty({ R, 4, 4 }, f32);
+		at::Tensor pre_out = at::empty({ R, 4 }, f32);
+		at::Tensor coll = at::empty({ R, D }, st->options().dtype(at::kHalf));
+
+		hc_mix2(*st, *fn, *base, *scale, rms_eps, hc_eps, (int64_t)iters, *pre,
+			partials, post, comb, pre_out, coll);
+
+		uc_value_t *r = ucv_array_new(vm);
+
+		ucv_array_push(r, tensor_wrap(vm, std::move(post), 0));
+		ucv_array_push(r, tensor_wrap(vm, std::move(comb), 0));
+		ucv_array_push(r, tensor_wrap(vm, std::move(coll), 0));
+		ucv_array_push(r, tensor_wrap(vm, std::move(pre_out), 0));
+
+		return r;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
  * hc_apply(x, y, post, comb): x
  *
  * Residual update of one sublayer site, IN PLACE on the streams:
@@ -9651,6 +9871,10 @@ static const uc_function_list_t torch_fns[] = {
 	{ "fp8_gemv",	torch_fp8_gemv },
 	{ "v41_attn",	torch_v41_attn },
 	{ "fp8_dequant",	torch_fp8_dequant },
+	{ "fp8_gemv_grouped",	torch_fp8_gemv_grouped },
+	{ "hc_mix2",	torch_hc_mix2 },
+	{ "v41_rope",	torch_v41_rope },
+	{ "v41_route",	torch_v41_route },
 	{ "fp4_dequant",	torch_fp4_dequant },
 	{ "fp4_moe_gemv",	torch_fp4_moe_gemv },
 	{ "stream_side",	torch_stream_side },

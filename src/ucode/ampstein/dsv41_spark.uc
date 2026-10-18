@@ -253,15 +253,15 @@ export function load(model, opts) {
 	/* one stage over the block; streams (R, 4, H) fp32 updated in place, pre (R, 4) the collapse weights of
 	 * the attention input; returns the pre of the next stage */
 	function stage(S, streams, pre, p0) {
-		let am = dsv41.hc_mixes(cfg, S.hc_attn, streams);
-		let xn = torch.rms_norm(dsv41.hc_collapse(streams, pre), S.attn_norm, eps);
+		let am = dsv41.hc_site(cfg, S.hc_attn, streams, pre);
+		let xn = torch.rms_norm(am.col, S.attn_norm, eps);
 		let y = attn(S, xn, p0);
 
 		glm5.hc_apply(streams, y, am.post, am.comb);
 
-		let fm = dsv41.hc_mixes(cfg, S.hc_ffn, streams);
+		let fm = dsv41.hc_site(cfg, S.hc_ffn, streams, am.pre);
 
-		xn = torch.rms_norm(dsv41.hc_collapse(streams, am.pre), S.ffn_norm, eps);
+		xn = torch.rms_norm(fm.col, S.ffn_norm, eps);
 		y = moe(S, xn);
 		glm5.hc_apply(streams, y, fm.post, fm.comb);
 
@@ -290,10 +290,9 @@ export function load(model, opts) {
 		let Hq = cfg.num_q_heads, D = cfg.head_dim, rd = cfg.rope_dim;
 		let qr = torch.rms_norm(A.q_a.forward(xn), A.q_norm, eps);
 		let q = A.q_b.forward(qr).view([R, Hq, D]);
-		let cs = dsv41.rope_cs_rows(A.inv_freq, P.posf);
-		let q16 = dsv41.rope_il(q.to('float32'), cs, rd).to('float16').contiguous();
+		let q16 = torch.v41_rope(q, P.posf, A.inv_freq);
 		let kv = torch.rms_norm(A.wkv.forward(xn), A.kv_norm, eps);
-		let kv16 = dsv41.rope_il(kv.to('float32').view([R, 1, D]), cs, rd).to('float16').view([R, D]).contiguous();
+		let kv16 = torch.v41_rope(kv.view([R, 1, D]), P.posf, A.inv_freq).view([R, D]);
 		let keys_ = torch.cat([S.ring.index(P.slots), kv16], 0);
 		let o = torch.v41_attn(q16, kv16, SKIP_POS, keys_, P.idx, A.sinks, A.inv_freq, 0, cfg.sm_scale, cfg.window, 0,
 			P.pos_t, 0);
@@ -302,15 +301,15 @@ export function load(model, opts) {
 	}
 
 	function stage_g(S, P, streams, pre) {
-		let am = dsv41.hc_mixes(cfg, S.hc_attn, streams);
-		let xn = torch.rms_norm(dsv41.hc_collapse(streams, pre), S.attn_norm, eps);
+		let am = dsv41.hc_site(cfg, S.hc_attn, streams, pre);
+		let xn = torch.rms_norm(am.col, S.attn_norm, eps);
 		let y = attn_g(S, P, xn);
 
 		glm5.hc_apply(streams, y, am.post, am.comb);
 
-		let fm = dsv41.hc_mixes(cfg, S.hc_ffn, streams);
+		let fm = dsv41.hc_site(cfg, S.hc_ffn, streams, am.pre);
 
-		xn = torch.rms_norm(dsv41.hc_collapse(streams, am.pre), S.ffn_norm, eps);
+		xn = torch.rms_norm(fm.col, S.ffn_norm, eps);
 		y = moe(S, xn);
 		glm5.hc_apply(streams, y, fm.post, fm.comb);
 

@@ -5509,10 +5509,16 @@ __global__ void amp_fp8_gemv_kernel(const __half *__restrict__ x, const uint8_t 
 template <int M>
 __global__ void __launch_bounds__(256)
 amp_fp8_gemv2_kernel(const __half *__restrict__ x, const uint8_t *__restrict__ w, const uint8_t *__restrict__ s,
-                     __half *__restrict__ out, int K, int N)
+                     __half *__restrict__ out, int K, int N, int xs, int os)
 {
 	const int lane = threadIdx.x & 31;
 	const int n0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 2;
+
+	/* blockIdx.z: weight group (the attention's wo_a); a plain call has one */
+	x += (size_t)blockIdx.z * K;
+	w += (size_t)blockIdx.z * N * K;
+	s += (size_t)blockIdx.z * (N >> 5) * (K >> 5);
+	out += (size_t)blockIdx.z * N;
 
 	if (n0 >= N)
 		return;
@@ -5551,7 +5557,7 @@ amp_fp8_gemv2_kernel(const __half *__restrict__ x, const uint8_t *__restrict__ w
 
 #pragma unroll
 		for (int m = 0; m < M; m++) {
-			const uint4 *xp = (const uint4 *)(x + (size_t)m * K + k);
+			const uint4 *xp = (const uint4 *)(x + (size_t)m * xs + k);
 			uint4 x0 = xp[0], x1 = xp[1];
 			const __half2 *h0 = (const __half2 *)&x0, *h1 = (const __half2 *)&x1;
 			float d0 = 0.0f, d1 = 0.0f;
@@ -5583,10 +5589,10 @@ amp_fp8_gemv2_kernel(const __half *__restrict__ x, const uint8_t *__restrict__ w
 		}
 
 		if (lane == 0) {
-			out[(size_t)m * N + n0] = __float2half(v0);
+			out[(size_t)m * os + n0] = __float2half(v0);
 
 			if (two)
-				out[(size_t)m * N + n0 + 1] = __float2half(v1);
+				out[(size_t)m * os + n0 + 1] = __float2half(v1);
 		}
 	}
 }
@@ -5599,6 +5605,11 @@ amp_fp8_gemv3_kernel(const __half *__restrict__ x, const uint8_t *__restrict__ w
                      __half *__restrict__ out, int K, int N)
 {
 	extern __shared__ uint4 g3_x[];                 /* the activation row, shared by the 8 rows of the block */
+
+	x += (size_t)blockIdx.z * K;                    /* blockIdx.z: weight group */
+	w += (size_t)blockIdx.z * N * K;
+	s += (size_t)blockIdx.z * (N >> 5) * (K >> 5);
+	out += (size_t)blockIdx.z * N;
 
 	const int lane = threadIdx.x & 31;
 	const int n = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -5687,7 +5698,7 @@ amp_fp8_gemv(const void *x, const void *w, const void *s, void *out, int M, int 
 	dim3 grid((N + 15) / 16), block(256);
 
 #define AMP_FP8G(MM) amp_fp8_gemv2_kernel<MM><<<grid, block, 0, stream>>>((const __half *)x, \
-	(const uint8_t *)w, (const uint8_t *)s, (__half *)out, K, N); break
+	(const uint8_t *)w, (const uint8_t *)s, (__half *)out, K, N, K, N); break
 
 	switch (M) {
 	case 1: AMP_FP8G(1);
@@ -5701,6 +5712,52 @@ amp_fp8_gemv(const void *x, const void *w, const void *s, void *out, int M, int 
 	}
 
 #undef AMP_FP8G
+
+	return (int)cudaGetLastError();
+}
+
+/* G weight groups in one launch: group g multiplies columns [g K, (g + 1) K) of x (M, G K) by its own (N, K) weight
+ * (rows g N .. of w) into columns [g N, (g + 1) N) of out (M, G N). M <= 8, N % 32 == 0. */
+extern "C" int
+amp_fp8_gemv_grouped(const void *x, const void *w, const void *s, void *out, int M, int K, int N, int G,
+                     cudaStream_t stream)
+{
+	if (M < 1 || M > 8 || K < 32 || (K % 32) || N < 32 || (N % 32) || G < 1 || G > 65535)
+		return (int)cudaErrorInvalidValue;
+
+	if (M == 1 && K <= 16 * 512) {
+		const int ns = (K + 511) / 512;
+		dim3 g1((N + 7) / 8, 1, G), b1(256);
+
+#define AMP_FP8GG3(NSV) case NSV: amp_fp8_gemv3_kernel<NSV><<<g1, b1, (size_t)K * 2, stream>>>((const __half *)x, \
+	(const uint8_t *)w, (const uint8_t *)s, (__half *)out, K, N); return (int)cudaGetLastError()
+
+		switch (ns) {
+		AMP_FP8GG3(1); AMP_FP8GG3(2); AMP_FP8GG3(3); AMP_FP8GG3(4); AMP_FP8GG3(5); AMP_FP8GG3(6); AMP_FP8GG3(7);
+		AMP_FP8GG3(8); AMP_FP8GG3(9); AMP_FP8GG3(10); AMP_FP8GG3(11); AMP_FP8GG3(12); AMP_FP8GG3(13); AMP_FP8GG3(14);
+		AMP_FP8GG3(15); AMP_FP8GG3(16);
+		}
+
+#undef AMP_FP8GG3
+	}
+
+	dim3 grid((N + 15) / 16, 1, G), block(256);
+
+#define AMP_FP8GG(MM) amp_fp8_gemv2_kernel<MM><<<grid, block, 0, stream>>>((const __half *)x, \
+	(const uint8_t *)w, (const uint8_t *)s, (__half *)out, K, N, G * K, G * N); break
+
+	switch (M) {
+	case 1: AMP_FP8GG(1);
+	case 2: AMP_FP8GG(2);
+	case 3: AMP_FP8GG(3);
+	case 4: AMP_FP8GG(4);
+	case 5: AMP_FP8GG(5);
+	case 6: AMP_FP8GG(6);
+	case 7: AMP_FP8GG(7);
+	default: AMP_FP8GG(8);
+	}
+
+#undef AMP_FP8GG
 
 	return (int)cudaGetLastError();
 }
@@ -5889,6 +5946,163 @@ amp_fp4_moe_gemv(const void *x, const void *ids, const void *wp, const void *sp,
 
 	amp_fp4_moe_gemv_kernel<<<grid, block, (size_t)(K + K / 32) * 4, stream>>>((const __half *)x,
 		(const long long *)ids, (const long long *)wp, (const long long *)sp, (float *)out, K, N, xdiv);
+
+	return (int)cudaGetLastError();
+}
+
+
+/* ------------------------------------------------------------------ */
+/* rotary embedding of DeepSeek-V4.1 rows: the trailing rd channels of every row are rotated pairwise (GPT-J
+ * layout) by the angle position * inv_freq; the leading channels are copied. One block per (row, head);
+ * the position of row t is read from a device tensor (int64 or fp32, element stride pstride). */
+template <typename P_T>
+__global__ void amp_v41_rope_kernel(const __half *__restrict__ x, const P_T *__restrict__ pos, long pstride,
+                                    const float *__restrict__ inv_freq, __half *__restrict__ out, int H, int D, int rd)
+{
+	const int row = blockIdx.x;                               /* t * H + h */
+	const int t = row / H;
+	const float p = (float)pos[(size_t)t * pstride];
+	const int lead = (D - rd) / 2;                            /* pairs copied */
+	const __half2 *xi = (const __half2 *)(x + (size_t)row * D);
+	__half2 *xo = (__half2 *)(out + (size_t)row * D);
+
+	for (int i = threadIdx.x; i < D / 2; i += blockDim.x) {
+		if (i < lead) {
+			xo[i] = xi[i];
+		}
+		else {
+			float s, c;
+
+			sincosf(p * inv_freq[i - lead], &s, &c);
+
+			float2 v = __half22float2(xi[i]);
+
+			xo[i] = __floats2half2_rn(v.x * c - v.y * s, v.x * s + v.y * c);
+		}
+	}
+}
+
+extern "C" int
+amp_v41_rope(const void *x, const void *pos, int pos_f32, long pstride, const float *inv_freq, void *out, int T,
+             int H, int D, int rd, cudaStream_t stream)
+{
+	if (T < 1 || H < 1 || D < rd || (D & 1) || (rd & 1) || rd < 2)
+		return (int)cudaErrorInvalidValue;
+
+	if (pos_f32)
+		amp_v41_rope_kernel<float><<<(unsigned)(T * H), 128, 0, stream>>>((const __half *)x, (const float *)pos,
+			pstride, inv_freq, (__half *)out, H, D, rd);
+	else
+		amp_v41_rope_kernel<long long><<<(unsigned)(T * H), 128, 0, stream>>>((const __half *)x,
+			(const long long *)pos, pstride, inv_freq, (__half *)out, H, D, rd);
+
+	return (int)cudaGetLastError();
+}
+
+
+/* ------------------------------------------------------------------ */
+/* DeepSeek-V4 / V4.1 router: affinity sqrt(softplus(logit)); the k experts with the highest affinity + bias (ties:
+ * the lower index) in descending order; weights = their affinities normalized to sum 1 (+ 1e-20) times scale.
+ * One block (128 threads) per row, k rounds of block argmax. */
+#define AMP_ROUTE_THREADS 128
+#define AMP_ROUTE_MAXE 512
+
+__global__ void __launch_bounds__(AMP_ROUTE_THREADS)
+amp_v41_route_kernel(const float *__restrict__ logits, const float *__restrict__ bias, long long *__restrict__ idx,
+                     float *__restrict__ wout, int E, int k, float scale)
+{
+	__shared__ float sc[AMP_ROUTE_MAXE];
+	__shared__ float key[AMP_ROUTE_MAXE];
+	__shared__ float wv[32];
+	__shared__ float red_v[AMP_ROUTE_THREADS / 32];
+	__shared__ int red_i[AMP_ROUTE_THREADS / 32];
+	__shared__ int pick;
+
+	const int row = blockIdx.x;
+	const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+
+	for (int e = threadIdx.x; e < E; e += blockDim.x) {
+		float x = logits[(size_t)row * E + e];
+		float sp = (x > 20.0f) ? x : log1pf(expf(x));
+		float a = sqrtf(sp);
+
+		sc[e] = a;
+		key[e] = a + bias[e];
+	}
+
+	__syncthreads();
+
+	for (int j = 0; j < k; j++) {
+		float bv = -INFINITY;
+		int bi = 0x7fffffff;
+
+		for (int e = threadIdx.x; e < E; e += blockDim.x) {
+			float v = key[e];
+
+			if (v > bv || (v == bv && e < bi)) {
+				bv = v;
+				bi = e;
+			}
+		}
+
+#pragma unroll
+		for (int o = 16; o > 0; o >>= 1) {
+			float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+			int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+
+			if (ov > bv || (ov == bv && oi < bi)) {
+				bv = ov;
+				bi = oi;
+			}
+		}
+
+		if (lane == 0) {
+			red_v[warp] = bv;
+			red_i[warp] = bi;
+		}
+
+		__syncthreads();
+
+		if (threadIdx.x == 0) {
+			float v = red_v[0];
+			int i = red_i[0];
+
+			for (int w = 1; w < AMP_ROUTE_THREADS / 32; w++)
+				if (red_v[w] > v || (red_v[w] == v && red_i[w] < i)) {
+					v = red_v[w];
+					i = red_i[w];
+				}
+
+			pick = i;
+			idx[(size_t)row * k + j] = i;
+			wv[j] = sc[i];
+			key[i] = -INFINITY;
+		}
+
+		__syncthreads();
+	}
+
+	if (threadIdx.x == 0) {
+		float sum = 0.f;
+
+		for (int j = 0; j < k; j++)
+			sum += wv[j];
+
+		const float inv = scale / (sum + 1e-20f);
+
+		for (int j = 0; j < k; j++)
+			wout[(size_t)row * k + j] = wv[j] * inv;
+	}
+}
+
+extern "C" int
+amp_v41_route(const float *logits, const float *bias, long long *idx, float *w, int T, int E, int k, float scale,
+              cudaStream_t stream)
+{
+	if (T < 1 || E < 1 || E > AMP_ROUTE_MAXE || k < 1 || k > 32 || k > E)
+		return (int)cudaErrorInvalidValue;
+
+	amp_v41_route_kernel<<<(unsigned)T, AMP_ROUTE_THREADS, 0, stream>>>(logits, bias, idx, w, E, k, scale);
 
 	return (int)cudaGetLastError();
 }

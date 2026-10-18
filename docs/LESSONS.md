@@ -621,3 +621,12 @@ Add new lessons at the end of the matching section.
   the indexer (`idx_score` already scores R rows from a device `pos0`) and the attention kernel run once for all
   rows: 83 -> 67 ms for 5 rows over the row-by-row loop (`AMP_DSV41_ROWLOOP=1` keeps that as the reference).
 
+- **L162 — Count kernels before counting bytes, then profile.** A V4.1 decode step was ~4,600 kernels (115 per layer, mostly
+  the composite rope / mHC / router / grouped-GEMV ops of ucode); `hc_mix2` (the mHC pass with the previous site's pre,
+  vendor patch 5), `v41_rope`, `v41_route` and `fp8_gemv_grouped` took 36.8 -> 31.7 ms (5 rows: 67 -> 60.5). After that
+  `nsys stats` (works without root; `ncu` needs counter permission) shows the GPU ~85% busy with three things: routed MoE
+  10.5 ms (the coop kernels, 5x off the byte roofline: trellis decode is ALU-bound), FP8 GEMVs 11.3 ms (77% of
+  bandwidth), the LM head 1.9 ms (at roofline).
+- **L163 — rsync keeps mtimes, make trusts them.** A source file edited while a build was running kept its old mtime on
+  the target, the object file looked newer, and the stale object linked in (`undefined symbol`, `not a function` from a
+  binding that was in the source). Sync with `--no-times` so changed files get the arrival time.

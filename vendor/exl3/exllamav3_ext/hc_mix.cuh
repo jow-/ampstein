@@ -23,6 +23,24 @@ void hc_mix
     at::Tensor collapsed
 );
 
+// V4.1 form: collapse with the previous site's pre, also return this site's pre
+void hc_mix2
+(
+    const at::Tensor& streams,
+    const at::Tensor& fn,
+    const at::Tensor& base,
+    const at::Tensor& scale,
+    double rms_eps,
+    double hc_eps,
+    int64_t sinkhorn_iters,
+    const at::Tensor& pre_in,
+    at::Tensor partials,
+    at::Tensor post,
+    at::Tensor comb,
+    at::Tensor pre_out,
+    at::Tensor collapsed
+);
+
 void hc_head
 (
     const at::Tensor& streams,

@@ -167,6 +167,10 @@ amp_test(fp8_ops)
 amp_test(fp4_ops)
 # v41_attn: DeepSeek-V4.1 sparse MQA attention kernel
 amp_test(v41_attn)
+# v41_rope: fused rotary embedding of V4.1 rows
+amp_test(v41_rope)
+# v41_route: fused sqrt-softplus router
+amp_test(v41_route)
 # moe_mixed: fused decode MoE with mixed bit widths per expert
 amp_test(moe_mixed)
 # dsv41_attn: V4.1 attention layers vs the reference run on the CPU
@@ -175,6 +179,8 @@ amp_test(dsv41_attn)
 amp_test(dsv41_engram)
 # dsv41_hc: hyper-connection mixes vs the reference
 amp_test(dsv41_hc)
+# dsv41_hc2: fused one-site-late mHC pass vs the composite form
+amp_test(dsv41_hc2)
 # dsv41_engram_apply: Engram gate vs the reference
 amp_test(dsv41_engram_apply)
 # dsv41_graph: CUDA-graph decode vs eager (needs the model)

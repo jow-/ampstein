@@ -24,3 +24,9 @@ invariant 3). Re-apply after any vendor refresh.
 4. `exllamav3_ext/quant/exl3_moe*.cu*` — the same for the token-sorted prefill MoE (`exl3_moe`): optional
    `bits_g / bits_u / bits_d` tables (uint8, per expert); the K = 0 (run-time switch) instances read
    the expert's widths from them (`k_*_e` kernel arguments). Without tables nothing changes.
+
+5. `exllamav3_ext/hc_mix.cu/.cuh` — `hc_mix2` for DeepSeek-V4.1's "one site late" mHC: the finalize kernel takes
+   optional `pre_in` (R, H) (the collapse weights of the *previous* site, replacing the site's own `pre`; the half
+   output is then clamped to the fp16 range) and `pre_out` (R, H) (this site's `pre`, written by the chunk-0
+   block). The partials kernel, the sinkhorn and every existing launch are unchanged (`pre_in`/`pre_out` null).
+   Replaces ~16 small composite kernels per site; checked against the composite form in `tests/dsv41_hc2.uc`.

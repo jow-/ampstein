@@ -34,6 +34,8 @@ const RING = +(getenv('AMP_DSV41_RING') || 8192);          // raw window rows ke
 const SCRATCH_ELEMS = 32 * 1024 * 1024;                    // fp8 -> fp16 dequant slice, elements
 const PROF = getenv('AMP_DSV41_PROF') != null;
 const NO_ENGRAM = getenv('AMP_DSV41_NO_ENGRAM') != null;
+const NO_GROUPED = getenv('AMP_DSV41_NO_GROUPED') != null;        // wo_a: one GEMV per group instead of the grouped kernel
+const NO_HC2 = getenv('AMP_DSV41_NO_HC2') != null;            // composite mHC mixes + collapse instead of the fused hc_mix2
 let ROWOFF = {};
 const SKIP = getenv('AMP_DSV41_SKIP');                      // profiling: 'attn' | 'moe' skipped in multi-row steps
 const ROWLOOP = getenv('AMP_DSV41_ROWLOOP') != null;          // multi-row decode: attention row by row (reference path)
@@ -219,6 +221,9 @@ export function lin8g(ws, key, G, dev) {
 			let M = x.shape()[0], K = this.in_features, R = this.rows;
 			let parts = [];
 
+			if (M <= 8 && !NO_GROUPED)
+				return torch.fp8_gemv_grouped(x.contiguous(), this.w, this.s, G);
+
 			for (let g = 0; g < G; g++) {
 				let xg = x.narrow(1, g * K, K).contiguous();
 
@@ -291,6 +296,22 @@ export function hc_mixes(cfg, hc, streams) {
 	let pre = torch.matmul(flat, hc.fn_pre_t).mul(rs).mul(hc.scale_pre).add(hc.base_pre).sigmoid().add(cfg.hc_eps);
 
 	return {pre: pre, post: r[0], comb: r[1]};
+}
+
+/* One mHC site of the "one site late" form in a single fused pass: the mixes of the streams (post, comb, this
+ * site's pre) and the sublayer input col = streams collapsed with pre_prev (the previous site's pre), (T, D) fp16
+ * saturated to the fp16 range. Returns {pre, post, comb, col}. */
+export function hc_site(cfg, hc, streams, pre_prev) {
+	if (NO_HC2) {
+		let m = hc_mixes(cfg, hc, streams);
+
+		return {pre: m.pre, post: m.post, comb: m.comb, col: hc_collapse(streams, pre_prev)};
+	}
+
+	let r = torch.hc_mix2(streams, hc.fn, hc.base, hc.scale, cfg.rms_norm_eps, cfg.hc_eps, cfg.hc_sinkhorn_iters,
+		pre_prev);
+
+	return {post: r[0], comb: r[1], col: r[2], pre: r[3]};
 }
 
 /* (T, D) fp16: streams collapsed with pre, saturated to the fp16 range (massive activations) */
@@ -945,7 +966,7 @@ function comp_decode(cfg, A, cl, xn, st) {
 
 	if (ratio == 1) {
 		lat = torch.rms_norm(torch.matmul(xn, C.wkv16), C.norm, eps);
-		posf = meta_f(st, 0);
+		posf = meta_i(st, 0);
 		slot = meta_i(st, 0);
 	}
 	else {
@@ -958,21 +979,20 @@ function comp_decode(cfg, A, cl, xn, st) {
 		cl.pk.copy_(kv);
 		cl.pg.copy_(g);
 		lat = torch.rms_norm(pooled.to('float16').contiguous(), C.norm, eps);
-		posf = meta_f(st, 3);
+		posf = meta_i(st, 3);
 		slot = meta_i(st, 2);
 	}
 
-	let cs = rope_cs_dev(A.inv_freq, posf);
 	let I = A.indexer;
 
 	if (I && I.owns_k) {
 		let k = torch.rms_norm(torch.matmul(lat, I.wk_t), I.k_norm, eps);
 
-		cl.kidx.index_copy_(0, slot, rope_il(k.to('float32').view([1, 1, cfg.index_head_dim]), cs, rd).to('float16')
+		cl.kidx.index_copy_(0, slot, torch.v41_rope(k.view([1, 1, cfg.index_head_dim]), posf, A.inv_freq)
 			.view([1, cfg.index_head_dim]));
 	}
 
-	cl.pool.index_copy_(0, slot, rope_il(lat.to('float32').view([1, 1, cfg.head_dim]), cs, rd).to('float16')
+	cl.pool.index_copy_(0, slot, torch.v41_rope(lat.view([1, 1, cfg.head_dim]), posf, A.inv_freq)
 		.view([1, cfg.head_dim]));
 }
 
@@ -1008,8 +1028,7 @@ function index_picks_dec(cfg, A, ctx, cache, xn, qr, st, Scap, src) {
 	let Hi = cfg.index_n_heads, Di = cfg.index_head_dim, rd = cfg.rope_dim;
 	let pc = pool_dec(cache, src, A.dev);
 	let qi = I.wq_b.forward(qr).view([1, Hi, Di]);
-	let cs = rope_cs_dev(A.inv_freq, meta_f(st, 0));
-	let q16 = rope_il(qi.to('float32'), cs, rd).to('float16').contiguous();
+	let q16 = torch.v41_rope(qi, meta_i(st, 0), A.inv_freq);
 	let w = torch.matmul(xn.to('float32'), I.w_t).contiguous();
 	let sc = torch.idx_score(q16, pc.kidx.narrow(0, 0, Scap), w, math.pow(Di * 1.0, -0.5) * math.pow(Hi * 1.0, -0.5),
 		meta_i(st, 0), ratio);
@@ -1060,10 +1079,9 @@ export function attn_decode(cfg, A, ctx, cache, cl, xn, st, caps) {
 
 	let qr = torch.rms_norm(A.q_a.forward(xn), A.q_norm, eps);
 	let q = A.q_b.forward(qr).view([1, H, D]);
-	let cs = rope_cs_dev(A.inv_freq, meta_f(st, 0));
-	let q16 = rope_il(q.to('float32'), cs, rd).to('float16').contiguous();
+	let q16 = torch.v41_rope(q, meta_i(st, 0), A.inv_freq);
 	let kv = torch.rms_norm(A.wkv.forward(xn), A.kv_norm, eps);
-	let kv16 = rope_il(kv.to('float32').view([1, 1, D]), cs, rd).to('float16').view([1, D]).contiguous();
+	let kv16 = torch.v41_rope(kv.view([1, 1, D]), meta_i(st, 0), A.inv_freq).view([1, D]);
 
 	cl.ring.index_copy_(0, meta_i(st, 1), kv16);
 
@@ -1205,7 +1223,7 @@ function comp_decode_rows(cfg, A, cl, xn, st) {
 
 	if (ratio == 1) {
 		lat = torch.rms_norm(torch.matmul(xn, C.wkv16), C.norm, eps);
-		posf = col_i(st, 0).to('float32');
+		posf = col_i(st, 0);
 		slot = col_i(st, 0).reshape([-1]);
 	}
 	else {
@@ -1224,7 +1242,7 @@ function comp_decode_rows(cfg, A, cl, xn, st) {
 		cl.pk.copy_(kv.narrow(0, S - 1, 1));
 		cl.pg.copy_(g.narrow(0, S - 1, 1));
 		lat = torch.rms_norm(pooled.to('float16').contiguous(), C.norm, eps);
-		posf = col_i(st, 3).to('float32');
+		posf = col_i(st, 3);
 
 		// rows that start a pair write their (unfinished) pooled value to the spare slot at the end
 		let cs_ = col_i(st, 5).reshape([-1]);
@@ -1232,17 +1250,16 @@ function comp_decode_rows(cfg, A, cl, xn, st) {
 		slot = torch.where(cs_.le(-1), torch.full([1], cl.pool.shape()[0] - 1, 'int64', dv), cs_);
 	}
 
-	let cs = rope_cs_rows(A.inv_freq, posf);
 	let I = A.indexer;
 
 	if (I && I.owns_k) {
 		let k = torch.rms_norm(torch.matmul(lat, I.wk_t), I.k_norm, eps);
 
-		cl.kidx.index_copy_(0, slot, rope_il(k.to('float32').view([S, 1, cfg.index_head_dim]), cs, rd).to('float16')
+		cl.kidx.index_copy_(0, slot, torch.v41_rope(k.view([S, 1, cfg.index_head_dim]), posf, A.inv_freq)
 			.view([S, cfg.index_head_dim]));
 	}
 
-	cl.pool.index_copy_(0, slot, rope_il(lat.to('float32').view([S, 1, cfg.head_dim]), cs, rd).to('float16')
+	cl.pool.index_copy_(0, slot, torch.v41_rope(lat.view([S, 1, cfg.head_dim]), posf, A.inv_freq)
 		.view([S, cfg.head_dim]));
 }
 
@@ -1254,8 +1271,7 @@ function index_picks_dec_rows(cfg, A, ctx, cache, xn, qr, st, Scap, src) {
 	let Hi = cfg.index_n_heads, Di = cfg.index_head_dim, rd = cfg.rope_dim;
 	let pc = pool_dec(cache, src, A.dev);
 	let qi = I.wq_b.forward(qr).view([S, Hi, Di]);
-	let cs = rope_cs_rows(A.inv_freq, col_i(st, 0).to('float32'));
-	let q16 = rope_il(qi.to('float32'), cs, rd).to('float16').contiguous();
+	let q16 = torch.v41_rope(qi, col_i(st, 0), A.inv_freq);
 	let w = torch.matmul(xn.to('float32'), I.w_t).contiguous();
 	let sc = torch.idx_score(q16, pc.kidx.narrow(0, 0, Scap), w, math.pow(Di * 1.0, -0.5) * math.pow(Hi * 1.0, -0.5),
 		st.meta.narrow(0, 0, 1).narrow(1, 0, 1), ratio);
@@ -1298,10 +1314,9 @@ export function attn_decode_batch(cfg, A, ctx, cache, cl, xn, st, caps) {
 	let ratio = A.ratio;
 	let qr = torch.rms_norm(A.q_a.forward(xn), A.q_norm, eps);
 	let q = A.q_b.forward(qr).view([S, H, D]);
-	let cs = rope_cs_rows(A.inv_freq, col_i(st, 0).to('float32'));
-	let q16 = rope_il(q.to('float32'), cs, rd).to('float16').contiguous();
+	let q16 = torch.v41_rope(q, col_i(st, 0), A.inv_freq);
 	let kv = torch.rms_norm(A.wkv.forward(xn), A.kv_norm, eps);
-	let kv16 = rope_il(kv.to('float32').view([S, 1, D]), cs, rd).to('float16').view([S, D]).contiguous();
+	let kv16 = torch.v41_rope(kv.view([S, 1, D]), col_i(st, 0), A.inv_freq).view([S, D]);
 
 	cl.ring.index_copy_(0, col_i(st, 1).reshape([-1]), kv16);
 
@@ -1335,17 +1350,17 @@ export function attn_decode_batch(cfg, A, ctx, cache, cl, xn, st, caps) {
 /* One block on S rows; streams (S, 4, D) fp32 updated in place, pre (S, 4). Returns the next pre. */
 export function block_decode_rows(cfg, L, ctxs, cache, cl, streams, pre, st, caps) {
 	let eps = cfg.rms_norm_eps;
-	let am = hc_mixes(cfg, L.hc_attn, streams);
-	let xn = torch.rms_norm(hc_collapse(streams, pre), L.attn_norm, eps);
+	let am = hc_site(cfg, L.hc_attn, streams, pre);
+	let xn = torch.rms_norm(am.col, L.attn_norm, eps);
 	let y = SKIP == 'attn' ? torch.zeros([xn.shape()[0], cfg.hidden_size], 'float16', 'cuda:' + L.dev) :
 		ROWLOOP ? attn_decode_rows(cfg, L.attn, ctxs, cache, cl, xn, st.rows, caps) :
 		attn_decode_batch(cfg, L.attn, ctxs[0], cache, cl, xn, st, caps);
 
 	glm5.hc_apply(streams, y, am.post, am.comb);
 
-	let fm = hc_mixes(cfg, L.hc_ffn, streams);
+	let fm = hc_site(cfg, L.hc_ffn, streams, am.pre);
 
-	xn = torch.rms_norm(hc_collapse(streams, am.pre), L.ffn_norm, eps);
+	xn = torch.rms_norm(fm.col, L.ffn_norm, eps);
 	y = SKIP == 'moe' ? torch.zeros([xn.shape()[0], cfg.hidden_size], 'float32', 'cuda:' + L.dev) : glm5.moe_forward(cfg, L.moe, xn);
 	glm5.hc_apply(streams, y, fm.post, fm.comb);
 
@@ -1467,8 +1482,8 @@ function block_forward(cfg, L, ctx, cache, cl, streams, pre, pos0) {
 
 	prof(null);
 
-	let am = hc_mixes(cfg, L.hc_attn, streams);
-	let xn = torch.rms_norm(hc_collapse(streams, pre), L.attn_norm, eps);
+	let am = hc_site(cfg, L.hc_attn, streams, pre);
+	let xn = torch.rms_norm(am.col, L.attn_norm, eps);
 
 	prof('0.hc_attn');
 
@@ -1478,9 +1493,9 @@ function block_forward(cfg, L, ctx, cache, cl, streams, pre, pos0) {
 
 	prof('i.hc_apply');
 
-	let fm = hc_mixes(cfg, L.hc_ffn, streams);
+	let fm = hc_site(cfg, L.hc_ffn, streams, am.pre);
 
-	xn = torch.rms_norm(hc_collapse(streams, am.pre), L.ffn_norm, eps);
+	xn = torch.rms_norm(fm.col, L.ffn_norm, eps);
 
 	prof('j.hc_ffn');
 
@@ -1498,15 +1513,15 @@ function block_forward(cfg, L, ctx, cache, cl, streams, pre, pos0) {
 /* One block on the one token (device position); streams (1, 4, D) fp32 updated in place. */
 export function block_decode(cfg, L, ctx, cache, cl, streams, pre, st, caps) {
 	let eps = cfg.rms_norm_eps;
-	let am = hc_mixes(cfg, L.hc_attn, streams);
-	let xn = torch.rms_norm(hc_collapse(streams, pre), L.attn_norm, eps);
+	let am = hc_site(cfg, L.hc_attn, streams, pre);
+	let xn = torch.rms_norm(am.col, L.attn_norm, eps);
 	let y = attn_decode(cfg, L.attn, ctx, cache, cl, xn, st, caps);
 
 	glm5.hc_apply(streams, y, am.post, am.comb);
 
-	let fm = hc_mixes(cfg, L.hc_ffn, streams);
+	let fm = hc_site(cfg, L.hc_ffn, streams, am.pre);
 
-	xn = torch.rms_norm(hc_collapse(streams, am.pre), L.ffn_norm, eps);
+	xn = torch.rms_norm(fm.col, L.ffn_norm, eps);
 	y = glm5.moe_forward(cfg, L.moe, xn);
 	glm5.hc_apply(streams, y, fm.post, fm.comb);
 

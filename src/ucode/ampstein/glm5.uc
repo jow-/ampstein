@@ -745,6 +745,7 @@ export const MM_BASE = 16777216;
  * scores + e_score_correction_bias, their weights are the UNbiased scores
  * normalised to sum 1 and scaled by routed_scaling_factor.
  * y: (T, hidden) fp16. Returns {idx (T, k) int64, w (T, k) fp32}. */
+const NO_FUSED_ROUTE = getenv('AMP_NO_FUSED_ROUTE') != null;
 export let TRACE = null;
 export function set_trace(f) { TRACE = f; }
 
@@ -769,6 +770,14 @@ export function moe_route(cfg, M, y) {
 		// selection only, hash layers (M.tid2eid) select by token id (M.ids,
 		// int64 (T,) on this device); weights = affinities of the selected
 		// experts normalised to sum 1, times routed_scaling_factor
+		if (!M.tid2eid && !(M.vlon && M.bias_vl) && !NO_FUSED_ROUTE) {
+			// one kernel: affinities, top-k on affinity + bias, normalized weights
+			let r = torch.v41_route(mm32(y.to('float32'), M.gate_t), M.bias, cfg.num_experts_per_tok,
+				cfg.routed_scaling_factor);
+
+			return {idx: r[0], w: r[1]};
+		}
+
 		let sc = mm32(y.to('float32'), M.gate_t).softplus().sqrt();
 		let vl = (M.vlon && M.bias_vl) ? M.ids.le(MM_BASE - 1) : null;      // text rows (chunk with image rows)
 		let tids = vl ? torch.where(vl, M.ids, torch.zeros([1], 'int64', 'cuda:' + M.dev)) : M.ids;

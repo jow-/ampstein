@@ -131,7 +131,10 @@ void hc_mix_finalize_kernel
     const int chunk_cols_c,              // multiple of 4
     const float rms_eps,
     const float hc_eps,
-    const int sinkhorn_iters
+    const int sinkhorn_iters,
+    const float* __restrict__ pre_in,    // (R, H) or null: collapse with these weights instead of this site's own
+                                         // (DeepSeek-V4.1 mixes "one site late"); the half output is then clamped to fp16 range
+    float* __restrict__ pre_out          // (R, H) or null: this site's pre weights
 )
 {
     constexpr int M = M_;
@@ -171,6 +174,9 @@ void hc_mix_finalize_kernel
     if (threadIdx.x < H)
         pre_s[threadIdx.x] = sigmoidf_(fmaf(mix_s[threadIdx.x] * rmr, scale[0], base[threadIdx.x])) + hc_eps;
     __syncthreads();
+
+    if (pre_out && blockIdx.x == 0 && threadIdx.x < H)
+        pre_out[(size_t) r * H + threadIdx.x] = pre_s[threadIdx.x];
 
     // Sinkhorn + post/comb writes: chunk-0 block only, one lane per comb element. Runs in
     // a dedicated warp, concurrent with the other warps' phase C: the ~20-iteration
@@ -226,7 +232,7 @@ void hc_mix_finalize_kernel
     // block the first warp is excluded, so the remaining threads re-cover its lanes
     float pre_r[H];
     #pragma unroll
-    for (int h = 0; h < H; ++h) pre_r[h] = pre_s[h];
+    for (int h = 0; h < H; ++h) pre_r[h] = pre_in ? pre_in[(size_t) r * H + h] : pre_s[h];
 
     const bool shrunk = !HEAD && blockIdx.x == 0;
     const int tid = shrunk ? threadIdx.x - 32 : threadIdx.x;
@@ -249,6 +255,13 @@ void hc_mix_finalize_kernel
         }
         if (HALF_OUT)
         {
+            if (pre_in)
+            {
+                o.x = fminf(fmaxf(o.x, -65504.0f), 65504.0f);
+                o.y = fminf(fmaxf(o.y, -65504.0f), 65504.0f);
+                o.z = fminf(fmaxf(o.z, -65504.0f), 65504.0f);
+                o.w = fminf(fmaxf(o.w, -65504.0f), 65504.0f);
+            }
             half2* out2 = (half2*) ((half*) collapsed + (size_t) r * D);
             out2[c * 2] = __floats2half2_rn(o.x, o.y);
             out2[c * 2 + 1] = __floats2half2_rn(o.z, o.w);
@@ -817,7 +830,9 @@ static void hc_mix_launch
     at::Tensor* post,
     at::Tensor* comb,
     at::Tensor& collapsed,
-    Graph* graph
+    Graph* graph,
+    const float* pre_in_p = nullptr,
+    float* pre_out_p = nullptr
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(streams.device());
@@ -859,7 +874,7 @@ static void hc_mix_launch
         (const float*) streams.data_ptr(), (const float*) partials.data_ptr(), \
         (const float*) base.data_ptr(), (const float*) scale.data_ptr(), \
         POST, COMB, collapsed.data_ptr(), \
-        D, n_chunks_a, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters
+        D, n_chunks_a, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters, pre_in_p, pre_out_p
     if (!head)
     {
         if (fn_half)
@@ -928,6 +943,28 @@ void hc_mix
         collapsed,
         nullptr
     );
+}
+
+void hc_mix2
+(
+    const at::Tensor& streams,           // (R, H, D) float
+    const at::Tensor& fn,
+    const at::Tensor& base,
+    const at::Tensor& scale,
+    double rms_eps,
+    double hc_eps,
+    int64_t sinkhorn_iters,
+    const at::Tensor& pre_in,            // (R, H) float: collapse weights (the previous site's pre)
+    at::Tensor partials,
+    at::Tensor post,
+    at::Tensor comb,
+    at::Tensor pre_out,                  // (R, H) float out: this site's pre
+    at::Tensor collapsed                 // (R, D) half out, clamped to the fp16 range
+)
+{
+    TORCH_CHECK(pre_in.is_contiguous() && pre_in.dtype() == at::kFloat && pre_in.size(0) == streams.size(0), "hc_mix2: pre_in");
+    hc_mix_launch(streams, fn, base, scale, (float) rms_eps, (float) hc_eps, (int) sinkhorn_iters,
+        partials, &post, &comb, collapsed, nullptr, (const float*) pre_in.data_ptr(), (float*) pre_out.data_ptr());
 }
 
 void hc_head

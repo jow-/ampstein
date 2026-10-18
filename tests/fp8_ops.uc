@@ -45,4 +45,30 @@ check(32768, 1280, 1);
 check(5120, 8192, 3);
 check(2304, 5120, 8);
 check(5120, 2304, 2);
+// grouped GEMV (the attention's wo_a): G groups against the per-group products
+function check_grouped(G, N, K, M) {
+	let w = torch.rand([G * N, K], 'float32', dv).sub(0.5).mul(12.0).to('float8_e4m3fn').contiguous();
+	let sv = [];
+
+	for (let i = 0; i < (G * N / 32) * (K / 32); i++)
+		push(sv, math.pow(2.0, (i * 7) % 8 - 8));
+
+	let s = torch.from_array(sv, 'float32', dv).view([int(G * N / 32), int(K / 32)]).to('float8_e8m0fnu').contiguous();
+	let x = torch.rand([M, G * K], 'float16', dv).sub(0.5).mul(4.0);
+	let y = torch.fp8_gemv_grouped(x, w, s, G);
+	let parts = [];
+
+	for (let g = 0; g < G; g++)
+		push(parts, torch.fp8_gemv(x.narrow(1, g * K, K).contiguous(), w.narrow(0, g * N, N),
+			s.narrow(0, int(g * N / 32), int(N / 32))));
+
+	let r = rel_rms(y, torch.cat(parts, 1));
+
+	assert(r < 1e-5, `grouped gemv G=${G} ${N}x${K} M=${M}: rel rms ${r}`);
+	printf('ok grouped G=%d %dx%d M=%d (rel %.2e)\n', G, N, K, M, r);
+}
+
+check_grouped(8, 1024, 4096, 1);
+check_grouped(8, 1024, 4096, 5);
+check_grouped(4, 64, 1280, 3);
 printf('fp8_ops: all ok\n');
