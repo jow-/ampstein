@@ -6741,6 +6741,57 @@ torch_v41_route(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+extern "C" int amp_moe_prep(const long long *idx, const float *w, int A, int K, int E, long long e0, long long *fe,
+                            long long *order, long long *tok, void *wts, long long *count, long long *start,
+                            long long *inv, long long *kind, cudaStream_t stream);
+
+/* torch.moe_prep(idx, w, E, e0): idx (T, K) int64 global expert ids, w (T, K) fp32 -> [fe (A) int64, order (A) int64,
+ * tok (A) int64, wts (A) fp16, count (E + 1) int64, start (E + 1) int64, inv (A) int64, kind (E) int64]: the token-sorted
+ * dispatch of the experts [e0, e0 + E) (see amp_moe_prep_kernel). */
+static uc_value_t *
+torch_moe_prep(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *idx, *w;
+
+	if (nargs != 4 || !(idx = tensor_arg(vm, uc_fn_arg(0))) || !(w = tensor_arg(vm, uc_fn_arg(1))) ||
+	    ucv_type(uc_fn_arg(2)) != UC_INTEGER || ucv_type(uc_fn_arg(3)) != UC_INTEGER)
+		RAISE("moe_prep: (idx, w, E, e0)");
+
+	long E = ucv_int64_get(uc_fn_arg(2)), e0 = ucv_int64_get(uc_fn_arg(3));
+
+	if (idx->dim() != 2 || idx->scalar_type() != at::kLong || !idx->is_contiguous() || !idx->is_cuda() ||
+	    w->scalar_type() != at::kFloat || !w->is_contiguous() || w->sizes() != idx->sizes() ||
+	    w->device() != idx->device() || E < 1 || E > 4096)
+		RAISE("moe_prep: idx (T, K) int64 and w (T, K) fp32, contiguous on one CUDA device, 1 <= E <= 4096");
+
+	TensorDeviceGuard dg(*idx);
+
+	try {
+		long A = idx->numel(), K = idx->size(1);
+		auto lo = idx->options(), fo = idx->options().dtype(at::kHalf);
+		at::Tensor fe = at::empty({ A }, lo), order = at::empty({ A }, lo), tok = at::empty({ A }, lo);
+		at::Tensor wts = at::empty({ A }, fo), count = at::empty({ E + 1 }, lo), start = at::empty({ E + 1 }, lo);
+		at::Tensor inv = at::empty({ A }, lo), kind = at::empty({ E }, lo);
+		int rc = amp_moe_prep((const long long *)idx->data_ptr(), (const float *)w->data_ptr(), (int)A, (int)K, (int)E, e0,
+			(long long *)fe.data_ptr(), (long long *)order.data_ptr(), (long long *)tok.data_ptr(), wts.data_ptr(),
+			(long long *)count.data_ptr(), (long long *)start.data_ptr(), (long long *)inv.data_ptr(),
+			(long long *)kind.data_ptr(), c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "moe_prep"))
+			return NULL;
+
+		uc_value_t *r = ucv_array_new(vm);
+
+		for (at::Tensor *t : { &fe, &order, &tok, &wts, &count, &start, &inv, &kind })
+			ucv_array_push(r, tensor_wrap(vm, std::move(*t), 0));
+
+		return r;
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 extern "C" int amp_fp4_dequant(const void *w, const void *s, void *out, int N, int K, cudaStream_t stream);
 extern "C" int amp_fp4_moe_gemv(const void *x, const void *ids, const void *wp, const void *sp, void *out,
                                 int slots, int K, int N, int xdiv, cudaStream_t stream);
@@ -9890,6 +9941,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "hc_mix2",	torch_hc_mix2 },
 	{ "v41_rope",	torch_v41_rope },
 	{ "v41_route",	torch_v41_route },
+	{ "moe_prep",	torch_moe_prep },
 	{ "fp4_dequant",	torch_fp4_dequant },
 	{ "fp4_moe_gemv",	torch_fp4_moe_gemv },
 	{ "stream_side",	torch_stream_side },

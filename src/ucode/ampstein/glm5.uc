@@ -746,6 +746,7 @@ export const MM_BASE = 16777216;
  * normalised to sum 1 and scaled by routed_scaling_factor.
  * y: (T, hidden) fp16. Returns {idx (T, k) int64, w (T, k) fp32}. */
 const NO_FUSED_ROUTE = getenv('AMP_NO_FUSED_ROUTE') != null;
+const NO_FUSED_PREP = getenv('AMP_NO_FUSED_PREP') != null;
 export let TRACE = null;
 export function set_trace(f) { TRACE = f; }
 
@@ -981,6 +982,18 @@ function moe_sorted_begin(cfg, M, y) {
 	let dv = 'cuda:' + M.dev;
 	let A = T * K;
 	let r = moe_route(cfg, M, y);
+
+	if (M.fused_prep && !NO_FUSED_PREP) {
+		// the whole dispatch (remap to local ids, stable sort by expert, counts / starts / inverse / kinds) in one kernel
+		if (M.coop.ts_g == null)
+			fused_temps(cfg, M);
+
+		let pr = torch.moe_prep(r.idx.contiguous(), r.w.contiguous(), E, (M.e0 != null) ? M.e0 : 0);
+
+		return {y: y, T: T, A: A, fe: pr[0], order: pr[1], tok: pr[2], wts: pr[3], count: pr[4], start: pr[5], inv: pr[6],
+			kind: pr[7], prep: true};
+	}
+
 	let fe = r.idx.reshape([-1]);
 
 	if (M.e0 != null) {
@@ -1049,10 +1062,10 @@ function moe_sorted_finish(cfg, M, p) {
 
 		if (MOE_DET) {
 			// every assignment (the sentinel bin included, never written) owns slot = its sorted position
-			let start = count.cumsum(0).sub(count);
+			let start = p.prep ? p.start : count.cumsum(0).sub(count);
 			let scratch = torch.empty([max(p.A, 1), H], 'float32', dv);
-			let inv = p.order.to('float32').neg().topk(p.A, 0).indices;      // argsort of the permutation
-			let kind = torch.ones([E + 1], 'int64', dv).sub(count.le(0).to('int64'));
+			let inv = p.prep ? p.inv : p.order.to('float32').neg().topk(p.A, 0).indices;      // argsort of the permutation
+			let kind = p.prep ? p.kind : torch.ones([E + 1], 'int64', dv).sub(count.le(0).to('int64'));
 
 			torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 33, FUSED_ROWS, 64, scratch, start);
 			torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 17, 32, 32, scratch, start);

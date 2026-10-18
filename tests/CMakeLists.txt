@@ -171,6 +171,8 @@ amp_test(v41_attn)
 amp_test(v41_rope)
 # v41_route: fused sqrt-softplus router
 amp_test(v41_route)
+# moe_prep: token-sorted MoE dispatch in one kernel
+amp_test(moe_prep)
 # moe_mixed: fused decode MoE with mixed bit widths per expert
 amp_test(moe_mixed)
 # dsv41_attn: V4.1 attention layers vs the reference run on the CPU

@@ -6009,6 +6009,87 @@ amp_v41_rope(const void *x, const void *pos, int pos_f32, long pstride, const fl
 
 
 /* ------------------------------------------------------------------ */
+/* Token-sorted MoE dispatch preparation (one block): the router's picks idx (T, K) int64 (global expert ids) and
+ * weights w (T, K) fp32 become, for the experts [e0, e0 + E) of this rank (foreign picks go to the sentinel bucket E):
+ *   fe[a]    local expert id (E for foreign) of assignment a = t * K + k
+ *   order[j] the assignment at sorted position j (stable counting sort by fe)
+ *   tok[j]   its token, wts[j] its weight (fp16), inv[a] the sorted position of assignment a
+ *   count[b] assignments per bucket (E + 1), start[b] their exclusive prefix sum, kind[e] = count[e] > 0
+ * Deterministic: bucket b's thread walks the assignments in order. */
+#define AMP_PREP_THREADS 1024
+
+__global__ void __launch_bounds__(AMP_PREP_THREADS)
+amp_moe_prep_kernel(const long long *__restrict__ idx, const float *__restrict__ w, int A, int K, int E, long long e0,
+                    long long *__restrict__ fe, long long *__restrict__ order, long long *__restrict__ tok,
+                    __half *__restrict__ wts, long long *__restrict__ count, long long *__restrict__ start,
+                    long long *__restrict__ inv, long long *__restrict__ kind)
+{
+	extern __shared__ int sh[];                 /* count[E + 1], start[E + 1] */
+	int *scnt = sh, *sst = sh + (E + 1);
+
+	for (int b = threadIdx.x; b <= E; b += blockDim.x)
+		scnt[b] = 0;
+
+	__syncthreads();
+
+	for (int a = threadIdx.x; a < A; a += blockDim.x) {
+		long long loc = idx[a] - e0;
+		int b = (loc >= 0 && loc < E) ? (int)loc : E;
+
+		fe[a] = b;
+		atomicAdd(&scnt[b], 1);
+	}
+
+	__syncthreads();
+
+	if (threadIdx.x == 0) {
+		int acc = 0;
+
+		for (int b = 0; b <= E; b++) {
+			sst[b] = acc;
+			acc += scnt[b];
+		}
+	}
+
+	__syncthreads();
+
+	for (int b = threadIdx.x; b <= E; b += blockDim.x) {
+		count[b] = scnt[b];
+		start[b] = sst[b];
+
+		if (b < E)
+			kind[b] = scnt[b] > 0;
+
+		int pos = sst[b];
+
+		for (int a = 0; a < A; a++) {
+			if (fe[a] == b) {
+				order[pos] = a;
+				tok[pos] = a / K;
+				wts[pos] = __float2half(w[a]);
+				inv[a] = pos;
+				pos++;
+			}
+		}
+	}
+}
+
+extern "C" int
+amp_moe_prep(const long long *idx, const float *w, int A, int K, int E, long long e0, long long *fe, long long *order,
+             long long *tok, void *wts, long long *count, long long *start, long long *inv, long long *kind,
+             cudaStream_t stream)
+{
+	if (A < 1 || K < 1 || E < 1 || E > 4096 || (size_t)(2 * (E + 1)) * 4 > 48 * 1024)
+		return (int)cudaErrorInvalidValue;
+
+	amp_moe_prep_kernel<<<1, AMP_PREP_THREADS, (size_t)(2 * (E + 1)) * 4, stream>>>(idx, w, A, K, E, e0, fe, order, tok,
+		(__half *)wts, count, start, inv, kind);
+
+	return (int)cudaGetLastError();
+}
+
+
+/* ------------------------------------------------------------------ */
 /* DeepSeek-V4 / V4.1 router: affinity sqrt(softplus(logit)); the k experts with the highest affinity + bias (ties:
  * the lower index) in descending order; weights = their affinities normalized to sum 1 (+ 1e-20) times scale.
  * One block (128 threads) per row, k rounds of block argmax. */

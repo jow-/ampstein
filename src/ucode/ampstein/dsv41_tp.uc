@@ -598,6 +598,23 @@ function dsv41_tp_methods(model) {
 		return c;
 	};
 
+	/* AMP_DSV41_TP_HOSTPROF=1: host seconds per phase of the prefill layers (dsv41_tp.HOSTPROF; the host only, no syncs) */
+	let HP = getenv('AMP_DSV41_TP_HOSTPROF') ? model.hostprof = {} : null;
+	let BAL = getenv('AMP_DSV41_TP_BALANCE') ? model.balance = {} : null;
+	let hp_t = 0;
+
+	function hp(name) {
+		if (!HP)
+			return;
+
+		let c = clock(true), t = c[0] + c[1] / 1e9;
+
+		if (name != null)
+			HP[name] = (HP[name] || 0) + t - hp_t;
+
+		hp_t = t;
+	}
+
 	/* the Engram rows of the chunk for layer i on every rank */
 	function engram_chunk(i, c) {
 		let li = index(cfg.engram_layers, i);
@@ -612,6 +629,8 @@ function dsv41_tp_methods(model) {
 		let L = layers[i];
 		let am = [], fm = [], p = [];
 
+		hp(null);
+
 		if (engrams[i]) {
 			let emb = engram_chunk(i, c);
 
@@ -622,6 +641,10 @@ function dsv41_tp_methods(model) {
 		if (c.taps && index(cfg.dspark_taps, i) >= 0)
 			push(c.taps, {dev: S.devs[0], t: c.h[0].mean(1)});
 
+		hp('engram');
+
+		let at = [];
+
 		for (let g = 0; g < Gs; g++) {
 			let lane = cache.lanes[g];
 
@@ -629,23 +652,60 @@ function dsv41_tp_methods(model) {
 
 			let xn = torch.rms_norm(am[g].col, L[g].attn_norm, eps);
 
-			p[g] = dsv41.attn_forward(cg, L[g].attn, c.ctx[g], lane, lane.layers[i], xn, c.pos0);
+			push(at, dsv41.attn_forward_steps(cg, L[g].attn, c.ctx[g], lane, lane.layers[i], xn, c.pos0));
 		}
+
+		hp('hc_attn');
+
+		// the ranks' launches alternate step by step (see attn_forward_steps)
+		for (let k = 0; k < length(at[0].steps); k++)
+			for (let g = 0; g < Gs; g++)
+				at[g].steps[k]();
+
+		for (let g = 0; g < Gs; g++)
+			p[g] = at[g].out();
+
+		hp('attn');
 
 		let s = allreduce(S, p);
 
+		hp('allreduce');
+
 		for (let g = 0; g < Gs; g++)
 			glm5.hc_apply(c.h[g], s[g], am[g].post, am[g].comb);
+
+		hp('hc_apply');
+
+		let pend = [];
 
 		for (let g = 0; g < Gs; g++) {
 			fm[g] = dsv41.hc_site(cg, L[g].hc_ffn, c.h[g], am[g].pre);
 
 			let xn = torch.rms_norm(fm[g].col, L[g].ffn_norm, eps);
 
-			p[g] = ffn_partial(glm5.moe_forward(cg, L[g].moe, xn));
+			push(pend, glm5.moe_begin(cg, L[g].moe, xn));
 		}
 
+		hp('hc_ffn');
+
+		if (BAL && pend[0].sorted) {                 // experiment: how unevenly the ranks' experts are loaded
+			let cnt = map(pend, (q, g) => q.sorted.count.narrow(0, 0, length(L[g].moe.experts)).sum().item());
+			let key = '' + i;
+
+			BAL[key] = BAL[key] || {n: 0, mx: 0, mean: 0};
+			BAL[key].n++;
+			BAL[key].mx += max(...cnt);
+			BAL[key].mean += (cnt[0] + cnt[1]) / 2.0;
+		}
+
+		for (let g = 0; g < Gs; g++)
+			p[g] = ffn_partial(glm5.moe_finish(cg, L[g].moe, pend[g]));
+
+		hp('moe');
+
 		s = allreduce(S, p);
+
+		hp('allreduce');
 
 		for (let g = 0; g < Gs; g++) {
 			glm5.hc_apply(c.h[g], s[g], fm[g].post.mul(FFN_SCALE), fm[g].comb);
@@ -1015,7 +1075,7 @@ export function load(model_dir, opts) {
 			let M = {
 				type: 'moe', dev: dev, experts: ex, e0: e0, e1: e0 + en, router: 'sqrtsp',
 				gate_t: gate_t.cuda(dev), bias: bias.cuda(dev), bias_vl: null, tid2eid: null, ids: null, vlon: false,
-				async_moe: true, shared: shard_mlp8(shared, plan.shared[g], dev)
+				async_moe: true, fused_prep: true, shared: shard_mlp8(shared, plan.shared[g], dev)
 			};
 
 			M.coop = (getenv('AMP_DSV41_NO_COOP') ? null : dsv41.build_coop(cfg, M)) || false;

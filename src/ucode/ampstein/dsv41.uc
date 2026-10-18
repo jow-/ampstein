@@ -32,7 +32,8 @@ const NEGH = -60000.0;
 const MAX_ROWS = 8;                       // rows of a multi-row decode step
 const RING = +(getenv('AMP_DSV41_RING') || 8192);          // raw window rows kept per layer (rollback span)
 const SCRATCH_ELEMS = 32 * 1024 * 1024;                    // fp8 -> fp16 dequant slice, elements
-const PROF = getenv('AMP_DSV41_PROF') != null;
+const HPROF = getenv('AMP_DSV41_HPROF') != null;
+const PROF = getenv('AMP_DSV41_PROF') != null || HPROF;
 const NO_ENGRAM = getenv('AMP_DSV41_NO_ENGRAM') != null;
 const NO_GROUPED = getenv('AMP_DSV41_NO_GROUPED') != null;        // wo_a: one GEMV per group instead of the grouped kernel
 const NO_HC2 = getenv('AMP_DSV41_NO_HC2') != null;            // composite mHC mixes + collapse instead of the fused hc_mix2
@@ -153,7 +154,8 @@ function prof(name) {
 	if (!PROF)
 		return;
 
-	torch.synchronize();
+	if (!HPROF)                     // AMP_DSV41_HPROF=1: host time only (no synchronize): where the launches go
+		torch.synchronize();
 
 	let t = prof_now();
 
@@ -227,6 +229,14 @@ export function lin8g_from(w, s, G, dev) {
 
 			if (M <= 8 && !NO_GROUPED)
 				return torch.fp8_gemv_grouped(x.contiguous(), this.w, this.s, G);
+
+			// a prefill chunk: dequantize the whole matrix once and run the G groups as one batched matmul
+			if (M > 8 && !NO_GROUPED && this.w.numel() <= SCRATCH_ELEMS) {
+				let wd = torch.fp8_dequant(this.w, this.s, scratch(this.dev)).view([G, R, K]).transpose(1, 2);
+				let y = torch.matmul(x.contiguous().view([M, G, K]).transpose(0, 1), wd);          // (G, M, R)
+
+				return y.transpose(0, 1).reshape([M, G * R]);
+			}
 
 			for (let g = 0; g < G; g++) {
 				let xg = x.narrow(1, g * K, K).contiguous();
@@ -676,15 +686,15 @@ function compress_chunk(cfg, A, cache, cl, xn, pos0) {
 
 	// index key: k_norm(wk(latent)), rope at the entry's position
 	let I = A.indexer;
-	let cs = rope_cs(A.inv_freq, base, n, ratio, A.dev);
+	let posf = torch.arange(n, 'float32', dv).mul(ratio * 1.0).add(base * 1.0);
 
 	if (I && I.owns_k) {
 		let k = torch.rms_norm(torch.matmul(lat, I.wk_t), I.k_norm, eps);
 
-		cl.kidx.narrow(0, e0, n).copy_(rope_il(k.to('float32').view([n, 1, cfg.index_head_dim]), cs, rd).to('float16').view([n, cfg.index_head_dim]));
+		cl.kidx.narrow(0, e0, n).copy_(torch.v41_rope(k.view([n, 1, cfg.index_head_dim]), posf, A.inv_freq).view([n, cfg.index_head_dim]));
 	}
 
-	cl.pool.narrow(0, e0, n).copy_(rope_il(lat.to('float32').view([n, 1, cfg.head_dim]), cs, rd).to('float16').view([n, cfg.head_dim]));
+	cl.pool.narrow(0, e0, n).copy_(torch.v41_rope(lat.view([n, 1, cfg.head_dim]), posf, A.inv_freq).view([n, cfg.head_dim]));
 	cl.n = e0 + n;
 
 	return n;
@@ -808,8 +818,7 @@ function index_picks(cfg, A, ctx, cache, xn, qr, pos0, src) {
 
 	let pc = pool_for(cache, src, A.dev);
 	let qi = I.wq_b.forward(qr).view([T, Hi, Di]);
-	let cs = rope_cs(A.inv_freq, pos0, T, 1, A.dev);
-	let q16 = rope_il(qi.to('float32'), cs, rd).to('float16').contiguous();
+	let q16 = torch.v41_rope(qi, torch.arange(T, 'float32', dv).add(pos0 * 1.0), A.inv_freq);
 	let w = torch.matmul(xn.to('float32'), I.w_t).contiguous();
 	let kk = pc.kidx.narrow(0, 0, S);
 	let scale = math.pow(Di * 1.0, -0.5) * math.pow(Hi * 1.0, -0.5);
@@ -851,82 +860,109 @@ function index_picks(cfg, A, ctx, cache, xn, qr, pos0, src) {
 /* ------------------------------------------------------------------ */
 /* attention forward                                                   */
 
-export function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
+/* The attention of a chunk as a list of steps: the ranks of a tensor-parallel stage run step k of rank 0, step k of
+ * rank 1, ... so that their launches interleave (a rank that is issued whole before its peer's first launch makes the
+ * peer's all-reduce wait for the host). Returns {steps: [fn ...], out: fn -> y}. */
+export function attn_forward_steps(cfg, A, ctx, cache, cl, xn, pos0) {
 	let T = xn.shape()[0];
 	let H = cfg.num_q_heads, D = cfg.head_dim, rd = cfg.rope_dim;
 	let eps = cfg.rms_norm_eps;
 	let dev = A.dev;
 	let ratio = A.ratio;
+	let st = {};
 
-	prof(null);
+	function qkv() {
+		prof(null);
 
-	let qr = torch.rms_norm(A.q_a.forward(xn), A.q_norm, eps);
-	let q = A.q_b.forward(qr).view([T, H, D]);
+		st.qr = torch.rms_norm(A.q_a.forward(xn), A.q_norm, eps);
 
-	prof('a.qproj');
+		let q = A.q_b.forward(st.qr).view([T, H, D]);
 
-	let cs = rope_cs(A.inv_freq, pos0, T, 1, dev);
-	let q16 = rope_il(q.to('float32'), cs, rd).to('float16').contiguous();
+		prof('a.qproj');
 
-	prof('b.qrope');
+		st.posf = torch.arange(T, 'float32', 'cuda:' + dev).add(pos0 * 1.0);
+		st.q16 = torch.v41_rope(q, st.posf, A.inv_freq);
 
-	let kv = torch.rms_norm(A.wkv.forward(xn), A.kv_norm, eps);
-	let kv16 = rope_il(kv.to('float32').view([T, 1, D]), cs, rd).to('float16').view([T, D]).contiguous();
+		prof('b.qrope');
+	}
 
-	prof('c.kv');
+	function kvrows() {
+		let kv = torch.rms_norm(A.wkv.forward(xn), A.kv_norm, eps);
+		let kv16 = torch.v41_rope(kv.view([T, 1, D]), st.posf, A.inv_freq).view([T, D]);
 
-	// window keys: the previous (window - 1) rows from the ring plus this chunk
-	let h = min(pos0, cfg.window - 1);
-	let kvw = (h > 0) ? torch.cat([ring_rows(cl, pos0 - h, pos0), kv16], 0) : kv16;
+		prof('c.kv');
 
-	ring_put(cl, pos0, kv16);
+		// window keys: the previous (window - 1) rows from the ring plus this chunk
+		st.h = min(pos0, cfg.window - 1);
+		st.kvw = (st.h > 0) ? torch.cat([ring_rows(cl, pos0 - st.h, pos0), kv16], 0) : kv16;
 
-	let pool = null, idx = null;
+		ring_put(cl, pos0, kv16);
+	}
 
-	if (ratio > 0) {
-		let src = cfg.src[A.idx];
-
-		if (A.kv_source)
+	function compress() {
+		if (ratio > 0 && A.kv_source)
 			compress_chunk(cfg, A, cache, cl, xn, pos0);
 
 		prof('d.compress');
+	}
 
-		if (A.idx_source) {
-			idx = index_picks(cfg, A, ctx, cache, xn, qr, pos0, src);
+	function select() {
+		st.pool = null;
+		st.idx = null;
 
-			prof('e.index');
-			ctx.topk = idx ? {dev: dev, t: idx} : null;
-		}
-		else if (ctx.topk) {
-			let ck = 'd' + dev;
+		if (ratio > 0) {
+			let src = cfg.src[A.idx];
 
-			if (ctx.topk[ck] == null)
-				ctx.topk[ck] = (ctx.topk.dev == dev) ? ctx.topk.t : ctx.topk.t.cuda(dev);
+			if (A.idx_source) {
+				st.idx = index_picks(cfg, A, ctx, cache, xn, st.qr, pos0, src);
 
-			idx = ctx.topk[ck];
-		}
+				prof('e.index');
+				ctx.topk = st.idx ? {dev: dev, t: st.idx} : null;
+			}
+			else if (ctx.topk) {
+				let ck = 'd' + dev;
 
-		if (idx) {
-			let pc = pool_for(cache, src, dev);
-			let S = int((pos0 + T) / ratio);
+				if (ctx.topk[ck] == null)
+					ctx.topk[ck] = (ctx.topk.dev == dev) ? ctx.topk.t : ctx.topk.t.cuda(dev);
 
-			pool = pc.pool.narrow(0, 0, S);
+				st.idx = ctx.topk[ck];
+			}
+
+			if (st.idx) {
+				let pc = pool_for(cache, src, dev);
+				let S = int((pos0 + T) / ratio);
+
+				st.pool = pc.pool.narrow(0, 0, S);
+			}
 		}
 	}
 
-	let o = torch.v41_attn(q16, kvw, pos0 - h, pool, idx, A.sinks, A.inv_freq, pos0, cfg.sm_scale, cfg.window);
+	function attend() {
+		st.o = torch.v41_attn(st.q16, st.kvw, pos0 - st.h, st.pool, st.idx, A.sinks, A.inv_freq, pos0, cfg.sm_scale, cfg.window);
 
-	prof('f.attn');
+		prof('f.attn');
+	}
 
-	let y = A.wo_a.forward(o.view([T, H * D]));
+	function project() {
+		let y = A.wo_a.forward(st.o.view([T, H * D]));
 
-	prof('g.wo_a');
+		prof('g.wo_a');
 
-	y = A.wo_b.forward(y);
+		st.y = A.wo_b.forward(y);
 
-	prof('h.wo_b');
+		prof('h.wo_b');
+	}
 
-	return y;
+	return {steps: [ qkv, kvrows, compress, select, attend, project ], out: function () {return st.y;}};
+}
+
+export function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
+	let a = attn_forward_steps(cfg, A, ctx, cache, cl, xn, pos0);
+
+	for (let f in a.steps)
+		f();
+
+	return a.out();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1483,7 +1519,7 @@ export function build_moe(ws, cfg, i, dev) {
 		type: 'moe', dev: dev, experts: experts, router: 'sqrtsp',
 		gate_t: mat32(ws, key + '.gate', dev),
 		bias: ws.gpu(key + '.gate.bias', dev).to('float32').reshape([1, -1]).contiguous(),
-		bias_vl: null, tid2eid: null, ids: null, vlon: false, async_moe: true,
+		bias_vl: null, tid2eid: null, ids: null, vlon: false, async_moe: true, fused_prep: true,
 		shared: build_mlp8(ws, key + '.shared_experts', dev)
 	};
 

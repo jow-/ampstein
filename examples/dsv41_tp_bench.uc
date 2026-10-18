@@ -1,6 +1,10 @@
 // examples/dsv41_tp_bench.uc — speed of the tensor-parallel model: prefill (wavefront) and the 1 .. 5 row decode steps.
 //   ucode ... examples/dsv41_tp_bench.uc <model_dir> <context tokens> [steps] [max_seq] [chunk]
 import * as dsv41_tp from 'ampstein.dsv41_tp';
+import * as dsv41 from 'ampstein.dsv41';
+
+if (getenv('AMP_GC_INTERVAL'))
+	gc('start', +getenv('AMP_GC_INTERVAL'));
 
 let dir = ARGV[0], ctxn = +ARGV[1], steps = +(ARGV[2] || 20), ctx = +(ARGV[3] || 32768), chunk = +(ARGV[4] || 1024);
 let m = dsv41_tp.load(dir, {devices: 6, stages: 3, max_seq: ctx, prefill_rows: chunk});
@@ -26,6 +30,25 @@ while (run.step(1)) {}
 
 torch.synchronize();
 printf('prefill %d tokens: %.1f s, %.0f tok/s\n', ctxn, now() - t0, ctxn / (now() - t0));
+
+if (getenv('AMP_DSV41_HPROF'))
+	for (let k in sort(keys(dsv41.PROFILE)))
+		printf('  hprof %-12s %.2f s\n', k, dsv41.PROFILE[k] / 1000);
+
+if (m.balance) {
+	let tot = 0, tm = 0;
+
+	for (let k in keys(m.balance)) {
+		tot += m.balance[k].mx;
+		tm += m.balance[k].mean;
+	}
+
+	printf('  expert-parallel imbalance: max rank load / mean = %.3f\n', tot / tm);
+}
+
+if (m.hostprof)
+	for (let k in sort(keys(m.hostprof)))
+		printf('  host %-10s %.2f s\n', k, m.hostprof[k]);
 
 for (let S = 1; S <= 5; S++) {
 	let tk = [];
