@@ -908,17 +908,39 @@ export function load(model_dir, opts) {
 			let active = map(stages, () => null);
 			let next = 0, prev_end = start, done = 0, result = null, parts = [];
 
+			// the PLE rows of the chunks are read from disk by a worker thread, a few chunks ahead of the wavefront
+			let ple_i = -1;
+
+			for (let i in tp.ples)
+				ple_i = +i;
+
+			let pjobs = [], tail = (ple_i >= 0 && cache.ple) ? cache.ple.ids : null;
+			let ahead = +(getenv('AMP_QWEN4_PLE_AHEAD') || 3);
+
+			function ple_ahead(upto) {
+				while (tail && length(pjobs) < length(bounds) && length(pjobs) <= upto) {
+					let k = length(pjobs);
+					let job = qwen4.ple_start(cfg, tp.ples[ple_i], tail, slice(ids, (k ? bounds[k - 1] : start) - start,
+						bounds[k] - start));
+
+					tail = job.next;
+					push(pjobs, job);
+				}
+			}
+
 			function admit() {
 				if (active[0] != null || next >= length(bounds))
 					return;
 
+				let k = next;
 				let end = bounds[next++];
 				let pos = prev_end;
 				let cids = slice(ids, pos - start, end - start);
 
 				prev_end = end;
+				ple_ahead(k + ahead);
 				active[0] = {pos: pos, T: end - pos, end: end, ids: cids, layer: stages[0].first, ctx: null,
-					h: tp.embed(cids, cache, pos)};
+					h: tp.embed(cids, cache, pos), pj: pjobs[k]};
 			}
 
 			function round() {
@@ -927,7 +949,14 @@ export function load(model_dir, opts) {
 
 					if (c && c.layer < stages[s].end && c.ctx == null) {
 						if (tp.ples[c.layer]) {
-							tp.ple_step(c.layer, c.h, c.ids, cache, null);
+							if (c.pj) {
+								tp.ple_step(c.layer, c.h, null, cache, qwen4.ple_finish(cfg, tp.ples[c.layer], c.pj));
+								cache.ple.ids = c.pj.next;
+								c.pj = null;
+							}
+							else {
+								tp.ple_step(c.layer, c.h, c.ids, cache, null);
+							}
 
 							if (opts.on_aux)
 								opts.on_aux(c.end);

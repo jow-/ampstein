@@ -139,6 +139,8 @@ export function build_ple(ws, cfg, idx, dev) {
 		conv_w: ws.gpu(key + '.conv1d.weight', dev).contiguous(),
 		state_len: (cfg.ple_kernel - 1) * cfg.ngram_size,
 		trellis: tab.tensor(tk + '.trellis'),                                // (rows, 61) int16, mmap
+		file: tab.file(tk + '.trellis'),                                     // the same table for row gathers
+		wname: tk + '.trellis',
 		K: 6,
 		offsets: tab.tensor(tk + '.head_offsets'),
 		sizes: tab.tensor(tk + '.head_vocab_sizes'),
@@ -165,16 +167,17 @@ export function new_ple_state(cfg, P) {
 	};
 }
 
-/* Host half: hash the chunk's n-grams, gather the unique table rows from the
- * mmap'd file, decode them on the GPU. Returns the n-gram embedding
- * (1, S, 2560) fp16 on the PLE device and advances the id context. */
-export function ple_prepare(cfg, P, token_ids, st) {
+/* Host half, in two steps. ple_start hashes the chunk's n-grams (ctx_ids: the ngram-1 ids before the chunk) and
+ * has a worker thread read the unique table rows from disk (many reads in flight, exactly the rows: no page
+ * faults on the launching thread, no readahead of 100 KB around every 122-byte row); ple_finish waits for the
+ * rows and decodes them on the GPU. The rows depend on the token ids only, so a prefill starts them chunks ahead.
+ * Returns the n-gram embedding (1, S, 2560) fp16 on the PLE device; job.next is the id context after the chunk. */
+export function ple_start(cfg, P, ctx_ids, token_ids) {
 	let S = length(token_ids);
-	let dv = 'cuda:' + P.dev;
 	let ctx = cfg.ngram_size - 1;
 	let hist = [];
 
-	for (let i in st.ids)
+	for (let i in ctx_ids)
 		push(hist, i);
 
 	for (let i in token_ids)
@@ -187,15 +190,34 @@ export function ple_prepare(cfg, P, token_ids, st) {
 	let heads = torch.zeros([n], 'int32');
 	let U = torch.ngram_hash(hist_t, S, P.mult, P.offsets, P.sizes,
 		cfg.heads_per_ngram, cfg.eos_token_id, uids, inverse, heads);
+	let u = uids.narrow(0, 0, U).contiguous();
+	let packed = torch.empty([U, 61], 'int16');
 
-	let packed = P.trellis.index(uids.narrow(0, 0, U)).cuda(P.dev);
-	let rows = torch.empty([U, 160], 'float16', dv);
+	return {S: S, U: U, inverse: inverse, heads: heads, packed: packed,
+		ticket: P.file.gather_async(P.wname, u, packed), next: slice(hist, length(hist) - ctx)};
+}
 
-	torch.ngram_dequant(packed, P.K, heads.narrow(0, 0, U).cuda(P.dev), P.bias, rows);
+export function ple_finish(cfg, P, job) {
+	let dv = 'cuda:' + P.dev;
 
-	st.ids = slice(hist, length(hist) - ctx);
+	torch.gather_wait(job.ticket);
 
-	return rows.index(inverse.cuda(P.dev)).view([1, S, P.heads * 160]);
+	// non-blocking copies: the host never waits for the device, so the stages keep flowing
+	let packed = job.packed.cuda(P.dev, true);
+	let rows = torch.empty([job.U, 160], 'float16', dv);
+
+	torch.ngram_dequant(packed, P.K, job.heads.narrow(0, 0, job.U).cuda(P.dev, true), P.bias, rows);
+
+	return rows.index(job.inverse.cuda(P.dev, true)).view([1, job.S, P.heads * 160]);
+}
+
+/* both steps at once; advances the id context st.ids */
+export function ple_prepare(cfg, P, token_ids, st) {
+	let job = ple_start(cfg, P, st.ids, token_ids);
+
+	st.ids = job.next;
+
+	return ple_finish(cfg, P, job);
 }
 
 /* Device half (capturable): add the PLE delta to the streams (S, 4, D) fp32

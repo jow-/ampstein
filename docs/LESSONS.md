@@ -648,3 +648,11 @@ memory-bound kernel 10-20x: `hc_apply` 0.2 -> 3.9 ms), 0.96 s with copy-engine t
 for the DMA). Kept as an opt-in experiment; the lever left is fewer bytes over the link, not more overlap.
 An early stage hand-off (126 MB of fp32 mHC state per rank, issued when the stage finishes instead of when the next
 round starts) was slower too (0.88 vs 0.84 s): the link is the bottleneck, so every byte competes with the all-reduces.
+
+## L166 — Qwen PLE rows: gather exact rows on a worker thread, chunks ahead
+
+`ple_prepare` read the 39 GB n-gram table through a memory mapping on the launching thread: every cold row is a page
+fault with kernel readahead (~100 KB around a 122-byte row), and when a chunk reached the PLE layer the host stopped
+issuing for all stages. With the page cache evicted by another model, prefill fell from 1900 to 500-600 tok/s after the
+cached system prompt. `ple_start` / `ple_finish` now use the pread pool of `stfile.gather_async` (as the DSV4.1 Engram),
+started three chunks ahead (`AMP_QWEN4_PLE_AHEAD`) in the TP wavefront.
