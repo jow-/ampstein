@@ -192,8 +192,8 @@ function fp8_matmul(w, s, dev, x, r0, n) {
 }
 
 /* Block-scaled FP8 linear (checkpoint key + '.weight' / '.scale'). x: (M, K) fp16 -> (M, N) fp16. */
-export function lin8(ws, key, dev) {
-	let w = ws.gpu(key + '.weight', dev), s = ws.gpu(key + '.scale', dev);
+/* the same from the tensors (w (N, K) e4m3, s (N / 32, K / 32) e8m0) */
+export function lin8_from(w, s, dev) {
 	let sh = w.shape();
 
 	return {
@@ -208,10 +208,14 @@ export function lin8(ws, key, dev) {
 	};
 }
 
+/* Block-scaled FP8 linear (checkpoint key + '.weight' / '.scale'). x: (M, K) fp16 -> (M, N) fp16. */
+export function lin8(ws, key, dev) {
+	return lin8_from(ws.gpu(key + '.weight', dev), ws.gpu(key + '.scale', dev), dev);
+}
+
 /* Grouped FP8 linear (the attention's wo_a): G blocks of R rows, block g sees columns [g * K, (g + 1) * K)
  * of x only. x: (M, G * K) fp16 -> (M, G * R). */
-export function lin8g(ws, key, G, dev) {
-	let w = ws.gpu(key + '.weight', dev), s = ws.gpu(key + '.scale', dev);
+export function lin8g_from(w, s, G, dev) {
 	let sh = w.shape();
 
 	return {
@@ -236,6 +240,33 @@ export function lin8g(ws, key, G, dev) {
 			return torch.cat(parts, 1);
 		}
 	};
+}
+
+export function lin8g(ws, key, G, dev) {
+	return lin8g_from(ws.gpu(key + '.weight', dev), ws.gpu(key + '.scale', dev), G, dev);
+}
+
+/* tensor-parallel shards of FP8 linears (copies on dev) */
+export function lin8_to(l, dev) {
+	return lin8_from(l.w.cuda(dev), l.s.cuda(dev), dev);
+}
+
+/* output rows [r0, r0 + n) */
+export function lin8_rows(l, r0, n, dev) {
+	return lin8_from(l.w.narrow(0, r0, n).contiguous().cuda(dev), l.s.narrow(0, int(r0 / 32), int(n / 32)).contiguous().cuda(dev), dev);
+}
+
+/* input columns [c0, c0 + n): the partial sum of a row-parallel layer */
+export function lin8_cols(l, c0, n, dev) {
+	return lin8_from(l.w.narrow(1, c0, n).contiguous().cuda(dev), l.s.narrow(1, int(c0 / 32), int(n / 32)).contiguous().cuda(dev), dev);
+}
+
+/* groups [g0, g0 + n) of a grouped linear */
+export function lin8g_groups(l, g0, n, dev) {
+	let R = l.rows;
+
+	return lin8g_from(l.w.narrow(0, g0 * R, n * R).contiguous().cuda(dev),
+		l.s.narrow(0, int(g0 * R / 32), int(n * R / 32)).contiguous().cuda(dev), n, dev);
 }
 
 /* bf16 / fp32 matrix used in fp32: x (M, K) -> (M, N) fp32 */
@@ -366,7 +397,7 @@ export function build_engram(ws, cfg, i, dev) {
 
 /* Hash ids of the T tokens of a chunk for engram layer slot `li`, gathered from the table and
  * dequantized: (T, heads * 3 * dim) fp16 on E.dev. cids: compressed ids of [3 history tokens, chunk]. */
-function engram_rows(cfg, meta, E, li, hist_t, T) {
+export function engram_rows(cfg, meta, E, li, hist_t, T) {
 	let H = (cfg.engram_ngram - 1) * cfg.engram_heads;
 
 	if (NO_ENGRAM)                                 // tests without the 200 GB tables
@@ -542,7 +573,7 @@ export function new_layer_cache(cfg, A, max_seq) {
 }
 
 /* ring rows of absolute positions [a, b) (b - a <= RING) */
-function ring_rows(cl, a, b) {
+export function ring_rows(cl, a, b) {
 	let n = b - a;
 
 	if (n <= 0)
@@ -556,7 +587,7 @@ function ring_rows(cl, a, b) {
 	return torch.cat([cl.ring.narrow(0, s, RING - s), cl.ring.narrow(0, 0, n - (RING - s))], 0);
 }
 
-function ring_put(cl, pos0, rows) {
+export function ring_put(cl, pos0, rows) {
 	let T = rows.shape()[0];
 
 	if (T > RING) {
@@ -1435,7 +1466,9 @@ export function build_coop(cfg, M) {
 		d_out: torch.zeros([slots, Ho], 'float32', dv),
 		ctr: torch.zeros([ctr_len], 'int32', dv),
 		out: torch.zeros([COOP_ROWS, cfg.hidden_size], 'float32', dv),
-		Hi: Hi, Kg: 1, Ku: 1, Kd: 1, mcg: false, mul1: true, act: 0, act_limit: cfg.swiglu_limit + 0.0
+		Hi: Hi, Kg: 1, Ku: 1, Kd: 1, mcg: false, mul1: true, act: 0, act_limit: cfg.swiglu_limit + 0.0,
+		// expert-parallel shards hold experts [e0, e1) of the router's range
+		min_expert: (M.e0 != null) ? M.e0 : -1, max_expert: (M.e1 != null) ? M.e1 : -1
 	};
 }
 
@@ -1608,9 +1641,13 @@ export let SPARK_DEVS = null;
  * embedding table goes to the least loaded device afterwards (embed_device). With `spark` (bytes of each
  * drafter stage) every stage also takes a device of its own choosing: all assignments are tried and the
  * best one is left in SPARK_DEVS. Returns the per-layer device array. */
-export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last, spark) {
+export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last, spark, shard) {
 	let nl = cfg.num_hidden_layers;
 	let bytes = layer_bytes(ws, cfg);
+
+	// tensor-parallel stages: every GPU of a stage holds 1 / shard of the layers' weights
+	if (shard > 1)
+		bytes = map(bytes, (b) => b / shard);
 	let ct = [];
 
 	for (let a = 0; a <= nl; a++) {
@@ -1849,6 +1886,9 @@ export function load(model_dir, opts) {
 		cfg: cfg, devs: devs, spark_devs: spark_devs, ws: ws, layers: layers, engrams: engrams, meta: meta, embed_tokens: embed_t, embed_dev: ed,
 		norm: ws.gpu16('norm.weight', last),
 		lm_head: lm_head,
+
+		/* logits (rows, vocab) fp16 of a normed state xn (rows, hidden) fp16 on any device */
+		head_full: function (xn) {return this.lm_head.forward(xn.cuda(last));},
 
 		new_cache: function (max_seq) {
 			let cache = {max_seq: max_seq, length: 0, layers: [], pools: {}, cids: [], toks: []};

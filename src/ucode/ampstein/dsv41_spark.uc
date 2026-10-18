@@ -434,7 +434,7 @@ export function load(model, opts) {
 			d.gs[b].replay();
 		}
 
-		let logits = model.lm_head.forward(G.xn.cuda(d.ghd));
+		let logits = model.head_full(G.xn);
 
 		G.logits.copy_(logits.to('float32').cuda(dl));
 		d.gchain.replay();
@@ -471,8 +471,7 @@ export function load(model, opts) {
 
 		let col = dsv41.hc_collapse(streams, pre);                                   // (B, H) fp16, on devs[nb - 1]
 		let xn = torch.rms_norm(col, dnorm, eps);
-		let hd = model.devs[cfg.num_hidden_layers - 1];
-		let logits = model.lm_head.forward(xn.cuda(hd)).cuda(dl).to('float32');       // (B, V)
+		let logits = model.head_full(xn).cuda(dl).to('float32');                       // (B, V)
 		let prev = torch.from_array([ seed ], 'int64', dvl);
 		let outs = [], embs = [];
 

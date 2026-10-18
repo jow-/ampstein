@@ -5886,6 +5886,14 @@ __global__ void amp_fp4_moe_gemv_kernel(const __half *__restrict__ x, const long
 		return;
 
 	const long long e = ids[slot];
+
+	if (e < 0) {                                     /* an expert of another rank (expert parallelism): no contribution */
+		if (lane < AMP_FP4_ROWS && n0 + lane < N)
+			out[(size_t)slot * N + n0 + lane] = 0.f;
+
+		return;
+	}
+
 	const uint8_t *wb = (const uint8_t *)wp[e] + (size_t)n0 * (K / 2);
 	const uint8_t *sb = (const uint8_t *)sp[e] + (size_t)n0 * (K / 32);
 	const int nr = min(AMP_FP4_ROWS, N - n0);

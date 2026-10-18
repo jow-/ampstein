@@ -25,6 +25,8 @@ import * as chat_dsv4 from './chat_dsv4.uc';
 import * as chat_dsv41 from './chat_dsv41.uc';
 import * as dsv41 from './dsv41.uc';
 import * as dsv41_spark from './dsv41_spark.uc';
+import * as dsv41_tp from './dsv41_tp.uc';
+import * as dsv41_spark_tp from './dsv41_spark_tp.uc';
 import * as qwen35 from './qwen35.uc';
 import * as qwen35_tp from './qwen35_tp.uc';
 import * as qwen35_vision from './qwen35_vision.uc';
@@ -170,6 +172,13 @@ export function serve(args) {
 		if (!args.stages)
 			args.stages = int(args.gpus / 2);
 	}
+	else if (D41 && args.tp && args.gpus >= 2) {
+		// DeepSeek-V4.1: pairs of GPUs (tensor-parallel) in a pipeline of stages (dsv41_tp.uc)
+		if (!args.stages)
+			args.stages = int(args.gpus / 2);
+
+		args.mtp = 0;
+	}
 	else if (DS || D41) {
 		args.tp = false;
 		args.mtp = 0;
@@ -243,6 +252,15 @@ export function serve(args) {
 			drafter: args.mtp > 0, prefill_rows: args.chunk}) :
 			dsv4.load(args.model, {devices: args.gpus});
 	}
+	else if (D41 && args.tp) {
+		model = dsv41_tp.load(args.model, {devices: args.gpus, stages: args.stages, max_seq: args.ctx,
+			prefill_rows: args.chunk, spark: D41_SPARK && args.stages == cfg.num_mtp_layers});
+
+		if (model.spark_stages) {
+			model.dspark = dsv41_spark_tp.load(model, {stages: model.spark_stages});
+			warn(`ampstein: DSpark drafter loaded on pipeline stages ${join(',', model.spark_stages)} (verify window ${args.dspark_window})\n`);
+		}
+	}
 	else if (D41) {
 		model = dsv41.load(args.model, {devices: args.gpus, max_seq: args.ctx, prefill_rows: args.chunk,
 			spark: D41_SPARK});
@@ -266,7 +284,7 @@ export function serve(args) {
 		warn(`ampstein: DSpark drafter loaded (verify window ${args.dspark_window})\n`);
 	}
 
-	if (args.tp && !GLM && !Q4 && !DS) {
+	if (args.tp && !GLM && !Q4 && !DS && !D41) {
 		if (args.gpus < 2) {
 			warn('ampstein: --tp needs --gpus >= 2\n');
 			exit(1);
@@ -308,7 +326,7 @@ export function serve(args) {
 
 	if (args.tp)
 		banner += `, tensor parallel over ${model.G} GPUs` +
-			(GLM || Q4 || DS ? ' (expert parallel MoE)' : ` (${model.comm.info().mode} all-reduce)`);
+			((GLM || Q4 || DS || D41) ? ' (expert parallel MoE)' : ` (${model.comm.info().mode} all-reduce)`);
 
 	if (eng.mtp_window)
 		banner += model.dflash ? `, speculative decoding (window ${eng.mtp_window})` :
