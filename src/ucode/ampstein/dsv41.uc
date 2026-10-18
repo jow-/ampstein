@@ -2242,7 +2242,9 @@ export function load(model_dir, opts) {
 				for (let it in items) {
 					it.graph = torch.graph();
 					it.graph.capture_begin(it.dev, null, gpool[it.dev]);
+					glm5.set_par(!getenv('AMP_DSV41_NO_PAR'));         // the shared expert on a forked stream
 					body(it);
+					glm5.set_par(false);
 					it.graph.capture_end();
 
 					if (!gpool[it.dev])
@@ -2339,7 +2341,9 @@ export function load(model_dir, opts) {
 					for (let it in items) {
 						it.graph = torch.graph();
 						it.graph.capture_begin(it.dev, null, gpool[it.dev]);
+						glm5.set_par(!getenv('AMP_DSV41_NO_PAR'));
 						body_rows(it);
+						glm5.set_par(false);
 						it.graph.capture_end();
 
 						if (!gpool[it.dev])

@@ -50,6 +50,10 @@ if (m.hostprof)
 	for (let k in sort(keys(m.hostprof)))
 		printf('  host %-10s %.2f s\n', k, m.hostprof[k]);
 
+if (m.stepprof)
+	for (let k in keys(m.stepprof))
+		m.stepprof[k] = 0;
+
 for (let S = 1; S <= 5; S++) {
 	if (!g.has(S))
 		continue;
@@ -75,3 +79,7 @@ for (let S = 1; S <= 5; S++) {
 
 	printf('S=%d: %.1f ms/step\n', S, (now() - t1) * 1000 / steps);
 }
+
+if (m.stepprof)
+	for (let k in sort(keys(m.stepprof)))
+		printf('  step %-8s %.2f ms per step (all sizes)\n', k, m.stepprof[k] * 1000 / steps);

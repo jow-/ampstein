@@ -196,6 +196,25 @@ function dsv41_tp_graphs(model, allreduce) {
 	let H = cfg.hidden_size, eps = cfg.rms_norm_eps;
 	let ed = model.embed_dev;
 
+	// AMP_DSV41_TP_STEPPROF=1: seconds per phase of a decode step (synchronizes after the graph replays)
+	let SPR = getenv('AMP_DSV41_TP_STEPPROF') ? model.stepprof = {} : null;
+	let sp_t = 0;
+
+	function sp_lap(name, sync) {
+		if (!SPR)
+			return;
+
+		if (sync)
+			torch.synchronize();
+
+		let c = clock(true), t = c[0] + c[1] / 1e9;
+
+		if (name != null)
+			SPR[name] = (SPR[name] || 0) + t - sp_t;
+
+		sp_t = t;
+	}
+
 	/* S rows (or one token) of layer i on the ranks of its stage; h / pre per rank, ctxs per lane, st per rank */
 	function block_dec(cache, i, h, pre, ctxs, sts, caps, S) {
 		let Sg = stages[stage_of[i]];
@@ -361,7 +380,9 @@ function dsv41_tp_graphs(model, allreduce) {
 
 					it.graph = torch.graph();
 					it.graph.capture_begin(Sg.devs[0], slice(Sg.devs, 1), gpool[Sg.devs[0]]);
+					glm5.set_par(!getenv('AMP_DSV41_NO_PAR'));         // the shared expert on a forked stream, beside the routed ones
 					body(it);
+					glm5.set_par(false);
 					it.graph.capture_end();
 
 					if (!gpool[Sg.devs[0]])
@@ -385,6 +406,8 @@ function dsv41_tp_graphs(model, allreduce) {
 		function run_rows(ids, pos) {
 			let S = length(ids);
 			let gs = sets[S];
+
+			sp_lap(null);
 
 			if (!gs)
 				die(`dsv41_tp: no graph for ${S} rows`);
@@ -441,6 +464,8 @@ function dsv41_tp_graphs(model, allreduce) {
 			let h = model.embed_tokens.index(idt.cuda(ed, true)).to('float32').reshape([S, 1, H]).expand([S, 4, H]).contiguous();
 			let taps = [], logits = null, am = null, prev = null;
 
+			sp_lap('pre');
+
 			for (let it in b.items) {
 				let Sg = stages[it.s];
 
@@ -458,10 +483,13 @@ function dsv41_tp_graphs(model, allreduce) {
 				for (let g = 1; g < Gs; g++)
 					it.bar[g].copy_(it.bar[0]);
 
+				sp_lap('copy_in');
 				it.graph.replay();
 
 				for (let g = 1; g < Gs; g++)
 					it.bar[g].copy_(it.bar[0]);
+
+				sp_lap('graph' + it.s, true);
 
 				for (let ctx in b.ctxs)
 					for (let k in keys(ctx.lk))
@@ -477,6 +505,7 @@ function dsv41_tp_graphs(model, allreduce) {
 					}
 
 				push(taps, ...it.taps);
+				sp_lap('post');
 
 				if (it.s == NS - 1) {
 					logits = it.logits;
