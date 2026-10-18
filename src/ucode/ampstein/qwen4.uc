@@ -367,7 +367,7 @@ export function indexer_update(cfg, L, x, cl, cos, sin, pos) {
 /* The selection core on device tensors (so a CUDA graph can replay it):
  * qpos_t, nbq_t (R, 1) and tail_t (R, cr) int64, nb the number of pooled
  * blocks scanned (masked per query by nbq_t). */
-function qsa_select_t(cfg, cl, qi, qpos_t, nbq_t, tail_t, nb, R) {
+export function qsa_select_t(cfg, cl, qi, qpos_t, nbq_t, tail_t, nb, R) {
 	let cr = cfg.indexer_compress_ratio;
 	let dv = 'cuda:' + cl.dev;
 	let ktop = min(int(cfg.indexer_budget / cr), nb);
@@ -603,6 +603,34 @@ export function dev_values(st, pos, mm) {
  * per query) and gathers a fixed 2052 tokens, so the shapes never change. While
  * the context fits the budget the selection keeps every token: the same
  * result as dense attention. */
+const NO_DSEL = getenv('AMP_QWEN4_NO_DSEL') ? true : false;
+let idx_w = {};
+
+/* The decode step's token lists (S, K) int32, -1 invalid, with the DSA kernels instead of the composite
+ * chain: idx_score scores the live pools only (the indexer heads padded to its 32, zero queries and weights),
+ * dsa_select takes the top pools, their tokens and the incomplete tail from the device-side position. The
+ * chain scanned the whole pool capacity (65536 blocks at ctx 262144) for every attention layer of every step. */
+export function qsa_idx_dev(cfg, cl, qi, st, S) {
+	let dv = 'cuda:' + cl.dev;
+	let ih = cfg.indexer_heads, ihd = cfg.indexer_head_dim, cr = cfg.indexer_compress_ratio;
+	let kp = int(cfg.indexer_budget / cr);
+	let key = cl.dev + ':' + S;
+
+	if (!idx_w[key]) {
+		let w = torch.zeros([S, 32], 'float32', dv);
+
+		w.narrow(1, 0, ih).fill_(1.0);
+		idx_w[key] = w;
+	}
+
+	let qp = torch.cat([ qi.view([S, ih, ihd]), torch.zeros([S, 32 - ih, ihd], 'float16', dv) ], 1).contiguous();
+	let p0 = st.pos.narrow(0, 0, 1);
+	let sc = torch.idx_score(qp, cl.pooled, idx_w[key], 1.0 / math.sqrt(ihd * 1.0), p0, cr);
+	let r = torch.dsa_select(sc, p0, cr, kp);
+
+	return torch.where(r[1].le(-1.0), torch.full([1], -1, 'int64', dv), r[0]).to('int32').contiguous();
+}
+
 export function attn_forward_dev(cfg, L, x, cl, st) {
 	let S = x.shape()[1];
 	let eps = cfg.rms_norm_eps;
@@ -636,8 +664,17 @@ export function attn_forward_dev(cfg, L, x, cl, st) {
 	cl.k_cache.index_copy_(0, st.pos, kk.view([S, kvh, hd]));
 	cl.v_cache.index_copy_(0, st.pos, v.view([S, kvh, hd]));
 
-	let sel = qsa_select_t(cfg, cl, qi, st.qpos, st.nbq, st.tail, st.nb, S);
-	let o = qsa_gather_attend(cfg, cl, q.view([S, nh, hd]), sel, S);
+	let o;
+
+	if (NO_DSEL) {
+		let sel = qsa_select_t(cfg, cl, qi, st.qpos, st.nbq, st.tail, st.nb, S);
+
+		o = qsa_gather_attend(cfg, cl, q.view([S, nh, hd]), sel, S);
+	}
+	else {
+		o = torch.qsa_attn(q.view([S, nh, hd]).contiguous(), cl.k_cache, cl.v_cache, qsa_idx_dev(cfg, cl, qi, st, S),
+			1.0 / math.sqrt(cfg.head_dim * 1.0));
+	}
 
 	return L.o_proj.forward(torch.attn_gate(o.view([1, S, nh, hd]).transpose(1, 2), g));
 }

@@ -243,6 +243,8 @@ amp_test(glm5_mtp_stages SCRIPT glm5_mtp ENV AMP_GLM5_STAGES=3)
 # --- Qwen3.8-Flash-Next
 # qsa_attn: gathered-attention kernel vs reference
 amp_test(qsa_attn)
+# qwen4_qsa_sel: decode token selection (DSA kernels) vs the composite chain
+amp_test(qwen4_qsa_sel)
 # qwen4_full: full model vs the oracle
 amp_test(qwen4_full)
 # qwen4_mtp: MTP head acceptance
