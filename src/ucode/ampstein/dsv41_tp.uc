@@ -194,7 +194,7 @@ function dsv41_tp_graphs(model, allreduce) {
 	let Gs = model.Gs, NS = model.NS, nl = model.nl, stages = model.stages, stage_of = model.stage_of;
 	let engrams = model.engrams, meta = model.meta, last = model.last;
 	let H = cfg.hidden_size, eps = cfg.rms_norm_eps;
-	let ed = devs[0];
+	let ed = model.embed_dev;
 
 	/* S rows (or one token) of layer i on the ranks of its stage; h / pre per rank, ctxs per lane, st per rank */
 	function block_dec(cache, i, h, pre, ctxs, sts, caps, S) {
@@ -246,6 +246,25 @@ function dsv41_tp_graphs(model, allreduce) {
 			push(caps_list, c);
 
 		push(caps_list, max_seq);
+
+		// AMP_DSV41_TP_BUCKETS=8192,65536: pool capacities of the graphs (the last one is always max_seq);
+		// AMP_DSV41_TP_SIZES=1,3,5: step sizes (a speculative round then verifies the nearest smaller one)
+		// Defaults: two pool buckets (16384, max_seq) and the step sizes 1 / 3 / 5: every captured graph costs memory on
+		// all six GPUs (the full set of 4 buckets x 5 sizes is ~0.4 GiB per GPU more, which is what the prefill chunk
+		// would otherwise get); AMP_DSV41_TP_BUCKETS=full / AMP_DSV41_TP_SIZES=full restore the complete sets.
+		let bk = getenv('AMP_DSV41_TP_BUCKETS') || '16384';
+
+		if (bk != 'full') {
+			caps_list = filter(map(split(bk, ','), (x) => +x), (c) => c < max_seq);
+			push(caps_list, max_seq);
+		}
+
+		let sz = getenv('AMP_DSV41_TP_SIZES') || '1,3,5';
+
+		if (sz != 'full')
+			sizes = filter(map(split(sz, ','), (x) => +x), (x) => index(sizes || [ 1 ], x) >= 0 || x == 1);
+
+		dsv41.mem_report(devs, 'before graphs (caches allocated)');
 
 		let sets = {};
 		let gpool = {};                              // one allocator pool per stage (rank 0's device) shared by its graphs
@@ -354,10 +373,13 @@ function dsv41_tp_graphs(model, allreduce) {
 			}
 
 			sets[S] = {buckets: buckets, sts: sts};
+			dsv41.mem_report(devs, `graphs captured (${S} rows)`);
 		}
 
 		model.aux_reset(cache);
 		dsv41.mem_report(devs, 'graphs captured');
+		torch.empty_cache();
+		dsv41.mem_report(devs, 'graphs captured, cache emptied');
 
 		/* S = length(ids) rows at pos .. pos + S - 1: {logits (S, vocab), am, taps (S, 3 * hidden) fp32} */
 		function run_rows(ids, pos) {
@@ -495,7 +517,7 @@ function dsv41_tp_methods(model) {
 	let Gs = model.Gs, NS = model.NS, nl = model.nl, stages = model.stages, stage_of = model.stage_of;
 	let engrams = model.engrams, meta = model.meta, last = model.last;
 	let H = cfg.hidden_size, eps = cfg.rms_norm_eps;
-	let ed = devs[0];
+	let ed = model.embed_dev;
 	let ENG0 = {};                                 // layer -> the rank-0 copy (the table reader)
 
 	for (let l in keys(engrams))
@@ -873,6 +895,24 @@ export function load(model_dir, opts) {
 		map(dsv41.spark_stage_bytes(ws, cfg), (b) => b / Gs) : null;
 	let stage_of = dsv41.plan_devices(ws, cfg, NS, max_seq, 1000000000, 1000000000, sb, Gs);
 	let spark_stages = sb ? dsv41.SPARK_DEVS : null;
+
+	// AMP_DSV41_TP_SPLIT=13,13,14: layers per stage (and AMP_DSV41_TP_SPARK=0,2,1: the stage of each drafter stage),
+	// for hand-tuning the memory balance
+	if (getenv('AMP_DSV41_TP_SPLIT')) {
+		let sz = map(split(getenv('AMP_DSV41_TP_SPLIT'), ','), (x) => +x), at = 0;
+
+		stage_of = [];
+
+		for (let s = 0; s < length(sz); s++)
+			for (let k = 0; k < sz[s]; k++)
+				push(stage_of, s);
+
+		if (length(stage_of) != nl)
+			die(`AMP_DSV41_TP_SPLIT: ${length(stage_of)} layers, the model has ${nl}`);
+
+		if (sb)
+			spark_stages = getenv('AMP_DSV41_TP_SPARK') ? map(split(getenv('AMP_DSV41_TP_SPARK'), ','), (x) => +x) : [ 0, 1, 2 ];
+	}
 	let bounds = '';
 
 	for (let i = 1; i < nl; i++)
@@ -1022,9 +1062,11 @@ export function load(model_dir, opts) {
 
 	let last = stages[stage_of[nl - 1]];
 
+	let ed = devs[0];
+
 	ws.upload(function (key) {
 		if (key == 'embed.weight')
-			return devs[0];
+			return ed;
 
 		if (key == 'head.weight' || key == 'norm.weight')
 			return last.devs[0];
@@ -1032,9 +1074,9 @@ export function load(model_dir, opts) {
 		return null;
 	});
 
-	let embed_t = ws.gpu16('embed.weight', devs[0]);
+	let embed_t = ws.gpu16('embed.weight', ed);
 
-	ws.release('embed.weight', devs[0]);
+	ws.release('embed.weight', ed);
 
 	let head_full = models.linear(ws, 'head', false, last.devs[0]);
 	// the head is a dense fp16 matrix in this pack: rank g multiplies its rows (vocabulary slice)
@@ -1052,6 +1094,8 @@ export function load(model_dir, opts) {
 
 	warn(sprintf('dsv41_tp: %d ranks (%d stage%s) loaded in %.0fs\n', G, NS, NS > 1 ? 's' : '', time() - t_load));
 	dsv41.mem_report(devs, 'weights loaded');
+	torch.empty_cache();
+	dsv41.mem_report(devs, 'weights loaded, cache emptied');
 
 	for (let S in stages) {
 		S.comm = torch.p2p_comm(S.devs, cap);
@@ -1061,7 +1105,7 @@ export function load(model_dir, opts) {
 	let model = {
 		cfg: cfg, cg: cg, layers: layers, devs: devs, G: G, tp: true, nl: nl, ws: ws, plan: plan, Gs: Gs, NS: NS,
 		stages: stages, stage_of: stage_of, last: last, engrams: engrams, meta: meta, spark_stages: spark_stages,
-		embed_tokens: embed_t, embed_dev: devs[0], lm_heads: lm_heads, lm_head: lm_heads[0],
+		embed_tokens: embed_t, embed_dev: ed, lm_heads: lm_heads, lm_head: lm_heads[0],
 		norm: map(last.devs, (d) => norm_w.cuda(d))
 	};
 

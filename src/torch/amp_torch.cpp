@@ -4437,6 +4437,20 @@ torch_mem_info(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+/* torch.empty_cache(): give the caching allocator's free blocks (on every device) back to the driver */
+static uc_value_t *
+torch_empty_cache(uc_vm_t *vm, size_t nargs)
+{
+	try {
+		c10::cuda::CUDACachingAllocator::emptyCache();
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
 /*
  * kv_q8_put(src, q, s, pos)
  * kv_q8_get(q, s, idx) / kv_q8_get(q, s, start, rows): torch.tensor
@@ -9843,6 +9857,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "idx_score",	torch_idx_score },
 	{ "dsa_select",	torch_dsa_select },
 	{ "mem_info",	torch_mem_info },
+	{ "empty_cache",	torch_empty_cache },
 	{ "kv_q8_put",	torch_kv_q8_put },
 	{ "kv_q8_get",	torch_kv_q8_get },
 	{ "kv_q4_put",	torch_kv_q4_put },

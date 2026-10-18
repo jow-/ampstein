@@ -187,6 +187,8 @@ export function load(model, opts) {
 		gc();
 	}
 
+	torch.empty_cache();                    // the staged copies of the shards
+
 	let d0 = pairs[0][0], dl = dlast, dvl = 'cuda:' + dl;
 	let last = `mtp.${nb - 1}`;
 	let main_proj = dsv41.lin8(ws, 'mtp.0.main_proj', d0);
@@ -519,6 +521,9 @@ export function load(model, opts) {
 				V = k + 1;
 			}
 		}
+
+		while (V > 0 && !d.graph.has(V + 1))          // only some step sizes may have been captured
+			V--;
 
 		let ids = [ seed, ...slice(r.drafts, 0, V) ];
 		let ver = (V == 0) ? d.graph.run([ seed ], p0) : d.graph.rows(ids, p0);

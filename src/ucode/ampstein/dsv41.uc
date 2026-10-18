@@ -1795,7 +1795,8 @@ export function mem_report(devs, tag) {
 
 		let m = torch.mem_info(d);
 
-		push(parts, sprintf('cuda:%d %.1f/%.1f', d, m[2] / 1073741824.0, m[3] / 1073741824.0));
+		push(parts, sprintf('cuda:%d %.1f/%.1f (cached %.1f)', d, m[2] / 1073741824.0, m[3] / 1073741824.0,
+			(m[1] - m[0]) / 1073741824.0));
 	}
 
 	warn(`dsv41: ${tag}: free/total GiB ${join(', ', parts)}\n`);

@@ -150,3 +150,33 @@ Measured with the server (256k context, chunk 1536): code, greedy 34 tok/s (2.6 
 draft 10, verify 64, update 1.4); the same at temperature 1.0 27.5 tok/s (2.1 per round); prose/thinking 29 - 34
 tok/s; plain decode 26 tok/s. 256k fits with chunk 2048 (the planner reserves 1 GB on the first GPU: layers 7/7/6/6/7/7, prefill ~900 tok/s, code decode 36 tok/s).
 
+## Tensor parallel: 3 stages x 2 ranks (`--tp`, `dsv41_tp.uc`, `dsv41_spark_tp.uc`)
+
+The layer split runs one GPU at a time. `--tp` makes the three pipeline stages pairs of GPUs (the layout of `dsv4_tp.uc`):
+each stage's two ranks run every layer of the stage on their share and sum the partial sublayer outputs with the P2P
+all-reduce; the 4 mHC streams stay replicated and bit-identical inside a pair.
+
+- **Sharding.** Attention: query heads (`wq_b` rows, sinks), `o_groups` (`wo_a` groups) and `wo_b` by input columns (a
+  partial sum); `wq_a`, `wkv`, the compressors and the indexer are replicated (one shared K = V head). MoE: expert
+  parallel (192 + 192, the fused kernels filter the router's picks to the rank's range), the shared expert by rows /
+  columns, router replicated. Engram replicated. Head by vocabulary slice over the last stage's ranks.
+- **Lanes.** Rank r of every stage forms a lane with its own complete cache (rings, pools, mirrors); `dsv41.uc`'s
+  `attn_forward / attn_decode / attn_decode_batch` run unchanged on a config copy with 32 heads / 4 groups.
+- **FFN all-reduce.** The expert partials exceed the fp16 range on the massive-activation rows (the single-chain model
+  sums them in fp32): they cross the fp16 all-reduce divided by 16 and `hc_apply` multiplies its post weights by 16.
+- **Graphs.** One multi-GPU graph per (stage, step size, pool bucket) with a barrier copy around every replay (as
+  `dsv4_tp`); the inter-stage hand-off, the cross-stage index / candidate copies and the pool mirrors are host-driven
+  between the replays, as in the single-chain model. Defaults: pool buckets 16384 / max_seq, step sizes 1 / 3 / 5
+  (`AMP_DSV41_TP_BUCKETS=full`, `AMP_DSV41_TP_SIZES=full` restore the complete sets: +0.4 GiB per GPU, ~5% faster).
+- **Drafter.** Each drafter stage runs on the GPU pair of one pipeline stage (attention heads / groups, FP4 experts
+  64 + 64, shared expert sharded; the FP4 kernel skips picks with id < 0). The planner chooses which pipeline stage hosts
+  which drafter stage (`SPARK_DEVS`).
+- **Tests.** `tests/dsv41_tp.uc` (2 stages x 2 ranks, 8 layers, against the single-chain model: prefill, wavefront,
+  eager steps, graph step, 5-row step; 1e-3 .. 1e-2 like every comparison of this model).
+
+Measured (jai, 256k context, chunk 1536, greedy code / temperature 1.0 / prose): **45 / 43 / 41 tok/s** with the
+drafter (47 / 45 with the full graph sets and chunk 1024), against 40 / 34 / 37 for the single chain. A plain step is
+24.5 ms (single chain 31.7), a 5-row verify step 44.5 ms (60.5). Prefill is host-bound under TP (each GPU busy ~30%:
+the host issues both ranks' launches): 667 tok/s at 75k tokens (single chain 899), and it grows with the chunk, which
+the memory (drafter + graphs + replicated pools) caps at 1536.
+
