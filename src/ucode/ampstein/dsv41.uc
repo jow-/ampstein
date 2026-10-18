@@ -455,12 +455,12 @@ export function engram_rows(cfg, meta, E, li, hist_t, T) {
 /* Start reading the table rows of the tokens ids (which follow the cache's history) into the page cache
  * without waiting: the hashes depend on the token ids only, so a whole prompt can be prefetched while the
  * first chunks compute. */
-export function engram_prefetch(cfg, meta, engrams, cache, ids, pos0) {
+export function engram_prefetch(cfg, meta, engrams, cache, ids, pos0, lo, hi) {
 	let H = (cfg.engram_ngram - 1) * cfg.engram_heads;
-	let n = length(ids);
+	let n = min(length(ids), hi == null ? length(ids) : hi);
 	let SL = 4096;
 
-	for (let a = 0; a < n; a += SL) {
+	for (let a = lo || 0; a < n; a += SL) {
 		let T = min(SL, n - a);
 		let cn = meta.token_map.index(torch.from_array(slice(ids, a, a + T), 'int64')).view([-1]).tolist();
 		let hist = [];

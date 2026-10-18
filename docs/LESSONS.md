@@ -630,3 +630,11 @@ Add new lessons at the end of the matching section.
 - **L163 — rsync keeps mtimes, make trusts them.** A source file edited while a build was running kept its old mtime on
   the target, the object file looked newer, and the stale object linked in (`undefined symbol`, `not a function` from a
   binding that was in the source). Sync with `--no-times` so changed files get the arrival time.
+
+## L164 — Engram prefetch on the launch path halved prefill speed
+
+`stfile.prefetch` issued one `posix_fadvise(WILLNEED)` per row of the whole prompt (hundreds of thousands of
+syscalls) before the first chunk: 7 s of host time, and the kernel's readahead queue then sat in front of the
+first chunk's real gathers. Now the calls run on a detached thread and the prompt is prefetched three chunks
+ahead (`AMP_DSV41_TP_AHEAD`). Prefill of 62k tokens: 700 -> 1416 tok/s; steady state is 0.89 s per 1536-token round
+(1725 tok/s). Always look at the time before the first kernel, not only at the kernel timeline.

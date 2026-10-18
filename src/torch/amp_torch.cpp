@@ -9693,13 +9693,17 @@ torch_st_prefetch(uc_vm_t *vm, size_t nargs)
 	const int64_t *r = (const int64_t *)rows->data_ptr();
 	int64_t n = rows->numel();
 
-	for (int64_t i = 0; i < n; i++) {
-		if (r[i] < 0 || r[i] >= nrows)
-			continue;
+	/* hundreds of thousands of fadvise calls take seconds: on a detached thread, off the launch path */
+	std::vector<int64_t> list(r, r + n);
+	int fd = f->fd;
+	off_t base = (off_t)(f->data_off + offset);
 
-		posix_fadvise(f->fd, (off_t)(f->data_off + offset + (size_t)r[i] * (size_t)row_bytes), (off_t)row_bytes,
-			POSIX_FADV_WILLNEED);
-	}
+	std::thread([list = std::move(list), fd, base, nrows, row_bytes]() {
+		for (int64_t row : list)
+			if (row >= 0 && row < nrows)
+				posix_fadvise(fd, base + (off_t)((size_t)row * (size_t)row_bytes), (off_t)row_bytes,
+					POSIX_FADV_WILLNEED);
+	}).detach();
 
 	return NULL;
 }

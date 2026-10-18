@@ -23,10 +23,28 @@ function now() {
 	return c[0] + c[1] / 1e9;
 }
 
+if (getenv('AMP_DSV41_TP_WARM')) {
+	let w = m.prefill_pipeline(m.new_cache(ctx), slice(ids, 0, chunk), {chunk: chunk});
+
+	while (w.step(1)) {}
+
+	torch.synchronize();
+}
+
 let t0 = now();
 let run = m.prefill_pipeline(cache, ids, {chunk: chunk});
 
-while (run.step(1)) {}
+let rt = now(), rn = 0;
+
+printf('  setup %.2f s\n', rt - t0);
+
+while (run.step(1)) {
+	if (getenv('AMP_DSV41_TP_ROUNDS')) {
+		torch.synchronize();
+		printf('  round %d: %.2f s\n', rn++, now() - rt);
+		rt = now();
+	}
+}
 
 torch.synchronize();
 printf('prefill %d tokens: %.1f s, %.0f tok/s\n', ctxn, now() - t0, ctxn / (now() - t0));

@@ -752,7 +752,7 @@ function dsv41_tp_methods(model) {
 	}
 
 	/* the chunk through stage s: copies the streams to the stage's ranks when it comes from another stage */
-	model.chunk_stage = function (c, cache, s) {
+	model.chunk_stage_begin = function (c, s) {
 		let S = stages[s];
 
 		if (c.stage != s) {
@@ -763,9 +763,29 @@ function dsv41_tp_methods(model) {
 
 			c.stage = s;
 		}
+	};
 
-		for (let i = S.first; i < S.end; i++)
+	model.chunk_stage = function (c, cache, s) {
+		model.chunk_stage_begin(c, s);
+
+		for (let i = stages[s].first; i < stages[s].end; i++)
 			layer_fwd(i, c, cache);
+	};
+
+	/* the active chunks' stages together, layer by layer round-robin: a stage issued whole blocks the host on its
+	 * full launch queue and the other stages' GPUs run dry meanwhile */
+	model.chunk_stages = function (cs, cache) {
+		let n = 0;
+
+		for (let e in cs) {
+			model.chunk_stage_begin(e.c, e.s);
+			n = max(n, stages[e.s].end - stages[e.s].first);
+		}
+
+		for (let j = 0; j < n; j++)
+			for (let e in cs)
+				if (stages[e.s].first + j < stages[e.s].end)
+					layer_fwd(stages[e.s].first + j, e.c, cache);
 	};
 
 	/* the DSpark taps of a finished chunk: (T, 3 * hidden) fp32 on the first tapped layer's device */
@@ -864,8 +884,17 @@ function dsv41_tp_methods(model) {
 		for (let s = 0; s < NS; s++)
 			push(active, null);
 
-		if (!getenv('AMP_DSV41_NO_ENGRAM'))
-			dsv41.engram_prefetch(cfg, meta, ENG0, cache, ids, start);
+		/* the page cache is filled a few chunks ahead, in order: one big request queue would stall the first gathers */
+		let ahead = +(getenv('AMP_DSV41_TP_AHEAD') || 3), pf = 0;
+
+		function prefetch(upto) {
+			if (!getenv('AMP_DSV41_NO_ENGRAM') && upto > pf) {
+				dsv41.engram_prefetch(cfg, meta, ENG0, cache, ids, start, pf, upto);
+				pf = max(pf, upto);
+			}
+		}
+
+		prefetch(min(total, ahead * chunk));
 
 		function admit() {
 			if (active[0] != null || next >= length(bounds))
@@ -878,6 +907,8 @@ function dsv41_tp_methods(model) {
 			}
 
 			let end = bounds[next++];
+
+			prefetch(min(total, end - start + ahead * chunk));
 			let last_c = (end == start + total);
 			let c = model.chunk_begin(slice(ids, prev_end - start, end - start), cache);
 
@@ -890,13 +921,23 @@ function dsv41_tp_methods(model) {
 		}
 
 		function round() {
+			let cs = [];
+
+			for (let s = NS - 1; s >= 0; s--)
+				if (active[s])
+					push(cs, {c: active[s], s: s});
+
+			if (!getenv('AMP_DSV41_TP_WHOLE'))
+				model.chunk_stages(cs, cache);
+
 			for (let s = NS - 1; s >= 0; s--) {
 				let c = active[s];
 
 				if (!c)
 					continue;
 
-				model.chunk_stage(c, cache, s);
+				if (getenv('AMP_DSV41_TP_WHOLE'))
+					model.chunk_stage(c, cache, s);
 
 				if (s == NS - 1) {
 					if (opts.on_taps)
