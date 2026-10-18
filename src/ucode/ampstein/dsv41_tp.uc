@@ -1036,9 +1036,12 @@ export function load(model_dir, opts) {
 	let spark_stages = sb ? dsv41.SPARK_DEVS : null;
 
 	// AMP_DSV41_TP_SPLIT=13,13,14: layers per stage (and AMP_DSV41_TP_SPARK=0,2,1: the stage of each drafter stage),
-	// for hand-tuning the memory balance
-	if (getenv('AMP_DSV41_TP_SPLIT')) {
-		let sz = map(split(getenv('AMP_DSV41_TP_SPLIT'), ','), (x) => +x), at = 0;
+	// for hand-tuning the memory balance; 'auto' keeps the planner's. 13,13,14 is the default for 40 layers on 3
+	// stages: the last stage's ratio-1 layers cost the most prefill time, and it fits at 256k context, chunk 1536
+	let spl = getenv('AMP_DSV41_TP_SPLIT') || ((NS == 3 && nl == 40) ? '13,13,14' : 'auto');
+
+	if (spl != 'auto') {
+		let sz = map(split(spl, ','), (x) => +x), at = 0;
 
 		stage_of = [];
 
