@@ -656,3 +656,20 @@ fault with kernel readahead (~100 KB around a 122-byte row), and when a chunk re
 issuing for all stages. With the page cache evicted by another model, prefill fell from 1900 to 500-600 tok/s after the
 cached system prompt. `ple_start` / `ple_finish` now use the pread pool of `stfile.gather_async` (as the DSV4.1 Engram),
 started three chunks ahead (`AMP_QWEN4_PLE_AHEAD`) in the TP wavefront.
+
+## L167 — Qwen3.8-Flash-Next TP decode: where the 20 ms went
+
+A decode step is three stages in series, each stage two GPUs: a GPU is busy ~30% of the step by construction, and
+inside a stage the all-reduce kernels are mostly *waiting* for the other rank (61 us average against 11 us when
+balanced). The waits had three sources: the attention owner rank running the QSA chain alone (~320 us per attention
+layer), the shared expert on one rank, and the expert-parallel imbalance. Measured (6 GPUs, ctx 262144, S=1 decode,
+4k deep): 21.97 ms -> 17.3 ms from (1) the shared expert on a forked stream beside the router chain inside the
+graphs (`glm5.set_par`, -1.3 ms), (2) the decode token selection through `idx_score` + `dsa_select` instead of the
+ATen chain, which scanned the whole pool *capacity* (65536 blocks at ctx 262144) for every attention layer and step
+(-3.2 ms, identical outputs; `tests/qwen4_qsa_sel.uc`), (3) the MTP draft chain on the device (greedy token feeds the
+next embedding, one host read per round: greedy code 62.8 -> 73-77 tok/s). A decode graph sized for the context cap
+costs the same at any depth: make fixed-shape graph kernels read the live length from a device value. A second
+stream for `in_proj_z` beside the GDN conv/scan chain gained nothing (the projections are bandwidth bound). Verify
+rows cost ~3 ms each (S=3 24.3 ms, S=5 ~30 ms), so the window stays 3. Left: the router chain (~35 us per layer,
+fusable), the gated-residual mixes (~36 us per site, bandwidth/latency bound), attention head-parallelism, expert
+imbalance (EXL3 weights cannot be sharded along K, so experts stay expert-parallel).

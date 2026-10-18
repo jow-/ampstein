@@ -160,6 +160,10 @@ Typical workflow (this is how the empty-split bug was found): run with
 | `AMP_QWEN4_QSA_REF` | off (only `1` enables) | Sparse attention via the composite ATen reference (`qsa_gather_attend_ref`) instead of the fused `torch.qsa_attn` kernel. **Useful to confirm or bypass kernel bugs** (it avoids the split-K workspace entirely). |
 | `AMP_QWEN4_MTP_TAP` | on (only `0` disables) | MTP input: per-stream stack (reference default) vs averaged. |
 | `AMP_QWEN4_NO_MTP_GRAPH` | unset | Do not CUDA-graph the MTP draft step. |
+| `AMP_QWEN4_NO_PAR` | unset | TP decode graphs: no forked stream for the shared expert. |
+| `AMP_QWEN4_NO_DSEL` | unset | Decode token selection through the composite ATen chain instead of `idx_score` + `dsa_select`. |
+| `AMP_QWEN4_PLE_AHEAD` | `3` | TP prefill: chunks ahead of the wavefront whose PLE rows are read from disk. |
+| `AMP_MTP_NO_CHAIN` | unset | Engine: draft step by step with a host read after each (instead of the device-side chain, TP Qwen4). |
 | `AMP_GDN_CHUNK` | off (only `1` enables) | Block-parallel GDN scan from chunk length 64 up (`qwen35.uc`). Experimental, opt-in. |
 | `AMP_GDN_NO_ABG` **(opt-out)** | unset | Qwen3.5/3.8: compute the fp16 `in_proj_a` / `in_proj_b` products and the gates as separate launches for decode / verify rows instead of `torch.gdn_ab_gates`. |
 | `AMP_NO_MLP_BUNDLE` **(opt-out)** | unset | Qwen3.5/3.8: run gate and up as two GEMMs for decode / verify rows instead of one `mgemm` launch. |

@@ -127,7 +127,18 @@ plain decode 23.2 ms/token (stages 2: 21.6, stages 1: 20.8), MTP 52 / 66 / 77 / 
 17.7-19.3 GiB per GPU at ctx 131072. This is the recommended TP setting; plain
 `--tp` (one group) decodes ~10% faster but prefills at a third of the speed.
 
+## Measured after the decode work (TP x 3 stages, ctx 262144, 6 GPUs)
+
+Plain decode 21.97 -> 17.3 ms/token at 4k depth (identical outputs), verify S=3 28.8 -> 24.3 ms; server, greedy
+code prompt 62.8 -> 77 tok/s (MTP window 3), T=1.0 ~63; needle at 64k depth correct, prefill 1.8-2.1k tok/s. See
+LESSONS L167 for what changed (shared expert fork in the graphs, DSA selection kernels, device-side draft chain).
+
 ## Open
+- RAM store / slots / hot-reload state file for this model (the engine's generic store assumes the dense
+  (1, kvh, n, hd) cache; the QSA layers have K, V, raw indexer keys and pooled keys on the owner rank only,
+  ~50 KB per token over the 12 attention layers, plus 36 GDN states, the MTP cache and the PLE state): needs
+  `cache_bytes` / `cache_export` / `cache_import` / `new_slot` hooks next to `aux_get` / `aux_set`.
+- Fused router (softmax + top-10 of 512), attention head-parallel split, fewer gated-residual kernels.
 
 - Balance the TP attention layers (the owner rank runs the QSA chain alone, ~285 us
   of arrival spread per attention layer) and the expert-parallel MoE.
