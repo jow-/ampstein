@@ -38,7 +38,8 @@ let model = use_tp ? qwen4_tp.load(model_dir, { stages: stages, prefill_rows: ch
 printf('loaded in %.1fs\n', elapsed(t0));
 
 let cache = model.new_cache(ctx);
-let g = use_graph ? model.graphs(cache, [ 1 ]) : null;
+let sizes = getenv('AMP_BENCH_SIZES') ? map(split(getenv('AMP_BENCH_SIZES'), ','), (x) => +x) : [ 1 ];
+let g = use_graph ? model.graphs(cache, sizes) : null;
 
 if (g) {
 	for (let cl in cache.layers)
@@ -80,10 +81,13 @@ while (r.step(2));
 
 let tok = r.logits().view([1, -1]).argmax(-1).tolist()[0];
 
+let gen = [];
+
 function step() {
 	let l = g ? g.run([tok], cache.length).logits : model.forward_chunk([tok], cache);
 
 	tok = l.view([1, -1]).argmax(-1).tolist()[0];
+	push(gen, tok);
 }
 
 for (let i = 0; i < 4; i++)
@@ -102,3 +106,30 @@ let tot = elapsed(t2);
 
 printf('%s%s decode at context ~%d: %.2f ms/token (%.1f tok/s) over %d dependent steps\n',
 	use_tp ? 'tp ' : '', g ? 'graph' : 'eager', nprefill, tot * 1000 / steps, steps / tot, steps);
+
+if (getenv('AMP_BENCH_TOKENS'))
+	printf('tokens %s\n', join(',', slice(gen, 0, 64)));
+
+if (g && length(sizes) > 1) {
+	let p0 = cache.length;
+
+	for (let S in sizes) {
+		let rows = [];
+
+		for (let i = 0; i < S; i++)
+			push(rows, 1000 + i * 37);
+
+		for (let i = 0; i < 3; i++)
+			g.run(rows, p0);
+
+		torch.synchronize();
+
+		let t = clock(true);
+
+		for (let i = 0; i < 40; i++)
+			g.run(rows, p0);
+
+		torch.synchronize();
+		printf('step S=%d: %.2f ms\n', S, elapsed(t) * 1000 / 40);
+	}
+}

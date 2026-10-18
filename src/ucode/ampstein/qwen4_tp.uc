@@ -837,7 +837,9 @@ export function load(model_dir, opts) {
 
 				st.graph = torch.graph();
 				st.graph.capture_begin(devs[0], slice(devs, 1));
+				glm5.set_par(!getenv('AMP_QWEN4_NO_PAR'));       // the shared expert beside the router chain
 				body();
+				glm5.set_par(false);
 				st.graph.capture_end();
 				torch.synchronize();
 
@@ -1134,7 +1136,9 @@ export function load(model_dir, opts) {
 
 			ent.graph = torch.graph();
 			ent.graph.capture_begin(md[0], slice(md, 1));
+			glm5.set_par(!getenv('AMP_QWEN4_NO_PAR'));
 			body();
+			glm5.set_par(false);
 			ent.graph.capture_end();
 			torch.synchronize();
 
