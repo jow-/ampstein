@@ -349,12 +349,12 @@ export function serve(args) {
 	 * The port-qualified path keeps concurrent servers apart. */
 	const CACHE_ST = `/tmp/Ampstein-cache-${args.port}.safetensors`;
 	const CACHE_META = `${CACHE_ST}.json`;
-	const layout = GLM ? {gpus: args.gpus, tp: !!args.tp, stages: args.stages ?? 0, kv_bits: kv_bits ?? 0} : {};
+	const layout = (GLM || Q4) ? {gpus: args.gpus, tp: !!args.tp, stages: args.stages ?? 0, kv_bits: kv_bits ?? 0} : {};
 
 	(function restore_cache() {
 		let meta;
 
-		if (Q4 || DS || D41)
+		if (DS || D41)
 			return;     // no cache-state file for these architectures yet
 
 		try {
@@ -1701,7 +1701,7 @@ export function serve(args) {
 		shutting_down = true;
 
 		try {
-			if (Q4 || DS || D41)
+			if (DS || D41)
 				die('not supported for this architecture yet');
 
 			let n = eng.save_state(CACHE_ST);

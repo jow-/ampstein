@@ -759,6 +759,13 @@ export function moe_route(cfg, M, y) {
 	if (M.router == 'softmax') {
 		// Qwen3.8-Flash-Next ("std" router): softmax over all expert
 		// logits, top-k, weights renormalised over the selected k
+		if (!NO_FUSED_ROUTE && !getenv('AMP_QWEN4_NO_FUSED_ROUTE')) {
+			// one kernel: top-k on the logits, softmax of the selected (the same weights)
+			let r = torch.v41_route(mm32(y.to('float32'), M.gate_t), null, cfg.num_experts_per_tok, 1.0);
+
+			return {idx: r[0], w: r[1]};
+		}
+
 		let p = mm32(y.to('float32'), M.gate_t).softmax(-1);
 		let tk = p.topk(cfg.num_experts_per_tok, -1);
 		let w = tk.values;

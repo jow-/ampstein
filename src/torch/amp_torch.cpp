@@ -6734,17 +6734,22 @@ torch_v41_route(uc_vm_t *vm, size_t nargs)
 {
 	at::Tensor *lg, *bias;
 
-	if (nargs != 4 || !(lg = tensor_arg(vm, uc_fn_arg(0))) || !(bias = tensor_arg(vm, uc_fn_arg(1))) ||
+	/* bias null: the plain softmax router (weights = softmax of the k largest logits, times scale) */
+	bool nobias = (nargs == 4 && uc_fn_arg(1) == NULL);
+
+	bias = NULL;
+
+	if (nargs != 4 || !(lg = tensor_arg(vm, uc_fn_arg(0))) || (!nobias && !(bias = tensor_arg(vm, uc_fn_arg(1)))) ||
 	    ucv_type(uc_fn_arg(2)) != UC_INTEGER ||
 	    (ucv_type(uc_fn_arg(3)) != UC_DOUBLE && ucv_type(uc_fn_arg(3)) != UC_INTEGER))
-		RAISE("v41_route: (logits, bias, k, scale)");
+		RAISE("v41_route: (logits, bias | null, k, scale)");
 
 	long k = ucv_int64_get(uc_fn_arg(2));
 	double scale = (ucv_type(uc_fn_arg(3)) == UC_DOUBLE) ? ucv_double_get(uc_fn_arg(3)) : (double)ucv_int64_get(uc_fn_arg(3));
 
 	if (lg->dim() != 2 || lg->scalar_type() != at::kFloat || !lg->is_contiguous() || !lg->is_cuda() ||
-	    bias->scalar_type() != at::kFloat || !bias->is_contiguous() || bias->numel() != lg->size(1) ||
-	    bias->device() != lg->device() || lg->size(1) > 512 || k < 1 || k > lg->size(1) || k > 32)
+	    (bias && (bias->scalar_type() != at::kFloat || !bias->is_contiguous() || bias->numel() != lg->size(1) ||
+	    bias->device() != lg->device())) || lg->size(1) > 512 || k < 1 || k > lg->size(1) || k > 32)
 		RAISE("v41_route: logits (T, E<=512) fp32 contiguous CUDA, bias (E) fp32, 1 <= k <= 32");
 
 	TensorDeviceGuard dg(*lg);
@@ -6752,7 +6757,7 @@ torch_v41_route(uc_vm_t *vm, size_t nargs)
 	try {
 		at::Tensor idx = at::empty({ lg->size(0), k }, lg->options().dtype(at::kLong));
 		at::Tensor w = at::empty({ lg->size(0), k }, lg->options());
-		int rc = amp_v41_route((const float *)lg->data_ptr(), (const float *)bias->data_ptr(),
+		int rc = amp_v41_route((const float *)lg->data_ptr(), bias ? (const float *)bias->data_ptr() : NULL,
 			(long long *)idx.data_ptr(), (float *)w.data_ptr(), (int)lg->size(0), (int)lg->size(1), (int)k,
 			(float)scale, c10::cuda::getCurrentCUDAStream().stream());
 

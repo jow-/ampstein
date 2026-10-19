@@ -20,6 +20,22 @@ function check(T, E, k, scale) {
 	assert(same == 0 && dw < 1e-6, 'fused router differs from the composite form');
 }
 
+// the plain softmax router (bias null): top-k of the logits, softmax renormalised over the selected k
+function check_soft(T, E, k) {
+	let lg = torch.rand([T, E], 'float32', dv).sub(0.5).mul(12.0);
+	let r = torch.v41_route(lg, null, k, 1.0);
+	let tk = lg.softmax(-1).topk(k, -1);
+	let w = tk.values.div(tk.values.sum(1, true).add(1e-20));
+	let same = r[0].to('float32').sub(tk.indices.to('float32')).abs().max(-1).max(-1).item();
+	let dw = r[1].sub(w).abs().max(-1).max(-1).item();
+
+	printf('softmax T=%d E=%d k=%d: index mismatch %g, weight diff %.1e\n', T, E, k, same, dw);
+	assert(same == 0 && dw < 1e-6, 'fused softmax router differs from the composite form');
+}
+
+check_soft(1, 512, 10);
+check_soft(3, 512, 10);
+check_soft(300, 512, 10);
 check(1, 384, 6, 2.5);
 check(5, 384, 6, 2.5);
 check(300, 384, 6, 1.5);

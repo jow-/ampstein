@@ -6148,8 +6148,19 @@ amp_v41_route_kernel(const float *__restrict__ logits, const float *__restrict__
 	const int row = blockIdx.x;
 	const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 
+	/* no bias: the "std" softmax router (Qwen): select by logit, the weights are the softmax of the selected logits
+	 * (the softmax over all experts renormalised over the selected k: the denominator cancels) */
+	const bool soft = (bias == NULL);
+
 	for (int e = threadIdx.x; e < E; e += blockDim.x) {
 		float x = logits[(size_t)row * E + e];
+
+		if (soft) {
+			sc[e] = x;
+			key[e] = x;
+			continue;
+		}
+
 		float sp = (x > 20.0f) ? x : log1pf(expf(x));
 		float a = sqrtf(sp);
 
@@ -6211,6 +6222,13 @@ amp_v41_route_kernel(const float *__restrict__ logits, const float *__restrict__
 
 	if (threadIdx.x == 0) {
 		float sum = 0.f;
+
+		if (soft) {
+			const float m = wv[0];                 /* the first pick is the largest logit */
+
+			for (int j = 0; j < k; j++)
+				wv[j] = expf(wv[j] - m);
+		}
 
 		for (int j = 0; j < k; j++)
 			sum += wv[j];

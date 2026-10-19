@@ -758,15 +758,39 @@ export function create(model, opts) {
 	// else the store stays off
 	let mla_store = false;     // MLA latent caches: generic device slots are available
 
-	function is_mla(c) {
-		return c.ckv != null || c.qk != null;
+	// a QSA attention cache (Qwen3.8-Flash-Next): K / V rows (max_seq, kvh, hd), raw indexer keys and the pooled blocks
+	function is_qsa(c) {
+		return c.raw_k != null && c.k_cache != null;
 	}
 
-	// the draft cache holders when the MTP block has an MLA cache (replicas under TP), else null
+	function is_mla(c) {
+		return c.ckv != null || c.qk != null || is_qsa(c);
+	}
+
+	// the holder of a layer's attention cache among its per-rank entries (a replica under TP; the owner rank only
+	// when the model keeps the cache on one rank), else null
+	function kv_holder(sts) {
+		for (let c in sts)
+			if (is_mla(c))
+				return c;
+
+		return null;
+	}
+
+	// the draft cache holders when the MTP block has an MLA / QSA cache (replicas under TP, or the owner rank of a
+	// row of per-rank entries), else null
 	function mtp_mla() {
 		let l = cache.mtp ? cache.mtp.layers : null;
 
-		return (l && length(l) && is_mla(l[0])) ? l : null;
+		if (l && length(l) && type(l[0]) == 'array')
+			l = l[0];
+
+		if (!l || !length(l))
+			return null;
+
+		l = filter(l, (x) => is_mla(x));
+
+		return length(l) ? l : null;
 	}
 
 	function store_supported() {
@@ -777,26 +801,36 @@ export function create(model, opts) {
 		if (model.cache_export)
 			return !!(model.cache_import && model.cache_bytes);
 
-		// models with recurrent state outside the layer entries (qwen4's PLE
-		// layer) are not stored in RAM yet
-		if (model.aux_get)
-			return false;
+		// recurrent state outside the layer entries (qwen4's PLE layer): aux_get / aux_set tensors and plain
+		// values, stored with the entry (aux_to_host)
+		for (let i = 0; i < cfg.num_hidden_layers; i++) {
+			let sts = states(i);
 
-		for (let i = 0; i < cfg.num_hidden_layers; i++)
-			for (let cl in states(i)) {
-				if (is_gdn(i)) {
+			if (is_gdn(i)) {
+				for (let cl in sts)
 					if (!cl.rec_state)
 						return false;
-				}
-				else if (cl.k_cache || is_mla(cl)) {
+
+				continue;
+			}
+
+			// the attention cache of a layer: on every rank (dense TP) or on one owner rank (QSA)
+			let h = kv_holder(sts);
+
+			if (h) {
+				kv = true;
+				mla_store = true;
+				continue;
+			}
+
+			for (let cl in sts)
+				if (cl.k_cache)
 					kv = true;
 
-					if (is_mla(cl))
-						mla_store = true;
-				}
-				else
+			for (let cl in sts)
+				if (!cl.k_cache)
 					return false;
-			}
+		}
 
 		return kv && (!cache.mtp || cache.mtp.k_cache != null || mtp_mla() != null);
 	}
@@ -819,6 +853,25 @@ export function create(model, opts) {
 		e.bytes += tbytes(h);
 
 		return h;
+	}
+
+	// a model's aux state (tensors, numbers, id lists) to host memory
+	function aux_to_host(v, e) {
+		let t = type(v);
+
+		if (t == 'array')
+			return map(v, (x) => aux_to_host(x, e));
+
+		if (t == 'object') {
+			let o = {};
+
+			for (let k in v)
+				o[k] = aux_to_host(v[k], e);
+
+			return o;
+		}
+
+		return (t == 'resource') ? to_host(v, e) : v;
 	}
 
 	/* Tiered precision of a stored KV region (a stored state is idle: the
@@ -924,7 +977,56 @@ export function create(model, opts) {
 		return int(n / cfg.index_kpool);
 	}
 
+	function qsa_pools(n) {
+		return int(n / cfg.indexer_compress_ratio) + 1;
+	}
+
+	function qsa_bytes(c, n) {
+		let sh = c.k_cache.shape();
+
+		return n * (2 * sh[1] * sh[2] + c.raw_k.shape()[1]) * 2 + qsa_pools(n) * c.pooled.shape()[1] * 2;
+	}
+
+	// the rows [0, n) of a QSA cache (K, V, raw indexer keys) and its pooled blocks, exact fp16
+	function qsa_to_host(c, dev, n, e) {
+		return {k: to_host(c.k_cache.narrow(0, 0, n), e), v: to_host(c.v_cache.narrow(0, 0, n), e),
+			raw: to_host(c.raw_k.narrow(0, 0, n), e),
+			pooled: to_host(c.pooled.narrow(0, 0, min(qsa_pools(n), c.pooled.shape()[0])), e)};
+	}
+
+	function qsa_from_host(c, dev, d, n) {
+		c.k_cache.narrow(0, 0, n).copy_(d.k.narrow(0, 0, n));
+		c.v_cache.narrow(0, 0, n).copy_(d.v.narrow(0, 0, n));
+		c.raw_k.narrow(0, 0, n).copy_(d.raw.narrow(0, 0, n));
+
+		let p = min(qsa_pools(n), d.pooled.shape()[0]);
+
+		c.pooled.narrow(0, 0, p).copy_(d.pooled.narrow(0, 0, p));
+	}
+
+	// rows [0, n) of a QSA cache to another (slot <-> live, any device)
+	function qsa_copy(d, s, n) {
+		for (let k in [ 'k_cache', 'v_cache', 'raw_k' ])
+			d[k].narrow(0, 0, n).copy_(s[k].narrow(0, 0, n).cuda(d.dev));
+
+		let p = min(qsa_pools(n), s.pooled.shape()[0]);
+
+		d.pooled.narrow(0, 0, p).copy_(s.pooled.narrow(0, 0, p).cuda(d.dev));
+	}
+
+	function qsa_alloc(c) {
+		let o = {dev: c.dev};
+
+		for (let k in [ 'k_cache', 'v_cache', 'raw_k', 'pooled' ])
+			o[k] = torch.zeros(c[k].shape(), c[k].dtype(), 'cuda:' + c.dev);
+
+		return o;
+	}
+
 	function mla_bytes(c, n) {
+		if (is_qsa(c))
+			return qsa_bytes(c, n);
+
 		let dc = (c.ckv ? c.ckv : c.qk).shape()[1];
 		let b = n * c.plane.shape()[1] * 2 + mla_pools(n) * c.pools.shape()[1] * 2;
 
@@ -940,6 +1042,9 @@ export function create(model, opts) {
 	}
 
 	function mla_to_host(c, dev, n, e) {
+		if (is_qsa(c))
+			return qsa_to_host(c, dev, n, e);
+
 		let chunks = [];
 		let dc = (c.ckv ? c.ckv : c.qk).shape()[1];
 
@@ -975,6 +1080,12 @@ export function create(model, opts) {
 	}
 
 	function mla_from_host(c, dev, d, n) {
+		if (d.k != null) {
+			qsa_from_host(c, dev, d, n);
+
+			return;
+		}
+
 		for (let k = 0; k * KV_CHUNK < n; k++) {
 			let o = k * KV_CHUNK;
 			let m = min(KV_CHUNK, n - o);
@@ -1008,6 +1119,12 @@ export function create(model, opts) {
 
 	// rows [0, n) of an MLA cache object to another (slot <-> live, any device)
 	function mla_copy(d, s, n) {
+		if (is_qsa(s)) {
+			qsa_copy(d, s, n);
+
+			return;
+		}
+
 		for (let k in [ 'ckv', 'qk', 'qs', 'plane' ])
 			if (s[k] != null)
 				d[k].narrow(0, 0, n).copy_(s[k].narrow(0, 0, n).cuda(d.dev));
@@ -1017,6 +1134,9 @@ export function create(model, opts) {
 	}
 
 	function mla_alloc(c) {
+		if (is_qsa(c))
+			return qsa_alloc(c);
+
 		let o = {dev: c.dev};
 
 		for (let k in [ 'ckv', 'qk', 'qs', 'plane', 'pools' ])
@@ -1041,7 +1161,7 @@ export function create(model, opts) {
 					torch.zeros(cl.conv_state.shape(), 'float16', 'cuda:' + cl.dev)
 				]);
 			else
-				sl.kv[i] = mla_alloc(sts[0]);
+				sl.kv[i] = mla_alloc(kv_holder(sts));
 		}
 
 		for (let k in gdn_layers) {
@@ -1091,8 +1211,8 @@ export function create(model, opts) {
 		for (let i = 0; i < cfg.num_hidden_layers; i++) {
 			let sts = states(i);
 
-			if (!is_gdn(i) && is_mla(sts[0])) {
-				b += mla_bytes(sts[0], n);
+			if (!is_gdn(i) && kv_holder(sts)) {
+				b += mla_bytes(kv_holder(sts), n);
 				continue;
 			}
 
@@ -1348,10 +1468,10 @@ export function create(model, opts) {
 							slot.gdn[i][r][1].copy_(sts[r].conv_state);
 						}
 					else
-						mla_copy(slot.kv[i], sts[0], n);
+						mla_copy(slot.kv[i], kv_holder(sts), n);
 				}
-				else if (!is_gdn(i) && is_mla(sts[0]))
-					e.kv[i] = [ mla_to_host(sts[0], sts[0].dev, n, e) ];
+				else if (!is_gdn(i) && kv_holder(sts))
+					e.kv[i] = [ mla_to_host(kv_holder(sts), kv_holder(sts).dev, n, e) ];
 				else
 					e[is_gdn(i) ? 'gdn' : 'kv'][i] = map(sts, (cl) => !is_gdn(i) ?
 						kv_to_host(cl, cl.dev, n, e) : [ to_host(cl.rec_state, e), to_host(cl.conv_state, e) ]);
@@ -1372,9 +1492,15 @@ export function create(model, opts) {
 			if (last_hidden)
 				e.hid = to_host(last_hidden, e);
 
+			if (model.aux_get)
+				e.aux = aux_to_host(model.aux_get(cache), e);
+
 			if (snap_ids != null && lcp(snap_ids, ids) == length(snap_ids)) {
 				e.snap_ids = slice(snap_ids);
 				e.snap = {};
+
+				if (model.aux_get && snap_aux)
+					e.snap_aux = aux_to_host(snap_aux, e);
 
 				for (let k in gdn_layers) {
 					if (slot) {
@@ -1495,6 +1621,9 @@ export function create(model, opts) {
 					else
 						mla_from_host(sts[r], sts[r].dev, e.kv[i][0], start);
 				}
+				else if (!is_gdn(i) && !sts[r].k_cache) {
+					// a rank without the layer's cache (QSA: the owner rank holds it)
+				}
 				else if (!is_gdn(i))
 					kv_from_host(sts[r], sts[r].dev, e.kv[i][r], start);
 				else if (live) {
@@ -1538,10 +1667,12 @@ export function create(model, opts) {
 
 			snap_ids = slice(e.snap_ids);
 			snap_hidden = e.snap_hid ? e.snap_hid.cuda(M.dev) : null;
+			snap_aux = e.snap_aux || null;
 		}
 		else {
 			snap_ids = null;
 			snap_hidden = null;
+			snap_aux = null;
 		}
 
 		let dl = min(e.dl, start);
@@ -1561,6 +1692,9 @@ export function create(model, opts) {
 			ids = slice(e.ids);
 			cache.length = e.n;
 			last_hidden = e.hid ? e.hid.cuda(M.dev) : null;
+
+			if (model.aux_set && e.aux)
+				model.aux_set(cache, e.aux);
 		}
 		else if (turn)
 			restore_turn();
