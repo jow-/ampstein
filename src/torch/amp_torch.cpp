@@ -2573,7 +2573,7 @@ torch_matmul(uc_vm_t *vm, size_t nargs)
 }
 
 /*
- * sdpa(q, k, v, is_causal?: boolean, attn_mask?: tensor): torch.tensor
+ * sdpa(q, k, v, is_causal?: boolean, attn_mask?: tensor, enable_gqa?: boolean, scale?: number): torch.tensor
  *
  * scaled_dot_product_attention: q/k/v are (..., L, E) with the last two
  * dimensions query length and head size; dispatches to libtorch's fused
@@ -2586,11 +2586,20 @@ torch_sdpa(uc_vm_t *vm, size_t nargs)
 {
 	at::Tensor *q, *k, *v, *mask = NULL;
 	bool is_causal = false, enable_gqa = false;
+	double scale = 0;
+	bool has_scale = false;
 
-	if (nargs < 3 || nargs > 6) {
+	if (nargs < 3 || nargs > 7) {
 		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
-			"expected (q, k, v, is_causal?, attn_mask?, enable_gqa?)");
+			"expected (q, k, v, is_causal?, attn_mask?, enable_gqa?, scale?)");
 		return NULL;
+	}
+
+	if (nargs >= 7 && ucv_type(uc_fn_arg(6)) != UC_NULL) {
+		if (!arg_number(vm, uc_fn_arg(6), &scale))
+			return NULL;
+
+		has_scale = true;
 	}
 
 	if (!(q = tensor_arg(vm, uc_fn_arg(0))) ||
@@ -2612,7 +2621,7 @@ torch_sdpa(uc_vm_t *vm, size_t nargs)
 		at::Tensor r = at::scaled_dot_product_attention(
 			*q, *k, *v,
 			mask ? c10::optional<at::Tensor>(*mask) : c10::nullopt,
-			0.0, is_causal, c10::nullopt, enable_gqa);
+			0.0, is_causal, has_scale ? c10::optional<double>(scale) : c10::nullopt, enable_gqa);
 
 		return tensor_wrap(vm, std::move(r), 0);
 	}

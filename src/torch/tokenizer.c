@@ -365,6 +365,9 @@ struct tok {
 	bool          ignore_merges;   /* model.ignore_merges: emit a whole
 	                                * pre-token straight from the vocab when
 	                                * it is a single entry, skipping merges */
+	bool          spm;      /* SentencePiece-style BPE (Gemma): spaces become U+2581, merges run over the whole
+	                         * text of a run (no pre-tokenizer), unknown characters fall back to <0xXX> byte tokens */
+	int64_t       byte_tok[256];   /* spm: the <0xXX> token ids (-1: none) */
 };
 
 /* --- json-c loading ------------------------------------------------------ */
@@ -713,11 +716,34 @@ tok_load(const char *dir)
 	if (json_object_object_get_ex(model, "ignore_merges", &v))
 		t->ignore_merges = json_object_get_boolean(v);
 
+	/* byte-fallback BPE without a byte-level pre-tokenizer: the SentencePiece family (Gemma) */
+	if (json_object_object_get_ex(model, "byte_fallback", &v) && json_object_get_boolean(v)) {
+		struct json_object *nz, *nt, *pat, *cont;
+
+		if (!json_object_object_get_ex(root, "normalizer", &nz) || !json_object_is_type(nz, json_type_object) ||
+		    !json_object_object_get_ex(nz, "type", &nt) || strcmp(json_object_get_string(nt), "Replace") ||
+		    !json_object_object_get_ex(nz, "pattern", &pat) || !json_object_object_get_ex(pat, "String", &pat) ||
+		    strcmp(json_object_get_string(pat), " ") || !json_object_object_get_ex(nz, "content", &cont) ||
+		    strcmp(json_object_get_string(cont), "\xe2\x96\x81"))
+			goto err;
+
+		t->spm = true;
+	}
+
 	if (json_object_object_get_ex(root, "added_tokens", &v) &&
 	    !added_tokens_from_array(t, v))
 		goto err;
 
 	byte_map_init(t->byte_map, t->byte_inv);
+
+	if (t->spm)
+		for (int b = 0; b < 256; b++) {
+			char nm[8];
+			int64_t id;
+
+			snprintf(nm, sizeof(nm), "<0x%02X>", b);
+			t->byte_tok[b] = ht_get(&t->vocab, nm, 6, "", 0, &id) ? id : -1;
+		}
 
 	/* reverse table: id -> piece, borrowed from the vocab keys */
 	int64_t max_id = -1;
@@ -789,6 +815,12 @@ tok_load(const char *dir)
 	 * falls back to the built-in GPT-2 pattern; an UNSUPPORTED one
 	 * (Metaspace, Whitespace, ...) fails the load — silently
 	 * substituting GPT-2 would mis-encode every piece. */
+	if (t->spm) {
+		json_object_put(root);
+
+		return t;
+	}
+
 	switch (resolve_split_re(root, t->re, &t->nre)) {
 	case 1:
 		break;
@@ -1150,6 +1182,219 @@ match_special(const tok_t *t, const char *text, size_t len, bool special,
 
 /* --- public API ------------------------------------------------------------ */
 
+/* --- SentencePiece-style BPE (Gemma) ------------------------------------- */
+
+typedef struct {
+	size_t  off, len;      /* slice of the normalized text (fixed symbols: unused) */
+	int     prev, next;
+	int64_t fixed;         /* >= 0: a byte-fallback token that never merges */
+	bool    alive;
+} spm_sym_t;
+
+typedef struct {
+	int64_t rank;
+	int     left;
+	size_t  total;         /* len(left) + len(right) when pushed: a stale entry no longer matches */
+} spm_cand_t;
+
+static bool
+spm_cand_less(const spm_cand_t *a, const spm_cand_t *b)
+{
+	return a->rank < b->rank || (a->rank == b->rank && a->left < b->left);
+}
+
+static void
+spm_heap_push(spm_cand_t *h, size_t *n, spm_cand_t c)
+{
+	size_t i = (*n)++;
+
+	h[i] = c;
+
+	while (i > 0) {
+		size_t p = (i - 1) / 2;
+
+		if (!spm_cand_less(&h[i], &h[p]))
+			break;
+
+		spm_cand_t tmp = h[i];
+
+		h[i] = h[p];
+		h[p] = tmp;
+		i = p;
+	}
+}
+
+static spm_cand_t
+spm_heap_pop(spm_cand_t *h, size_t *n)
+{
+	spm_cand_t top = h[0];
+
+	h[0] = h[--(*n)];
+
+	size_t i = 0;
+
+	for (;;) {
+		size_t l = 2 * i + 1, r = l + 1, m = i;
+
+		if (l < *n && spm_cand_less(&h[l], &h[m]))
+			m = l;
+
+		if (r < *n && spm_cand_less(&h[r], &h[m]))
+			m = r;
+
+		if (m == i)
+			break;
+
+		spm_cand_t tmp = h[i];
+
+		h[i] = h[m];
+		h[m] = tmp;
+		i = m;
+	}
+
+	return top;
+}
+
+/* spaces -> U+2581, one symbol per UTF-8 character (a character missing from the vocab becomes its byte tokens), then
+ * the lowest-ranked merge first (ties: leftmost), over the whole run */
+static bool
+spm_encode_run(const tok_t *t, const char *text, size_t len, int64_t *ids, size_t *nids)
+{
+	char *buf = malloc(3 * len + 1);
+	size_t nb = 0, nsym = 0, cap = len * 4 + 1;
+	spm_sym_t *sym = malloc(cap * sizeof(*sym));
+	spm_cand_t *heap = NULL;
+	size_t nheap = 0, hcap = 0;
+	bool ok = false;
+
+	if (!buf || !sym)
+		goto out;
+
+	for (size_t i = 0; i < len; i++) {
+		if (text[i] == ' ') {
+			buf[nb++] = (char)0xe2;
+			buf[nb++] = (char)0x96;
+			buf[nb++] = (char)0x81;
+		}
+		else
+			buf[nb++] = text[i];
+	}
+
+	for (size_t i = 0; i < nb; ) {
+		size_t cl = 1;
+		unsigned char c = (unsigned char)buf[i];
+
+		if (c >= 0xf0)
+			cl = 4;
+		else if (c >= 0xe0)
+			cl = 3;
+		else if (c >= 0xc0)
+			cl = 2;
+
+		if (i + cl > nb)
+			cl = nb - i;
+
+		int64_t id;
+
+		if (ht_get(&t->vocab, buf + i, cl, "", 0, &id)) {
+			sym[nsym].off = i;
+			sym[nsym].len = cl;
+			sym[nsym].fixed = -1;
+			sym[nsym].alive = true;
+			nsym++;
+		}
+		else {
+			for (size_t k = 0; k < cl; k++) {
+				int64_t bt = t->byte_tok[(unsigned char)buf[i + k]];
+
+				if (bt < 0)
+					goto out;
+
+				sym[nsym].off = i + k;
+				sym[nsym].len = 1;
+				sym[nsym].fixed = bt;
+				sym[nsym].alive = true;
+				nsym++;
+			}
+		}
+
+		i += cl;
+	}
+
+	for (size_t i = 0; i < nsym; i++) {
+		sym[i].prev = (int)i - 1;
+		sym[i].next = (i + 1 < nsym) ? (int)i + 1 : -1;
+	}
+
+	hcap = nsym + 1;
+	heap = malloc(hcap * sizeof(*heap));
+
+	if (!heap)
+		goto out;
+
+	/* heap entries: at most one per adjacent pair at any time plus the stale ones: grow on demand */
+#define SPM_TRY(L, R) do { \
+		int l_ = (L), r_ = (R); \
+		int64_t rk_; \
+		if (l_ >= 0 && r_ >= 0 && sym[l_].fixed < 0 && sym[r_].fixed < 0 && \
+		    ht_get(&t->merges, buf + sym[l_].off, sym[l_].len, buf + sym[r_].off, sym[r_].len, &rk_)) { \
+			if (nheap == hcap) { \
+				hcap *= 2; \
+				spm_cand_t *nh_ = realloc(heap, hcap * sizeof(*heap)); \
+				if (!nh_) goto out; \
+				heap = nh_; \
+			} \
+			spm_heap_push(heap, &nheap, (spm_cand_t){rk_, l_, sym[l_].len + sym[r_].len}); \
+		} \
+	} while (0)
+
+	for (size_t i = 0; i + 1 < nsym; i++)
+		SPM_TRY((int)i, (int)i + 1);
+
+	while (nheap > 0) {
+		spm_cand_t c = spm_heap_pop(heap, &nheap);
+		int l = c.left, r = sym[l].next;
+
+		if (!sym[l].alive || r < 0 || !sym[r].alive || sym[l].len + sym[r].len != c.total)
+			continue;
+
+		sym[l].len += sym[r].len;
+		sym[r].alive = false;
+		sym[l].next = sym[r].next;
+
+		if (sym[r].next >= 0)
+			sym[sym[r].next].prev = l;
+
+		SPM_TRY(sym[l].prev, l);
+		SPM_TRY(l, sym[l].next);
+	}
+
+#undef SPM_TRY
+
+	for (int i = 0; i >= 0 && nsym; i = sym[i].next) {
+		if (sym[i].fixed >= 0) {
+			ids[(*nids)++] = sym[i].fixed;
+			continue;
+		}
+
+		int64_t id;
+
+		if (!ht_get(&t->vocab, buf + sym[i].off, sym[i].len, "", 0, &id))
+			goto out;
+
+		ids[(*nids)++] = id;
+	}
+
+	ok = true;
+
+out:
+	free(buf);
+	free(sym);
+	free(heap);
+
+	return ok;
+}
+
 /* Pretokenize + BPE one run of plain text, appending to ids/nids. */
 static bool
 encode_run(const tok_t *t, const char *text, size_t len, int64_t *ids,
@@ -1158,6 +1403,9 @@ encode_run(const tok_t *t, const char *text, size_t len, int64_t *ids,
 	span_t *spans = NULL;
 	size_t nspans = 0;
 	bool ok = false;
+
+	if (t->spm)
+		return spm_encode_run(t, text, len, ids, nids);
 
 	if (!pretokenize(t, text, len, &spans, &nspans))
 		return false;
@@ -1261,6 +1509,41 @@ tok_decode(const tok_t *t, const int64_t *ids, size_t n, char **out,
 
 	if (!buf)
 		return false;
+
+	if (t->spm) {
+		/* SentencePiece decoder: U+2581 -> space, <0xXX> -> the byte, special pieces verbatim */
+		for (size_t i = 0; i < n; i++) {
+			const char *piece = t->rev[ids[i]];
+			size_t plen = strlen(piece);
+			int64_t sid;
+			unsigned bv;
+			char tail;
+
+			if (ht_get(&t->added, piece, plen, "", 0, &sid) && sid == ids[i]) {
+				memcpy(buf + len, piece, plen);
+				len += plen;
+			}
+			else if (plen == 6 && sscanf(piece, "<0x%2X%c", &bv, &tail) == 2 && tail == '>') {
+				buf[len++] = (unsigned char)bv;
+			}
+			else {
+				for (size_t k = 0; k < plen; ) {
+					if (k + 2 < plen && (unsigned char)piece[k] == 0xe2 && (unsigned char)piece[k + 1] == 0x96 &&
+					    (unsigned char)piece[k + 2] == 0x81) {
+						buf[len++] = ' ';
+						k += 3;
+					}
+					else
+						buf[len++] = (unsigned char)piece[k++];
+				}
+			}
+		}
+
+		*out = (char *)buf;
+		*outlen = len;
+
+		return true;
+	}
 
 	for (size_t i = 0; i < n; i++) {
 		int64_t id = ids[i];

@@ -176,6 +176,9 @@ export function hc_apply(streams, y, post, comb) {
 
 /* Clamped SwiGLU (swiglu_limit): silu(min(g, L)) * clamp(u, -L, L). */
 export function act_mul(cfg, g, u) {
+	if (cfg.act == 'gelu')                      // Gemma 4: gelu (tanh form) gated
+		return g.gelu_tanh().mul(u);
+
 	let lim = cfg.swiglu_limit;
 
 	if (lim && lim != 0)
@@ -756,6 +759,14 @@ export function route_peek(cfg, M, y, k) {
 }
 
 export function moe_route(cfg, M, y) {
+	if (M.router == 'gemma4') {
+		// Gemma 4: the router logits come from the caller (M.rl, computed on the residual stream); softmax over all
+		// experts, top-k, renormalised over the selected, times the per-expert scale of each selected expert
+		let r = torch.v41_route(M.rl.contiguous(), null, cfg.num_experts_per_tok, 1.0);
+
+		return {idx: r[0], w: r[1].mul(M.pes.index(r[0].reshape([-1])).view(r[0].shape()))};
+	}
+
 	if (M.router == 'softmax') {
 		// Qwen3.8-Flash-Next ("std" router): softmax over all expert
 		// logits, top-k, weights renormalised over the selected k
@@ -869,7 +880,7 @@ function build_coop(cfg, M) {
 		ctr: torch.zeros([ctr_len], 'int32', dv),
 		out: torch.zeros([COOP_ROWS, cfg.hidden_size], 'float32', dv),
 		Hi: Hi, Kg: g0.K, Ku: u0.K, Kd: d0.K, mcg: g0.mcg ? true : false,
-		mul1: g0.mul1 ? true : false, act: 0, act_limit: cfg.swiglu_limit + 0.0,
+		mul1: g0.mul1 ? true : false, act: (cfg.act == 'gelu') ? 1 : 0, act_limit: cfg.swiglu_limit + 0.0,
 		// expert-parallel shards hold experts [e0, e1) of the router's range
 		min_expert: (M.e0 != null) ? M.e0 : -1, max_expert: (M.e1 != null) ? M.e1 : -1
 	};
