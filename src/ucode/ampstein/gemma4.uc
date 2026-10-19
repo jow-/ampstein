@@ -242,6 +242,39 @@ function global_attn(L, q, K, V, pos0, T) {
 	return (length(outs) == 1) ? outs[0] : torch.cat(outs, 0);
 }
 
+/* rows [a, b) of a ring of `ring` rows (position p lives in slot p mod ring) as one tensor */
+function ring_rows(t, a, b, ring) {
+	let s0 = a % ring, n = b - a;
+
+	if (s0 + n <= ring)
+		return t.narrow(0, s0, n);
+
+	return torch.cat([ t.narrow(0, s0, ring - s0), t.narrow(0, 0, n - (ring - s0)) ], 0);
+}
+
+/* sliding-window attention of a prefill chunk (T rows) as fused sdpa with an explicit window mask over the keys
+ * [pos0 - (win - 1), pos0 + T): K / V heads expanded to the q heads, scale 1 */
+function window_attn(cfg, L, q, cl, pos0, T, ring) {
+	let nh = L.nh, kvh = L.kvh, hd = L.hd, win = cfg.sliding_window;
+	let rep = int(nh / kvh);
+	let dv = 'cuda:' + L.dev;
+	let kst = max(0, pos0 - (win - 1));
+	let len = pos0 + T - kst;
+
+	function heads(t) {
+		return ring_rows(t, kst, pos0 + T, ring).unsqueeze(2).expand([len, kvh, rep, hd]).reshape([len, nh, hd])
+			.transpose(0, 1).unsqueeze(0);
+	}
+
+	let qpos = torch.arange(T, 'float32', dv).add(pos0 * 1.0).view([T, 1]);
+	let kpos = torch.arange(len, 'float32', dv).add(kst * 1.0).view([1, len]);
+	let d = qpos.sub(kpos);
+	let ok = d.neg().le(0.0).to('float32').mul(d.le(win - 1.0).to('float32')).neg().le(-0.5);
+	let o = torch.sdpa(q.transpose(0, 1).unsqueeze(0), heads(cl.k), heads(cl.v), false, ok, false, 1.0);
+
+	return o.transpose(1, 2).reshape([T, nh * hd]);
+}
+
 function attn_forward(cfg, L, a, cl, pos0, ctx) {
 	let T = a.shape()[0];
 	let nh = L.nh, kvh = L.kvh, hd = L.hd, eps = cfg.rms_norm_eps;
@@ -279,6 +312,10 @@ function attn_forward(cfg, L, a, cl, pos0, ctx) {
 		cl.k.narrow(0, 0, T - n1).copy_(kk.view([T, kvh, hd]).narrow(0, n1, T - n1));
 		cl.v.narrow(0, 0, T - n1).copy_(vv.view([T, kvh, hd]).narrow(0, n1, T - n1));
 	}
+
+	// prefill chunks: fused sdpa with a window mask; decode / verify rows: the gathered kernel over the window's slots
+	if (T >= 64 && !getenv('AMP_GEMMA4_NO_SDPA'))
+		return L.o.forward(window_attn(cfg, L, q.view([T, nh, hd]), cl, pos0, T, ring));
 
 	let o = torch.qsa_attn(q.view([T, nh, hd]).contiguous(), cl.k, cl.v, ctx.widx, 1.0);
 
@@ -436,7 +473,7 @@ export function load(model_dir, opts) {
 						ring: ring,
 						cs_l: rope_cs(invs[dev].l, pos0, n, dev),
 						cs_g: rope_cs(invs[dev].g, pos0, n, dev),
-						widx: window_idx(pos0, n, cfg.sliding_window, ring, dev)
+						widx: (n < 64 || getenv('AMP_GEMMA4_NO_SDPA')) ? window_idx(pos0, n, cfg.sliding_window, ring, dev) : null
 					};
 				}
 
