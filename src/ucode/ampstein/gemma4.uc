@@ -209,7 +209,7 @@ function window_idx(pos0, T, win, ring, dev) {
 
 /* the one-row decode context of the position held in the device tensor posf (1) fp32: rope tables, the ring slot of
  * the new row and the window's slots, all computed on the device (CUDA-graph capture) */
-function dyn_ctx(cfg, inv, posf, ring, dev) {
+function dyn_ctx(cfg, inv, posf, ring, dev, glen) {
 	let dv = 'cuda:' + dev, win = cfg.sliding_window;
 	let fr = posf.view([1, 1]).mul(inv.l);
 	let tok = torch.arange(win, 'float32', dv).view([1, win]).add(posf.sub(win - 1.0).view([1, 1]));
@@ -217,10 +217,14 @@ function dyn_ctx(cfg, inv, posf, ring, dev) {
 	let q = tok.mul(1.0 / ring).to('int64').to('float32');
 	let slot = tok.sub(q.mul(ring * 1.0));
 	let pq = posf.mul(1.0 / ring).to('int64').to('float32');
+	let fg = posf.view([1, 1]).mul(inv.g);
 
 	return {
 		ring: ring,
 		cs_l: {cos: fr.cos().contiguous(), sin: fr.sin().contiguous()},
+		cs_g: {cos: fg.cos().contiguous(), sin: fg.sin().contiguous()},
+		glen: glen, posf: posf,
+		gslot: posf.to('int64').view([1]),
 		widx: torch.where(valid, slot.to('int32'), torch.full([1], -1, 'int32', dv)).contiguous(),
 		dyn: {slot: posf.sub(pq.mul(ring * 1.0)).to('int64').view([1])}
 	};
@@ -259,6 +263,28 @@ function global_attn(L, q, K, V, pos0, T) {
 	}
 
 	return (length(outs) == 1) ? outs[0] : torch.cat(outs, 0);
+}
+
+/* the one-row global attention over the first glen cache rows with the position in the device tensor posf */
+function global_attn_dyn(L, q, K, V, posf, glen) {
+	let nh = L.nh, kvh = L.kvh, hd = L.hd;
+	let rep = int(nh / kvh);
+	let dv = 'cuda:' + L.dev;
+	let kpos = torch.arange(glen, 'float32', dv).view([1, glen]);
+	let late = kpos.sub(posf.view([1, 1])).neg().le(-0.5);           // kpos > pos
+	let o = [];
+
+	for (let j = 0; j < kvh; j++) {
+		let qj = q.narrow(1, j * rep, rep).reshape([rep, hd]).to('float32');
+		let kj = K.narrow(1, j, 1).reshape([glen, hd]).to('float32');
+		let vj = V.narrow(1, j, 1).reshape([glen, hd]).to('float32');
+		let sc = torch.matmul(qj, kj.t());
+
+		sc = torch.where(late, torch.full([1], -1e30, 'float32', dv), sc);
+		push(o, torch.matmul(sc.softmax(-1), vj));
+	}
+
+	return torch.cat(o, 0).view([1, nh * hd]).to('float16');
 }
 
 /* rows [a, b) of a ring of `ring` rows (position p lives in slot p mod ring) as one tensor */
@@ -303,6 +329,14 @@ function attn_forward(cfg, L, a, cl, pos0, ctx) {
 	let vraw = L.v ? L.v.forward(a) : kraw;                       // global layers: V = the K projection before its norm
 	let kk = torch.qk_norm_rope(kraw.view([1, T, kvh, hd]), L.k_norm, cs.cos, cs.sin, hd, eps);
 	let vv = torch.rms_norm(vraw.contiguous().view([T * kvh, hd]), L.v_norm, eps);
+
+	if (L.full && ctx.dyn) {
+		cl.k.index_copy_(0, ctx.gslot, kk.view([1, kvh, hd]));
+		cl.v.index_copy_(0, ctx.gslot, vv.view([1, kvh, hd]));
+
+		return L.o.forward(global_attn_dyn(L, q.view([1, nh, hd]), cl.k.narrow(0, 0, ctx.glen),
+			cl.v.narrow(0, 0, ctx.glen), ctx.posf, ctx.glen));
+	}
 
 	if (L.full) {
 		cl.k.narrow(0, pos0, T).copy_(kk.view([T, kvh, hd]));
@@ -357,10 +391,15 @@ function attn_forward(cfg, L, a, cl, pos0, ctx) {
 /* AMP_GEMMA4_HP=1: host seconds per phase of the layers (export HP) */
 export let HP = getenv('AMP_GEMMA4_HP') ? {} : null;
 let hp_t = 0;
+let hp_off = false;
+let HP_SYNC = getenv('AMP_GEMMA4_HPSYNC');
 
 function hp(name) {
 	if (!HP)
 		return;
+
+	if (HP_SYNC && !hp_off)
+		torch.synchronize();
 
 	let c = clock(true), t = c[0] + c[1] / 1e9;
 
@@ -383,18 +422,18 @@ function block_forward(cfg, L, x, cl, pos0, ctx) {
 
 	hp('attn');
 
-	x = x.add(rms32(ao.to('float32'), L.post_attn, eps));
+	x = torch.norm32(ao, L.post_attn, eps, x);
 
 	// feed-forward: the dense MLP and (every layer of this model) the routed experts side by side
 	let f = glm5.rms_norm_f32(x, L.pre_ff, eps);
-	let m = glm5.mlp_forward(cfg, L.mlp, f).to('float32');
+	let m = glm5.mlp_forward(cfg, L.mlp, f);
 	let h;
 
 	hp('mlp');
 
 	if (L.moe) {
 		// the router sees the residual: rms-normalised, scaled by the router scale / sqrt(hidden)
-		let rin = rms32(x, L.rscale, eps);
+		let rin = torch.norm32(x, L.rscale, eps);
 
 		hp('r.norm');
 
@@ -411,14 +450,12 @@ function block_forward(cfg, L, x, cl, pos0, ctx) {
 		hp('moe');
 
 		L.moe.rl = null;
-		h = rms32(m, L.post_ff1, eps).add(rms32(mo, L.post_ff2, eps));
+		h = torch.norm32(mo, L.post_ff2, eps, torch.norm32(m, L.post_ff1, eps));
 	}
 	else
 		h = m;
 
-	x = x.add(rms32(h, L.post_ff, eps));
-
-	return x.mul(L.scalar);
+	return torch.norm32(h, L.post_ff, eps, x, L.scalar);
 }
 
 /* ------------------------------------------------------------------ */
@@ -573,79 +610,86 @@ export function load(model_dir, opts) {
 
 			let model = this;
 			let H = cfg.hidden_size;
-			let items = [];
+			let runs = [];
 			let posf = {};
-
-			for (let d in uniq(map(layers, (L) => L.dev)))
-				posf[d] = torch.zeros([1], 'float32', 'cuda:' + d);
+			let gmax = cache.max_seq;
 
 			for (let i = 0; i < nl; i++) {
-				let L = layers[i];
-				let last = length(items) ? items[length(items) - 1] : null;
-
-				if (L.full)
-					push(items, {eager: true, layer: i, dev: L.dev});
-				else if (last && !last.eager && last.dev == L.dev)
-					last.end = i + 1;
+				if (!length(runs) || runs[length(runs) - 1].dev != layers[i].dev)
+					push(runs, {dev: layers[i].dev, first: i, end: i + 1, gr: {}});
 				else
-					push(items, {eager: false, first: i, end: i + 1, dev: L.dev});
+					runs[length(runs) - 1].end = i + 1;
+
+				if (posf[layers[i].dev] == null)
+					posf[layers[i].dev] = torch.zeros([1], 'float32', 'cuda:' + layers[i].dev);
 			}
 
-			function body(it) {
-				let ctx = dyn_ctx(cfg, invs[it.dev], posf[it.dev], ring, it.dev);
-				let h = it.h_in;
+			for (let r in runs)
+				r.h_in = torch.zeros([1, H], 'float32', 'cuda:' + r.dev);
 
-				for (let i = it.first; i < it.end; i++)
+			function body(r, glen) {
+				let ctx = dyn_ctx(cfg, invs[r.dev], posf[r.dev], ring, r.dev, glen);
+				let h = r.h_in;
+
+				for (let i = r.first; i < r.end; i++)
 					h = block_forward(cfg, layers[i], h, cache.layers[i], 0, ctx);
 
-				it.h_out = h;
+				return h;
 			}
 
-			for (let it in items)
-				if (!it.eager) {
-					it.h_in = torch.zeros([1, H], 'float32', 'cuda:' + it.dev);
-					body(it);
-				}
+			// the attention length of the global layers is the graph's fixed shape: the smallest power of two >= pos + 1
+			function bucket(pos) {
+				let b = 256;
 
-			torch.synchronize();
+				while (b < pos + 1)
+					b *= 2;
 
-			for (let it in items)
-				if (!it.eager) {
-					it.graph = torch.graph();
-					it.graph.capture_begin(it.dev);
-					body(it);
-					it.graph.capture_end();
-				}
+				return min(b, gmax);
+			}
 
-			torch.synchronize();
+			function graph_of(r, glen) {
+				let e = r.gr[glen];
+
+				if (e)
+					return e;
+
+				// the warm-up runs write the rows of this very position (the replay rewrites them)
+				hp_off = true;
+				body(r, glen);
+				torch.synchronize();
+
+				e = {graph: torch.graph()};
+				e.graph.capture_begin(r.dev);
+				e.h_out = body(r, glen);
+				e.graph.capture_end();
+				torch.synchronize();
+				hp_off = false;
+				r.gr[glen] = e;
+
+				return e;
+			}
 
 			function run_ids(tids, pos) {
 				for (let d in posf)
 					posf[d].copy_(torch.from_array([ pos * 1.0 ], 'float32', 'cuda:' + d));
 
+				hp(null);
+
 				let h = embed_t.index(tids).to('float32').mul(EMBED_SCALE);
-				let dev = first;
+				let glen = bucket(pos);
 
-				for (let it in items) {
-					if (it.dev != dev) {
-						h = h.cuda(it.dev);
-						dev = it.dev;
-					}
+				hp('d.embed');
 
-					if (it.eager) {
-						let ctx = {
-							ring: ring,
-							cs_l: rope_cs(invs[dev].l, pos, 1, dev),
-							cs_g: rope_cs(invs[dev].g, pos, 1, dev)
-						};
+				for (let r in runs) {
+					if (r.dev != first || r != runs[0])
+						h = h.cuda(r.dev);
 
-						h = block_forward(cfg, layers[it.layer], h, cache.layers[it.layer], pos, ctx);
-					}
-					else {
-						it.h_in.copy_(h);
-						it.graph.replay();
-						h = it.h_out;
-					}
+					let e = graph_of(r, glen);
+
+					r.h_in.copy_(h);
+					e.graph.replay();
+					h = e.h_out;
+					hp('d.graph');
 				}
 
 				cache.length = pos + 1;
@@ -658,8 +702,14 @@ export function load(model_dir, opts) {
 					lg = e.sub(1.0).div(e.add(1.0)).mul(cfg.softcap).to('float16');
 				}
 
+				hp('d.head');
+
 				return {logits: lg, hidden: null};
 			}
+
+			// capture the first bucket now (a real position is not needed: nothing is read from the cache before a write)
+			for (let r in runs)
+				graph_of(r, bucket(0));
 
 			return {
 				has: function (S) {return S == 1;},

@@ -3846,6 +3846,10 @@ amp_rms_norm_f32in(const void *x, const void *w, void *out, long rows, int dim,
                   double eps, cudaStream_t stream);
 
 extern "C" int
+amp_norm32(const void *x, int x_half, const void *w, const void *res, const void *scale, void *out,
+          long rows, int dim, double eps, cudaStream_t stream);
+
+extern "C" int
 amp_dflash_conv_res(void *h, const void *y, const void *dyn, const void *base,
                    int R, int H, int G, long dstride, float scale,
                    cudaStream_t stream);
@@ -5646,6 +5650,61 @@ torch_rms_norm_f32(uc_vm_t *vm, size_t nargs)
 			c10::cuda::getCurrentCUDAStream().stream());
 
 		if (!launch_ok(vm, rc, "rms_norm_f32"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
+ * norm32(x, weight, eps [, res [, scale]]): (res + rms(x) * weight) * scale, fp32
+ *
+ * x (R, H) fp16 or fp32 contiguous, weight fp32 (H), res fp32 (R, H) or null, scale fp32 (1) or null.
+ */
+static uc_value_t *
+torch_norm32(uc_vm_t *vm, size_t nargs)
+{
+	double eps;
+
+	if (nargs < 3 || nargs > 5 || !arg_number(vm, uc_fn_arg(2), &eps)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (x, weight, eps [, res [, scale]])");
+		return NULL;
+	}
+
+	at::Tensor *x = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *w = x ? f32_arg(vm, uc_fn_arg(1), "norm32: weight") : NULL;
+	at::Tensor *res = NULL, *scale = NULL;
+
+	if (!w)
+		return NULL;
+
+	if (nargs >= 4 && ucv_type(uc_fn_arg(3)) != UC_NULL && !(res = f32_arg(vm, uc_fn_arg(3), "norm32: res")))
+		return NULL;
+
+	if (nargs >= 5 && ucv_type(uc_fn_arg(4)) != UC_NULL && !(scale = f32_arg(vm, uc_fn_arg(4), "norm32: scale")))
+		return NULL;
+
+	if ((x->scalar_type() != at::kFloat && x->scalar_type() != at::kHalf) || !x->is_cuda() ||
+	    !x->is_contiguous() || x->dim() != 2 || w->numel() != x->size(1) || x->device() != w->device() ||
+	    (res && (res->sizes() != x->sizes() || res->device() != x->device())) ||
+	    (scale && (scale->numel() != 1 || scale->device() != x->device()))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"norm32: x must be contiguous (R, H) fp16 / fp32, weight (H) fp32, res like x, scale one element, one device");
+		return NULL;
+	}
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		at::Tensor out = at::empty(x->sizes(), x->options().dtype(at::kFloat));
+		int rc = amp_norm32(x->data_ptr(), x->scalar_type() == at::kHalf, w->data_ptr(),
+			res ? res->data_ptr() : NULL, scale ? scale->data_ptr() : NULL, out.data_ptr(),
+			(long)x->size(0), (int)x->size(1), eps, c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "norm32"))
 			return NULL;
 
 		return tensor_wrap(vm, std::move(out), 0);
@@ -10350,6 +10409,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "dflash_conv",	torch_dflash_conv },
 	{ "dflash_select",	torch_dflash_select },
 	{ "rms_norm_f32",	torch_rms_norm_f32 },
+	{ "norm32",	torch_norm32 },
 	{ "dflash_conv_res",	torch_dflash_conv_res },
 	{ "gdn_out_norm",	torch_gdn_out_norm },
 	{ "flash_attn",	torch_flash_attn },

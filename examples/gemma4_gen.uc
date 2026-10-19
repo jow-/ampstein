@@ -71,5 +71,9 @@ for (let i = 0; i < n; i++) {
 }
 
 torch.synchronize();
+if (gemma4.HP)
+	for (let k in sort(keys(gemma4.HP)))
+		printf('  host %-8s %.2f s\n', k, gemma4.HP[k]);
+
 printf('decode %d tokens in %.2f s (%.1f tok/s)\n', length(out), now() - t2, length(out) / (now() - t2));
 printf('%s\n', tok.decode(out));

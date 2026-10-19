@@ -1901,6 +1901,75 @@ amp_rms_norm_f32in(const void *x, const void *w, void *out, long rows, int dim,
 	return (int)cudaGetLastError();
 }
 
+// amp_norm32: out = (res + rms(x) * w) * scale[0], fp32 out; x fp16 or fp32, w fp32,
+// res / scale optional. The Gemma 4 post-norm residual blocks in one kernel.
+template <typename T>
+__global__ void amp_norm32_kernel(const T *__restrict__ x, const float *__restrict__ w,
+                                  const float *__restrict__ res, const float *__restrict__ scale,
+                                  float *__restrict__ out, int dim, float eps)
+{
+	const int row = blockIdx.x;
+	const T *xr = x + (size_t)row * dim;
+	float acc = 0.0f;
+
+	for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+		float v = (float)xr[i];
+
+		acc += v * v;
+	}
+
+#pragma unroll
+	for (int off = 16; off > 0; off >>= 1)
+		acc += __shfl_down_sync(0xffffffffu, acc, off);
+
+	__shared__ float warp_sum[32];
+
+	if ((threadIdx.x & 31) == 0)
+		warp_sum[threadIdx.x >> 5] = acc;
+
+	__syncthreads();
+
+	if (threadIdx.x == 0) {
+		float total = 0.0f;
+
+		for (int i = 0; i < (int)(blockDim.x >> 5); i++)
+			total += warp_sum[i];
+
+		warp_sum[0] = rsqrtf(total / dim + eps);
+	}
+
+	__syncthreads();
+
+	const float sc = warp_sum[0];
+	const float s = scale ? scale[0] : 1.0f;
+
+	for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+		float v = (float)xr[i] * sc * w[i];
+
+		if (res)
+			v += res[(size_t)row * dim + i];
+
+		out[(size_t)row * dim + i] = v * s;
+	}
+}
+
+extern "C" int
+amp_norm32(const void *x, int x_half, const void *w, const void *res, const void *scale, void *out,
+           long rows, int dim, double eps, cudaStream_t stream)
+{
+	if (rows <= 0 || dim <= 0)
+		return 0;
+
+	if (x_half)
+		amp_norm32_kernel<__half><<<(int)rows, 256, 0, stream>>>((const __half *)x, (const float *)w,
+			(const float *)res, (const float *)scale, (float *)out, dim, (float)eps);
+	else
+		amp_norm32_kernel<float><<<(int)rows, 256, 0, stream>>>((const float *)x, (const float *)w,
+			(const float *)res, (const float *)scale, (float *)out, dim, (float)eps);
+
+	return (int)cudaGetLastError();
+}
+
 __global__ void amp_dflash_conv_res_kernel(float *__restrict__ h,
                                           const __half *__restrict__ y,
                                           const __half *__restrict__ dyn,
