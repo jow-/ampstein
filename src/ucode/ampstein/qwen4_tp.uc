@@ -446,10 +446,14 @@ export function load(model_dir, opts) {
 	let mtp = null;
 
 	if (has_mtp) {
-		let pw = weights.open(model_dir, 'mtp_hyper_connection_mixer_patch.safetensors');
+		// the MTP block's own mixer: in the main checkpoint (4.05 bpw: already uploaded with the other mtp.*
+		// tensors) or in a separate patch file (6.05 bpw)
+		let in_main = ws.has('mtp.hyper_connection_mixer.hc_norm.weight');
+		let pw = in_main ? ws : weights.open(model_dir, 'mtp_hyper_connection_mixer_patch.safetensors');
 		let d0 = last.devs[0];
 
-		pw.upload((key) => d0);
+		if (!in_main)
+			pw.upload((key) => d0);
 
 		let mx = qwen4.build_gr(pw, cfg, 'mtp.hyper_connection_mixer', d0, false);
 

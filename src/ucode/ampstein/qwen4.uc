@@ -1111,10 +1111,13 @@ export function load(model_dir, opts) {
 	// the MTP head is opt-in (opts.mtp = true): the engine's draft machinery is not
 	// wired to it (docs/QWEN4.md), so a loaded head would only enable a broken path
 	if (!partial && opts.mtp == true && ws.has('mtp.fc_hidden.trellis')) {
-		let pw = weights.open(model_dir, 'mtp_hyper_connection_mixer_patch.safetensors');
+		let in_main = ws.has('mtp.hyper_connection_mixer.hc_norm.weight');
+		let pw = in_main ? ws : weights.open(model_dir, 'mtp_hyper_connection_mixer_patch.safetensors');
 
 		ws.upload((key) => index(key, 'mtp.') == 0 ? last_dev : null);
-		pw.upload((key) => last_dev);
+
+		if (!in_main)
+			pw.upload((key) => last_dev);
 
 		mtp = build_mtp(ws, pw, cfg, last_dev);
 	}
