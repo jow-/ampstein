@@ -99,8 +99,15 @@ TP, stages, KV form) must match.
   and the snapshot / turn checkpoint, so a first prompt that diverges after the
   restart still rewinds instead of prefilling. The entry's tensors are the
   file, its structure `.tree` (JSON); restoring is the store's own swap-in.
-  States below 2048 tokens are not saved. DeepSeek-V4 and Qwen4 are not wired
-  into the server yet.
+  States below 2048 tokens are not saved. DeepSeek-V4 is not wired into the
+  server yet.
+- **Qwen3.8-Flash-Next (TP):** the same entry layout: the QSA attention caches of the 12 attention layers (K, V,
+  raw indexer keys, pooled blocks; on each layer's owner rank only, exact fp16, ~30 KB per token), the 36 GDN
+  states, the PLE state (`aux_get`: conv tail + id context, stored with the entry), the MTP draft cache and the
+  snapshot. RAM store, resident device slots (a swap is ~5 ms, 3k tokens) and the hot-reload file all work
+  (`tests/engine_store_qwen4.uc`). Measured on the 2.05 bpw quant, 2 GPUs: 38k tokens saved at SIGTERM (1.4 GB
+  file), restored in 0.5 s at the next start, and the repeated 38k-token prompt then prefilled 7 tokens
+  (snapshot reuse) in 0.3 s end to end.
 
 ## 3. What a cache entry is on a hybrid model
 

@@ -134,11 +134,16 @@ code prompt 62.8 -> 77 tok/s (MTP window 3), T=1.0 ~63; needle at 64k depth corr
 LESSONS L167 for what changed (shared expert fork in the graphs, DSA selection kernels, device-side draft chain).
 
 ## Open
-- RAM store / slots / hot-reload state file for this model (the engine's generic store assumes the dense
-  (1, kvh, n, hd) cache; the QSA layers have K, V, raw indexer keys and pooled keys on the owner rank only,
-  ~50 KB per token over the 12 attention layers, plus 36 GDN states, the MTP cache and the PLE state): needs
-  `cache_bytes` / `cache_export` / `cache_import` / `new_slot` hooks next to `aux_get` / `aux_set`.
-- Fused router (softmax + top-10 of 512), attention head-parallel split, fewer gated-residual kernels.
+- Q8 KV pools for the QSA caches (the 2.05 bpw quant on 48 GB uses 23.6 of 24 GB per GPU at ctx 131072).
+- Attention head-parallel split, fewer gated-residual kernels, stage-staggered decode of several sequences.
+
+## Other checkpoints
+
+- 4.05 bpw: the MTP block's mixer is in the main checkpoint (no `mtp_hyper_connection_mixer_patch` file).
+- 2.05 bpw (turboderp `2.05bpw_h4_ng4`, 36.4 GB of weights): the n-gram table is 128 consecutive shards of
+  (2,500,012, 41) int16 (K = 4, 26 GB); `build_ple` addresses them as one table (`stfile.gather_async` with
+  `total_rows`). Fits two 24 GB GPUs at ctx 131072 (`--gpus 2 --tp --stages 1`): decode 15.0 ms/token, MTP
+  ~94-112 tok/s, needle at 38k correct, prefill ~1.2k tok/s.
 
 - Balance the TP attention layers (the owner rank runs the QSA chain alone, ~285 us
   of arrival spread per attention layer) and the expert-parallel MoE.
