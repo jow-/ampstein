@@ -9589,8 +9589,8 @@ torch_st_gather_async(uc_vm_t *vm, size_t nargs)
 	if (!f)
 		return NULL;
 
-	if (nargs != 3 || ucv_type(name) != UC_STRING) {
-		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (name, rows, out)");
+	if ((nargs != 3 && nargs != 4) || ucv_type(name) != UC_STRING) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (name, rows, out, total_rows?)");
 		return NULL;
 	}
 
@@ -9613,6 +9613,22 @@ torch_st_gather_async(uc_vm_t *vm, size_t nargs)
 		RAISE("gather_async: not a row-major table");
 
 	int64_t row_bytes = (int64_t)(nbytes / (size_t)nrows);
+
+	/* total_rows: the table is stored as consecutive equal shards (name = the first one): the rows run on through
+	 * the file past the first tensor */
+	if (nargs == 4) {
+		int64_t total;
+
+		if (!arg_int(vm, uc_fn_arg(3), &total) || total < nrows)
+			RAISE("gather_async: total_rows must be an integer >= the first shard's rows");
+
+		struct stat sb;
+
+		if (fstat(f->fd, &sb) != 0 || (int64_t)(f->data_off + offset) + total * row_bytes > (int64_t)sb.st_size)
+			RAISE("gather_async: total_rows run past the end of the file");
+
+		nrows = total;
+	}
 
 	if (rows->scalar_type() != at::kLong || rows->is_cuda() || !rows->is_contiguous() ||
 	    out->is_cuda() || !out->is_contiguous() || out->dim() != 2 || out->size(0) < rows->numel() ||

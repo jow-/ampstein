@@ -54,6 +54,7 @@ export function load_config(model_dir) {
 	cfg.ple_kernel = t.ple_conv_kernel_size;
 	cfg.ngram_size = t.ngram_size;
 	cfg.heads_per_ngram = t.heads_per_ngram;
+	cfg.ngram_parts = t.split_ngram_parts;
 	cfg.sparse_threshold = 4 * (t.indexer_budget / t.indexer_compress_ratio) + 3;
 
 	if (cfg.output_gate_type != 'sigmoid')
@@ -128,7 +129,11 @@ export function build_ple(ws, cfg, idx, dev) {
 	let tab = weights.open(cfg.model_dir, 'ngram_embedding.safetensors');
 	let tk = `${key}.ple_embedding.ngram_embedding`;
 	let H = cfg.hc_mult, D = cfg.hidden_size;
-	let trellis = tab.tensor(tk + '.trellis');
+	// the n-gram table is one tensor (4 / 6 bpw checkpoints) or consecutive equal shards (ng4: 128 x (2.5 M, 41)),
+	// which lie back to back in the file: gathers address them as one table
+	let sharded = !tab.has(tk + '.trellis');
+	let tname = sharded ? tk + '.shard_0.trellis' : tk + '.trellis';
+	let trellis = tab.tensor(tname);
 
 	return {
 		dev: dev, idx: idx,
@@ -140,8 +145,9 @@ export function build_ple(ws, cfg, idx, dev) {
 		conv_w: ws.gpu(key + '.conv1d.weight', dev).contiguous(),
 		state_len: (cfg.ple_kernel - 1) * cfg.ngram_size,
 		trellis: trellis,                                                    // (rows, 1 + 10 K) int16, mmap
-		file: tab.file(tk + '.trellis'),                                     // the same table for row gathers
-		wname: tk + '.trellis',
+		file: tab.file(tname),                                               // the same table for row gathers
+		wname: tname,
+		total_rows: sharded ? trellis.shape()[0] * cfg.ngram_parts : null,
 		K: int((trellis.shape()[1] - 1) / 10),                               // 6 (the 4/6 bpw checkpoints), 4 (ng4)
 		words: trellis.shape()[1],
 		offsets: tab.tensor(tk + '.head_offsets'),
@@ -196,7 +202,8 @@ export function ple_start(cfg, P, ctx_ids, token_ids) {
 	let packed = torch.empty([U, P.words], 'int16');
 
 	return {S: S, U: U, inverse: inverse, heads: heads, packed: packed,
-		ticket: P.file.gather_async(P.wname, u, packed), next: slice(hist, length(hist) - ctx)};
+		ticket: P.total_rows ? P.file.gather_async(P.wname, u, packed, P.total_rows) : P.file.gather_async(P.wname, u, packed),
+		next: slice(hist, length(hist) - ctx)};
 }
 
 export function ple_finish(cfg, P, job) {
