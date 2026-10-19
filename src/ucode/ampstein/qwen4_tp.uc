@@ -1128,13 +1128,15 @@ export function load(model_dir, opts) {
 				ent.out_stack = h[0].to('float16').to('float32');
 				ent.out_hid = qwen4.gr_mix(cfg, M.mixer[0], h[0])[1];
 
-				let vals = [], idxs = [];
+				let vals = [], idxs = [], sums = [];
 
 				for (let g = 0; g < Gs; g++) {
 					let l = tp.lm_heads[g].forward(ent.out_hid.cuda(md[g]).view([1, 1, D])).view([-1]);
+					let m = l.max().view([1]).to('float32');
 
-					push(vals, l.max().view([1]).to('float32').cuda(md[0]));
+					push(vals, m.cuda(md[0]));
 					push(idxs, l.argmax(-1).view([1]).cuda(md[0]));
+					push(sums, l.to('float32').sub(m).exp().sum().view([1]).cuda(md[0]));    // for the draft's confidence
 				}
 
 				ent.vals = torch.cat(vals, 0);
@@ -1144,6 +1146,9 @@ export function load(model_dir, opts) {
 				let best = ent.vals.argmax(-1).view([1]);
 
 				ent.tok = ent.voff.index(best).add(ent.idx.view([Gs, 1]).index(best)).view([1]);
+
+				// softmax probability of that token: 1 / sum_g sumexp_g * exp(max_g - max)
+				ent.conf = torch.cat(sums, 0).mul(ent.vals.sub(ent.vals.max()).exp()).sum().pow(-1.0).view([1]);
 			};
 
 			put(0);
@@ -1187,12 +1192,24 @@ export function load(model_dir, opts) {
 			/* W greedy draft steps chained on the device: step k embeds the token step k-1 picked, nothing is read back
 			 * until the W tokens are done. hidden: the target's flattened stack (1, 1, 4D) fp16; seed: the round's
 			 * first token (host); p: the target position of the seed. Returns the W token ids. */
-			ent.chain = function (seed, hidden, p, W) {
-				let acc = torch.zeros([W], 'int64', 'cuda:' + md[0]);
+			ent.chain = function (seed, hidden, p, W, n0, go) {
+				let acc = torch.zeros([2 * W], 'float32', 'cuda:' + md[0]);       // W tokens (exact in fp32), W confidences
 				let stack = hidden.reshape([1, H, D]).to('float32').cuda(M.dev);
 				let row = tp.embed_tokens.index(torch.from_array([ seed ], 'int64', 'cuda:' + devs[0]));
 
 				for (let k = 1; k <= W; k++) {
+					// the first n0 steps always; the others only when go(tokens, confidences so far) says the draft is
+					// promising (one host read of the n0 results, the chain state stays on the device)
+					if (go && k == n0 + 1) {
+						let r0 = acc.tolist();
+
+						if (!go(map(slice(r0, 0, n0), (x) => int(x)), slice(r0, W, W + n0))) {
+							W = n0;
+
+							break;
+						}
+					}
+
 					ent.emb.copy_(row.view([1, 1, D]).cuda(md[0]));
 					ent.stack.copy_(stack);
 					put(p + k);
@@ -1205,14 +1222,18 @@ export function load(model_dir, opts) {
 					for (let g = 1; g < Gs; g++)
 						ent.bar[g].copy_(ent.bar[0]);
 
-					acc.narrow(0, k - 1, 1).copy_(ent.tok);
+					acc.narrow(0, k - 1, 1).copy_(ent.tok.to('float32'));
+					acc.narrow(0, W + k - 1, 1).copy_(ent.conf);
 					stack = ent.out_stack;
 
 					if (k < W)
 						row = tp.embed_tokens.index(ent.tok.cuda(devs[0]));
 				}
 
-				return acc.tolist();
+				let r = acc.tolist();
+				let n = length(r) / 2;
+
+				return {tok: map(slice(r, 0, W), (x) => int(x)), conf: slice(r, n, n + W)};
 			};
 
 			return ent;
@@ -1251,8 +1272,8 @@ export function load(model_dir, opts) {
 
 		/* the greedy draft chain of a round without host reads between the steps (engine: replaces the
 		 * step-by-step loop when present) */
-		mtp_chain: function (seed, hidden, p, W) {
-			return this.mtp_g.chain(seed, hidden, p, W);
+		mtp_chain: function (seed, hidden, p, W, n0, go) {
+			return this.mtp_g.chain(seed, hidden, p, W, n0, go);
 		},
 
 		/* greedy draft token from a collapsed hidden (1 row) */

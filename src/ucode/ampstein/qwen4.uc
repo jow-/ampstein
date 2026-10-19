@@ -246,7 +246,7 @@ export function ple_apply(cfg, P, streams, emb, st) {
 
 	// speculative verify (the engine set st.spec_w = W): keep the conv tail after each
 	// of the first W-1 rows so a rejection restores it (engine: copy_many)
-	if (st.spec_w && S == st.spec_w)
+	if (st.spec_w && S >= 2 && S <= st.spec_w)
 		for (let i = 0; i < S - 1; i++)
 			st.spec_conv[i].copy_(cstream.narrow(2, i + 1, P.state_len));
 
@@ -271,19 +271,31 @@ function nf(t) {
 	return x.sub(x).abs().max().item() != 0.0;
 }
 
+const GDN_NO_ABG = getenv('AMP_QWEN4_NO_ABG') ? true : false;
+
 export function gdn_forward(cfg, L, x, cl) {
 	let S = x.shape()[1];
 	let Hv = cfg.ln_num_v_heads;
 	let qkv = L.in_proj_qkv.forward(x);
 	let z = L.in_proj_z.forward(x);
-	let b = L.in_proj_b.forward(x);
-	let a = L.in_proj_a.forward(x);
-	let gates = torch.gdn_gates(a.contiguous(), b.contiguous(), L.dt_bias, L.neg_exp_a_log);
+	let a = null, b = null, gates;
+
+	// decode and verify rows (S <= 8) with fp16 a / b weights: both products and the gate math in one launch (at 3 rows
+	// the two matmuls fall on a 15 us cuBLAS kernel each, per GDN layer)
+	if (S <= 8 && !GDN_NO_ABG && L.in_proj_a.weight != null && L.in_proj_a.bias == null && L.in_proj_b.bias == null &&
+	    L.in_proj_b.weight != null) {
+		gates = torch.gdn_ab_gates(x.contiguous(), L.in_proj_a.weight, L.in_proj_b.weight, L.dt_bias, L.neg_exp_a_log);
+	}
+	else {
+		b = L.in_proj_b.forward(x);
+		a = L.in_proj_a.forward(x);
+		gates = torch.gdn_gates(a.contiguous(), b.contiguous(), L.dt_bias, L.neg_exp_a_log);
+	}
 
 	// speculative verify (the engine set cl.spec_w = W and this is the W-token verify
 	// step): keep the state after each of the first W-1 tokens — the conv window per
 	// candidate here (before gdn_prep advances it), the recurrent state in the scan
-	let spec = cl.spec_w && S == cl.spec_w;
+	let spec = cl.spec_w && S >= 2 && S <= cl.spec_w;       // (any verify size up to the window: adaptive windows)
 
 	if (spec) {
 		let km1 = cl.conv_state.shape()[2];
@@ -297,7 +309,7 @@ export function gdn_forward(cfg, L, x, cl) {
 		cfg.ln_num_k_heads, Hv, cfg.ln_k_head_dim);
 	let core = spec ?
 		torch.gdn_scan(qkv3[0], qkv3[1], qkv3[2], gates[0], gates[1], cl.rec_state,
-			1.0 / math.sqrt(cfg.ln_k_head_dim), cl.spec_states) :
+			1.0 / math.sqrt(cfg.ln_k_head_dim), cl.spec_states.narrow(0, 0, S - 1)) :
 		torch.gdn_scan(qkv3[0], qkv3[1], qkv3[2], gates[0], gates[1], cl.rec_state,
 			1.0 / math.sqrt(cfg.ln_k_head_dim));
 

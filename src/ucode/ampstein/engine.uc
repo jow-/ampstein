@@ -459,6 +459,13 @@ export function create(model, opts) {
 	let mtp_planned = ((model.mtp || DF) && opts.mtp_window > 0) ? opts.mtp_window : 0;
 	let graph = null;
 
+	// adaptive verify length (model.mtp_chain: the draft chain on the device with a confidence per token): each round
+	// verifies the number of rows that maximises the expected tokens per millisecond
+	// (measured on the Qwen3.8-Flash-Next 2.05 bpw quant, 12 prompts x 2 temperatures: no gain over the fixed window 3 -
+	// the extra verify rows cost more than the extra accepted drafts bring - so it is opt-in: AMP_MTP_ADAPT=1)
+	const MTP_ADAPT = !!(model.mtp_chain && !DF && mtp_planned >= 2 && getenv('AMP_MTP_ADAPT') != null &&
+		opts.mtp_adaptive != false);
+
 	// per-position GDN states for MTP verify (W >= 2): the W-token verify
 	// forward keeps every GDN layer's recurrent + conv state after each
 	// of its first W-1 tokens (qwen35.gdn_forward, cl.spec_*), so a
@@ -525,8 +532,12 @@ export function create(model, opts) {
 				push(sizes, k);
 
 		// with per-position states only the verify size replays; the
-		// snapshot path re-runs 2..W-1 accepted tokens as well
-		if (spec)
+		// snapshot path re-runs 2..W-1 accepted tokens as well. An adaptive window (the chained draft with
+		// confidences) verifies any length up to the window: every size keeps its per-position states
+		if (spec && MTP_ADAPT)
+			for (let k = 2; k <= mtp_planned; k++)
+				push(sizes, k);
+		else if (spec)
 			push(sizes, mtp_planned);
 		else
 			for (let k = 2; k <= mtp_planned; k++)
@@ -2385,8 +2396,91 @@ export function create(model, opts) {
 	 * output's hidden (cache.hidden at verify time). mark/tm: MTP_TIMING
 	 * hooks — null from the async path, whose marks would measure host
 	 * enqueue, not device time. */
-	function mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows) {
-		let W = mtp_w;
+	/* --- adaptive verify length ---
+	 * ad.tv[S]: milliseconds of a verify step of S rows (measured, EMA); ad.fixed: the rest of a round (draft chain,
+	 * accept, host); ad.acc: how often a draft of a given confidence bin (per sampling class and depth class) was
+	 * accepted when it was examined. V = argmax over 1..window of E[tokens](V) / (fixed + tv[V]) with
+	 * E[tokens](V) = 1 + sum_{i <= V} prod_{k <= i} q_k, q_k = calibrated acceptance of draft k. */
+	const AD_NB = 10;
+	const AD_N0 = +(getenv('AMP_MTP_N0') || 3);            // drafts always made
+	const AD_EXT = +(getenv('AMP_MTP_EXT') || 0.35);      // chance that all of them are accepted above which the chain is extended
+	const AD_DEBUG = getenv('AMP_MTP_DEBUG') != null;
+	let ad = {tv: [], fixed: 6.0, acc: {}, rounds: 0};
+
+	for (let sz = 0; sz <= 16; sz++)
+		push(ad.tv, 16.0 + 3.5 * (sz > 0 ? sz - 1 : 0));
+
+	function ad_key(g, depth, conf) {
+		let b = int(min(max(conf, 0.0), 0.9999) * AD_NB);
+
+		return `${g}:${min(depth, 2)}:${b}`;
+	}
+
+	function ad_q(g, depth, conf) {
+		let st = ad.acc[ad_key(g, depth, conf)];
+		let pc = (int(min(max(conf, 0.0), 0.9999) * AD_NB) + 0.5) / AD_NB;
+		let n = st ? st.n : 0, k = st ? st.k : 0;
+
+		return (k + 3.0 * pc) / (n + 3.0);
+	}
+
+	// S rows verify S - 1 drafts (the last row's prediction is the bonus): a round yields min(a + 1, S) tokens, so
+	// E[tokens](S) = 1 + sum_{k=1}^{S-1} prod_{i <= k} q_i. conf[i]: the confidence of draft i + 1.
+	function ad_pick(conf, temp) {
+		let g = (temp <= 0) ? 0 : 1;
+		let cum = 1.0, E = 1.0, best = 1, bestv = E / (ad.fixed + ad.tv[1]);
+
+		for (let S = 2; S <= length(conf) + 1; S++) {
+			cum *= ad_q(g, S - 2, conf[S - 2]);
+			E += cum;
+
+			let v = E / (ad.fixed + ad.tv[S]);
+
+			if (v > bestv) {
+				bestv = v;
+				best = S;
+			}
+		}
+
+		return best;
+	}
+
+	// a round's outcome (V rows): drafts 1 .. min(a + 1, V - 1) were examined, those up to a accepted
+	function ad_learn(conf, temp, V, a, t_verify, t_round) {
+		let g = (temp <= 0) ? 0 : 1;
+
+		for (let i = 1; i <= min(a + 1, V - 1); i++) {
+			let k = ad_key(g, i - 1, conf[i - 1]);
+			let st = ad.acc[k] || (ad.acc[k] = {n: 0, k: 0});
+
+			st.n++;
+
+			if (i <= a)
+				st.k++;
+		}
+
+		ad.tv[V] = (ad.rounds < 6 ? 0.5 : 0.1) * t_verify + (ad.rounds < 6 ? 0.5 : 0.9) * ad.tv[V];
+		ad.fixed = 0.9 * ad.fixed + 0.1 * max(t_round - t_verify, 0.0);
+		ad.rounds++;
+		ad.vh = ad.vh || {};
+		ad.vh[V] = (ad.vh[V] || 0) + 1;
+
+		if (AD_DEBUG && ad.rounds % 100 == 0) {
+			let t = [], cal = [];
+
+			for (let sz = 1; sz <= mtp_w; sz++)
+				push(t, sprintf('%.1f', ad.tv[sz]));
+
+			for (let k in sort(keys(ad.acc)))
+				push(cal, sprintf('%s=%d/%d', k, ad.acc[k].k, ad.acc[k].n));
+
+			warn(sprintf('mtp-adapt: round %d V hist %J tv [%s] fixed %.1f cal %s\n', ad.rounds, ad.vh, join(' ', t), ad.fixed,
+				join(' ', cal)));
+		}
+	}
+
+	function mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows, V) {
+		let W = (V != null) ? V : mtp_w;
 
 		// a stop id among the accepted drafts ends the round there: it
 		// becomes the round's last token (the bonus), so a consumer that
@@ -2566,6 +2660,8 @@ export function create(model, opts) {
 		// draft chain
 		let c = [j.t_next];
 		let D = last_hidden;
+		let conf = null;          // the confidence of each draft (adaptive verify length)
+		let t_round0 = now_ms();
 		let temp = (s.temperature != null) ? s.temperature : 1.0;
 
 		// (a tensor-parallel model scores the draft with its vocabulary-
@@ -2640,8 +2736,23 @@ export function create(model, opts) {
 			push(c, ...DF.draft(j.t_next, df_pprev, cache.length));
 			df_pprev = cache.length;
 		}
-		else if (model.mtp_chain && sharded && !MTP_TIMING_STEPS && model.mtp_g)
-			push(c, ...model.mtp_chain(j.t_next, D, p, W));
+		else if (model.mtp_chain && sharded && !MTP_TIMING_STEPS && model.mtp_g) {
+			// the first AD_N0 drafts always; more only while the calibrated chance that all of them are accepted is high
+			let g0 = (temp <= 0) ? 0 : 1;
+			// W rows verify W - 1 drafts: the last row only yields the bonus, so a W-th draft would be wasted
+			let nmax = W - 1;
+			let ch = model.mtp_chain(j.t_next, D, p, nmax, min(AD_N0, nmax), (!MTP_ADAPT || nmax <= AD_N0) ? null : function (tk, cf) {
+				let cum = 1.0;
+
+				for (let i = 0; i < length(cf); i++)
+					cum *= ad_q(g0, i, cf[i]);
+
+				return cum >= AD_EXT;
+			});
+
+			push(c, ...ch.tok, -1);          // (the dummy never matches: no accepted-all case, the bonus comes from the last row)
+			conf = ch.conf;
+		}
 		else
 		for (let k = 1; k <= W; k++) {
 			let r = mtp_run([c[k - 1]], D, p + k, sharded ? null : (draft_head || model.lm_head));
@@ -2667,8 +2778,16 @@ export function create(model, opts) {
 
 		mark('snapshot');
 
-		let vlogits = step_fwd(slice(c, 0, W));
-		let vrows = vlogits.view([W, -1]);
+		let V = (conf && MTP_ADAPT && ad) ? ad_pick(conf, temp) : W;
+
+		if (conf && V < W) {
+			c = slice(c, 0, V);
+			push(c, -1);
+		}
+
+		let t_v0 = now_ms();
+		let vlogits = step_fwd(slice(c, 0, V));
+		let vrows = vlogits.view([V, -1]);
 		let vhidden = cache.hidden;
 
 		mark('verify');
@@ -2679,10 +2798,10 @@ export function create(model, opts) {
 		if (temp <= 0) {
 			let vpred = vrows.argmax(-1).tolist();
 
-			while (a < W && vpred[a] == c[a + 1])
+			while (a < V && vpred[a] == c[a + 1])
 				a++;
 
-			if (a < W)
+			if (a < V)
 				bonus = vpred[a];
 		}
 		else {
@@ -2690,7 +2809,7 @@ export function create(model, opts) {
 			// row right away; the emit loop below counts only the bonus
 			let cnt = counts_for(j, vrows);
 
-			for (let k = 0; k < W; k++) {
+			for (let k = 0; k < V; k++) {
 				let x = c[k + 1];
 				let r = spec_step(dist(vrows.narrow(0, k, 1), s, cnt), x);
 
@@ -2705,7 +2824,10 @@ export function create(model, opts) {
 			}
 		}
 
-		mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows);
+		if (conf && MTP_ADAPT)
+			ad_learn(conf, temp, V, a, now_ms() - t_v0, now_ms() - t_round0);
+
+		mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows, V);
 	}
 
 	/* a speculative round keeps the first L rows: the cache length, and the model's own state of the rows

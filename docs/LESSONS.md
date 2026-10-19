@@ -687,3 +687,19 @@ slot and the first long prompt then ran out of memory with 800 MiB "free". `allo
 the warm-up's cached bytes free on top of the margin, takes the slots and warms up again. A continuation of two
 identical engines agrees on only 4 of 12 greedy tokens in about half of the runs (near-ties), so
 `engine_store_qwen4` judges a restored state by not diverging at once.
+
+## L169 — Speculative rounds: W rows verify W - 1 drafts; an adaptive window did not pay
+
+A verify of S rows yields min(a + 1, S) tokens (a = accepted drafts): the last row only produces the bonus, so the
+W-th draft of a window-W round was wasted work (a draft step is ~1.2 ms). The TP chain now makes W - 1 drafts and a
+dummy that never matches (same tokens, same cache state). `gdn_ab_gates` (the a / b projections + gate math in one
+launch, already used by Qwen3.5) replaces two cuBLAS calls (15 us each at 2-8 rows) per GDN layer: -0.6 ms per
+verify step. Measured step times on the 2.05 bpw quant, 2 GPUs: S = 1 14.6 ms, then 17.5 / 19.0 / 20.7 / 23.1 /
+25.5 ms for S = 2..6 (the m = 1 int8 GEMV path is ~2 ms cheaper than anything at m >= 2; per extra row MoE +0.6,
+all-reduce waits +0.5, projections +0.5 ms).
+The adaptive variant (draft chain with a confidence per token from the sharded head's softmax, calibrated online per
+confidence bin, rows chosen by expected tokens per millisecond, `AMP_MTP_ADAPT=1`, verify graphs for every size)
+works and its calibration is good (draft confidence >= 0.9 is accepted 98%), but over 12 prompts x 2 temperatures
+(4800 tokens each): fixed window 3: 93.6 / 86.1 tok/s (T = 0 / 0.7), adaptive up to 6: 92.6 / 85.4, up to 7:
+88.3 / 85.9; fixed 4: 88.3 / 79.7. More accepted drafts per round (2.6 vs 2.2 tokens) cost as much in verify rows
+and draft steps as they return, so it is off by default. The lever is the cost of a row, not the window.
