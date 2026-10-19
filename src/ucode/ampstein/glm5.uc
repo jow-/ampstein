@@ -1085,16 +1085,26 @@ function moe_sorted_finish(cfg, M, p) {
 			let inv = p.prep ? p.inv : p.order.to('float32').neg().topk(p.A, 0).indices;      // argsort of the permutation
 			let kind = p.prep ? p.kind : torch.ones([E + 1], 'int64', dv).sub(count.le(0).to('int64'));
 
-			torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 33, FUSED_ROWS, 64, scratch, start);
-			torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 17, 32, 32, scratch, start);
-			torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 1, 16, 16, scratch, start);
+			if (M.coop.mul1) {
+				torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 33, FUSED_ROWS, 64, scratch, start);
+				torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 17, 32, 32, scratch, start);
+				torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 1, 16, 16, scratch, start);
+			}
+			else {
+				// (the 32 / 64 row tiles exist for the mul1 codebook only: one tier of 16 row tiles)
+				torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 1, FUSED_ROWS, 16, scratch, start);
+			}
 			torch.moe_gather(out, scratch, p.fe, inv, start.narrow(0, 0, E), start.narrow(0, 0, E),
 				kind.narrow(0, 0, E), wts);
 		}
 		else {
-			torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 33, FUSED_ROWS, 64);
-			torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 17, 32, 32);
-			torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 1, 16, 16);
+			if (M.coop.mul1) {
+				torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 33, FUSED_ROWS, 64);
+				torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 17, 32, 32);
+				torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 1, 16, 16);
+			}
+			else
+				torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 1, FUSED_ROWS, 16);
 		}
 
 		return M.shared ? out.add(shared_out(cfg, M, y)) : out;
@@ -1120,6 +1130,8 @@ function moe_sorted_finish(cfg, M, p) {
 
 		if (cl[e] == 0)
 			continue;
+		else if (!c.mul1 && cl[e] <= FUSED_ROWS)
+			n0++;                                  // mcg: 16-row tiles for every expert the kernel holds
 		else if (cl[e] <= 16)
 			n0++;
 		else if (cl[e] <= 32)
@@ -1132,9 +1144,13 @@ function moe_sorted_finish(cfg, M, p) {
 
 	let yc = y.contiguous();
 
-	if (n2) torch.moe_fused(yc, out, count, tok, wts, c, n2, 33, FUSED_ROWS, 64);
-	if (n1) torch.moe_fused(yc, out, count, tok, wts, c, n1, 17, 32, 32);
-	if (n0) torch.moe_fused(yc, out, count, tok, wts, c, n0, 1, 16, 16);
+	if (c.mul1) {
+		if (n2) torch.moe_fused(yc, out, count, tok, wts, c, n2, 33, FUSED_ROWS, 64);
+		if (n1) torch.moe_fused(yc, out, count, tok, wts, c, n1, 17, 32, 32);
+		if (n0) torch.moe_fused(yc, out, count, tok, wts, c, n0, 1, 16, 16);
+	}
+	else if (n0)
+		torch.moe_fused(yc, out, count, tok, wts, c, n0, 1, FUSED_ROWS, 16);
 
 	for (let e in heavy) {
 		let rt = tok.narrow(0, starts[e], cl[e]);
@@ -1166,7 +1182,7 @@ export function moe_begin(cfg, M, y) {
 		if (M.coop && T <= COOP_ROWS)
 			return {done: moe_forward_fused(cfg, M, y)};
 
-		if (M.coop && M.coop.mul1 && !getenv('AMP_GLM5_NO_SORTED'))
+		if (M.coop && (M.coop.mul1 || M.coop.mcg) && !getenv('AMP_GLM5_NO_SORTED'))
 			return {sorted: moe_sorted_begin(cfg, M, y)};
 	}
 
