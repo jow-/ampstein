@@ -530,6 +530,20 @@ amp_image_prepare(const unsigned char *data, size_t len,
 		size_t r = (((size_t)a * (gw / m) + b) * m + i) * m + j;
 		float *o = patches + r * row;
 
+		if (p->hwc) {
+			for (int py = 0; py < ps; py++)
+			for (int px = 0; px < ps; px++)
+			for (int c = 0; c < 3; c++) {
+				int y = (a * m + i) * ps + py;
+				int x = (b * m + j) * ps + px;
+				float v = (float)rs[((size_t)y * nw + x) * 3 + c] * rescale;
+
+				*o++ = (v - p->mean[c]) / p->std[c];
+			}
+
+			continue;
+		}
+
 		for (int c = 0; c < 3; c++)
 		for (int t = 0; t < tp; t++)
 		for (int py = 0; py < ps; py++)

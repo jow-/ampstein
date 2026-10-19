@@ -20,7 +20,7 @@ import * as models from './models.uc';
 import * as weights from './weights.uc';
 import * as glm5 from './glm5.uc';
 import * as math from 'math';
-import {readfile} from 'fs';
+import {readfile, stat} from 'fs';
 
 const LP = 'model.language_model.layers.';
 const EMBED_SCALE = 53.0;        // bf16(sqrt(2816))
@@ -55,7 +55,8 @@ export function load_config(model_dir) {
 		act: 'gelu',
 		eos_token_id: c.eos_token_id,
 		bos_token_id: t.bos_token_id,
-		image_token_id: c.image_token_id
+		image_token_id: c.image_token_id,
+		has_vision: (c.vision_config != null && c.image_token_id != null && stat(model_dir + '/processor_config.json') != null)
 	};
 
 	if (t.hidden_size_per_layer_input)
@@ -299,7 +300,7 @@ function ring_rows(t, a, b, ring) {
 
 /* sliding-window attention of a prefill chunk (T rows) as fused sdpa with an explicit window mask over the keys
  * [pos0 - (win - 1), pos0 + T): K / V heads expanded to the q heads, scale 1 */
-function window_attn(cfg, L, q, cl, pos0, T, ring) {
+function window_attn(cfg, L, q, cl, pos0, T, ring, vspans) {
 	let nh = L.nh, kvh = L.kvh, hd = L.hd, win = cfg.sliding_window;
 	let rep = int(nh / kvh);
 	let dv = 'cuda:' + L.dev;
@@ -314,7 +315,17 @@ function window_attn(cfg, L, q, cl, pos0, T, ring) {
 	let qpos = torch.arange(T, 'float32', dv).add(pos0 * 1.0).view([T, 1]);
 	let kpos = torch.arange(len, 'float32', dv).add(kst * 1.0).view([1, len]);
 	let d = qpos.sub(kpos);
-	let ok = d.neg().le(0.0).to('float32').mul(d.le(win - 1.0).to('float32')).neg().le(-0.5);
+	let acc = d.neg().le(0.0).to('float32').mul(d.le(win - 1.0).to('float32'));
+
+	// the rows of one image attend to each other in both directions (sliding layers only)
+	for (let sp in (vspans || [])) {
+		let inq = qpos.sub(sp[0] * 1.0).neg().le(0.0).to('float32').mul(qpos.sub(sp[1] - 1.0).le(0.0).to('float32'));
+		let ink = kpos.sub(sp[0] * 1.0).neg().le(0.0).to('float32').mul(kpos.sub(sp[1] - 1.0).le(0.0).to('float32'));
+
+		acc = acc.add(inq.mul(ink));
+	}
+
+	let ok = acc.neg().le(-0.5);
 	let o = torch.sdpa(q.transpose(0, 1).unsqueeze(0), heads(cl.k), heads(cl.v), false, ok, false, 1.0);
 
 	return o.transpose(1, 2).reshape([T, nh * hd]);
@@ -377,8 +388,8 @@ export function attn_forward(cfg, L, a, cl, pos0, ctx) {
 	}
 
 	// prefill chunks: fused sdpa with a window mask; decode / verify rows: the gathered kernel over the window's slots
-	if (T >= 64 && !getenv('AMP_GEMMA4_NO_SDPA'))
-		return L.o.forward(window_attn(cfg, L, q.view([T, nh, hd]), cl, pos0, T, ring));
+	if ((T >= 64 || ctx.vspans) && !getenv('AMP_GEMMA4_NO_SDPA'))
+		return L.o.forward(window_attn(cfg, L, q.view([T, nh, hd]), cl, pos0, T, ring, ctx.vspans));
 
 	let o = torch.qsa_attn(q.view([T, nh, hd]).contiguous(), cl.k, cl.v, ctx.widx, 1.0);
 
@@ -461,6 +472,117 @@ function block_forward(cfg, L, x, cl, pos0, ctx) {
 /* ------------------------------------------------------------------ */
 /* model                                                               */
 
+/* ------------------------------------------------------------------ */
+/* multimodal rows                                                     */
+
+/* the image spans of a prompt: images = [{start, emb (n, hidden) fp16}] -> {spans: [{start, n, emb}]} */
+export function mm_build(cfg, images) {
+	if (!images || !length(images))
+		return null;
+
+	let spans = [], prev_end = 0;
+
+	for (let im in images) {
+		let n = im.emb ? im.emb.shape()[0] : im.n;
+
+		if (im.start < prev_end)
+			die('gemma4: overlapping or unordered image spans');
+
+		push(spans, {start: im.start, n: n, emb: im.emb});
+		prev_end = im.start + n;
+	}
+
+	return {spans: spans};
+}
+
+/* [start, end) pairs of the image spans that touch the rows [pos0, pos0 + n) (null: none) */
+export function mm_spans(mm, pos0, n) {
+	if (!mm)
+		return null;
+
+	let out = [];
+
+	for (let sp in mm.spans)
+		if (sp.start < pos0 + n && sp.start + sp.n > pos0)
+			push(out, [ sp.start, sp.start + sp.n ]);
+
+	return length(out) ? out : null;
+}
+
+/* embeddings (n, hidden) fp32 of the token ids at pos0 on device dev: the text rows scaled, the image rows (marker ids
+ * >= 2^30) replaced by the tower's embeddings, which are not scaled */
+export function embed_rows(embed_t, token_ids, pos0, mm, dev) {
+	let n = length(token_ids);
+	let ids = mm ? map(token_ids, (t) => (t >= 1073741824) ? 0 : t) : token_ids;
+	let x = embed_t.index(torch.from_array(ids, 'int64', 'cuda:' + dev)).to('float32').mul(EMBED_SCALE);
+
+	for (let sp in (mm ? mm.spans : [])) {
+		let a = max(sp.start, pos0), b = min(sp.start + sp.n, pos0 + n);
+
+		if (b > a)
+			x.narrow(0, a - pos0, b - a).copy_(sp.emb.narrow(0, a - sp.start, b - a).to('float32').cuda(dev));
+	}
+
+	return x;
+}
+
+/* The chunk boundaries (sorted, the last one the end) of a prefill of `total` rows at `start`: every `chunk` rows plus the
+ * extra cuts, with no boundary inside an image span (its rows attend to each other, so one chunk must hold them all)
+ * unless the chunk would outgrow `cap` rows. */
+export function plan_bounds(start, total, chunk, cuts, mm, cap) {
+	let end = start + total;
+	let bounds = [];
+
+	for (let p = start + chunk; p < end; p += chunk)
+		push(bounds, p);
+
+	for (let c in (cuts || []))
+		if (c > start && c < end && index(bounds, c) < 0)
+			push(bounds, c);
+
+	for (let sp in (mm ? mm.spans : []))
+		for (let c in [ sp.start, sp.start + sp.n ])
+			if (c > start && c < end && index(bounds, c) < 0)
+				push(bounds, c);
+
+	bounds = sort(bounds, (a, b) => a - b);
+
+	if (mm) {
+		let keep = [], prev = start;
+
+		for (let b in bounds) {
+			let inside = false;
+
+			for (let sp in mm.spans)
+				if (sp.start < b && b < sp.start + sp.n)
+					inside = true;
+
+			if (inside) {
+				// move on to the end of the span unless that makes the chunk too long
+				let e = b;
+
+				for (let sp in mm.spans)
+					if (sp.start < b && b < sp.start + sp.n)
+						e = sp.start + sp.n;
+
+				if (e - prev > cap)
+					inside = false;
+			}
+
+			if (!inside) {
+				push(keep, b);
+				prev = b;
+			}
+		}
+
+		bounds = keep;
+	}
+
+	push(bounds, end);
+
+	return bounds;
+}
+
 export function load(model_dir, opts) {
 	opts = opts || {};
 
@@ -518,7 +640,7 @@ export function load(model_dir, opts) {
 			};
 
 	let model = {
-		cfg: cfg, devs: devs, ws: ws, layers: layers, embed_tokens: embed_t, ring: ring, invs: invs, chunk_cap: chunk_cap,
+		cfg: cfg, devs: devs, ws: ws, layers: layers, embed_tokens: embed_t, ring: ring, invs: invs, chunk_cap: chunk_cap, mm_build: mm_build,
 		norm: ws.gpu16('model.language_model.norm.weight', last),
 		lm_head: models.linear(ws, 'lm_head', false, last),
 
@@ -559,8 +681,8 @@ export function load(model_dir, opts) {
 			}
 
 			let pos0 = cache.length;
-			let ids = torch.from_array(token_ids, 'int64', 'cuda:' + first);
-			let x = embed_t.index(ids).to('float32').mul(EMBED_SCALE);
+			let x = embed_rows(embed_t, token_ids, pos0, cache.mm, first);
+			let vsp = mm_spans(cache.mm, pos0, n);
 			let dev = first;
 			let ctx = null;
 
@@ -576,7 +698,8 @@ export function load(model_dir, opts) {
 						ring: ring,
 						cs_l: rope_cs(invs[dev].l, pos0, n, dev),
 						cs_g: rope_cs(invs[dev].g, pos0, n, dev),
-						widx: (n < 64 || getenv('AMP_GEMMA4_NO_SDPA')) ? window_idx(pos0, n, cfg.sliding_window, ring, dev) : null
+						vspans: vsp,
+						widx: ((n < 64 && !vsp) || getenv('AMP_GEMMA4_NO_SDPA')) ? window_idx(pos0, n, cfg.sliding_window, ring, dev) : null
 					};
 				}
 
@@ -719,10 +842,9 @@ export function load(model_dir, opts) {
 		},
 
 		/* The first stage's work on a chunk: embedding + its layers; stage_run() continues on the next device. */
-		stage_begin: function (token_ids, pos0) {
-			let ids = torch.from_array(token_ids, 'int64', 'cuda:' + first);
-
-			return {pos0: pos0, n: length(token_ids), x: embed_t.index(ids).to('float32').mul(EMBED_SCALE), dev: first, ctx: null};
+		stage_begin: function (token_ids, pos0, mm) {
+			return {pos0: pos0, n: length(token_ids), x: embed_rows(embed_t, token_ids, pos0, mm, first), dev: first, ctx: null,
+				vspans: mm_spans(mm, pos0, length(token_ids))};
 		},
 
 		/* chunk c arrives at the stage that starts at layer i0: moves to its device, builds the per-device tables */
@@ -742,7 +864,8 @@ export function load(model_dir, opts) {
 					ring: ring,
 					cs_l: rope_cs(invs[dev].l, c.pos0, c.n, dev),
 					cs_g: rope_cs(invs[dev].g, c.pos0, c.n, dev),
-					widx: (c.n < 64 || getenv('AMP_GEMMA4_NO_SDPA')) ? window_idx(c.pos0, c.n, cfg.sliding_window, ring, dev) : null
+					vspans: c.vspans,
+					widx: ((c.n < 64 && !c.vspans) || getenv('AMP_GEMMA4_NO_SDPA')) ? window_idx(c.pos0, c.n, cfg.sliding_window, ring, dev) : null
 				};
 		},
 
@@ -774,17 +897,7 @@ export function load(model_dir, opts) {
 			let model = this;
 			let chunk = min(opts.chunk || 1024, chunk_cap);
 			let start = cache.length, total = length(ids);
-			let bounds = [];
-
-			for (let p = start + chunk; p < start + total; p += chunk)
-				push(bounds, p);
-
-			for (let c in (opts.cuts || []))
-				if (c > start && c < start + total && index(bounds, c) < 0)
-					push(bounds, c);
-
-			bounds = sort(bounds, (a, b) => a - b);
-			push(bounds, start + total);
+			let bounds = plan_bounds(start, total, chunk, opts.cuts, cache.mm, chunk_cap);
 
 			// contiguous layer runs per device
 			let stages = [];
@@ -811,7 +924,7 @@ export function load(model_dir, opts) {
 							return;
 
 				let end = bounds[next++];
-				let c = model.stage_begin(slice(ids, prev - start, end - start), prev);
+				let c = model.stage_begin(slice(ids, prev - start, end - start), prev, cache.mm);
 
 				c.end = end;
 				prev = end;

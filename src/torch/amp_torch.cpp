@@ -9236,6 +9236,8 @@ torch_image_prepare(uc_vm_t *vm, size_t nargs)
 		}
 	}
 
+	p.hwc = ucv_is_truish(ucv_object_get(opts, "hwc", NULL)) ? 1 : 0;
+
 	if (p.patch_size < 1 || p.merge_size < 1 || p.temporal_patch_size < 1 ||
 	    p.max_pixels < 1)
 		RAISE("image_prepare: invalid geometry options");

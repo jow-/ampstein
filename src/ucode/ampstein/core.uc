@@ -32,6 +32,7 @@ import * as dsv41_spark_tp from './dsv41_spark_tp.uc';
 import * as qwen35 from './qwen35.uc';
 import * as qwen35_tp from './qwen35_tp.uc';
 import * as gemma4_tp from './gemma4_tp.uc';
+import * as gemma4_vision from './gemma4_vision.uc';
 import * as qwen35_vision from './qwen35_vision.uc';
 import * as glm5 from './glm5.uc';
 import * as glm5_tp from './glm5_tp.uc';
@@ -519,14 +520,15 @@ export function serve(args) {
 		if (!args.vision)
 			die('image input is disabled (--no-vision)');
 
-		if ((GLM || DS) ? !cfg.has_vision : !cfg.vision_merge)
+		if ((GLM || DS || GEM) ? !cfg.has_vision : !cfg.vision_merge)
 			die('this model has no (supported) vision tower');
 
 		if (!vis) {
 			let t = time();
 
 			warn(`ampstein: loading the vision tower on cuda:${args.vision_device}\n`);
-			vis = DS ? dsv4_vision.load(args.model, {device: args.vision_device}) : GLM ? glm5_vision.load(args.model, {
+			vis = GEM ? gemma4_vision.load(args.model, {device: args.vision_device}) :
+			DS ? dsv4_vision.load(args.model, {device: args.vision_device}) : GLM ? glm5_vision.load(args.model, {
 				device: args.vision_device,
 				max_tokens: int(args.image_max_pixels / 784)       // 28 x 28 pixels per row
 			}) : qwen35_vision.load(args.model, {
@@ -680,10 +682,17 @@ export function serve(args) {
 				continue;
 			}
 
+			// Gemma 4: begin-of-image, one row per soft token, end-of-image
+			if (GEM)
+				push(out, vis.cfg.boi);
+
 			push(images, {start: length(out), grid: e.grid, emb: e.emb});
 
 			for (let r = 0; r < e.n; r++)
 				push(out, e.marker);
+
+			if (GEM)
+				push(out, vis.cfg.eoi);
 
 			prev = pads[k] + 1;
 		}

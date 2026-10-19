@@ -32,6 +32,8 @@ struct amp_image_params {
 	 * (pad == 1: PIL ImageOps.pad, bicubic). Use merge_size = 1. */
 	int target_w, target_h;
 	int pad;
+	/* Gemma 4: every patch is flattened (y, x, channel) instead of (channel, t, y, x) */
+	int hwc;
 };
 
 struct amp_image_result {

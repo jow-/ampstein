@@ -31,6 +31,11 @@ References: transformers `modeling_gemma4.py`, exllamav3 `architecture/gemma4.py
   padded width (2176 = 1152 + 1024), experts expert-parallel (64 + 64), lm_head by vocabulary ranges; two all-reduces per layer
   (attention; dense MLP and experts stacked). Decode is GPU-bound on ~1700 small kernels per token, so tp gains only ~15%;
   tp prefill is slower than the pipeline (1350-1700 tok/s).
+- **Vision** (`gemma4_vision.uc`, text + image input, no video / audio): the 27-block tower (bf16 -> fp16 weights, fp32 residual)
+  on `--vision-device`, loaded on the first image. Images are resized (bicubic, aspect preserved, sides a multiple of 48, at most
+  280 x 9 patches), embedded to `n` soft tokens (<= 280) that replace `<|image|>` as `<|image> + n rows + <image|>`. The soft
+  tokens are not scaled by the embedding factor, and the rows of one image attend to each other in both directions in the sliding
+  layers (global layers stay causal), so prefill chunk boundaries never split an image (`plan_bounds`).
 - The RAM store / slots / hot reload are off (no `cache_export` yet).
 - Tokenizer: SentencePiece-style BPE (`tokenizer.c` spm mode: spaces -> U+2581, merges over the whole run, `<0xXX>` byte
   fallback); identical to the HF reference on the test strings (`examples/tok_ids.uc`).
@@ -42,4 +47,4 @@ References: transformers `modeling_gemma4.py`, exllamav3 `architecture/gemma4.py
 ## Open
 
 Fewer kernels per decode token (batched q/k/v and gate/up launches), a head-512 decode attention kernel (the global layers read
-the whole cache in fp32), vision tower, store / hot reload, KV quantization of the 5 global layers.
+the whole cache in fp32), store / hot reload, KV quantization of the 5 global layers.

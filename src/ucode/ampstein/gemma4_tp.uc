@@ -158,7 +158,7 @@ export function shard(model, opts) {
 		comm: torch.p2p_comm(devs, cap), comm_cap: cap,
 		comm_pf: (pf_rows > P2P_ROWS) ? torch.p2p_comm(devs, pf_rows * cfg.hidden_size) : null,
 		comm_pf_cap: pf_rows * cfg.hidden_size,
-		ring: ring, chunk_cap: chunk_cap,
+		ring: ring, chunk_cap: chunk_cap, mm_build: gemma4.mm_build,
 		embed_tokens: embed_t, norm: norms, lm_heads: heads, lm_head: model.lm_head,
 
 		new_cache: function (max_seq) {
@@ -186,12 +186,14 @@ export function shard(model, opts) {
 		},
 
 		/* the per-rank attention contexts of a chunk of n rows at pos0 */
-		contexts: function (pos0, n) {
+		contexts: function (pos0, n, mm) {
+			let vsp = gemma4.mm_spans(mm, pos0, n);
+
 			return map(devs, (d) => ({
-				ring: ring,
+				ring: ring, vspans: vsp,
 				cs_l: gemma4.rope_cs(invs[d].l, pos0, n, d),
 				cs_g: gemma4.rope_cs(invs[d].g, pos0, n, d),
-				widx: (n < 64 || getenv('AMP_GEMMA4_NO_SDPA')) ? gemma4.window_idx(pos0, n, cfg.sliding_window, ring, d) : null
+				widx: ((n < 64 && !vsp) || getenv('AMP_GEMMA4_NO_SDPA')) ? gemma4.window_idx(pos0, n, cfg.sliding_window, ring, d) : null
 			}));
 		},
 
@@ -281,8 +283,9 @@ export function shard(model, opts) {
 			}
 
 			let pos0 = cache.length;
-			let x = this.embed(torch.from_array(token_ids, 'int64', 'cuda:' + first));
-			let ctxs = this.contexts(pos0, n);
+			let x0 = gemma4.embed_rows(embed_t, token_ids, pos0, cache.mm, first);
+			let x = map(devs, (d, g) => (g == 0) ? x0 : x0.cuda(d));
+			let ctxs = this.contexts(pos0, n, cache.mm);
 
 			for (let i = 0; i < nl; i++)
 				x = this.layer(i, x, cache, pos0, ctxs);
@@ -297,17 +300,7 @@ export function shard(model, opts) {
 			let tp = this;
 			let chunk = min(opts.chunk || 1024, chunk_cap);
 			let start = cache.length, total = length(ids);
-			let bounds = [];
-
-			for (let q = start + chunk; q < start + total; q += chunk)
-				push(bounds, q);
-
-			for (let c in (opts.cuts || []))
-				if (c > start && c < start + total && index(bounds, c) < 0)
-					push(bounds, c);
-
-			bounds = sort(bounds, (a, b) => a - b);
-			push(bounds, start + total);
+			let bounds = gemma4.plan_bounds(start, total, chunk, opts.cuts, cache.mm, chunk_cap);
 
 			let next = 0, done = 0, logits = null;
 

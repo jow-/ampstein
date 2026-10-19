@@ -47,6 +47,12 @@ function text_of(c) {
 	return join('\n\n', parts);
 }
 
+/* A content part holding an image (the server collects them in order of appearance) */
+export function image_part(part) {
+	return type(part) == 'object' &&
+	       (part.type == 'image' || part.type == 'image_url' || part.image != null || part.image_url != null);
+}
+
 /* OpenAI messages -> the template's: the tool messages after an assistant message with calls become its
  * `tool_responses` (name, response); the answer that follows is merged into the same message */
 export function prepare(msgs, tools, ropts) {
@@ -92,7 +98,9 @@ export function prepare(msgs, tools, ropts) {
 			push(out, {role: 'user', content: text_of(m.content)});
 		}
 		else if (type(m.content) == 'array') {
-			push(out, {...m, content: (m.role == 'assistant' || m.role == 'system') ? text_of(m.content) : m.content});
+			// user parts: the template renders its own image placeholder for {type: 'image'}
+			push(out, {...m, content: (m.role == 'assistant' || m.role == 'system') ? text_of(m.content) :
+				map(m.content, (p) => image_part(p) ? {type: 'image'} : p)});
 		}
 		else
 			push(out, m);
@@ -107,7 +115,8 @@ export function prepare(msgs, tools, ropts) {
 
 export const tpl_opts = {
 	prepare: prepare,
-	gen: gen
+	gen: gen,
+	image_part: image_part
 };
 
 /* ------------------------------------------------------------------ */
