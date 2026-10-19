@@ -128,6 +128,7 @@ export function build_ple(ws, cfg, idx, dev) {
 	let tab = weights.open(cfg.model_dir, 'ngram_embedding.safetensors');
 	let tk = `${key}.ple_embedding.ngram_embedding`;
 	let H = cfg.hc_mult, D = cfg.hidden_size;
+	let trellis = tab.tensor(tk + '.trellis');
 
 	return {
 		dev: dev, idx: idx,
@@ -138,10 +139,11 @@ export function build_ple(ws, cfg, idx, dev) {
 		norm_conv: ws.gpu(key + '.norm_conv.weight', dev),
 		conv_w: ws.gpu(key + '.conv1d.weight', dev).contiguous(),
 		state_len: (cfg.ple_kernel - 1) * cfg.ngram_size,
-		trellis: tab.tensor(tk + '.trellis'),                                // (rows, 61) int16, mmap
+		trellis: trellis,                                                    // (rows, 1 + 10 K) int16, mmap
 		file: tab.file(tk + '.trellis'),                                     // the same table for row gathers
 		wname: tk + '.trellis',
-		K: 6,
+		K: int((trellis.shape()[1] - 1) / 10),                               // 6 (the 4/6 bpw checkpoints), 4 (ng4)
+		words: trellis.shape()[1],
 		offsets: tab.tensor(tk + '.head_offsets'),
 		sizes: tab.tensor(tk + '.head_vocab_sizes'),
 		mult: tab.tensor(tk + '.layer_multipliers'),
@@ -191,7 +193,7 @@ export function ple_start(cfg, P, ctx_ids, token_ids) {
 	let U = torch.ngram_hash(hist_t, S, P.mult, P.offsets, P.sizes,
 		cfg.heads_per_ngram, cfg.eos_token_id, uids, inverse, heads);
 	let u = uids.narrow(0, 0, U).contiguous();
-	let packed = torch.empty([U, 61], 'int16');
+	let packed = torch.empty([U, P.words], 'int16');
 
 	return {S: S, U: U, inverse: inverse, heads: heads, packed: packed,
 		ticket: P.file.gather_async(P.wname, u, packed), next: slice(hist, length(hist) - ctx)};
