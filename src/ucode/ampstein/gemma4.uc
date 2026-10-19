@@ -473,6 +473,168 @@ function block_forward(cfg, L, x, cl, pos0, ctx) {
 /* model                                                               */
 
 /* ------------------------------------------------------------------ */
+/* cache state: the window aux state, the host-RAM store, hot reload   */
+/*                                                                     */
+/* The sliding layers keep a ring: a state at length n is fully described by the last min(n, window) rows (position   */
+/* order), which is the aux state (a snapshot of the live ring: the rows survive the generation that follows, a       */
+/* rewind to the snapshot writes them back). The global layers keep rows [0, n) of their cache.                       */
+
+/* the per-rank cache entries of a layer: one object, or an array under tensor parallelism */
+function cl_list(c) {
+	return (type(c) == 'array') ? c : [ c ];
+}
+
+function is_sliding(cfg, i) {
+	return cfg.layer_types[i] != 'full_attention';
+}
+
+/* the rows (w, kvh, hd) of the positions [a, a + w) from / into a ring of `ring` rows */
+function ring_read(t, a, w, ring) {
+	return ring_rows(t, a, a + w, ring).add(0.0);
+}
+
+function ring_write(t, a, rows, ring) {
+	let w = rows.shape()[0], s0 = a % ring;
+
+	if (s0 + w <= ring)
+		t.narrow(0, s0, w).copy_(rows);
+	else {
+		t.narrow(0, s0, ring - s0).copy_(rows.narrow(0, 0, ring - s0));
+		t.narrow(0, 0, w - (ring - s0)).copy_(rows.narrow(0, ring - s0, w - (ring - s0)));
+	}
+}
+
+/* the aux state: {n, layers: [per layer: null (global) | per rank {k, v}: the last min(n, window) rows]} (device copies) */
+export function window_aux(cfg, cache, ring) {
+	let n = cache.length, w = min(n, cfg.sliding_window);
+	let layers = [];
+
+	for (let i = 0; i < cfg.num_hidden_layers; i++) {
+		let a = null;
+
+		if (is_sliding(cfg, i)) {
+			a = map(cl_list(cache.layers[i]), (cl) => ({k: ring_read(cl.k, n - w, w, ring), v: ring_read(cl.v, n - w, w, ring)}));
+
+			if (type(cache.layers[i]) != 'array')
+				a = a[0];
+		}
+
+		push(layers, a);
+	}
+
+	return {n: n, layers: layers};
+}
+
+/* write the window rows of aux back into the rings (the cache length is the caller's) */
+export function window_restore(cfg, cache, aux, ring) {
+	for (let i = 0; i < cfg.num_hidden_layers; i++) {
+		if (!is_sliding(cfg, i))
+			continue;
+
+		let cls = cl_list(cache.layers[i]), ax = cl_list(aux.layers[i]);
+
+		for (let r = 0; r < length(cls); r++) {
+			let w = ax[r].k.shape()[0];
+
+			ring_write(cls[r].k, aux.n - w, ax[r].k.cuda(cls[r].dev), ring);
+			ring_write(cls[r].v, aux.n - w, ax[r].v.cuda(cls[r].dev), ring);
+		}
+	}
+}
+
+/* bytes of a stored state of n tokens */
+export function state_bytes(cfg, cache, n) {
+	let b = 0;
+
+	for (let i = 0; i < cfg.num_hidden_layers; i++)
+		for (let cl in cl_list(cache.layers[i])) {
+			let sh = cl.k.shape();
+
+			b += 4 * sh[1] * sh[2] * (is_sliding(cfg, i) ? min(n, cfg.sliding_window) : n);
+		}
+
+	return b;
+}
+
+/* a value of an aux tree (tensors, arrays, objects) with every tensor passed through f */
+function aux_map(v, f) {
+	if (type(v) == 'resource')
+		return f(v);
+
+	if (type(v) == 'array')
+		return map(v, (x) => aux_map(x, f));
+
+	if (type(v) == 'object') {
+		let r = {};
+
+		for (let k in v)
+			r[k] = aux_map(v[k], f);
+
+		return r;
+	}
+
+	return v;
+}
+
+/* the store entry of the live state of n tokens: put(t) turns a device tensor into the entry's copy */
+export function state_export(cfg, cache, n, put, snap_aux, ring) {
+	let aux = window_aux(cfg, cache, ring);
+	let layers = [];
+
+	for (let i = 0; i < cfg.num_hidden_layers; i++) {
+		let cls = cl_list(cache.layers[i]);
+
+		push(layers, map(cls, (cl) => is_sliding(cfg, i) ? null : {k: put(cl.k.narrow(0, 0, n)), v: put(cl.v.narrow(0, 0, n))}));
+	}
+
+	return {n: n, layers: layers, win: aux_map(aux.layers, put),
+		snap: snap_aux ? {n: snap_aux.n, layers: aux_map(snap_aux.layers, put)} : null};
+}
+
+/* an aux tree of host tensors on the devices of the cache's layers */
+export function aux_to_device(cfg, cache, aux) {
+	let layers = [];
+
+	for (let i = 0; i < cfg.num_hidden_layers; i++) {
+		let a = aux.layers[i];
+
+		if (a == null) {
+			push(layers, null);
+			continue;
+		}
+
+		let cls = cl_list(cache.layers[i]), ax = cl_list(a);
+		let m = map(ax, (x, r) => aux_map(x, (t) => t.cuda(cls[r].dev)));
+
+		push(layers, (type(a) == 'array') ? m : m[0]);
+	}
+
+	return {n: aux.n, layers: layers};
+}
+
+/* back into the live buffers up to `start` tokens: start == em.n restores the live state, else the snapshot's */
+export function state_import(cfg, cache, em, start, live, ring) {
+	for (let i = 0; i < cfg.num_hidden_layers; i++) {
+		if (is_sliding(cfg, i))
+			continue;
+
+		let cls = cl_list(cache.layers[i]);
+
+		for (let r = 0; r < length(cls); r++) {
+			cls[r].k.narrow(0, 0, start).copy_(em.layers[i][r].k.narrow(0, 0, start));
+			cls[r].v.narrow(0, 0, start).copy_(em.layers[i][r].v.narrow(0, 0, start));
+		}
+	}
+
+	let src = live ? {n: em.n, layers: em.win} : em.snap;
+
+	window_restore(cfg, cache, src, ring);
+	cache.length = start;
+
+	return {snap: em.snap};
+}
+
+/* ------------------------------------------------------------------ */
 /* multimodal rows                                                     */
 
 /* the image spans of a prompt: images = [{start, emb (n, hidden) fp16}] -> {spans: [{start, n, emb}]} */
@@ -660,6 +822,29 @@ export function load(model_dir, opts) {
 			}
 
 			return cache;
+		},
+
+		/* Engine hooks (snapshot of the sliding rings, host-RAM store, hot reload): see window_aux */
+		aux_get: function (cache) {
+			return window_aux(cfg, cache, ring);
+		},
+
+		aux_set: function (cache, aux) {
+			window_restore(cfg, cache, aux, ring);
+		},
+
+		cache_bytes: function (cache, n) {
+			return state_bytes(cfg, cache, n);
+		},
+
+		cache_export: function (cache, n, put, snap_aux, dst) {
+			return state_export(cfg, cache, n, put, snap_aux, ring);
+		},
+
+		cache_import: function (cache, em, start, live) {
+			let r = state_import(cfg, cache, em, start, live, ring);
+
+			return {snap: r.snap ? aux_to_device(cfg, cache, r.snap) : null};
 		},
 
 		/* The token ids appended to the cache; returns the logits (rows, vocab) fp16 of the last `rows` positions

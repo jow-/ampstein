@@ -185,6 +185,29 @@ export function shard(model, opts) {
 			return cache;
 		},
 
+		/* engine hooks (snapshot of the sliding rings, host-RAM store, hot reload): see gemma4.window_aux */
+		aux_get: function (cache) {
+			return gemma4.window_aux(cfg, cache, ring);
+		},
+
+		aux_set: function (cache, aux) {
+			gemma4.window_restore(cfg, cache, aux, ring);
+		},
+
+		cache_bytes: function (cache, n) {
+			return gemma4.state_bytes(cfg, cache, n);
+		},
+
+		cache_export: function (cache, n, put, snap_aux, dst) {
+			return gemma4.state_export(cfg, cache, n, put, snap_aux, ring);
+		},
+
+		cache_import: function (cache, em, start, live) {
+			let r = gemma4.state_import(cfg, cache, em, start, live, ring);
+
+			return {snap: r.snap ? gemma4.aux_to_device(cfg, cache, r.snap) : null};
+		},
+
 		/* the per-rank attention contexts of a chunk of n rows at pos0 */
 		contexts: function (pos0, n, mm) {
 			let vsp = gemma4.mm_spans(mm, pos0, n);
