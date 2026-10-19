@@ -13,7 +13,9 @@ import { stat } from 'fs';
 const MODEL = getenv('AMP_MODEL_QWEN4') || '/data/models/Qwen3.8-Flash-Next-exl3-6.05bpw';
 const NGPU = +(getenv('AMP_QWEN4_GPUS') || 6);
 const STAGES = +(getenv('AMP_QWEN4_STAGES') || 3);
-const TOL = 8, N = 12;
+// greedy continuations of identical engines agree on only 4 of 12 tokens in about half the runs (near-tie logits,
+// atomics in the kernels: see the baseline line), so a restored state is judged by not diverging at once
+const TOL = 3, N = 12;
 
 if (!stat(MODEL) || torch.device_count() < NGPU) {
 	warn('skip: needs the Qwen3.8-Flash-Next model and ' + NGPU + ' GPUs\n');
@@ -114,6 +116,18 @@ for (let W in [ 3 ]) {
 	let A2 = [ ...A, ...a1.toks, ...TAIL ];        // extends A's live state
 	let A3 = [ ...slice(A, 0, length(A) - 20), ...TAIL, ...TAIL ];   // extends the snapshot only
 	let r2 = run_job(ref, A2, 0);
+
+	// how repeatable is a continuation at all (greedy near-ties, atomics): the same A then A2 on a second engine
+	{
+		let e0 = mk();
+
+		run_job(e0, A, length(A) - 20);
+
+		let r2b = run_job(e0, A2, 0);
+
+		printf('baseline: A2 continuation of two identical engines agrees on %d of %d tokens\n', same_head(r2.toks, r2b.toks),
+			length(r2.toks));
+	}
 
 	check(`W=${W}: reference A2 is a live continuation`, r2.info.reuse == 'live', r2.info.reuse);
 

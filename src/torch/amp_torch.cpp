@@ -9906,7 +9906,7 @@ extern "C" long
 amp_qsa_attn_ws_floats(int R, int Hq, int Hk, int E, int ns);
 
 extern "C" int
-amp_qsa_attn_fp16(const void *q, const void *kc, const void *vc, const int *idx,
+amp_qsa_attn_fp16(const void *q, const void *kc, const void *vc, const void *ks, const void *vs, const int *idx,
                  void *ws, void *out, int R, int Hq, int Hk, int E, int Kt,
                  int ns, float scale, cudaStream_t stream);
 
@@ -9914,7 +9914,9 @@ amp_qsa_attn_fp16(const void *q, const void *kc, const void *vc, const int *idx,
  * qsa_attn(q, k_cache, v_cache, idx, scale, splits?): out
  *
  * Gathered GQA attention (Qwen3.8-Flash-Next QSA): q (R, Hq, E) fp16, the K/V
- * caches (max_seq, Hk, E) fp16, idx (R, Kt) int32 — per query row the cache
+ * caches (max_seq, Hk, E) fp16 — or each [codes (max_seq, Hk, E) int8, scales
+ * (max_seq, Hk, E / 32) fp16], a Q8 cache dequantized while the kernel stages
+ * its tiles — idx (R, Kt) int32 — per query row the cache
  * rows it attends to, -1 = padding. Returns (R, Hq, E) fp16. splits: KV
  * splits per (row, kv head); default sized so the launch fills the GPU.
  */
@@ -9930,21 +9932,49 @@ torch_qsa_attn(uc_vm_t *vm, size_t nargs)
 	}
 
 	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
-	at::Tensor *kc = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
-	at::Tensor *vc = kc ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	at::Tensor *kc = NULL, *vc = NULL, *ksc = NULL, *vsc = NULL;
+	uc_value_t *ka = q ? uc_fn_arg(1) : NULL, *va = q ? uc_fn_arg(2) : NULL;
+
+	/* each cache: a tensor, or [codes, scales] */
+	if (ka && ucv_type(ka) == UC_ARRAY) {
+		if (ucv_array_length(ka) != 2 || !(kc = tensor_arg(vm, ucv_array_get(ka, 0))) ||
+		    !(ksc = tensor_arg(vm, ucv_array_get(ka, 1))))
+			return NULL;
+	}
+	else if (ka)
+		kc = tensor_arg(vm, ka);
+
+	if (kc && va && ucv_type(va) == UC_ARRAY) {
+		if (ucv_array_length(va) != 2 || !(vc = tensor_arg(vm, ucv_array_get(va, 0))) ||
+		    !(vsc = tensor_arg(vm, ucv_array_get(va, 1))))
+			return NULL;
+	}
+	else if (kc && va)
+		vc = tensor_arg(vm, va);
+
 	at::Tensor *idx = vc ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
 
 	if (!idx)
 		return NULL;
 
+	bool q8 = (ksc != NULL);
+	at::ScalarType cdt = q8 ? at::kChar : at::kHalf;
+
+	if ((ksc == NULL) != (vsc == NULL) ||
+	    (q8 && (ksc->scalar_type() != at::kHalf || vsc->scalar_type() != at::kHalf || !ksc->is_contiguous() ||
+	            !vsc->is_contiguous() || ksc->dim() != 3 || vsc->dim() != 3 || ksc->size(2) * 32 != kc->size(2) ||
+	            vsc->size(2) * 32 != kc->size(2) || ksc->size(0) != kc->size(0) || vsc->size(0) != kc->size(0) ||
+	            ksc->size(1) != kc->size(1) || vsc->size(1) != kc->size(1))))
+		RAISE("qsa_attn: a Q8 cache is [codes (max_seq, Hk, E) int8, scales (max_seq, Hk, E / 32) fp16] for K and V");
+
 	if (q->dim() != 3 || kc->dim() != 3 || vc->dim() != 3 || idx->dim() != 2 ||
-	    q->scalar_type() != at::kHalf || kc->scalar_type() != at::kHalf ||
-	    vc->scalar_type() != at::kHalf || idx->scalar_type() != at::kInt ||
+	    q->scalar_type() != at::kHalf || kc->scalar_type() != cdt ||
+	    vc->scalar_type() != cdt || idx->scalar_type() != at::kInt ||
 	    !q->is_contiguous() || !kc->is_contiguous() || !vc->is_contiguous() ||
 	    !idx->is_contiguous() || !q->is_cuda() || q->size(0) != idx->size(0) ||
 	    kc->size(1) != vc->size(1) || kc->size(2) != q->size(2) ||
 	    vc->size(2) != q->size(2) || q->size(1) % kc->size(1))
-		RAISE("qsa_attn: q (R, Hq, E) fp16, caches (max_seq, Hk, E) fp16, idx (R, Kt) int32, all contiguous CUDA");
+		RAISE("qsa_attn: q (R, Hq, E) fp16, caches (max_seq, Hk, E) fp16 (or Q8), idx (R, Kt) int32, all contiguous CUDA");
 
 	try {
 		TensorDeviceGuard dg(*q);
@@ -9968,7 +9998,8 @@ torch_qsa_attn(uc_vm_t *vm, size_t nargs)
 		at::Tensor out = at::empty({ R, Hq, E }, q->options());
 
 		if (!launch_ok(vm, amp_qsa_attn_fp16(q->data_ptr(), kc->data_ptr(),
-		    vc->data_ptr(), (const int *)idx->data_ptr(), ws.data_ptr(), out.data_ptr(),
+		    vc->data_ptr(), q8 ? ksc->data_ptr() : NULL, q8 ? vsc->data_ptr() : NULL,
+		    (const int *)idx->data_ptr(), ws.data_ptr(), out.data_ptr(),
 		    R, Hq, Hk, E, Kt, (int)sp, (float)scale,
 		    c10::cuda::getCurrentCUDAStream().stream()), "qsa_attn"))
 			return NULL;

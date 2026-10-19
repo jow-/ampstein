@@ -673,3 +673,17 @@ stream for `in_proj_z` beside the GDN conv/scan chain gained nothing (the projec
 rows cost ~3 ms each (S=3 24.3 ms, S=5 ~30 ms), so the window stays 3. Left: the router chain (~35 us per layer,
 fusable), the gated-residual mixes (~36 us per site, bandwidth/latency bound), attention head-parallelism, expert
 imbalance (EXL3 weights cannot be sharded along K, so experts stay expert-parallel).
+
+## L168 — Q8 KV for the QSA caches, and slots that ate the working set
+
+`--cache-mode Q8` now applies to Qwen3.8-Flash-Next: K and V are int8 codes + a fp16 scale per 32 values
+(`kv_q8_put` at write time, also with device-side positions in the decode graphs), and `qsa_attn` dequantizes while
+it stages its tiles (bit-identical to the fp16 kernel on the dequantized caches, `tests/qsa_attn.uc`). NLL of real
+text through the decode graphs at 14k context, 1500 scored positions: fp16 2.154 / 2.161, Q8 2.158 / 2.159 (the
+run-to-run spread of fp16 is as large as the difference). On the 2.05 bpw quant on two 24 GB GPUs at ctx 131072 it
+frees ~0.7 GB per GPU (23.6 -> 22.9). The saved/stored entries carry the codes, so they shrink as well.
+Resident slots are carved out of the allocator's cached blocks: the warm-up's working set was consumed by the first
+slot and the first long prompt then ran out of memory with 800 MiB "free". `alloc_slots` now returns the cache, keeps
+the warm-up's cached bytes free on top of the margin, takes the slots and warms up again. A continuation of two
+identical engines agrees on only 4 of 12 greedy tokens in about half of the runs (near-ties), so
+`engine_store_qwen4` judges a restored state by not diverging at once.

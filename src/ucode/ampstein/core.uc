@@ -236,8 +236,11 @@ export function serve(args) {
 
 	let kv_bits = (args.cache_mode == 'Q8') ? 8 : null;
 
-	if (kv_bits && !GLM)
-		warn('ampstein: --cache-mode Q8 is implemented for GLM only (ignored)\n');
+	if (kv_bits && !GLM && !Q4)
+		warn('ampstein: --cache-mode Q8 is implemented for GLM and Qwen3.8-Flash-Next only (ignored)\n');
+
+	if (kv_bits && Q4)
+		qwen4.set_kv_q8(true);      // the QSA K / V caches as int8 codes + a scale per 32 values
 
 	let model;
 

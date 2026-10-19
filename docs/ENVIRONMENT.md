@@ -160,6 +160,7 @@ Typical workflow (this is how the empty-split bug was found): run with
 | `AMP_QWEN4_QSA_REF` | off (only `1` enables) | Sparse attention via the composite ATen reference (`qsa_gather_attend_ref`) instead of the fused `torch.qsa_attn` kernel. **Useful to confirm or bypass kernel bugs** (it avoids the split-K workspace entirely). |
 | `AMP_QWEN4_MTP_TAP` | on (only `0` disables) | MTP input: per-stream stack (reference default) vs averaged. |
 | `AMP_QWEN4_NO_MTP_GRAPH` | unset | Do not CUDA-graph the MTP draft step. |
+| `AMP_QWEN4_KV` | unset | `q8`: the QSA K / V caches as int8 + scales without the server flag (benchmarks, tests; `--cache-mode Q8` sets it). |
 | `AMP_QWEN4_NO_PAR` | unset | TP decode graphs: no forked stream for the shared expert. |
 | `AMP_QWEN4_NO_DSEL` | unset | Decode token selection through the composite ATen chain instead of `idx_score` + `dsa_select`. |
 | `AMP_QWEN4_PLE_AHEAD` | `3` | TP prefill: chunks ahead of the wavefront whose PLE rows are read from disk. |

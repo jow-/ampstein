@@ -326,6 +326,67 @@ export function gdn_forward(cfg, L, x, cl) {
 	return L.out_proj.forward(o.view([1, S, cfg.ln_v_dim]));
 }
 
+/* ------------------------------------------------------------------ */
+/* the K / V cache of a full-attention layer: fp16 rows (max_seq, kvh, hd), or (set_kv_q8, --cache-mode Q8) int8      */
+/* codes + a fp16 scale per 32 values (kv_q8_put at write time, dequantized in the qsa_attn kernel's tile staging)    */
+
+let KV_Q8 = (getenv('AMP_QWEN4_KV') == 'q8');
+
+export function set_kv_q8(b) {
+	KV_Q8 = b ? true : false;
+}
+
+export function kv_alloc(cfg, max_seq, dv) {
+	let kvh = cfg.num_kv_heads, hd = cfg.head_dim;
+
+	if (!KV_Q8)
+		return {k_cache: torch.zeros([max_seq, kvh, hd], 'float16', dv),
+			v_cache: torch.zeros([max_seq, kvh, hd], 'float16', dv)};
+
+	let kq = torch.zeros([max_seq, kvh * hd], 'int8', dv), ks = torch.zeros([max_seq, kvh * hd / 32], 'float16', dv);
+	let vq = torch.zeros([max_seq, kvh * hd], 'int8', dv), vs = torch.zeros([max_seq, kvh * hd / 32], 'float16', dv);
+
+	return {kq: kq, ks: ks, vq: vq, vs: vs, kq3: kq.view([max_seq, kvh, hd]), ks3: ks.view([max_seq, kvh, hd / 32]),
+		vq3: vq.view([max_seq, kvh, hd]), vs3: vs.view([max_seq, kvh, hd / 32])};
+}
+
+/* rows kk, v (S, kvh, hd) fp16 into the cache at `pos`: a start row (integer) or an int64 tensor of S rows */
+function kv_put(cfg, cl, kk, v, pos, S) {
+	let w = cfg.num_kv_heads * cfg.head_dim;
+
+	if (cl.kq) {
+		torch.kv_q8_put(kk.reshape([S, w]).contiguous(), cl.kq, cl.ks, pos);
+		torch.kv_q8_put(v.reshape([S, w]).contiguous(), cl.vq, cl.vs, pos);
+	}
+	else if (type(pos) == 'int') {
+		cl.k_cache.narrow(0, pos, S).copy_(kk.view([S, cfg.num_kv_heads, cfg.head_dim]));
+		cl.v_cache.narrow(0, pos, S).copy_(v.view([S, cfg.num_kv_heads, cfg.head_dim]));
+	}
+	else {
+		cl.k_cache.index_copy_(0, pos, kk.view([S, cfg.num_kv_heads, cfg.head_dim]));
+		cl.v_cache.index_copy_(0, pos, v.view([S, cfg.num_kv_heads, cfg.head_dim]));
+	}
+}
+
+/* the cache arguments of torch.qsa_attn */
+function kv_k(cl) {
+	return cl.kq ? [ cl.kq3, cl.ks3 ] : cl.k_cache;
+}
+
+function kv_v(cl) {
+	return cl.kq ? [ cl.vq3, cl.vs3 ] : cl.v_cache;
+}
+
+/* rows [0, len) as fp16 (len, kvh, hd) */
+function kv_rows(cfg, cl, len) {
+	if (!cl.kq)
+		return [ cl.k_cache.narrow(0, 0, len), cl.v_cache.narrow(0, 0, len) ];
+
+	let sh = [ len, cfg.num_kv_heads, cfg.head_dim ];
+
+	return [ torch.kv_q8_get(cl.kq, cl.ks, 0, len).view(sh), torch.kv_q8_get(cl.vq, cl.vs, 0, len).view(sh) ];
+}
+
 const QSA_SCORE_ELEMS = 50331648;       // fp32 score elements per selection slab (192 MiB)
 
 /* ------------------------------------------------------------------ */
@@ -464,7 +525,7 @@ function qsa_gather_attend(cfg, cl, q, sel, R) {
 	let idx = torch.where(sel.ok.le(0.5), torch.full([1], -1, 'int64', dv), sel.tok)
 		.to('int32').contiguous();
 
-	return torch.qsa_attn(q.contiguous(), cl.k_cache, cl.v_cache, idx,
+	return torch.qsa_attn(q.contiguous(), kv_k(cl), kv_v(cl), idx,
 		1.0 / math.sqrt(cfg.head_dim * 1.0));
 }
 
@@ -526,15 +587,15 @@ export function attn_forward(cfg, L, x, cos, sin, cl, pos, mr) {
 	q = torch.qk_norm_rope(q, L.q_norm_w, mcos, msin, cfg.rotary_dim, eps);       // (1, S, nh, hd)
 	kk = torch.qk_norm_rope(kk, L.k_norm_w, mcos, msin, cfg.rotary_dim, eps);
 
-	cl.k_cache.narrow(0, pos, S).copy_(kk.view([S, kvh, hd]));
-	cl.v_cache.narrow(0, pos, S).copy_(v.view([S, kvh, hd]));
+	kv_put(cfg, cl, kk, v, pos, S);
 
 	let len = pos + S;
 	let attn;
 
 	if (len <= cfg.sparse_threshold) {
-		let K = cl.k_cache.narrow(0, 0, len).transpose(0, 1).unsqueeze(0).contiguous();
-		let V = cl.v_cache.narrow(0, 0, len).transpose(0, 1).unsqueeze(0).contiguous();
+		let kvr = kv_rows(cfg, cl, len);
+		let K = kvr[0].transpose(0, 1).unsqueeze(0).contiguous();
+		let V = kvr[1].transpose(0, 1).unsqueeze(0).contiguous();
 
 		attn = torch.attn_gate(torch.flash_attn(q.transpose(1, 2), K, V, true), g);
 	} else {
@@ -670,8 +731,7 @@ export function attn_forward_dev(cfg, L, x, cl, st) {
 		mcos, msin, cfg.rotary_dim, eps);
 	let v = L.v_proj.forward(x).view([1, S, kvh, hd]);
 
-	cl.k_cache.index_copy_(0, st.pos, kk.view([S, kvh, hd]));
-	cl.v_cache.index_copy_(0, st.pos, v.view([S, kvh, hd]));
+	kv_put(cfg, cl, kk, v, st.pos, S);
 
 	let o;
 
@@ -681,7 +741,7 @@ export function attn_forward_dev(cfg, L, x, cl, st) {
 		o = qsa_gather_attend(cfg, cl, q.view([S, nh, hd]), sel, S);
 	}
 	else {
-		o = torch.qsa_attn(q.view([S, nh, hd]).contiguous(), cl.k_cache, cl.v_cache, qsa_idx_dev(cfg, cl, qi, st, S),
+		o = torch.qsa_attn(q.view([S, nh, hd]).contiguous(), kv_k(cl), kv_v(cl), qsa_idx_dev(cfg, cl, qi, st, S),
 			1.0 / math.sqrt(cfg.head_dim * 1.0));
 	}
 
@@ -1024,8 +1084,7 @@ export function new_mtp_cache(cfg, max_seq, dev) {
 
 	return {
 		type: 'full_attention', dev: dev, length: 0,
-		k_cache: torch.zeros([max_seq, cfg.num_kv_heads, cfg.head_dim], 'float16', dv),
-		v_cache: torch.zeros([max_seq, cfg.num_kv_heads, cfg.head_dim], 'float16', dv),
+		...kv_alloc(cfg, max_seq, dv),
 		raw_k: torch.zeros([max_seq, cfg.indexer_head_dim], 'float16', dv),
 		pooled: torch.zeros([int(max_seq / cfg.indexer_compress_ratio) + 1,
 			cfg.indexer_head_dim], 'float16', dv),
@@ -1167,8 +1226,9 @@ export function load(model_dir, opts) {
 					cl.rec_state = torch.zeros([cfg.ln_num_v_heads, cfg.ln_k_head_dim,
 						cfg.ln_v_head_dim], 'float32', dv);
 				} else {
-					cl.k_cache = torch.zeros([max_seq, cfg.num_kv_heads, cfg.head_dim], 'float16', dv);
-					cl.v_cache = torch.zeros([max_seq, cfg.num_kv_heads, cfg.head_dim], 'float16', dv);
+					for (let k, x in kv_alloc(cfg, max_seq, dv))
+						cl[k] = x;
+
 					cl.raw_k = torch.zeros([max_seq, cfg.indexer_head_dim], 'float16', dv);
 					cl.pooled = torch.zeros([int(max_seq / cfg.indexer_compress_ratio) + 1,
 						cfg.indexer_head_dim], 'float16', dv);

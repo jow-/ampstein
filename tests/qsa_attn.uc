@@ -60,6 +60,31 @@ for (let sp in [ 0, 1, 4, 16 ]) {
 		ok = false;
 }
 
+// Q8 caches (int8 codes + a fp16 scale per 32 values, written by kv_q8_put): the kernel dequantizes while staging, so
+// the result must equal the fp16 kernel run on the dequantized caches bit for bit
+{
+	let kq = torch.zeros([MS, HK * E], 'int8', DEV), ks = torch.zeros([MS, HK * E / 32], 'float16', DEV);
+	let vq = torch.zeros([MS, HK * E], 'int8', DEV), vs = torch.zeros([MS, HK * E / 32], 'float16', DEV);
+
+	torch.kv_q8_put(kc.view([MS, HK * E]), kq, ks, 0);
+	torch.kv_q8_put(vc.view([MS, HK * E]), vq, vs, 0);
+
+	let kd = torch.kv_q8_get(kq, ks, 0, MS).view([MS, HK, E]), vd = torch.kv_q8_get(vq, vs, 0, MS).view([MS, HK, E]);
+
+	for (let sp in [ 0, 4 ]) {
+		let want8 = torch.qsa_attn(q, kd, vd, idx, scale, sp);
+		let got8 = torch.qsa_attn(q, [ kq.view([MS, HK, E]), ks.view([MS, HK, E / 32]) ],
+			[ vq.view([MS, HK, E]), vs.view([MS, HK, E / 32]) ], idx, scale, sp);
+		let d = got8.sub(want8).abs().max().item();
+
+		printf('Q8 splits %d: max |diff| vs the fp16 kernel on dequantized caches %g; rel-rms vs fp16 caches %.3e\n', sp, d,
+			rel(got8, torch.qsa_attn(q, kc, vc, idx, scale, sp)));
+
+		if (d != 0)
+			ok = false;
+	}
+}
+
 // determinism
 let a = torch.qsa_attn(q, kc, vc, idx, scale, 4), b = torch.qsa_attn(q, kc, vc, idx, scale, 4);
 

@@ -134,7 +134,7 @@ code prompt 62.8 -> 77 tok/s (MTP window 3), T=1.0 ~63; needle at 64k depth corr
 LESSONS L167 for what changed (shared expert fork in the graphs, DSA selection kernels, device-side draft chain).
 
 ## Open
-- Q8 KV pools for the QSA caches (the 2.05 bpw quant on 48 GB uses 23.6 of 24 GB per GPU at ctx 131072).
+- (done) Q8 KV: `--cache-mode Q8` (see L168); the 2.05 bpw quant on 48 GB then uses 22.9 of 24 GB per GPU at ctx 131072.
 - Attention head-parallel split, fewer gated-residual kernels, stage-staggered decode of several sequences.
 
 ## Other checkpoints

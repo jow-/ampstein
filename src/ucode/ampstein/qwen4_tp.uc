@@ -530,8 +530,7 @@ export function load(model_dir, opts) {
 				let rc = qwen35.rope_cache(cfg, max_seq, dev);
 
 				return {
-					k_cache: torch.zeros([max_seq, cfg.num_kv_heads, cfg.head_dim], 'float16', dv),
-					v_cache: torch.zeros([max_seq, cfg.num_kv_heads, cfg.head_dim], 'float16', dv),
+					...qwen4.kv_alloc(cfg, max_seq, dv),
 					raw_k: torch.zeros([max_seq, cfg.indexer_head_dim], 'float16', dv),
 					pooled: torch.zeros([int(max_seq / cfg.indexer_compress_ratio) + 1,
 						cfg.indexer_head_dim], 'float16', dv),

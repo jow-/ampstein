@@ -760,7 +760,7 @@ export function create(model, opts) {
 
 	// a QSA attention cache (Qwen3.8-Flash-Next): K / V rows (max_seq, kvh, hd), raw indexer keys and the pooled blocks
 	function is_qsa(c) {
-		return c.raw_k != null && c.k_cache != null;
+		return c.raw_k != null && (c.k_cache != null || c.kq != null);
 	}
 
 	function is_mla(c) {
@@ -981,44 +981,62 @@ export function create(model, opts) {
 		return int(n / cfg.indexer_compress_ratio) + 1;
 	}
 
-	function qsa_bytes(c, n) {
-		let sh = c.k_cache.shape();
-
-		return n * (2 * sh[1] * sh[2] + c.raw_k.shape()[1]) * 2 + qsa_pools(n) * c.pooled.shape()[1] * 2;
+	// the tensors of a QSA cache, row-indexed by token (K / V as fp16 or as int8 codes + scales) and the pooled blocks
+	function qsa_fields(c) {
+		return c.kq != null ? [ 'kq', 'ks', 'vq', 'vs', 'raw_k', 'pooled' ] : [ 'k_cache', 'v_cache', 'raw_k', 'pooled' ];
 	}
 
-	// the rows [0, n) of a QSA cache (K, V, raw indexer keys) and its pooled blocks, exact fp16
+	function qsa_rows(c, name, n) {
+		return (name == 'pooled') ? min(qsa_pools(n), c.pooled.shape()[0]) : n;
+	}
+
+	function qsa_bytes(c, n) {
+		let b = 0;
+
+		for (let f in qsa_fields(c)) {
+			let sh = c[f].shape(), per = 1;
+
+			for (let i = 1; i < length(sh); i++)
+				per *= sh[i];
+
+			b += qsa_rows(c, f, n) * per * elsize(c[f]);
+		}
+
+		return b;
+	}
+
+	// the rows [0, n) of a QSA cache and its pooled blocks, exactly as stored on the device
 	function qsa_to_host(c, dev, n, e) {
-		return {k: to_host(c.k_cache.narrow(0, 0, n), e), v: to_host(c.v_cache.narrow(0, 0, n), e),
-			raw: to_host(c.raw_k.narrow(0, 0, n), e),
-			pooled: to_host(c.pooled.narrow(0, 0, min(qsa_pools(n), c.pooled.shape()[0])), e)};
+		let o = {};
+
+		for (let f in qsa_fields(c))
+			o[f] = to_host(c[f].narrow(0, 0, qsa_rows(c, f, n)), e);
+
+		return o;
 	}
 
 	function qsa_from_host(c, dev, d, n) {
-		c.k_cache.narrow(0, 0, n).copy_(d.k.narrow(0, 0, n));
-		c.v_cache.narrow(0, 0, n).copy_(d.v.narrow(0, 0, n));
-		c.raw_k.narrow(0, 0, n).copy_(d.raw.narrow(0, 0, n));
+		for (let f in qsa_fields(c)) {
+			let m = min(qsa_rows(c, f, n), d[f].shape()[0]);
 
-		let p = min(qsa_pools(n), d.pooled.shape()[0]);
-
-		c.pooled.narrow(0, 0, p).copy_(d.pooled.narrow(0, 0, p));
+			c[f].narrow(0, 0, m).copy_(d[f].narrow(0, 0, m));
+		}
 	}
 
 	// rows [0, n) of a QSA cache to another (slot <-> live, any device)
 	function qsa_copy(d, s, n) {
-		for (let k in [ 'k_cache', 'v_cache', 'raw_k' ])
-			d[k].narrow(0, 0, n).copy_(s[k].narrow(0, 0, n).cuda(d.dev));
+		for (let f in qsa_fields(s)) {
+			let m = qsa_rows(s, f, n);
 
-		let p = min(qsa_pools(n), s.pooled.shape()[0]);
-
-		d.pooled.narrow(0, 0, p).copy_(s.pooled.narrow(0, 0, p).cuda(d.dev));
+			d[f].narrow(0, 0, m).copy_(s[f].narrow(0, 0, m).cuda(d.dev));
+		}
 	}
 
 	function qsa_alloc(c) {
 		let o = {dev: c.dev};
 
-		for (let k in [ 'k_cache', 'v_cache', 'raw_k', 'pooled' ])
-			o[k] = torch.zeros(c[k].shape(), c[k].dtype(), 'cuda:' + c.dev);
+		for (let f in qsa_fields(c))
+			o[f] = torch.zeros(c[f].shape(), c[f].dtype(), 'cuda:' + c.dev);
 
 		return o;
 	}
@@ -1080,7 +1098,7 @@ export function create(model, opts) {
 	}
 
 	function mla_from_host(c, dev, d, n) {
-		if (d.k != null) {
+		if (d.raw_k != null) {
 			qsa_from_host(c, dev, d, n);
 
 			return;
@@ -3604,6 +3622,17 @@ export function create(model, opts) {
 		let t0 = now_ms();
 		let why = 'requested count reached';
 
+		// the warm-up left its working set cached in the allocator; slots would be carved out of those blocks and
+		// the first long request then needs fresh memory. Give the cache back, keep that much free per device on top
+		// of the margin, and warm up again once the slots are in place
+		let extra = map(model.devs, function (d) {
+			let m = torch.mem_info(d);
+
+			return max(m[1] - m[0], 0);
+		});
+
+		torch.empty_cache();
+
 		function free_of(d) {
 			return torch.mem_info(d)[2];
 		}
@@ -3630,7 +3659,7 @@ export function create(model, opts) {
 				let short = false;
 
 				for (let i = 0; i < length(model.devs); i++)
-					if (free_of(model.devs[i]) < cost[i] + margin)
+					if (free_of(model.devs[i]) < cost[i] + margin + extra[i])
 						short = true;
 
 				if (short) {
@@ -3655,10 +3684,30 @@ export function create(model, opts) {
 			cost = map(model.devs, (d, i) => max(before[i] - free_of(d), 0));
 			push(slots_free, s);
 			slots_total++;
+
+			// the slot itself may breach the margin (the first one has no cost estimate yet): give it back
+			let over = false;
+
+			for (let i = 0; i < length(model.devs); i++)
+				if (free_of(model.devs[i]) < margin + extra[i])
+					over = true;
+
+			if (over) {
+				pop(slots_free);
+				slots_total--;
+				s = null;
+				torch.empty_cache();
+				why = sprintf('margin reached (%.0f MiB free, %.0f MiB per slot)', min_free() / 1048576.0,
+					max(...cost) / 1048576.0);
+				break;
+			}
 		}
 
 		warn(sprintf('engine: %d resident cache slots (%s) allocated in %.1f s, %.0f MiB free on the fullest GPU\n',
 			slots_total, why, (now_ms() - t0) / 1000.0, min_free() / 1048576.0));
+
+		if (slots_total > 0)
+			warmup();
 	}
 
 	alloc_slots();

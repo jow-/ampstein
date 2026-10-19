@@ -5050,11 +5050,12 @@ amp_attn_dec_mma_fp16(const void *q, const void *k, const void *v,
 
 #define AMP_QSA_BK 32
 
-template <int E>
+template <int E, bool Q8>
 __global__ void
 amp_qsa_attn_kernel(const __half *__restrict__ q,
                    const __half *__restrict__ kc,
                    const __half *__restrict__ vc,
+                   const __half *__restrict__ ks, const __half *__restrict__ vs,    /* Q8: scales, kc / vc are int8 codes */
                    const int *__restrict__ idx, float *__restrict__ ws,
                    int Hq, int Hk, int Kt, int ns, float scale)
 {
@@ -5146,7 +5147,16 @@ amp_qsa_attn_kernel(const __half *__restrict__ q,
 			if (piece == 0)
 				vflag[stage][key] = (tok >= 0) ? 1 : 0;
 
-			if (tok >= 0) {
+			if (tok >= 0 && Q8) {
+				/* int8 codes + a fp16 scale per 32 values: dequantized while staging (no async copy) */
+				size_t crow = (size_t)tok * rstride + (size_t)j * E;
+				size_t srow = ((size_t)tok * Hk + j) * (E / 32);
+
+				*(uint4 *)((char *)kd + amp_adm_swz(key, piece, RB)) =
+					amp_q8x8((const signed char *)kc + crow, ks + srow, piece);
+				*(uint4 *)((char *)vd + amp_adm_swz(key, piece, RB)) =
+					amp_q8x8((const signed char *)vc + crow, vs + srow, piece);
+			} else if (tok >= 0) {
 				size_t off = (size_t)tok * rstride + (size_t)j * E + piece * 8;
 
 				amp_adm_cp(AMP_ADM_ADDR(kd, key, piece, RB), kc + off);
@@ -5398,7 +5408,7 @@ amp_qsa_attn_ws_floats(int R, int Hq, int Hk, int E, int ns)
 }
 
 extern "C" int
-amp_qsa_attn_fp16(const void *q, const void *kc, const void *vc, const int *idx,
+amp_qsa_attn_fp16(const void *q, const void *kc, const void *vc, const void *ks, const void *vs, const int *idx,
                  void *ws, void *out, int R, int Hq, int Hk, int E, int Kt,
                  int ns, float scale, cudaStream_t stream)
 {
@@ -5413,27 +5423,36 @@ amp_qsa_attn_fp16(const void *q, const void *kc, const void *vc, const int *idx,
 	int block = AMP_ADM_WARPS * 32;
 	size_t smem = amp_attn_dec_mma_smem(E);
 
-#define AMP_QSA_K(EV) do { \
+#define AMP_QSA_K(EV, QV) do { \
 	static bool attr_done[64] = { false }; \
 	int qdev = 0; \
 	cudaGetDevice(&qdev); \
 	if (qdev >= 0 && qdev < 64 && !attr_done[qdev]) { \
-		cudaFuncSetAttribute(amp_qsa_attn_kernel<EV>, \
+		cudaFuncSetAttribute(amp_qsa_attn_kernel<EV, QV>, \
 			cudaFuncAttributeMaxDynamicSharedMemorySize, (int)amp_attn_dec_mma_smem(EV)); \
 		attr_done[qdev] = true; \
 	} \
-	amp_qsa_attn_kernel<EV><<<grid, block, smem, stream>>>((const __half *)q, \
-		(const __half *)kc, (const __half *)vc, idx, (float *)ws, Hq, Hk, Kt, ns, scale); \
+	amp_qsa_attn_kernel<EV, QV><<<grid, block, smem, stream>>>((const __half *)q, \
+		(const __half *)kc, (const __half *)vc, (const __half *)ks, (const __half *)vs, idx, (float *)ws, \
+		Hq, Hk, Kt, ns, scale); \
 	amp_qsa_combine_kernel<EV><<<(unsigned)R * Hq, EV, 0, stream>>>( \
 		(const float *)ws, (__half *)out, Hq, Hk, ns); \
 } while (0)
 
-	if (E == 256)
-		AMP_QSA_K(256);
+	if (ks) {
+		if (E == 256)
+			AMP_QSA_K(256, true);
+		else if (E == 128)
+			AMP_QSA_K(128, true);
+		else
+			AMP_QSA_K(64, true);
+	}
+	else if (E == 256)
+		AMP_QSA_K(256, false);
 	else if (E == 128)
-		AMP_QSA_K(128);
+		AMP_QSA_K(128, false);
 	else
-		AMP_QSA_K(64);
+		AMP_QSA_K(64, false);
 
 #undef AMP_QSA_K
 
