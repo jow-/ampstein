@@ -23,6 +23,8 @@ import * as chat_qwen35 from './chat_qwen35.uc';
 import * as chat_glm5 from './chat_glm5.uc';
 import * as chat_dsv4 from './chat_dsv4.uc';
 import * as chat_dsv41 from './chat_dsv41.uc';
+import * as chat_gemma4 from './chat_gemma4.uc';
+import * as gemma4 from './gemma4.uc';
 import * as dsv41 from './dsv41.uc';
 import * as dsv41_spark from './dsv41_spark.uc';
 import * as dsv41_tp from './dsv41_tp.uc';
@@ -120,18 +122,25 @@ export function serve(args) {
 		args.arch = (index(arch, 'Glm5Next') == 0) ? 'glm5' :
 			(index(arch, 'DeepseekV41') == 0) ? 'dsv41' :
 			(index(arch, 'DeepseekV4') == 0) ? 'dsv4' :
-			(index(arch, 'Qwen4Exp') == 0) ? 'qwen4' : 'qwen35';
+			(index(arch, 'Qwen4Exp') == 0) ? 'qwen4' :
+			(index(arch, 'Gemma4') == 0) ? 'gemma4' : 'qwen35';
 	}
 
 	const GLM = (args.arch == 'glm5');
 	const Q4 = (args.arch == 'qwen4');       // Qwen3.8-Flash-Next (qwen4.uc)
 	const DS = (args.arch == 'dsv4');        // DeepSeek-V4-Flash (dsv4.uc): layer split, no MTP / TP / vision yet
 	const D41 = (args.arch == 'dsv41');      // DeepSeek-V4.1-Flash (dsv41.uc): layer split, text only
+	const GEM = (args.arch == 'gemma4');     // Gemma 4 (gemma4.uc): layer split, text only, eager decode
 
 	// default device count: every GPU for GLM (117 GB) and Qwen-Flash-Next (100 GB),
 	// two for the dense Qwen
 	if (args.gpus == null)
 		args.gpus = (GLM || Q4 || DS || D41) ? torch.device_count() : 2;
+
+	if (GEM) {
+		args.tp = false;        // layer split only
+		args.mtp = 0;
+	}
 
 	// Qwen3.8-Flash-Next: the verify window is the draft window, so a window of 1 verifies a
 	// single row and cannot gain anything; 3 measured best (2: 1.25-1.45x, 3: 1.4-1.8x, 4: same)
@@ -187,9 +196,9 @@ export function serve(args) {
 	if (DS && !args.dspark_window)
 		args.dspark_window = 4;
 
-	let chat = GLM ? chat_glm5 : DS ? chat_dsv4 : D41 ? chat_dsv41 : chat_qwen35;
+	let chat = GLM ? chat_glm5 : DS ? chat_dsv4 : D41 ? chat_dsv41 : GEM ? chat_gemma4 : chat_qwen35;
 	let cfg = GLM ? glm5.load_config(args.model) : DS ? dsv4.load_config(args.model) :
-		D41 ? dsv41.load_config(args.model) :
+		D41 ? dsv41.load_config(args.model) : GEM ? gemma4.load_config(args.model) :
 		Q4 ? qwen4.load_config(args.model) : qwen35.load_config(args.model);
 
 	// DeepSeek-V4.1: the DSpark block drafter (mtp.* weights) unless --mtp 0
@@ -273,6 +282,9 @@ export function serve(args) {
 			warn(`ampstein: DSpark drafter loaded on cuda:${join(',cuda:', model.spark_devs)} (verify window ${args.dspark_window})\n`);
 		}
 	}
+	else if (GEM) {
+		model = gemma4.load(args.model, {devices: args.gpus, prefill_rows: args.chunk});
+	}
 	else if (Q4) {
 		model = args.tp ? qwen4_tp.load(args.model, {devices: args.gpus, mtp: args.mtp > 0,
 			prefill_rows: args.chunk, stages: args.stages}) :
@@ -287,7 +299,7 @@ export function serve(args) {
 		warn(`ampstein: DSpark drafter loaded (verify window ${args.dspark_window})\n`);
 	}
 
-	if (args.tp && !GLM && !Q4 && !DS && !D41) {
+	if (args.tp && !GLM && !Q4 && !DS && !D41 && !GEM) {
 		if (args.gpus < 2) {
 			warn('ampstein: --tp needs --gpus >= 2\n');
 			exit(1);
@@ -322,7 +334,7 @@ export function serve(args) {
 		slot_margin: args.slot_margin,
 		slice_ms: args.slice_ms,
 		slice_tokens: args.slice_tokens,
-		graphs: ((GLM || Q4) && getenv('AMP_GLM5_NO_GRAPHS')) ? false : null
+		graphs: GEM ? false : ((GLM || Q4) && getenv('AMP_GLM5_NO_GRAPHS')) ? false : null
 	});
 
 	let banner = `ampstein: model loaded in ${time() - t0}s`;
@@ -357,7 +369,7 @@ export function serve(args) {
 	(function restore_cache() {
 		let meta;
 
-		if (DS || D41)
+		if (DS || D41 || GEM)
 			return;     // no cache-state file for these architectures yet
 
 		try {
@@ -932,6 +944,9 @@ export function serve(args) {
 		let effort = body.reasoning_effort;
 		let enable_thinking = kw.enable_thinking;
 
+		if (GEM && enable_thinking == null)
+			enable_thinking = false;           // Gemma 4 thinks only when asked (<|think|> in the system turn)
+
 		if (effort != null && (lc('' + effort) == 'none' || lc('' + effort) == 'off'))
 			enable_thinking = false;
 
@@ -974,6 +989,9 @@ export function serve(args) {
 		let kw = body.chat_template_kwargs || {};
 		let effort = body.reasoning_effort;
 		let enable_thinking = kw.enable_thinking;
+
+		if (GEM && enable_thinking == null)
+			enable_thinking = false;           // Gemma 4 thinks only when asked (<|think|> in the system turn)
 
 		if (effort != null && (lc('' + effort) == 'none' || lc('' + effort) == 'off'))
 			enable_thinking = false;
@@ -1704,7 +1722,7 @@ export function serve(args) {
 		shutting_down = true;
 
 		try {
-			if (DS || D41)
+			if (DS || D41 || GEM)
 				die('not supported for this architecture yet');
 
 			let n = eng.save_state(CACHE_ST);
