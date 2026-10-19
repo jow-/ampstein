@@ -3706,8 +3706,7 @@ export function create(model, opts) {
 		warn(sprintf('engine: %d resident cache slots (%s) allocated in %.1f s, %.0f MiB free on the fullest GPU\n',
 			slots_total, why, (now_ms() - t0) / 1000.0, min_free() / 1048576.0));
 
-		if (slots_total > 0)
-			warmup();
+		warmup();                      // (the cache was returned above: reserve the working set again)
 	}
 
 	alloc_slots();
