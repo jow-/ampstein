@@ -16,7 +16,7 @@
 #include <cstring>
 
 extern "C" {
-#include <ucode/module.h>
+#include <ucode/lib.h>
 #include <ucode/vm.h>
 #include "tokenizer.h"
 }
