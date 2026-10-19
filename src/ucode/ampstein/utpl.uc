@@ -101,6 +101,32 @@ export function tpl_rev(a) {
 	return tv.arr(out, tv.tainted(a));
 }
 
+/* Jinja a[lo:hi] (step 1; negative bounds count from the end): arrays and strings */
+export function tpl_slice(a, lo, hi) {
+	let n = tv.length_of(a);
+	let l = (lo == null) ? 0 : lo;
+	let h = (hi == null) ? n : hi;
+
+	if (l < 0)
+		l = max(n + l, 0);
+
+	if (h < 0)
+		h = max(n + h, 0);
+
+	l = min(l, n);
+	h = min(h, n);
+
+	if (type(a) == 'string')
+		return (h > l) ? substr(a, l, h - l) : '';
+
+	let out = [];
+
+	for (let i = l; i < h; i++)
+		push(out, tv.idx(a, i));
+
+	return tv.arr(out, tv.tainted(a));
+}
+
 /* Jinja |tojson == json.dumps(v, ensure_ascii=False) with the default
  * separators (", " and ": "). ucode's %J matches the escaping; only the
  * structural spacing differs. */
@@ -241,7 +267,7 @@ export function cap_abort() {
  * via __utpl_state.tv.<n> / __utpl_state.utpl.<n> (jinja2utpl emit).
  * `tv` is the imported module namespace; __ops is a hand-built namespace
  * of utpl's own output/capture/value ops. */
-let __ops = {tpl_range, tpl_rev, pyjson, tpl_out, tpl_out_untrusted,
+let __ops = {tpl_range, tpl_rev, tpl_slice, pyjson, tpl_out, tpl_out_untrusted,
 	cap_begin, cap_end, cap_abort};
 
 export function new_state(ctx) {

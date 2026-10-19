@@ -217,8 +217,8 @@ export function serve(args) {
 	   chat request. User content lands in tainted segments, so a user
 	   string containing a special-token sequence can never tokenize as a
 	   special token (ucode/chat_jinja.uc, ucode/utpl.uc). */
-	let render_prompt = chat_jinja.make_renderer(D41 ? sourcepath(0, true) + '/chat_dsv41.jinja' : args.model,
-		chat.tpl_opts);
+	let render_prompt = chat_jinja.make_renderer(D41 ? sourcepath(0, true) + '/chat_dsv41.jinja' :
+		GEM ? sourcepath(0, true) + '/chat_gemma4.jinja' : args.model, chat.tpl_opts);
 
 	let devs = [];
 	let per = args.split || int((cfg.num_hidden_layers + args.gpus - 1) / args.gpus);

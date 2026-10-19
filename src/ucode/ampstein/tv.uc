@@ -568,6 +568,60 @@ export function items(o) {
 	return out;
 }
 
+/* Jinja |list: an array as it is, a string as its characters, a mapping as its keys */
+export function tolist(v) {
+	let r = raw(v);
+
+	if (type(r) == 'array')
+		return v;
+
+	if (type(r) == 'string') {
+		let out = [];
+
+		for (let c in split(r, ''))
+			push(out, c);
+
+		return arr(out, tainted(v));
+	}
+
+	if (type(r) == 'object')
+		return arr(map(keys(r), (k) => tstr(k)), tainted(v));
+
+	return arr([], 0);
+}
+
+/* Jinja |map('name'): the filter `name` (upper / lower / trim / string) applied to every item */
+export function mapf(v, name) {
+	let out = [];
+
+	for (let x in raw(v)) {
+		let e = tag_raw(x, tainted(v) ? 1 : 0);
+
+		push(out, (name == 'upper') ? upper(e) : (name == 'lower') ? lower(e) : (name == 'trim') ? trim(e) :
+			(name == 'string') ? tostr(e) : die('tv: map: unsupported filter ' + name));
+	}
+
+	return arr(out, tainted(v));
+}
+
+/* Jinja |dictsort: the item pairs of a mapping sorted by key */
+export function dictsort(o) {
+	if (raw(o) == null)
+		return [];
+
+	let r = raw(o);
+
+	if (type(r) != 'object')
+		die('tv: dictsort: can only sort a mapping (got ' + type(r) + ')');
+
+	let out = [];
+
+	for (let k in sort(keys(r)))
+		push(out, [ tstr(k), tag_raw(r[k], tainted(o) ? 1 : 0) ]);
+
+	return out;
+}
+
 /* deep-convert a MIXED value to a PLAIN ucode value (the view pyjson
  * and the driver consume): strings -> visible text, containers ->
  * plain containers, scalars -> their value */

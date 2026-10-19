@@ -524,6 +524,10 @@ export function jinja_expr(s) {
 			if (FOR_FILTER && (P.peek() == null || P.peek().k != 'name' || P.peek().v != 'else'))
 				return {t: 'forfilter', a: a, cond: cond};
 
+			// without `else` the value is undefined (renders as nothing)
+			if (P.peek() == null || P.peek().k != 'name' || P.peek().v != 'else')
+				return {t: 'ternary', a: a, cond: cond, b: {t: 'str', s: ''}};
+
 			P.expect_name('else');
 			let b = P.parse_ternary();
 
@@ -742,18 +746,33 @@ export function jinja_expr(s) {
 		/* [ expr ] | [ -1 ] | [ ::-1 ] */
 		let t = P.peek();
 
+		let lo = null;
+
 		if (t == null || t.k != 'op' || t.v != ':') {
 			let e = P.parse_ternary();
-			P.expect_op(']');
 
-			return {t: 'index', e: base, idx: e};
+			if (P.peek() == null || P.peek().k != 'op' || P.peek().v != ':') {
+				P.expect_op(']');
+
+				return {t: 'index', e: base, idx: e};
+			}
+
+			lo = e;
 		}
 
-		// slice: only ::-1 is supported
+		// slice a[lo:hi] / a[lo:] / a[:hi] (step 1), or ::-1
 		P.next();
 
-		if (P.peek() == null || P.peek().v != ':')
-			die('jinja2utpl: unsupported slice (only ::-1): ' + ustr(s));
+		if (P.peek() == null || P.peek().k != 'op' || P.peek().v != ':') {
+			let hi = null;
+
+			if (P.peek() != null && !(P.peek().k == 'op' && P.peek().v == ']'))
+				hi = P.parse_ternary();
+
+			P.expect_op(']');
+
+			return {t: 'slice', e: base, lo: lo, hi: hi};
+		}
 
 		P.next();
 
@@ -1307,17 +1326,17 @@ let AMP_NAMES = {
  * names after the import, so they are reserved for template
  * declarations just like the builtins */
 let UTPL_HELPERS = {
-	tpl_out: 1, tpl_out_untrusted: 1, tpl_range: 1, tpl_rev: 1,
+	tpl_out: 1, tpl_out_untrusted: 1, tpl_range: 1, tpl_rev: 1, tpl_slice: 1,
 	pyjson: 1, cap_begin: 1, cap_end: 1, cap_abort: 1
 };
 
 /* value ops imported into the emitted program (ucode/tv.uc) */
-let TV_NAMES = {
-	taint: 1, cat: 1, truthy: 1, get: 1, idx: 1, eq: 1, ne: 1,
-	in_op: 1, kind: 1, plain: 1, capitalize: 1, replace: 1, trim: 1,
-	lower: 1, upper: 1, tostr: 1, length_of: 1, items: 1, deflt: 1,
-	join: 1, startswith: 1, endswith: 1, split: 1
-};
+let TV_NAMES = [
+	'taint', 'cat', 'truthy', 'get', 'idx', 'eq', 'ne',
+	'in_op', 'kind', 'plain', 'capitalize', 'replace', 'trim',
+	'lower', 'upper', 'tostr', 'length_of', 'items', 'deflt',
+	'join', 'startswith', 'endswith', 'split', 'dictsort', 'tolist', 'mapf'
+];
 
 let KEYWORDS = {
 	if: 1, elif: 1, else: 1, for: 1, while: 1, function: 1, let: 1,
@@ -1331,7 +1350,7 @@ let KEYWORDS = {
 
 function is_uc_name(n) {
 	return index(keys(AMP_NAMES), n) >= 0 || index(keys(UTPL_HELPERS), n) >= 0
-	       || index(keys(TV_NAMES), n) >= 0;
+	       || n in TV_NAMES;
 }
 
 /* filters whose result carries the taint of their arguments */
@@ -1339,7 +1358,7 @@ let FILTERS = {
 	tojson: 'ident', trim: 'ident', lower: 'ident', upper: 'ident',
 	string: 'ident', safe: 'ident', default: 'ident', join: 'ident',
 	length: 'clean', items: 'ident', capitalize: 'ident',
-	replace: 'ident'
+	replace: 'ident', dictsort: 'ident', list: 'ident', map: 'ident'
 };
 
 /* methods on strings (Jinja calls Python str methods) */
@@ -1357,7 +1376,7 @@ function check_test(name) {
 	switch (name) {
 	case 'string': case 'integer': case 'int': case 'float': case 'double':
 	case 'number': case 'boolean': case 'bool': case 'mapping':
-	case 'iterable': case 'none': case 'undefined': case 'defined':
+	case 'iterable': case 'sequence': case 'none': case 'undefined': case 'defined':
 	case 'true': case 'false':
 		return;
 	}
@@ -1513,6 +1532,15 @@ function taint_expr(n, scope, macros, free, call_sinks) {
 	case 'rev':
 		return taint_expr(n.e, scope, macros, free, call_sinks);
 
+	case 'slice':
+		if (n.lo)
+			taint_expr(n.lo, scope, macros, free, call_sinks);
+
+		if (n.hi)
+			taint_expr(n.hi, scope, macros, free, call_sinks);
+
+		return taint_expr(n.e, scope, macros, free, call_sinks);
+
 	case 'attr': {
 		if (n.e.t == 'name' && n.e.n == 'loop' &&
 		    (n.n == 'previtem' || n.n == 'nextitem')) {
@@ -1534,9 +1562,9 @@ function taint_expr(n, scope, macros, free, call_sinks) {
 		for (let i = 0; i < length(n.args); i++) {
 			let a = n.args[i];
 
-			if (a.k != null && !(n.e.t == 'name' && n.e.n == 'namespace'))
+			if (a.k != null && !(n.e.t == 'name' && (n.e.n == 'namespace' || macros[n.e.n])))
 				die('jinja2utpl: keyword argument ' + a.k + '= is only ' +
-				    'supported in namespace()');
+				    'supported in namespace() and macro calls');
 
 			t = max(t, taint_expr(a.v, scope, macros, free, call_sinks));
 		}
@@ -1964,6 +1992,7 @@ function is_primary(n) {
 	case 'dict':
 	case 'index':
 	case 'rev':
+	case 'slice':
 	case 'attr':
 	case 'call':
 		return true;
@@ -2130,6 +2159,12 @@ EM.emit_filter = function(n) {
 		return use_tv('length_of') + '(' + x + ')';
 	case 'items':
 		return use_tv('items') + '(' + x + ')';
+	case 'dictsort':
+		return use_tv('dictsort') + '(' + x + ')';
+	case 'list':
+		return use_tv('tolist') + '(' + x + ')';
+	case 'map':
+		return use_tv('mapf') + '(' + x + ', ' + a0 + ')';
 	case 'default':
 		return use_tv('deflt') + '(' + x + ', ' + a0 + ')';
 	case 'join':
@@ -2171,6 +2206,9 @@ EM.emit_is = function(n) {
 	case 'iterable':
 		s = '(' + kr + ' == ' + ustr('a') + ' || ' +
 		    kr + ' == ' + ustr('s') + ')';
+		break;
+	case 'sequence':
+		s = kr + ' == ' + ustr('a');
 		break;
 	case 'none':
 	case 'undefined':
@@ -2260,13 +2298,24 @@ function macro_scope_lines(m) {
 function macro_bindings(m, n) {
 	let out = [];
 	let pi = 0;
+	let named = {};
 
 	for (let i = 0; i < length(n.args); i++) {
 		let a = n.args[i];
 
-		if (a.k != null)
-			die('jinja2utpl: keyword argument ' + a.k + '= is not '
-			    + 'supported in macro calls');
+		if (a.k != null) {
+			let known = false;
+
+			for (let p in m.params)
+				if (p.name == a.k)
+					known = true;
+
+			if (!known)
+				die('jinja2utpl: macro ' + m.name + ' has no parameter ' + a.k);
+
+			named[a.k] = a.v;
+			continue;
+		}
 
 		if (pi >= length(m.params))
 			die('jinja2utpl: macro ' + m.name + ' takes '
@@ -2279,7 +2328,10 @@ function macro_bindings(m, n) {
 	for (; pi < length(m.params); pi++) {
 		let p = m.params[pi];
 
-		push(out, [ p.name, p.def ? EM.emit_e(p.def, 0) : 'null' ]);
+		if (exists(named, p.name))
+			push(out, [ p.name, EM.emit_e(named[p.name], 0) ]);
+		else
+			push(out, [ p.name, p.def ? EM.emit_e(p.def, 0) : 'null' ]);
 	}
 
 	return out;
@@ -2561,6 +2613,9 @@ EM.emit_e = function(n, minrank) {
 
 	case 'rev':
 		return `${use_utpl('tpl_rev')}(${EM.emit_e(n.e, 0)})`;
+
+	case 'slice':
+		return `${use_utpl('tpl_slice')}(${EM.emit_e(n.e, 0)}, ${n.lo ? EM.emit_e(n.lo, 0) : 'null'}, ${n.hi ? EM.emit_e(n.hi, 0) : 'null'})`;
 
 	case 'attr':
 		/* tv.get: MIXED-safe attribute; a missing attribute is a tagged
@@ -2910,6 +2965,17 @@ function rename_e(e, map) {
 	case 'dict':
 		for (let i = 0; i < length(e.items); i++)
 			rename_e(e.items[i][1], map);
+		break;
+
+	case 'slice':
+		rename_e(e.e, map);
+
+		if (e.lo)
+			rename_e(e.lo, map);
+
+		if (e.hi)
+			rename_e(e.hi, map);
+
 		break;
 
 	case 'not':
