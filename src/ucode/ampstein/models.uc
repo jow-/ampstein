@@ -389,8 +389,9 @@ export function sub_columns(lin, ranges) {
 	for (let i = 0; i < length(ranges); i++) {
 		let a = ranges[i][0], len = ranges[i][1];
 
-		if (a % 256 || len % 256 || a + len > lin.out_features)
-			die(`models.sub_columns: range [${a}, ${len}] not 256-aligned/in bounds`);
+		// 128 is what the kernels need (a layer whose own width is no multiple of 256, e.g. 2176, shards by 128)
+		if (a % 128 || len % 128 || a + len > lin.out_features)
+			die(`models.sub_columns: range [${a}, ${len}] not 128-aligned/in bounds`);
 
 		push(ts, lin.trellis.narrow(1, a / 16, len / 16));
 		push(ss, lin.svh.narrow(0, a, len));

@@ -1,17 +1,27 @@
 // examples/gemma4_gen.uc — greedy generation with the Gemma 4 text model (eager decode), for bring-up.
 //   AMP_GEMMA4_GPUS=n ucode ... examples/gemma4_gen.uc <model_dir> "<prompt>" [new_tokens] [max_seq]
 import * as gemma4 from 'ampstein.gemma4';
+import * as gemma4_tp from 'ampstein.gemma4_tp';
 import { readfile } from 'fs';
 
 let dir = ARGV[0], prompt = ARGV[1], n = +(ARGV[2] || 64), max_seq = +(ARGV[3] || 4096);
 let tok = torch.tokenizer(dir);
 let t0 = clock(true);
-let m = gemma4.load(dir, {devices: +(getenv('AMP_GEMMA4_GPUS') || 1), prefill_rows: 1024});
+let m = gemma4.load(dir, {devices: +(getenv('AMP_GEMMA4_GPUS') || 1), prefill_rows: +(getenv('AMP_GEMMA4_CHUNK') || 1024)});
 
 function now() {
 	let c = clock(true);
 
 	return c[0] + c[1] / 1e9;
+}
+
+if (getenv('AMP_GEMMA4_TP')) {
+	let ng = +(getenv('AMP_GEMMA4_GPUS') || 2), rk = [];
+
+	for (let g = 0; g < ng; g++)
+		push(rk, g);
+
+	m = gemma4_tp.shard(m, {devices: rk, prefill_rows: +(getenv('AMP_GEMMA4_CHUNK') || 1024)});
 }
 
 printf('loaded in %.1f s\n', now() - (t0[0] + t0[1] / 1e9));

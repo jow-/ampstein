@@ -31,6 +31,7 @@ import * as dsv41_tp from './dsv41_tp.uc';
 import * as dsv41_spark_tp from './dsv41_spark_tp.uc';
 import * as qwen35 from './qwen35.uc';
 import * as qwen35_tp from './qwen35_tp.uc';
+import * as gemma4_tp from './gemma4_tp.uc';
 import * as qwen35_vision from './qwen35_vision.uc';
 import * as glm5 from './glm5.uc';
 import * as glm5_tp from './glm5_tp.uc';
@@ -130,7 +131,7 @@ export function serve(args) {
 	const Q4 = (args.arch == 'qwen4');       // Qwen3.8-Flash-Next (qwen4.uc)
 	const DS = (args.arch == 'dsv4');        // DeepSeek-V4-Flash (dsv4.uc): layer split, no MTP / TP / vision yet
 	const D41 = (args.arch == 'dsv41');      // DeepSeek-V4.1-Flash (dsv41.uc): layer split, text only
-	const GEM = (args.arch == 'gemma4');     // Gemma 4 (gemma4.uc): layer split, text only, eager decode
+	const GEM = (args.arch == 'gemma4');     // Gemma 4 (gemma4.uc, gemma4_tp.uc): text only
 
 	// default device count: every GPU for GLM (117 GB) and Qwen-Flash-Next (100 GB),
 	// two for the dense Qwen
@@ -138,7 +139,8 @@ export function serve(args) {
 		args.gpus = (GLM || Q4 || DS || D41) ? torch.device_count() : 2;
 
 	if (GEM) {
-		args.tp = false;        // layer split only
+		// layer split (prefill pipelines over the stages: the fastest prefill) or --tp (tensor parallel: faster decode)
+		args.tp = !!args.tp && args.gpus >= 2;
 		args.mtp = 0;
 	}
 
@@ -284,6 +286,15 @@ export function serve(args) {
 	}
 	else if (GEM) {
 		model = gemma4.load(args.model, {devices: args.gpus, prefill_rows: args.chunk});
+
+		if (args.tp) {
+			let ranks = [];
+
+			for (let g = 0; g < args.gpus; g++)
+				push(ranks, g);
+
+			model = gemma4_tp.shard(model, {devices: ranks, prefill_rows: args.chunk});
+		}
 	}
 	else if (Q4) {
 		model = args.tp ? qwen4_tp.load(args.model, {devices: args.gpus, mtp: args.mtp > 0,

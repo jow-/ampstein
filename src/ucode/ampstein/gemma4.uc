@@ -187,7 +187,7 @@ function plan_devices(ws, cfg, n) {
 /* attention                                                           */
 
 /* (cos, sin) (T, hd / 2) fp32 of the positions pos0 .. pos0 + T - 1 for the inverse frequencies inv (1, hd / 2) */
-function rope_cs(inv, pos0, T, dev) {
+export function rope_cs(inv, pos0, T, dev) {
 	let pos = torch.arange(T, 'float32', 'cuda:' + dev).add(pos0 * 1.0).view([T, 1]);
 	let fr = pos.mul(inv);
 
@@ -196,7 +196,7 @@ function rope_cs(inv, pos0, T, dev) {
 
 /* ring slots of the token positions of the sliding layers: for every query row r (position pos0 + r) the cache slots of
  * its last `win` tokens, -1 before the first token: (T, win) int32 */
-function window_idx(pos0, T, win, ring, dev) {
+export function window_idx(pos0, T, win, ring, dev) {
 	let dv = 'cuda:' + dev;
 	let base = torch.arange(T, 'float32', dv).add(pos0 * 1.0 - (win - 1.0)).view([T, 1]);
 	let tok = base.add(torch.arange(win, 'float32', dv).view([1, win]));
@@ -209,7 +209,7 @@ function window_idx(pos0, T, win, ring, dev) {
 
 /* the one-row decode context of the position held in the device tensor posf (1) fp32: rope tables, the ring slot of
  * the new row and the window's slots, all computed on the device (CUDA-graph capture) */
-function dyn_ctx(cfg, inv, posf, ring, dev, glen) {
+export function dyn_ctx(cfg, inv, posf, ring, dev, glen) {
 	let dv = 'cuda:' + dev, win = cfg.sliding_window;
 	let fr = posf.view([1, 1]).mul(inv.l);
 	let tok = torch.arange(win, 'float32', dv).view([1, win]).add(posf.sub(win - 1.0).view([1, 1]));
@@ -320,7 +320,7 @@ function window_attn(cfg, L, q, cl, pos0, T, ring) {
 	return o.transpose(1, 2).reshape([T, nh * hd]);
 }
 
-function attn_forward(cfg, L, a, cl, pos0, ctx) {
+export function attn_forward(cfg, L, a, cl, pos0, ctx) {
 	let T = a.shape()[0];
 	let nh = L.nh, kvh = L.kvh, hd = L.hd, eps = cfg.rms_norm_eps;
 	let cs = L.full ? ctx.cs_g : ctx.cs_l;
@@ -518,7 +518,7 @@ export function load(model_dir, opts) {
 			};
 
 	let model = {
-		cfg: cfg, devs: devs, ws: ws, layers: layers, embed_tokens: embed_t, ring: ring,
+		cfg: cfg, devs: devs, ws: ws, layers: layers, embed_tokens: embed_t, ring: ring, invs: invs, chunk_cap: chunk_cap,
 		norm: ws.gpu16('model.language_model.norm.weight', last),
 		lm_head: models.linear(ws, 'lm_head', false, last),
 

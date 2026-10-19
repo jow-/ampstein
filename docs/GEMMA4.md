@@ -17,12 +17,21 @@ References: transformers `modeling_gemma4.py`, exllamav3 `architecture/gemma4.py
 
 ## Runtime
 
-- `gemma4.uc`: layers split over `--gpus` (contiguous runs), prefill chunk by chunk, **eager decode** (no CUDA graphs, no
-  speculative decoding, no TP yet). Sliding layers keep a ring of 1024 + chunk rows and attend with `qsa_attn` over the window's
-  slots; global layers attend in fp32 on slabs of queries (head dim 512 has no fused kernel).
-- Experts share one bit rate and the mcg codebook: decode uses the cooperative MoE kernel (gelu), prefill the composite
-  per-expert path (the fused sorted path is `mul1`-only), which bounds prefill (~470 tok/s at 3.6k tokens on two A5000).
-- The RAM store / slots / hot reload are off (no `cache_export` yet), `--tp` is ignored.
+- `gemma4.uc` (layer split over `--gpus`, the default): contiguous layer runs per device. Sliding layers keep a ring of 1024 +
+  chunk rows; prefill attends with fused sdpa under a window mask, decode with `qsa_attn` over the window's slots. Global layers
+  attend in fp32 on slabs of queries (head dim 512 has no fused kernel).
+- **Prefill** is a wavefront over the device runs (`prefill_pipeline`): every round each stage advances its own chunk, the layers
+  of the stages are issued round-robin (a stage issued whole blocks the host on its launch queue and starves the other GPU).
+  The MoE needs no host read (experts and `mcg` codebook: one tier of 16-row fused tiles). 3.6k tokens 1550 tok/s, 14k 2400-2580
+  tok/s on two A5000.
+- **Decode** replays CUDA graphs, one per device run and global-attention length bucket (power of two >= position + 1, captured
+  lazily); the position is a device tensor (rope tables, ring slot, window slots, causal mask of the global layers). The post-norm
+  residual blocks are one `norm32` kernel each. ~72 tok/s layer split, ~81-84 tok/s with `--tp`.
+- `--tp` (`gemma4_tp.uc`): attention by KV-head groups (sliding 4+4, global 1+1), dense MLP by columns / rows over the 128-aligned
+  padded width (2176 = 1152 + 1024), experts expert-parallel (64 + 64), lm_head by vocabulary ranges; two all-reduces per layer
+  (attention; dense MLP and experts stacked). Decode is GPU-bound on ~1700 small kernels per token, so tp gains only ~15%;
+  tp prefill is slower than the pipeline (1350-1700 tok/s).
+- The RAM store / slots / hot reload are off (no `cache_export` yet).
 - Tokenizer: SentencePiece-style BPE (`tokenizer.c` spm mode: spaces -> U+2581, merges over the whole run, `<0xXX>` byte
   fallback); identical to the HF reference on the test strings (`examples/tok_ids.uc`).
 - Chat: `chat_gemma4.uc` + `chat_gemma4.jinja` (the checkpoint template with its two recursive macros unrolled to depth 4; the
@@ -30,12 +39,7 @@ References: transformers `modeling_gemma4.py`, exllamav3 `architecture/gemma4.py
   channel); tool calls `<|tool_call>call:NAME{k:<|"|>v<|"|>}<tool_call|>` are parsed to OpenAI tool calls, tool results go back
   inside the same model turn.
 
-## Measured (2 x RTX A5000, layer split, eager)
-
-Needle at 1.8k depth (beyond the window) correct; prefill 470 tok/s (3.6k tokens), decode ~22 tok/s; chat, system prompts, tool
-calls with a tool result round trip and thinking mode behave.
-
 ## Open
 
-CUDA-graph decode, a fused mcg MoE prefill path, a head-512 decode attention kernel, TP / stage pipeline, vision tower,
-store / hot reload, KV quantization of the 5 global layers.
+Fewer kernels per decode token (batched q/k/v and gate/up launches), a head-512 decode attention kernel (the global layers read
+the whole cache in fp32), vision tower, store / hot reload, KV quantization of the 5 global layers.
