@@ -334,7 +334,7 @@ export function serve(args) {
 		slot_margin: args.slot_margin,
 		slice_ms: args.slice_ms,
 		slice_tokens: args.slice_tokens,
-		graphs: GEM ? false : ((GLM || Q4) && getenv('AMP_GLM5_NO_GRAPHS')) ? false : null
+		graphs: ((GLM || Q4) && getenv('AMP_GLM5_NO_GRAPHS')) ? false : null
 	});
 
 	let banner = `ampstein: model loaded in ${time() - t0}s`;

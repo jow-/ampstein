@@ -57,16 +57,17 @@ if (gemma4.HP)
 printf('prefill %.2f s (%.0f tok/s)\n', now() - t1, length(ids) / (now() - t1));
 
 let out = [];
+let gr = getenv('AMP_GEMMA4_GRAPH') ? m.graphs(cache, [ 1 ]) : null;
 let t2 = now();
 
 for (let i = 0; i < n; i++) {
 	let nx = lg.view([1, -1]).argmax(-1).tolist()[0];
 
-	if (nx == 1 || nx == 106)
+	if ((nx == 1 || nx == 106) && !getenv('AMP_GEMMA4_NOSTOP'))
 		break;
 
 	push(out, nx);
-	lg = m.forward_chunk([ nx ], cache, 1);
+	lg = gr ? gr.run([ nx ], cache.length).logits : m.forward_chunk([ nx ], cache, 1);
 }
 
 torch.synchronize();

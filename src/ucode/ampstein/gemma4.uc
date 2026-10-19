@@ -207,6 +207,25 @@ function window_idx(pos0, T, win, ring, dev) {
 	return torch.where(valid, slot.to('int32'), torch.full([1], -1, 'int32', dv)).contiguous();
 }
 
+/* the one-row decode context of the position held in the device tensor posf (1) fp32: rope tables, the ring slot of
+ * the new row and the window's slots, all computed on the device (CUDA-graph capture) */
+function dyn_ctx(cfg, inv, posf, ring, dev) {
+	let dv = 'cuda:' + dev, win = cfg.sliding_window;
+	let fr = posf.view([1, 1]).mul(inv.l);
+	let tok = torch.arange(win, 'float32', dv).view([1, win]).add(posf.sub(win - 1.0).view([1, 1]));
+	let valid = tok.neg().le(0.0);
+	let q = tok.mul(1.0 / ring).to('int64').to('float32');
+	let slot = tok.sub(q.mul(ring * 1.0));
+	let pq = posf.mul(1.0 / ring).to('int64').to('float32');
+
+	return {
+		ring: ring,
+		cs_l: {cos: fr.cos().contiguous(), sin: fr.sin().contiguous()},
+		widx: torch.where(valid, slot.to('int32'), torch.full([1], -1, 'int32', dv)).contiguous(),
+		dyn: {slot: posf.sub(pq.mul(ring * 1.0)).to('int64').view([1])}
+	};
+}
+
 /* global attention in fp32 for T query rows at pos0 over the cache rows [0, pos0 + T): K / V (len, kvh, hd) fp16,
  * q (T, nh, hd) fp16; scale 1. Query slabs bound the score matrix. Returns (T, nh * hd) fp16 */
 function global_attn(L, q, K, V, pos0, T) {
@@ -293,6 +312,16 @@ function attn_forward(cfg, L, a, cl, pos0, ctx) {
 		let o = global_attn(L, q.view([T, nh, hd]), cl.k.narrow(0, 0, len), cl.v.narrow(0, 0, len), pos0, T);
 
 		return L.o.forward(o);
+	}
+
+	// graph-captured decode step: the position is a device tensor (ctx.dyn)
+	if (ctx.dyn) {
+		cl.k.index_copy_(0, ctx.dyn.slot, kk.view([1, kvh, hd]));
+		cl.v.index_copy_(0, ctx.dyn.slot, vv.view([1, kvh, hd]));
+
+		let o = torch.qsa_attn(q.view([1, nh, hd]).contiguous(), cl.k, cl.v, ctx.widx, 1.0);
+
+		return L.o.forward(o.view([1, nh * hd]));
 	}
 
 	// sliding layer: the chunk's rows go to their ring slots (the chunk never exceeds RING - window rows), then qsa_attn
@@ -534,6 +563,109 @@ export function load(model_dir, opts) {
 			}
 
 			return lg;
+		},
+
+		/* CUDA-graph decode (one row): runs of sliding layers on one device are captured as one graph each (the position is
+		 * a device tensor); the global layers run eagerly between them (their attention length is a host value). */
+		graphs: function (cache, sizes) {
+			if (getenv('AMP_GEMMA4_NO_GRAPHS'))
+				return null;
+
+			let model = this;
+			let H = cfg.hidden_size;
+			let items = [];
+			let posf = {};
+
+			for (let d in uniq(map(layers, (L) => L.dev)))
+				posf[d] = torch.zeros([1], 'float32', 'cuda:' + d);
+
+			for (let i = 0; i < nl; i++) {
+				let L = layers[i];
+				let last = length(items) ? items[length(items) - 1] : null;
+
+				if (L.full)
+					push(items, {eager: true, layer: i, dev: L.dev});
+				else if (last && !last.eager && last.dev == L.dev)
+					last.end = i + 1;
+				else
+					push(items, {eager: false, first: i, end: i + 1, dev: L.dev});
+			}
+
+			function body(it) {
+				let ctx = dyn_ctx(cfg, invs[it.dev], posf[it.dev], ring, it.dev);
+				let h = it.h_in;
+
+				for (let i = it.first; i < it.end; i++)
+					h = block_forward(cfg, layers[i], h, cache.layers[i], 0, ctx);
+
+				it.h_out = h;
+			}
+
+			for (let it in items)
+				if (!it.eager) {
+					it.h_in = torch.zeros([1, H], 'float32', 'cuda:' + it.dev);
+					body(it);
+				}
+
+			torch.synchronize();
+
+			for (let it in items)
+				if (!it.eager) {
+					it.graph = torch.graph();
+					it.graph.capture_begin(it.dev);
+					body(it);
+					it.graph.capture_end();
+				}
+
+			torch.synchronize();
+
+			function run_ids(tids, pos) {
+				for (let d in posf)
+					posf[d].copy_(torch.from_array([ pos * 1.0 ], 'float32', 'cuda:' + d));
+
+				let h = embed_t.index(tids).to('float32').mul(EMBED_SCALE);
+				let dev = first;
+
+				for (let it in items) {
+					if (it.dev != dev) {
+						h = h.cuda(it.dev);
+						dev = it.dev;
+					}
+
+					if (it.eager) {
+						let ctx = {
+							ring: ring,
+							cs_l: rope_cs(invs[dev].l, pos, 1, dev),
+							cs_g: rope_cs(invs[dev].g, pos, 1, dev)
+						};
+
+						h = block_forward(cfg, layers[it.layer], h, cache.layers[it.layer], pos, ctx);
+					}
+					else {
+						it.h_in.copy_(h);
+						it.graph.replay();
+						h = it.h_out;
+					}
+				}
+
+				cache.length = pos + 1;
+
+				let lg = model.lm_head.forward(glm5.rms_norm_f32(h, model.norm, cfg.rms_norm_eps));
+
+				if (cfg.softcap > 0) {
+					let e = lg.to('float32').mul(2.0 / cfg.softcap).exp();
+
+					lg = e.sub(1.0).div(e.add(1.0)).mul(cfg.softcap).to('float16');
+				}
+
+				return {logits: lg, hidden: null};
+			}
+
+			return {
+				has: function (S) {return S == 1;},
+				run: function (ids, pos) {return run_ids(torch.from_array(ids, 'int64', 'cuda:' + first), pos);},
+				run_dev: function (ids_dev, pos) {return run_ids(ids_dev.view([1]), pos);}
+			};
 		},
 
 		/* The first stage's work on a chunk: embedding + its layers; stage_run() continues on the next device. */
