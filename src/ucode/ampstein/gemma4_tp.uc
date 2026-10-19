@@ -228,7 +228,7 @@ export function shard(model, opts) {
 			let p = [];
 
 			for (let g = 0; g < G; g++)
-				push(p, gemma4.attn_forward(cfg, Ls[g], glm5.rms_norm_f32(x[g], Ls[g].in_ln, eps), cl[g], pos0, ctxs[g]));
+				push(p, gemma4.attn_forward(cfg, Ls[g], torch.rms_norm_f32(x[g], Ls[g].in_ln, eps), cl[g], pos0, ctxs[g]));
 
 			let s = allreduce(this, p);
 
@@ -239,11 +239,11 @@ export function shard(model, opts) {
 
 			for (let g = 0; g < G; g++) {
 				let S = Ls[g];
-				let m = glm5.mlp_forward(cfg, S.mlp, glm5.rms_norm_f32(x[g], S.pre_ff, eps));
+				let m = glm5.mlp_forward(cfg, S.mlp, torch.rms_norm_f32(x[g], S.pre_ff, eps));
 
 				S.moe.rl = torch.matmul(torch.norm32(x[g], S.rscale, eps), S.moe.gate_t);
 
-				let mo = glm5.moe_forward(cfg, S.moe, glm5.rms_norm_f32(x[g], S.pre_ff2, eps));
+				let mo = glm5.moe_forward(cfg, S.moe, torch.rms_norm_f32(x[g], S.pre_ff2, eps));
 
 				S.moe.rl = null;
 				push(p, torch.cat([ m, mo.to('float16') ], 0));

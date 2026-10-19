@@ -1848,18 +1848,15 @@ amp_dflash_conv(const void *h, const void *dyn, const void *base, void *out,
 // after a layer or two; its reference runs in bf16).
 //   amp_rms_norm_f32in: out = fp16(x * rsqrt(mean(x^2) + eps)) * w
 //   amp_dflash_conv_res: h += scale * conv2(y)   (h fp32 in place)
-__global__ void amp_rms_norm_f32in_kernel(const float *__restrict__ x,
-                                         const __half *__restrict__ w,
-                                         __half *__restrict__ out, int dim,
-                                         float eps)
+// Rows of up to NC_MAX elements are held in registers (independent unrolled loads: the row is read once, the
+// reduction is the only serial part); longer rows take the generic two-pass loop.
+#define NC_THREADS 256
+#define NC_PER 16
+#define NC_MAX (NC_THREADS * NC_PER)
+
+// the rsqrt(mean(x^2) + eps) of one row held as v[NC_PER] per thread of a NC_THREADS block
+__device__ __forceinline__ float amp_row_rsqrt(float acc, int dim, float eps)
 {
-	const int row = blockIdx.x;
-	const float *xr = x + (size_t)row * dim;
-	float acc = 0.0f;
-
-	for (int i = threadIdx.x; i < dim; i += blockDim.x)
-		acc += xr[i] * xr[i];
-
 #pragma unroll
 	for (int off = 16; off > 0; off >>= 1)
 		acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -1882,10 +1879,52 @@ __global__ void amp_rms_norm_f32in_kernel(const float *__restrict__ x,
 
 	__syncthreads();
 
-	const float sc = warp_sum[0];
+	return warp_sum[0];
+}
+
+__global__ void amp_rms_norm_f32in_kernel(const float *__restrict__ x,
+                                         const __half *__restrict__ w,
+                                         __half *__restrict__ out, int dim,
+                                         float eps)
+{
+	const size_t base = (size_t)blockIdx.x * dim;
+	float acc = 0.0f;
+
+	if (dim <= NC_MAX) {
+		float v[NC_PER];
+		__half wv[NC_PER];
+
+#pragma unroll
+		for (int j = 0; j < NC_PER; j++) {
+			const int i = threadIdx.x + j * NC_THREADS;
+
+			v[j] = (i < dim) ? x[base + i] : 0.0f;
+			wv[j] = (i < dim) ? w[i] : __float2half(0.0f);
+		}
+#pragma unroll
+		for (int j = 0; j < NC_PER; j++)
+			acc += v[j] * v[j];
+
+		const float sc = amp_row_rsqrt(acc, dim, eps);
+
+#pragma unroll
+		for (int j = 0; j < NC_PER; j++) {
+			const int i = threadIdx.x + j * NC_THREADS;
+
+			if (i < dim)
+				out[base + i] = __hmul(__float2half(v[j] * sc), wv[j]);
+		}
+
+		return;
+	}
 
 	for (int i = threadIdx.x; i < dim; i += blockDim.x)
-		out[(size_t)row * dim + i] = __hmul(__float2half(xr[i] * sc), w[i]);
+		acc += x[base + i] * x[base + i];
+
+	const float sc = amp_row_rsqrt(acc, dim, eps);
+
+	for (int i = threadIdx.x; i < dim; i += blockDim.x)
+		out[base + i] = __hmul(__float2half(x[base + i] * sc), w[i]);
 }
 
 extern "C" int
@@ -1895,7 +1934,7 @@ amp_rms_norm_f32in(const void *x, const void *w, void *out, long rows, int dim,
 	if (rows <= 0 || dim <= 0)
 		return 0;
 
-	amp_rms_norm_f32in_kernel<<<(int)rows, 256, 0, stream>>>((const float *)x,
+	amp_rms_norm_f32in_kernel<<<(int)rows, NC_THREADS, 0, stream>>>((const float *)x,
 		(const __half *)w, (__half *)out, dim, (float)eps);
 
 	return (int)cudaGetLastError();
@@ -1903,53 +1942,64 @@ amp_rms_norm_f32in(const void *x, const void *w, void *out, long rows, int dim,
 
 // amp_norm32: out = (res + rms(x) * w) * scale[0], fp32 out; x fp16 or fp32, w fp32,
 // res / scale optional. The Gemma 4 post-norm residual blocks in one kernel.
+//
 template <typename T>
 __global__ void amp_norm32_kernel(const T *__restrict__ x, const float *__restrict__ w,
                                   const float *__restrict__ res, const float *__restrict__ scale,
                                   float *__restrict__ out, int dim, float eps)
 {
-	const int row = blockIdx.x;
-	const T *xr = x + (size_t)row * dim;
+	const size_t base = (size_t)blockIdx.x * dim;
+	float v[NC_PER], wv[NC_PER];
 	float acc = 0.0f;
 
-	for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-		float v = (float)xr[i];
+	if (dim <= NC_MAX) {
+#pragma unroll
+		for (int j = 0; j < NC_PER; j++) {
+			const int i = threadIdx.x + j * NC_THREADS;
 
-		acc += v * v;
-	}
+			v[j] = (i < dim) ? (float)x[base + i] : 0.0f;
+			wv[j] = (i < dim) ? w[i] : 0.0f;
+		}
+#pragma unroll
+		for (int j = 0; j < NC_PER; j++)
+			acc += v[j] * v[j];
+
+		const float sc = amp_row_rsqrt(acc, dim, eps);
+		const float s = scale ? scale[0] : 1.0f;
 
 #pragma unroll
-	for (int off = 16; off > 0; off >>= 1)
-		acc += __shfl_down_sync(0xffffffffu, acc, off);
+		for (int j = 0; j < NC_PER; j++) {
+			const int i = threadIdx.x + j * NC_THREADS;
 
-	__shared__ float warp_sum[32];
+			if (i < dim) {
+				float o = v[j] * sc * wv[j];
 
-	if ((threadIdx.x & 31) == 0)
-		warp_sum[threadIdx.x >> 5] = acc;
+				if (res)
+					o += res[base + i];
 
-	__syncthreads();
+				out[base + i] = o * s;
+			}
+		}
 
-	if (threadIdx.x == 0) {
-		float total = 0.0f;
-
-		for (int i = 0; i < (int)(blockDim.x >> 5); i++)
-			total += warp_sum[i];
-
-		warp_sum[0] = rsqrtf(total / dim + eps);
+		return;
 	}
 
-	__syncthreads();
+	for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+		float q = (float)x[base + i];
 
-	const float sc = warp_sum[0];
+		acc += q * q;
+	}
+
+	const float sc = amp_row_rsqrt(acc, dim, eps);
 	const float s = scale ? scale[0] : 1.0f;
 
 	for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-		float v = (float)xr[i] * sc * w[i];
+		float o = (float)x[base + i] * sc * w[i];
 
 		if (res)
-			v += res[(size_t)row * dim + i];
+			o += res[base + i];
 
-		out[(size_t)row * dim + i] = v * s;
+		out[base + i] = o * s;
 	}
 }
 
@@ -1961,10 +2011,10 @@ amp_norm32(const void *x, int x_half, const void *w, const void *res, const void
 		return 0;
 
 	if (x_half)
-		amp_norm32_kernel<__half><<<(int)rows, 256, 0, stream>>>((const __half *)x, (const float *)w,
+		amp_norm32_kernel<__half><<<(int)rows, NC_THREADS, 0, stream>>>((const __half *)x, (const float *)w,
 			(const float *)res, (const float *)scale, (float *)out, dim, (float)eps);
 	else
-		amp_norm32_kernel<float><<<(int)rows, 256, 0, stream>>>((const float *)x, (const float *)w,
+		amp_norm32_kernel<float><<<(int)rows, NC_THREADS, 0, stream>>>((const float *)x, (const float *)w,
 			(const float *)res, (const float *)scale, (float *)out, dim, (float)eps);
 
 	return (int)cudaGetLastError();

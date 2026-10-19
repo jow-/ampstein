@@ -26,7 +26,11 @@ References: transformers `modeling_gemma4.py`, exllamav3 `architecture/gemma4.py
   tok/s on two A5000.
 - **Decode** replays CUDA graphs, one per device run and global-attention length bucket (power of two >= position + 1, captured
   lazily); the position is a device tensor (rope tables, ring slot, window slots, causal mask of the global layers). The post-norm
-  residual blocks are one `norm32` kernel each. ~72 tok/s layer split, ~81-84 tok/s with `--tp`.
+  residual blocks are one `norm32` kernel each, the pre-norms one `rms_norm_f32` (both keep a row in registers: independent loads, one
+  pass; the old loops were latency-bound at ~7 us per norm), and single-row decode runs q+k+v and gate+up as one `mgemm` launch each
+  (`AMP_GEMMA4_NO_MGEMM=1` for the separate gemms). ~94 tok/s layer split, ~98 tok/s with `--tp` (a layer is ~320 us: experts 106,
+  attention gemms 80, dense MLP 56, ~20 small kernels 60). Running the dense MLP on a forked stream beside the router gained 2% (the
+  gemms fill the SMs) and was dropped.
 - `--tp` (`gemma4_tp.uc`): attention by KV-head groups (sliding 4+4, global 1+1), dense MLP by columns / rows over the 128-aligned
   padded width (2176 = 1152 + 1024), experts expert-parallel (64 + 64), lm_head by vocabulary ranges; two all-reduces per layer
   (attention; dense MLP and experts stacked). Decode is GPU-bound on ~1700 small kernels per token, so tp gains only ~15%;

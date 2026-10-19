@@ -131,6 +131,16 @@ function build_layer(ws, cfg, i, dev) {
 		};
 	}
 
+	// single-row decode: q + k (+ v) and gate + up as one launch each (mgemm; fp16-noise different from the separate gemms)
+	if (!getenv('AMP_GEMMA4_NO_MGEMM')) {
+		let dv = 'cuda:' + dev;
+		let lins = L.v ? [ L.q, L.k, L.v ] : [ L.q, L.k ];
+
+		L.qkv_out = map(lins, (l) => torch.zeros([1, 1, l.out_features], 'float16', dv));
+		L.qkv = models.sliced(lins, L.qkv_out, dev);
+		L.mlp.gu = models.multi([ L.mlp.gate, L.mlp.up ], torch.zeros([2, 1, L.mlp.gate.out_features], 'float16', dv), dev);
+	}
+
 	return L;
 }
 
@@ -335,9 +345,21 @@ export function attn_forward(cfg, L, a, cl, pos0, ctx) {
 	let T = a.shape()[0];
 	let nh = L.nh, kvh = L.kvh, hd = L.hd, eps = cfg.rms_norm_eps;
 	let cs = L.full ? ctx.cs_g : ctx.cs_l;
-	let q = torch.qk_norm_rope(L.q.forward(a).view([1, T, nh, hd]), L.q_norm, cs.cos, cs.sin, hd, eps);
-	let kraw = L.k.forward(a);
-	let vraw = L.v ? L.v.forward(a) : kraw;                       // global layers: V = the K projection before its norm
+	let qraw, kraw, vraw;
+
+	if (T == 1 && L.qkv) {
+		L.qkv.run(a.view([1, 1, a.shape()[1]]));
+		qraw = L.qkv_out[0].view([1, -1]);
+		kraw = L.qkv_out[1].view([1, -1]);
+		vraw = L.v ? L.qkv_out[2].view([1, -1]) : kraw;
+	}
+	else {
+		qraw = L.q.forward(a);
+		kraw = L.k.forward(a);
+		vraw = L.v ? L.v.forward(a) : kraw;                       // global layers: V = the K projection before its norm
+	}
+
+	let q = torch.qk_norm_rope(qraw.view([1, T, nh, hd]), L.q_norm, cs.cos, cs.sin, hd, eps);
 	let kk = torch.qk_norm_rope(kraw.view([1, T, kvh, hd]), L.k_norm, cs.cos, cs.sin, hd, eps);
 	let vv = torch.rms_norm(vraw.contiguous().view([T * kvh, hd]), L.v_norm, eps);
 
@@ -428,7 +450,7 @@ function block_forward(cfg, L, x, cl, pos0, ctx) {
 	hp(null);
 
 	// attention
-	let a = glm5.rms_norm_f32(x, L.in_ln, eps);
+	let a = torch.rms_norm_f32(x, L.in_ln, eps);
 	let ao = attn_forward(cfg, L, a, cl, pos0, ctx);
 
 	hp('attn');
@@ -436,7 +458,7 @@ function block_forward(cfg, L, x, cl, pos0, ctx) {
 	x = torch.norm32(ao, L.post_attn, eps, x);
 
 	// feed-forward: the dense MLP and (every layer of this model) the routed experts side by side
-	let f = glm5.rms_norm_f32(x, L.pre_ff, eps);
+	let f = torch.rms_norm_f32(x, L.pre_ff, eps);
 	let m = glm5.mlp_forward(cfg, L.mlp, f);
 	let h;
 
@@ -452,7 +474,7 @@ function block_forward(cfg, L, x, cl, pos0, ctx) {
 
 		hp('r.mm');
 
-		let y2 = glm5.rms_norm_f32(x, L.pre_ff2, eps);
+		let y2 = torch.rms_norm_f32(x, L.pre_ff2, eps);
 
 		hp('r.y2');
 
@@ -461,6 +483,7 @@ function block_forward(cfg, L, x, cl, pos0, ctx) {
 		hp('moe');
 
 		L.moe.rl = null;
+
 		h = torch.norm32(mo, L.post_ff2, eps, torch.norm32(m, L.post_ff1, eps));
 	}
 	else
