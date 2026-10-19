@@ -173,6 +173,17 @@ Typical workflow (this is how the empty-split bug was found): run with
 | `AMP_GDN_SCAN_CFG` | `0` (default shape) | GDN scan kernel shape, for experiments: `0` = register-blocked (`11`), `10`-`13` = other register-blocked shapes, `VT*100+RS` (e.g. `3204`, `6401`) = the per-column form. Read once at module load. |
 | `AMP_GDN_TRACE` | unset | See [Diagnostics](#gdn_trace). |
 
+## Gemma 4 (`src/ucode/ampstein/gemma4.uc`, `src/ucode/ampstein/gemma4_tp.uc`, `src/ucode/ampstein/gemma4_vision.uc`)
+
+| variable | default | effect |
+|---|---|---|
+| `AMP_GEMMA4_NO_GRAPHS` **(opt-out)** | unset | Eager decode instead of the bucketed CUDA graphs. |
+| `AMP_GEMMA4_NO_SDPA` **(opt-out)** | unset | Sliding-layer prefill through the gathered `qsa_attn` kernel instead of fused sdpa with a window mask (also disables the bidirectional image mask). |
+| `AMP_GEMMA4_SYNC_MOE` **(opt-out)** | unset | MoE with the host read of the per-expert counts instead of the readback-free fused path. |
+| `AMP_GEMMA4_HP`, `AMP_GEMMA4_HPSYNC` | unset | Host seconds per phase of a layer (`gemma4.HP`, printed by `examples/gemma4_gen.uc`); with `HPSYNC` every phase ends in a device synchronisation (so it is the GPU time). |
+| `AMP_GEMMA4_GPUS`, `AMP_GEMMA4_TP`, `AMP_GEMMA4_PIPE`, `AMP_GEMMA4_GRAPH`, `AMP_GEMMA4_TWICE`, `AMP_GEMMA4_CHUNK`, `AMP_GEMMA4_FILE`, `AMP_GEMMA4_RAW`, `AMP_GEMMA4_NOSTOP` | `examples/gemma4_gen.uc` | Bring-up script: GPU count, tensor parallel, wavefront prefill, graph decode, a warm-up pass before the timed one, chunk, prompt file, raw prompt, ignore the end-of-turn token. |
+| `AMP_MODEL_GEMMA4` | `tests/gemma4_tokenizer.uc`, `tests/engine_store_gemma4.uc` | Model directory (`/data/models/gemma-4-26B-A4B-it-exl3-6.10bpw`). `AMP_GEMMA4_GPUS` / `AMP_GEMMA4_TP=1` choose the layout of the store test. |
+
 ## GLM-5 (`src/ucode/ampstein/glm5.uc`, `src/ucode/ampstein/glm5_tp.uc`)
 
 | variable | default | effect |

@@ -703,3 +703,26 @@ works and its calibration is good (draft confidence >= 0.9 is accepted 98%), but
 (4800 tokens each): fixed window 3: 93.6 / 86.1 tok/s (T = 0 / 0.7), adaptive up to 6: 92.6 / 85.4, up to 7:
 88.3 / 85.9; fixed 4: 88.3 / 79.7. More accepted drafts per round (2.6 vs 2.2 tokens) cost as much in verify rows
 and draft steps as they return, so it is off by default. The lever is the cost of a row, not the window.
+
+## L170 — Gemma 4: sliding rings, graph decode, and what the aux state is
+
+- A sliding layer's ring (window + chunk rows) makes a prefix rewind exact only up to the slack. The snapshot / store state
+  therefore carries the last `window` rows of every ring (`gemma4.window_aux`, the model's `aux_get` / `aux_set`) instead of
+  trusting the ring after a long generation: the 1200-token test in `engine_store_gemma4` wraps the rings and still rewinds
+  to the end-of-prompt snapshot, bit-for-bit against a fresh prefill.
+- The chat template drops the empty thought channel of earlier turns, so the cache diverges at `<|turn>model\n` of every new
+  turn: reuse is the snapshot at the prefix end, not the live state (cached_tokens was 0 until `aux_get` existed).
+- Decode graphs: the position is a device tensor (rope tables, ring slot via `index_copy_`, window slots, causal mask of the
+  global layers); the global layers' attention length is the graph's fixed shape, so one graph per power-of-two bucket,
+  captured on first use (warm-up writes the rows of the position about to run; the replay rewrites them). 23.6 -> 61-72 tok/s;
+  fusing the post-norm residual blocks (`norm32`) only bought 4%: a token is ~1700 small dependent kernels, ~10 ms of GPU time
+  on two A5000, so `--tp` (81-84 tok/s) gains little, and tp prefill (1350-1700 tok/s) loses to the pipelined layer split.
+- Wavefront prefill needs round-robin layer issue: issuing a whole stage's layers at once blocks the host on the launch queue
+  (about 1000 launches per layer pass) and the other GPU runs dry (1750 -> 2580 tok/s at 14k).
+- `models.sub_columns` accepts 128-aligned ranges now: Gemma's dense MLP is 2176 wide (2112 padded to 17 x 128), which does not
+  split in 256s.
+- Vision: patches are flattened (y, x, channel) (`image_prepare` option `hwc`), positions are x / y tables summed, the 2-D rope
+  rotates the first half of the head with x and the second with y; soft tokens are not scaled by the embedding factor, and the
+  rows of one image attend bidirectionally in the sliding layers only (the global layers stay causal), so prefill chunks may not
+  split an image (`plan_bounds`).
+

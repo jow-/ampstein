@@ -36,7 +36,11 @@ References: transformers `modeling_gemma4.py`, exllamav3 `architecture/gemma4.py
   280 x 9 patches), embedded to `n` soft tokens (<= 280) that replace `<|image|>` as `<|image> + n rows + <image|>`. The soft
   tokens are not scaled by the embedding factor, and the rows of one image attend to each other in both directions in the sliding
   layers (global layers stay causal), so prefill chunk boundaries never split an image (`plan_bounds`).
-- The RAM store / slots / hot reload are off (no `cache_export` yet).
+- **Cache state**: the model's `aux_get` (the last 1024 rows of every sliding ring) makes the end-of-prompt snapshot exact after
+  any amount of generation, and `cache_export` / `cache_import` give the host-RAM store (`--cache-ram`, 32 GiB default) and hot
+  reload (SIGTERM state file, `--tp` or not): a 100k-token state is ~2.2 GB (the global layers' rows + the windows). No resident
+  device slots (`new_slot` is not implemented). The chat template drops the empty thought channel of earlier turns, so a new turn
+  reuses the snapshot at the end of the previous prompt, not the generated answer.
 - Tokenizer: SentencePiece-style BPE (`tokenizer.c` spm mode: spaces -> U+2581, merges over the whole run, `<0xXX>` byte
   fallback); identical to the HF reference on the test strings (`examples/tok_ids.uc`).
 - Chat: `chat_gemma4.uc` + `chat_gemma4.jinja` (the checkpoint template with its two recursive macros unrolled to depth 4; the

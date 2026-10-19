@@ -245,6 +245,13 @@ amp_test(glm5_mtp_stages SCRIPT glm5_mtp ENV AMP_GLM5_STAGES=3)
 amp_test(qsa_attn)
 # engine_store_qwen4: RAM store, slots and hot reload for Qwen3.8-Flash-Next TP
 amp_test(engine_store_qwen4)
+# chat_gemma4: the Gemma 4 chat template (unrolled macros) vs jinja2 on the checkpoint's own template, and the stream parser
+amp_test(chat_gemma4)
+# gemma4_tokenizer: SentencePiece-style BPE (byte fallback, special tokens) vs the HF oracle
+amp_test(gemma4_tokenizer)
+# engine_store_gemma4: snapshot (ring window aux state), RAM store, hot reload for Gemma 4, layer split and tensor parallel
+amp_test(engine_store_gemma4)
+amp_test(engine_store_gemma4_tp SCRIPT engine_store_gemma4 ENV "AMP_GEMMA4_TP=1")
 # qwen4_qsa_sel: decode token selection (DSA kernels) vs the composite chain
 amp_test(qwen4_qsa_sel)
 # qwen4_full: full model vs the oracle
