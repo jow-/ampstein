@@ -25,10 +25,35 @@ let ids = tok.encode(text, true);
 
 printf('%d prompt tokens\n', length(ids));
 
+if (getenv('AMP_GEMMA4_TWICE')) {
+	// a warm-up pass (allocator, autotuning), then the timed one on a fresh cache
+	let run0 = m.prefill_pipeline(cache, ids, {chunk: +(getenv('AMP_GEMMA4_CHUNK') || 1024)});
+
+	while (run0.step(1)) {}
+
+	torch.synchronize();
+	cache = m.new_cache(max_seq);
+}
+
 let t1 = now();
-let lg = m.forward_chunk(ids, cache, 1);
+let lg;
+
+if (getenv('AMP_GEMMA4_PIPE')) {
+	let run = m.prefill_pipeline(cache, ids, {chunk: +(getenv('AMP_GEMMA4_CHUNK') || 1024)});
+
+	while (run.step(1)) {}
+
+	printf('issued in %.2f s\n', now() - t1);
+	lg = run.logits();
+}
+else
+	lg = m.forward_chunk(ids, cache, 1);
 
 torch.synchronize();
+if (gemma4.HP)
+	for (let k in sort(keys(gemma4.HP)))
+		printf('  host %-8s %.2f s\n', k, gemma4.HP[k]);
+
 printf('prefill %.2f s (%.0f tok/s)\n', now() - t1, length(ids) / (now() - t1));
 
 let out = [];

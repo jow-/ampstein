@@ -325,14 +325,34 @@ function attn_forward(cfg, L, a, cl, pos0, ctx) {
 /* ------------------------------------------------------------------ */
 /* block                                                               */
 
+/* AMP_GEMMA4_HP=1: host seconds per phase of the layers (export HP) */
+export let HP = getenv('AMP_GEMMA4_HP') ? {} : null;
+let hp_t = 0;
+
+function hp(name) {
+	if (!HP)
+		return;
+
+	let c = clock(true), t = c[0] + c[1] / 1e9;
+
+	if (name != null)
+		HP[name] = (HP[name] || 0) + t - hp_t;
+
+	hp_t = t;
+}
+
 /* x (T, H) fp32 -> (T, H) fp32 */
 function block_forward(cfg, L, x, cl, pos0, ctx) {
 	let eps = cfg.rms_norm_eps;
 	let T = x.shape()[0];
 
+	hp(null);
+
 	// attention
 	let a = glm5.rms_norm_f32(x, L.in_ln, eps);
 	let ao = attn_forward(cfg, L, a, cl, pos0, ctx);
+
+	hp('attn');
 
 	x = x.add(rms32(ao.to('float32'), L.post_attn, eps));
 
@@ -341,14 +361,25 @@ function block_forward(cfg, L, x, cl, pos0, ctx) {
 	let m = glm5.mlp_forward(cfg, L.mlp, f).to('float32');
 	let h;
 
+	hp('mlp');
+
 	if (L.moe) {
 		// the router sees the residual: rms-normalised, scaled by the router scale / sqrt(hidden)
 		let rin = rms32(x, L.rscale, eps);
 
+		hp('r.norm');
+
 		L.moe.rl = torch.matmul(rin, L.moe.gate_t);
 
+		hp('r.mm');
+
 		let y2 = glm5.rms_norm_f32(x, L.pre_ff2, eps);
+
+		hp('r.y2');
+
 		let mo = glm5.moe_forward(cfg, L.moe, y2);
+
+		hp('moe');
 
 		L.moe.rl = null;
 		h = rms32(m, L.post_ff1, eps).add(rms32(mo, L.post_ff2, eps));
@@ -398,6 +429,12 @@ export function load(model_dir, opts) {
 
 	for (let i = 0; i < nl; i++)
 		push(layers, build_layer(ws, cfg, i, devs[i]));
+
+	// readback-free MoE (every expert holds at most one row per token of a chunk): no host stall, so the stages overlap
+	if (!getenv('AMP_GEMMA4_SYNC_MOE'))
+		for (let L in layers)
+			if (L.moe)
+				L.moe.async_moe = true;
 
 	let embed_t = ws.gpu16('model.language_model.embed_tokens.weight', first);
 
@@ -499,7 +536,58 @@ export function load(model_dir, opts) {
 			return lg;
 		},
 
-		/* Engine interface: chunked prefill of ids at cache.length. */
+		/* The first stage's work on a chunk: embedding + its layers; stage_run() continues on the next device. */
+		stage_begin: function (token_ids, pos0) {
+			let ids = torch.from_array(token_ids, 'int64', 'cuda:' + first);
+
+			return {pos0: pos0, n: length(token_ids), x: embed_t.index(ids).to('float32').mul(EMBED_SCALE), dev: first, ctx: null};
+		},
+
+		/* chunk c arrives at the stage that starts at layer i0: moves to its device, builds the per-device tables */
+		stage_enter: function (c, i0) {
+			let dev = layers[i0].dev;
+
+			if (c.dev != dev) {
+				hp(null);
+				c.x = c.x.cuda(dev);
+				c.dev = dev;
+				c.ctx = null;
+				hp('xfer');
+			}
+
+			if (!c.ctx)
+				c.ctx = {
+					ring: ring,
+					cs_l: rope_cs(invs[dev].l, c.pos0, c.n, dev),
+					cs_g: rope_cs(invs[dev].g, c.pos0, c.n, dev),
+					widx: (c.n < 64 || getenv('AMP_GEMMA4_NO_SDPA')) ? window_idx(c.pos0, c.n, cfg.sliding_window, ring, dev) : null
+				};
+		},
+
+		/* the layers [i0, i1) (all on one device) of chunk c */
+		stage_run: function (c, cache, i0, i1) {
+			this.stage_enter(c, i0);
+
+			for (let i = i0; i < i1; i++)
+				c.x = block_forward(cfg, layers[i], c.x, cache.layers[i], c.pos0, c.ctx);
+		},
+
+		/* the logits (1, vocab) of the last row of a finished chunk */
+		stage_head: function (c) {
+			let x = c.x.narrow(0, c.n - 1, 1).contiguous();
+			let lg = this.lm_head.forward(glm5.rms_norm_f32(x, this.norm, cfg.rms_norm_eps));
+
+			if (cfg.softcap > 0) {
+				let e = lg.to('float32').mul(2.0 / cfg.softcap).exp();
+
+				lg = e.sub(1.0).div(e.add(1.0)).mul(cfg.softcap).to('float16');
+			}
+
+			return lg;
+		},
+
+		/* Engine interface: chunked prefill of ids at cache.length as a wavefront over the device runs: every round each
+		 * stage advances its chunk, so the GPUs work on consecutive chunks at the same time (the MoE needs no host read). */
 		prefill_pipeline: function (cache, ids, opts) {
 			let model = this;
 			let chunk = min(opts.chunk || 1024, chunk_cap);
@@ -516,29 +604,107 @@ export function load(model_dir, opts) {
 			bounds = sort(bounds, (a, b) => a - b);
 			push(bounds, start + total);
 
+			// contiguous layer runs per device
+			let stages = [];
+
+			for (let i = 0; i < nl; i++)
+				if (!length(stages) || stages[length(stages) - 1].dev != layers[i].dev)
+					push(stages, {i0: i, i1: i + 1, dev: layers[i].dev});
+				else
+					stages[length(stages) - 1].i1 = i + 1;
+
+			let ns = length(stages);
+			let active = map(stages, () => null);
 			let next = 0, prev = start, done = 0, result = null;
+			let snap_at = (opts.cuts && length(opts.cuts)) ? opts.cuts[0] : 0;
+
+			function admit() {
+				if (active[0] != null || next >= length(bounds))
+					return;
+
+				// a snapshot boundary is taken at the chunk end: nothing may be in flight behind it
+				if (snap_at && prev == snap_at)
+					for (let c in active)
+						if (c)
+							return;
+
+				let end = bounds[next++];
+				let c = model.stage_begin(slice(ids, prev - start, end - start), prev);
+
+				c.end = end;
+				prev = end;
+				active[0] = c;
+			}
+
+			function round() {
+				// the stages' layers are issued round-robin: a stage issued whole blocks the host on its full launch
+				// queue and the other stages' GPUs run dry meanwhile
+				let n = 0;
+
+				for (let s = ns - 1; s >= 0; s--)
+					if (active[s]) {
+						model.stage_enter(active[s], stages[s].i0);
+						n = max(n, stages[s].i1 - stages[s].i0);
+					}
+
+				for (let j = 0; j < n; j++)
+					for (let s = ns - 1; s >= 0; s--) {
+						let c = active[s], i = stages[s].i0 + j;
+
+						if (c && i < stages[s].i1)
+							c.x = block_forward(cfg, layers[i], c.x, cache.layers[i], c.pos0, c.ctx);
+					}
+
+				for (let s = ns - 1; s >= 0; s--) {
+					let c = active[s];
+
+					if (!c)
+						continue;
+
+					if (s == ns - 1) {
+						if (c.end == start + total)
+							result = model.stage_head(c);
+
+						cache.length = c.end;
+						done = c.end - start;
+						active[s] = null;
+
+						if (opts.on_aux)
+							opts.on_aux(c.end);
+					}
+					else {
+						active[s + 1] = c;
+						active[s] = null;
+					}
+				}
+
+				admit();
+			}
+
+			admit();
 
 			return {
 				step: function (rounds) {
 					for (let r = 0; r < (rounds || 1); r++) {
-						if (next >= length(bounds))
+						let busy = (next < length(bounds));
+
+						for (let c in active)
+							if (c)
+								busy = true;
+
+						if (!busy)
 							break;
 
-						let end = bounds[next++];
-						let last_c = (end == start + total);
-						let lg = model.forward_chunk(slice(ids, prev - start, end - start), cache, last_c ? 1 : 0);
-
-						if (last_c)
-							result = lg;
-
-						prev = end;
-						done = end - start;
-
-						if (opts.on_aux)
-							opts.on_aux(end);
+						round();
 					}
 
-					return next < length(bounds);
+					let more = (next < length(bounds));
+
+					for (let c in active)
+						if (c)
+							more = true;
+
+					return more;
 				},
 
 				done_tokens: function () {return done;},
