@@ -104,6 +104,50 @@ export function LinearEXL3(ws, key, dev) {
 	};
 }
 
+/* An EXL3 linear whose trellis stays in host memory (`host`: a view of a pinned
+ * arena, see qwen4_tp host_experts). The fused MoE kernels read it through the
+ * pointer tables over the host link; suh / svh are the small per-matrix scale
+ * vectors and live on the device. forward() is the rare composite fallback: it
+ * copies the trellis to the device for the call. */
+export function LinearEXL3Cold(ws, key, dev, host) {
+	let s = ws.info(key + '.trellis').shape;
+	let mul1 = ws.has(key + '.mul1') ? true : false;
+	let mcg = ws.has(key + '.mcg') ? true : false;
+
+	if (mul1 && mcg)
+		die(`LinearEXL3Cold: ${key}: both .mul1 and .mcg marker tensors present`);
+
+	return {
+		trellis: host,
+		suh: ws.gpu(key + '.suh', dev),
+		svh: ws.gpu(key + '.svh', dev),
+		bias: null,
+		K: s[2] / 16.0,
+		mul1: mul1,
+		mcg: mcg,
+		dev: dev_of(dev),
+		host: true,
+		dev_trellis: null,
+		in_features: s[0] * 16,
+		out_features: s[1] * 16,
+
+		forward: function (x) {
+			let m = x.shape()[0];
+			// dev_trellis: a view of the staged copy (expert_host.mlp), else the trellis is copied for this call
+			let t = this.dev_trellis ?? this.trellis.cuda(this.dev);
+
+			if (m > RECON_ROWS && this.out_features <= RECON_MAX_N)
+				return torch.exl3_gemm_recon(x.contiguous(), t, this.suh, this.svh, this.K, this.mul1, this.mcg);
+
+			let out = torch.empty([m, this.out_features], 'float16', 'cuda:' + this.dev);
+
+			torch.exl3_gemm(x, t, out, this.suh, this.svh, this.mul1, this.mcg);
+
+			return out;
+		}
+	};
+}
+
 /* Sequence-aware EXL3 variant: accepts 2-D (m, k) or 3-D (batch, seq,
  * k) input; 3-D is flattened for the kernel and reshaped back. */
 export function LinearEXL3Seq(ws, key, dev) {

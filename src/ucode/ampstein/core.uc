@@ -298,8 +298,14 @@ export function serve(args) {
 		}
 	}
 	else if (Q4) {
+		if (args.expert_resident != null && args.expert_resident < 1.0 && !(args.tp && args.expert_profile)) {
+			warn('ampstein: --expert-resident below 1 needs --tp and --expert-profile\n');
+			exit(1);
+		}
+
 		model = args.tp ? qwen4_tp.load(args.model, {devices: args.gpus, mtp: args.mtp > 0,
-			prefill_rows: args.chunk, stages: args.stages}) :
+			prefill_rows: args.chunk, stages: args.stages,
+			host_experts: args.expert_resident != null ? {frac: args.expert_resident, profile: args.expert_profile} : null}) :
 			qwen4.load(args.model, {devices: args.gpus, mtp: args.mtp > 0});
 	}
 	else {

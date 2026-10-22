@@ -14,6 +14,7 @@ import * as math from 'math';
 import * as weights from './weights.uc';
 import * as models from './models.uc';
 import * as qwen35 from './qwen35.uc';
+import * as expert_host from './expert_host.uc';
 import {readfile, stat} from 'fs';
 
 export const LP = 'model.language_model.layers.';
@@ -774,12 +775,18 @@ export function moe_route(cfg, M, y) {
 			// one kernel: top-k on the logits, softmax of the selected (the same weights)
 			let r = torch.v41_route(mm32(y.to('float32'), M.gate_t), null, cfg.num_experts_per_tok, 1.0);
 
+			if (TRACE)
+				TRACE(cfg, M, y, r[0]);
+
 			return {idx: r[0], w: r[1]};
 		}
 
 		let p = mm32(y.to('float32'), M.gate_t).softmax(-1);
 		let tk = p.topk(cfg.num_experts_per_tok, -1);
 		let w = tk.values;
+
+		if (TRACE)
+			TRACE(cfg, M, y, tk.indices);
 
 		return {idx: tk.indices, w: w.div(w.sum(1, true).add(1e-20))};
 	}
@@ -1154,7 +1161,7 @@ function moe_sorted_finish(cfg, M, p) {
 
 	for (let e in heavy) {
 		let rt = tok.narrow(0, starts[e], cl[e]);
-		let d = mlp_forward(cfg, M.experts[e], y.index(rt)).to('float32');
+		let d = mlp_forward(cfg, (M.stage && M.stage.on) ? expert_host.mlp(M, e) : M.experts[e], y.index(rt)).to('float32');
 		let wt = wts.narrow(0, starts[e], cl[e]).to('float32').view([-1, 1]);
 
 		out.index_add_(0, rt, d.mul(wt));
@@ -1182,6 +1189,15 @@ export function moe_begin(cfg, M, y) {
 		if (M.coop && T <= COOP_ROWS)
 			return {done: moe_forward_fused(cfg, M, y)};
 
+		// host-resident experts, staged for this chunk (expert_host.begin): the prefill tables point at the staging buffer
+		if (M.coop && M.stage && M.stage.on) {
+			if (M.stage.pf == null)
+				M.stage.pf = expert_host.tables(M);
+
+			M.stage.dec = M.coop;
+			M.coop = M.stage.pf;
+		}
+
 		if (M.coop && (M.coop.mul1 || M.coop.mcg) && !getenv('AMP_GLM5_NO_SORTED'))
 			return {sorted: moe_sorted_begin(cfg, M, y)};
 	}
@@ -1190,7 +1206,14 @@ export function moe_begin(cfg, M, y) {
 }
 
 export function moe_finish(cfg, M, p) {
-	return p.sorted ? moe_sorted_finish(cfg, M, p.sorted) : p.done;
+	let r = p.sorted ? moe_sorted_finish(cfg, M, p.sorted) : p.done;
+
+	if (M.stage && M.stage.on) {
+		M.coop = M.stage.dec;
+		M.stage.on = false;
+	}
+
+	return r;
 }
 
 /* y: (T, hidden) fp16. Returns the MoE output (T, hidden) fp32. */

@@ -149,3 +149,11 @@ LESSONS L167 for what changed (shared expert fork in the graphs, DSA selection k
   of arrival spread per attention layer) and the expert-parallel MoE.
 - RAM store / hot reload for the PLE state, fused router kernel (`routing.cu` is
   vendored but not built), the async device-id MTP round (needs a device-side PLE hash).
+
+## Experts in host memory (`--expert-resident`)
+
+`--tp --expert-resident F --expert-profile FILE` keeps the fraction F of the experts in VRAM (ranked by the routing
+profile) and the rest in pinned host RAM, for quants that do not fit in VRAM (4.05 bpw on 2x 24 GB: F = 0.45 at ctx
+131072). Prefill stages the cold experts layer by layer behind the compute; decode reads them over PCIe from inside
+the kernels. Without the flag nothing changes. See `docs/EXPERT_STREAMING.md` (Qwen3.8-Flash-Next on j7) for numbers,
+`tests/qwen4_host_experts.uc` for the test and L171.

@@ -43,9 +43,11 @@
 //   let cache = m.new_cache(max_seq);
 //   let logits = m.forward_chunk(ids, cache);
 
+import {readfile} from 'fs';
 import * as weights from './weights.uc';
 import * as models from './models.uc';
 import * as glm5 from './glm5.uc';
+import * as expert_host from './expert_host.uc';
 import * as qwen35 from './qwen35.uc';
 import * as qwen4 from './qwen4.uc';
 
@@ -302,6 +304,53 @@ export function load(model_dir, opts) {
 		shared_owner[i] = (i + 2) % Gs;
 	}
 
+	// ---- host-resident experts (opts.host_experts = {frac, profile}): per expert-parallel rank, the
+	// `frac` of its (layer, expert) pairs with the highest counts in the routing profile keep their
+	// trellis in VRAM; the rest stay in pinned host memory and the fused kernels read them over the
+	// link (a miss costs its transfer, a hit nothing). Unset (or frac >= 1): nothing below runs and
+	// every expert is uploaded to its rank's device as before.
+	let cold = null, n_cold = 0;
+	let hx = opts.host_experts;
+
+	if (hx && hx.frac != null && hx.frac < 1.0) {
+		let prof = json(readfile(hx.profile)).counts;
+
+		if (type(prof) != 'array' || length(prof) < nl)
+			die(`qwen4_tp: host_experts profile ${hx.profile} has no counts for ${nl} layers`);
+
+		cold = [];
+
+		for (let i = 0; i < nl; i++) {
+			let row = [];
+
+			for (let e = 0; e < cfg.n_routed_experts; e++)
+				push(row, false);
+
+			push(cold, row);
+		}
+
+		for (let S in stages) {
+			for (let r = 0; r < S.G; r++) {
+				let e0 = S.plan.experts[r][0], en = S.plan.experts[r][1];
+				let items = [];
+
+				for (let i = S.first; i < S.end && i < nl; i++)
+					for (let e = e0; e < e0 + en; e++)
+						push(items, [prof[i][e], i, e]);
+
+				sort(items, (a, b) => (b[0] - a[0]) || (a[1] - b[1]) || (a[2] - b[2]));
+
+				for (let k = int(length(items) * hx.frac + 0.5); k < length(items); k++) {
+					cold[items[k][1]][items[k][2]] = true;
+					n_cold++;
+				}
+			}
+		}
+
+		warn(sprintf('qwen4_tp: host experts: %d of %d routed experts stay in pinned host memory (resident fraction %.2f)\n',
+			n_cold, nl * cfg.n_routed_experts, hx.frac));
+	}
+
 	// ---- one batched upload of everything, routed to where it is used (the
 	// staged ones — GDN, router, gated-residual tables — are sliced / copied below)
 	let by_layer = [];
@@ -326,8 +375,13 @@ export function load(model_dir, opts) {
 
 			if (index(sub, 'mlp.experts.') == 0) {
 				let r2 = substr(sub, 12);
+				let ex = +substr(r2, 0, index(r2, '.'));
 
-				return S.devs[S.expert_rank[+substr(r2, 0, index(r2, '.'))]];
+				// a cold expert's trellis is read into the pinned arena by make_row, not uploaded
+				if (cold && cold[i][ex] && substr(r2, -8) == '.trellis')
+					return null;
+
+				return S.devs[S.expert_rank[ex]];
 			}
 
 			if (index(sub, 'mlp.shared_expert.') == 0)
@@ -379,7 +433,7 @@ export function load(model_dir, opts) {
 	 * staged weights: sublayer shards (GDN) or the owner's whole attention, replicated
 	 * gated-residual sites and router, this rank's experts, the shared expert on its
 	 * owner. */
-	function make_row(S, key, type_i, ao, so, st, staged) {
+	function make_row(S, key, type_i, ao, so, st, staged, cold_l, li) {
 		let sd = S.devs;
 		let hc_a = qwen4.build_gr(ws, cfg, key + '.attn_hyper_connection', st, true);
 		let hc_f = qwen4.build_gr(ws, cfg, key + '.mlp_hyper_connection', st, true);
@@ -402,9 +456,58 @@ export function load(model_dir, opts) {
 				(g == ao) ? own : {type: type_i, dev: dev};
 			let e0 = S.plan.experts[g][0], en = S.plan.experts[g][1];
 			let ex = [];
+			let arena = null, slot = 0;
 
-			for (let e = e0; e < e0 + en; e++)
-				push(ex, glm5.build_mlp(ws, `${mkey}.experts.${e}`, dev));
+			if (cold_l) {
+				// this rank's cold experts: one pinned arena per matrix, an expert's trellis is a view of it
+				let nc = 0, first = -1;
+
+				for (let e = e0; e < e0 + en; e++)
+					if (cold_l[e]) {
+						nc++;
+
+						if (first < 0)
+							first = e;
+					}
+
+				if (nc) {
+					arena = {};
+
+					for (let pn in ['gate_proj', 'up_proj', 'down_proj']) {
+						let k0 = `${mkey}.experts.${first}.${pn}.trellis`;
+						let sh = ws.info(k0).shape;
+
+						arena[pn] = torch.pinned_empty([nc, sh[0], sh[1], sh[2]], ws.tensor(k0).dtype());
+					}
+				}
+			}
+
+			for (let e = e0; e < e0 + en; e++) {
+				if (!(cold_l && cold_l[e])) {
+					push(ex, glm5.build_mlp(ws, `${mkey}.experts.${e}`, dev));
+					continue;
+				}
+
+				let hs = {};
+				let my_slot = slot;
+
+				for (let pn in ['gate_proj', 'up_proj', 'down_proj']) {
+					let src = ws.tensor(`${mkey}.experts.${e}.${pn}.trellis`);
+					let dst = arena[pn].narrow(0, slot, 1).view(src.shape());
+
+					dst.copy_(src);
+					hs[pn] = dst;
+				}
+
+				slot++;
+
+				push(ex, {
+					slot: my_slot,
+					gate: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.gate_proj`, dev, hs.gate_proj),
+					up: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.up_proj`, dev, hs.up_proj),
+					down: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.down_proj`, dev, hs.down_proj)
+				});
+			}
 
 			R.attn_hc = gr_to(hc_a, dev);
 			R.mlp_hc = gr_to(hc_f, dev);
@@ -414,6 +517,12 @@ export function load(model_dir, opts) {
 				shared: (g == so) ? shared : null,
 				shared_gate: (g == so) ? sgate_t.cuda(dev) : null
 			};
+
+			if (arena)
+				R.moe.stage = {
+					dev: dev, arena: [arena.gate_proj, arena.up_proj, arena.down_proj], nc: slot, par: li % 2,
+					bufs: null, bytes: null, next: null, copied: false, on: false, pf: null, dec: null
+				};
 
 			push(row, R);
 		}
@@ -432,13 +541,19 @@ export function load(model_dir, opts) {
 			ples[i] = qwen4.build_ple(ws, cfg, i, devs[0]);
 
 		push(layers, make_row(S, LP + i, cfg.layer_types[i], attn_owner[i], shared_owner[i],
-			S.devs[i % Gs], by_layer[i]));
+			S.devs[i % Gs], by_layer[i], cold ? cold[i] : null, i));
 
 		if (i % 4 == 3)
 			gc();
 	}
 
 	gc();
+
+	if (cold) {
+		let sb = expert_host.setup(layers, nl);
+
+		warn(sprintf('qwen4_tp: host experts: staging buffers %.2f GiB per device pair\n', sb / 1073741824.0 / Gs));
+	}
 
 	// the MTP draft block: a full-attention block like a trunk layer (own cache) on the
 	// last stage, its input combine on that stage's rank 0, its own mixer from the
@@ -602,6 +717,12 @@ export function load(model_dir, opts) {
 			let S = h[0].shape()[0];
 			let cg = St.cg;
 			let m = [], p = [];
+
+			// host-resident experts: stage this layer's cold ones (and queue the next layer's) for a prefill-sized chunk
+			if (S >= expert_host.STAGE_MIN)
+				for (let g = 0; g < Gs; g++)
+					if (L[g].moe.stage)
+						expert_host.begin(L[g].moe);
 
 			for (let g = 0; g < Gs; g++)
 				push(m, qwen4.gr_mix(cfg, L[g].attn_hc, h[g]));

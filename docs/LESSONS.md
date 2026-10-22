@@ -726,3 +726,17 @@ and draft steps as they return, so it is off by default. The lever is the cost o
   rows of one image attend bidirectionally in the sliding layers only (the global layers stay causal), so prefill chunks may not
   split an image (`plan_bounds`).
 
+## L171 — Host-resident MoE experts: stage prefill, zero-copy decode, and the heavy path is the trap
+
+With part of the experts in pinned host memory, the fused MoE kernels can read them in place through the
+pointer tables, which is right for decode (a miss costs its transfer, a hit nothing, bit-identical) and wrong for
+prefill: every row tile of every launch re-reads the weights, so a 4096-row chunk moved ~3x the bytes of one pass
+(129 ms/layer against 48 resident). The fix is a bulk copy of the layer's cold experts into a device double
+buffer, one layer ahead on a side stream, and a second set of tables. Two traps while measuring it: (1) the
+"heavy" experts (more rows than the fused tiers take) go through the ordinary linear, and a cold linear that
+copies its trellis synchronously per call costs ~20 ms of host time per layer, and one that lacks the
+reconstruct path for many rows computes slower than a resident one; both showed up only in a per-layer
+timing against the all-resident baseline, not in tokens/s; (2) the all-VRAM model is not bit-reproducible
+(the synchronous prefill MoE accumulates with atomics), so a whole-model "bit-exact" test is the wrong
+criterion: check the kernel bit for bit and the model against its own run-to-run noise
+(`tests/qwen4_host_experts.uc`). Details and numbers: `docs/EXPERT_STREAMING.md`.

@@ -262,6 +262,8 @@ amp_test(qwen4_mtp)
 amp_test(qwen4_vision)
 # qwen4_tp: tensor / expert parallel
 amp_test(qwen4_tp)
+# qwen4_host_experts: part of the experts in pinned host memory (prefill staging, zero-copy decode) vs all in VRAM
+amp_test(qwen4_host_experts)
 # qwen4_depth: quality vs exllamav3 as a function of context depth
 amp_test(qwen4_depth)
 # qwen4_depth_decode: decode at depth: graph vs eager, determinism

@@ -1,9 +1,10 @@
 # Expert streaming: serving MoE models larger than VRAM
 
-Status: investigation, nothing shipped. Measurements on jai (6x RTX A5000, PCIe
-gen3 x4 per GPU), 2026-10-13. The aim is a larger quant of GLM (or DeepSeek-V4)
-than fits in VRAM, with the cold experts held in host memory and moved on demand.
-The target to try next is j7 (2x RTX 3090, PCIe 4.0 x8).
+Status: GLM / DeepSeek-V4: investigation, nothing shipped (measurements on jai, 6x RTX A5000, PCIe gen3 x4 per
+GPU, 2026-10-13). Qwen3.8-Flash-Next: **shipped as an opt-in** (`--expert-resident`, static residency, see
+"Qwen3.8-Flash-Next on j7" at the end): a 4.05 bpw quant that does not fit in 48 GB, 45% of its experts in
+VRAM, prefill 1.3-1.55k tok/s and decode 36-65 tok/s on j7 (2x RTX 3090, PCIe 4.0 x8). The dynamic cache is
+the open part.
 
 ## Summary
 
@@ -245,3 +246,88 @@ Use absolute `-L` paths: relative ones do not resolve the `ampstein.*` modules.
 - Other related work: MoE-Infinity, Mira, Pre-gated MoE, llama.cpp #29887
   (LRU slot bank, no prefetch, <= 32-token batches), Strata (hot/cold tiering plus
   1-2 token-ahead prediction; the repository was not inspected).
+
+## Qwen3.8-Flash-Next on j7
+
+2026-10-22. Model: 48 layers x 512 routed experts, top-10, an expert is 4.9 M weights (1.23 MB at 2.05 bpw,
+2.46 MB at 4.05 bpw, 3.7 MB at 6.05 bpw). Strata (Niko1221/Strata, a llama.cpp-derived engine for this one model)
+was read for ideas: its CPU computation of cold experts, the route tail skip and the global decayed-count cache.
+The numbers below say the PCIe-only path is enough here, so the CPU expert path was not built.
+
+### Measured
+
+| What | Result |
+|---|---|
+| host -> device copy, per GPU / both GPUs at once | 12.47 GB/s / 12.47 GB/s each (24.9 total) |
+| CPU streaming read of DRAM (AVX-512) | 55-60 GB/s, unchanged while both GPUs copy |
+| `torch.moe_coop` (T = 1), 10 experts in VRAM / all on the host / half | 0.069 / 0.955 / 0.497 ms (layer 3, 2.05 bpw) |
+| one missed expert | 88 us at 1.23 MB (13.9 GB/s), linear in the rows T; a hit costs nothing |
+| output of the kernel with VRAM, host and mixed tables | bit-identical (`examples/bench_zerocopy_qwen4.uc`) |
+
+Routing locality (`examples/trace_routing_qwen4.uc`, 8 open-source agent sessions, 3,139 decode tokens, warm
+cache; `tests/oracle/routing_analysis_qwen4.py`): decode hit rate at 10 / 25 / 40 / 55 / 78% of the experts
+resident, per-layer LRU 0.63 / 0.84 / 0.92 / 0.96 / 0.99, a global decayed-count cache 0.60 / 0.84 / 0.93 / 0.97 /
+0.99. Much better than GLM (0.63 at 25%) because the experts are small and numerous. A *static* profile built from
+other sessions is far worse (leave-one-out: 0.40 / 0.65 / 0.81 / 0.91 / 0.98), so a shipped profile is only a
+starting point. Consecutive tokens share 3.2 of 10 experts, a 3-token window touches 22.9 of 30, a prefill
+chunk 419 of 512 per layer. Misses concentrate in the low router ranks (ranks 7-9 hold 42-53% of them), which
+is what Strata's tail skip exploits.
+
+### Design (`src/ucode/ampstein/expert_host.uc`, `qwen4_tp.uc`, `models.uc`)
+
+`ampstein --model Qwen3.8-Flash-Next-... --tp --expert-resident F --expert-profile profile.json` keeps the
+fraction F of each rank's (layer, expert) pairs, ranked by the profile's counts across all layers of the
+rank, in VRAM. The rest have their trellis in pinned host memory: one arena per layer, rank and matrix, an
+expert's tensor is a view of it (`models.LinearEXL3Cold`; the small `suh` / `svh` stay on the device). Nothing
+changes in the kernels: the pointer tables that `build_coop` makes simply hold host addresses.
+
+- **Decode** (and verify windows, S < 128) reads cold experts over the link from inside the fused kernel.
+- **Prefill** (S >= `AMP_EXPERT_STAGE_MIN`, 128) first copies the layer's cold experts in bulk (three copies per
+  layer and rank) into a per-device double buffer on a side stream, one layer ahead, behind the previous layer's
+  compute (`torch.copy_h2d_async`, `stream_side` slot 0), and runs on a second set of tables that point into the
+  buffer. Experts with more than `FUSED_ROWS` rows use the composite path on the staged copy.
+- The MTP head's experts stay resident. `M.stage` is null for every layer without cold experts, so a model
+  without `--expert-resident` takes none of these branches.
+- A profile is `counts[layer][expert]`; `tests/oracle/routing_profile.py` makes one from a trace.
+
+### Results (4.05 bpw, 45% resident, ctx 131072, Q8 KV, 22.5 / 22.9 GB used, 2 GB free)
+
+| | before staging | with staging |
+|---|---|---|
+| prefill 16k tokens, chunk 1024 / 4096 | 715 / 800 tok/s | 1.55k tok/s (chunk 4096) |
+| prefill 9.4k tokens | 630 tok/s | 1.3k tok/s |
+| decode, 512 greedy tokens (C / Python / prose, MTP 3) | 47 / 65 / 36 tok/s | same |
+
+For comparison, the 2.05 bpw model fully in VRAM does 145 tok/s decode and 1.5-1.6k tok/s prefill on the same
+box. Per layer of a 4096-row chunk (8 layers of the real model, `100%` = all in VRAM): 48 ms at 100% resident,
+129 / 91 / 69 / 56 ms at 45% resident as the work above was added (zero-copy reads, staging, staged heavy experts,
+the reconstruct path for heavy experts), 197 -> 71 ms with nothing resident. The copy of a layer (600 MB per GPU)
+takes 45-50 ms against 48 ms of compute, so the layer time can approach the larger of the two.
+
+Decode: eager steps on 8 layers cost 0.58 ms/layer resident, 0.78 at 45%, 1.47 with nothing resident (the
+last matches 480 misses x 177 us / 2 GPUs). At 45% the stall is about 9 ms per token, the miss rate being
+about 20% with the static hot set against 7% predicted for an adaptive cache. Hosting 45% of the *2.05 bpw*
+model (same compute) halves decode, 145 -> 70 tok/s.
+
+### 6.05 bpw (86.6 GiB of experts)
+
+`--expert-resident 0.28`, chunk 4096, ctx 131072, Q8 KV: loads in ~4 min (184 s of it the arenas), 23.4 / 23.5 GB
+used, 1.6 GB free, ~62 GiB pinned (host: 45 GB available afterwards). Output coherent. Prefill 870-1080 tok/s
+(9.4k / 16k prompts, 60 decoded tokens subtracted), decode 22-29 tok/s (C / Python / prose, MTP 3).
+
+Per layer of a 4096-row chunk (8 layers): 49 ms all resident, 75 ms at 28%, 94 ms with nothing resident. The copy
+of a layer's cold experts is 54 ms at 28%, so the chunk size decides how much of it hides: at 28% resident
+a layer costs 62 ms (chunk 2048, copy-bound), ~68 (4096, steady state), ~104 (8192, 5% over the resident
+compute), i.e. ~1.1k and ~1.5k tok/s steady state at 4096 and 8192. Chunk 8192 and 6144 do not fit next to 26-28%
+resident experts (OOM in warm-up / the first chunk on GPU 0): VRAM, not the link, limits the chunk.
+Ways to buy room without giving up resident experts: a balanced cold count per layer (the staging buffers are
+sized for the largest layer, 1.42 GiB), staging only the experts a chunk uses, a smaller ctx.
+
+### Open
+
+- A dynamic cache for decode: a host thread keeping decayed counts, rewriting table entries between graph
+  replays and promoting experts with async copies (the sketch above). The simulation says 0.93 hits at 40%
+  resident against 0.81 for the static set.
+- Route tail skip (`Strata`: skip a missed expert that every token of the window ranks 7th or lower).
+- The 6.05 bpw quant (85 GiB of experts, 40% resident); `--expert-resident` autosizing from free VRAM.
+- Loading cold experts by sequential `read()` into the arenas (L40) instead of copying from the mmap'd files.
