@@ -907,6 +907,15 @@ function moe_forward_fused(cfg, M, y) {
 	if (sh)
 		join(M.dev, 1);
 
+	if (M.skip) {
+		// route tail skip (host-resident experts): picks of a cold expert at router rank >= skip are not computed
+		// (their weight is lost, not renormalised); an id outside the rank's range is ignored by the kernel
+		let sk = M.skip, ix = r.idx.reshape([-1]);
+		let keep = sk.cold.gather(0, ix).view(r.idx.shape()).mul(sk.tail).le(0);
+
+		r = {idx: torch.where(keep, r.idx, sk.drop), w: r.w};
+	}
+
 	torch.moe_coop(y.contiguous(), r.idx.contiguous(), r.w.to('float16').contiguous(),
 		M.coop, sh);
 

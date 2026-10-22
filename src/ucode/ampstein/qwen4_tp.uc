@@ -539,6 +539,23 @@ export function load(model_dir, opts) {
 					bufs: null, bytes: null, next: null, copied: false, on: false, pf: null, dec: null
 				};
 
+			// route tail skip: cold picks at router rank >= hx.skip are dropped in the decode step (glm5.moe_forward_fused)
+			if (arena && hx.skip > 0) {
+				let K = cfg.num_experts_per_tok, cm = [], tl = [];
+
+				for (let e = 0; e < cfg.n_routed_experts; e++)
+					push(cm, (e >= e0 && e < e0 + en && ex[e - e0].slot != null) ? 1.0 : 0.0);
+
+				for (let k = 0; k < K; k++)
+					push(tl, k >= hx.skip ? 1.0 : 0.0);
+
+				R.moe.skip = {
+					cold: torch.from_array(cm, 'float32', 'cuda:' + dev),
+					tail: torch.from_array(tl, 'float32', 'cuda:' + dev).view([1, K]),
+					drop: torch.full([1], -1, 'int64', 'cuda:' + dev)
+				};
+			}
+
 			push(row, R);
 		}
 

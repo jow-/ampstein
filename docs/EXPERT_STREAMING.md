@@ -367,8 +367,16 @@ content displaces the experts (decay 0.99 per step: `AMP_EXPERT_DYN_DECAY`, plan
 that a layer's output does not change by one bit, then runs planned exchanges and a staged prefill against the VRAM
 model at its own run-to-run noise.
 
+### Route tail skip (`--expert-skip N`)
+In a decode step a pick of a host-resident expert at router rank N or lower (0-based, the router returns them by weight) is
+not computed: the pick is rewritten to an id outside the rank's range, which the fused kernel ignores, so the expert is not
+read over the link. The weight is lost, not renormalised. Resident experts are always computed; prefill is exact.
+6.05 bpw, 24% resident, 4 swaps, same 12 requests of 400 tokens: skip off 12.8-19.8 s, skip 6 8.7-15.5 s (~-30%),
+skip 4 7.1-11.8 s (~-45%, ~40 tok/s). The output is approximate: at temperature 0 it leaves the exact run's text within
+tens to hundreds of characters but stays coherent in the samples checked (code, explanations); no perplexity measurement
+yet. Off by default.
+
 ### Open
-- Route tail skip (`Strata`: skip a missed expert that every token of the window ranks 7th or lower).
 - `--expert-resident` autosizing from free VRAM (today the fraction is found by trying: ~0.43 GiB per GPU per point at 6.05 bpw).
 - Exchanges on a side stream overlapping the next replay (today they run between replays, ~0.6 ms each at 6.05 bpw).
 - The 4.05 bpw configuration at chunk 8192 (probably ~0.42 resident), and 3-stage TP with host experts.

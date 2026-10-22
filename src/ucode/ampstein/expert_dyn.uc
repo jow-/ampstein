@@ -135,6 +135,10 @@ export function create(tp, layers, nl, cfg, hx) {
 			B[NAMES[m]].dev_trellis = null;
 		}
 
+		if (M.skip)
+			M.skip.cold.index_copy_(0, torch.from_array([M.e0 + jc, M.e0 + jh], 'int64', dv),
+				torch.from_array([0.0, 1.0], 'float32', dv));
+
 		B.slot = A.slot;
 		A.slot = null;
 		stg.pf = null;         // the staging tables are rebuilt from the experts at the next staged chunk
