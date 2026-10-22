@@ -6219,6 +6219,59 @@ torch_copy_async(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * copy_h2d_async(dst, src): null
+ *
+ * Enqueues a host-to-device copy of src into dst WITHOUT synchronizing:
+ * src must be a contiguous PINNED CPU tensor, dst a contiguous CUDA tensor
+ * of the same byte size (no dtype conversion). The transfer runs on the
+ * destination device's current stream (a stream_side branch for copies that
+ * overlap compute); the pinned source must stay alive and unchanged until
+ * the stream has passed the copy. at::Tensor::copy_ would synchronize the
+ * host thread.
+ */
+static uc_value_t *
+torch_copy_h2d_async(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *dst, *src;
+
+	if (nargs != 2) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"copy_h2d_async: expected (dst, src)");
+		return NULL;
+	}
+
+	if (!(dst = tensor_arg(vm, uc_fn_arg(0))) ||
+	    !(src = tensor_arg(vm, uc_fn_arg(1))))
+		return NULL;
+
+	if (!dst->is_cuda() || src->device().type() != at::kCPU ||
+	    !src->is_pinned() || !dst->is_contiguous() || !src->is_contiguous() ||
+	    dst->numel() * dst->element_size() !=
+	    src->numel() * src->element_size()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"copy_h2d_async: contiguous pinned CPU src, contiguous CUDA dst, "
+			"equal byte size expected");
+		return NULL;
+	}
+
+	try {
+		c10::cuda::CUDAGuard g((c10::DeviceIndex)dst->get_device());
+		cudaError_t e = cudaMemcpyAsync(dst->data_ptr(), src->data_ptr(),
+			dst->numel() * dst->element_size(), cudaMemcpyHostToDevice,
+			c10::cuda::getCurrentCUDAStream(
+				(c10::DeviceIndex)dst->get_device()).stream());
+
+		if (e != cudaSuccess)
+			RAISE(cudaGetErrorString(e));
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+/*
  * common_prefix(a, b): int
  *
  * Length of the common prefix of two arrays of integers (token ids),
@@ -10375,6 +10428,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "common_prefix",	torch_common_prefix },
 	{ "copy_many",	torch_copy_many },
 	{ "copy_async",	torch_copy_async },
+	{ "copy_h2d_async",	torch_copy_h2d_async },
 	{ "moe_coop",	torch_moe_coop },
 	{ "skinny",	torch_skinny },
 	{ "fp8_gemv",	torch_fp8_gemv },

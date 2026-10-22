@@ -29,6 +29,21 @@ function expect_raise(what, fn) {
 
 /* --- constructors ------------------------------------------------------- */
 
+/* --- host/device copies ---------------------------------------------------- */
+
+expect_raise('copy_h2d_async: no args', function () { torch.copy_h2d_async(); });
+expect_raise('copy_h2d_async: one arg', function () { torch.copy_h2d_async(torch.zeros([2])); });
+expect_raise('copy_h2d_async: not tensors', function () { torch.copy_h2d_async(1, 2); });
+expect_raise('copy_h2d_async: CPU dst', function () {
+	torch.copy_h2d_async(torch.zeros([2]), torch.pinned_empty([2]));
+});
+expect_raise('copy_h2d_async: unpinned src', function () {
+	torch.copy_h2d_async(torch.zeros([2], 'float32', 'cuda:0'), torch.zeros([2]));
+});
+expect_raise('copy_h2d_async: size mismatch', function () {
+	torch.copy_h2d_async(torch.zeros([2], 'float32', 'cuda:0'), torch.pinned_empty([3]));
+});
+
 expect_raise('zeros: no args', function () { torch.zeros(); });
 expect_raise('zeros: negative dim', function () { torch.zeros([-1]); });
 expect_raise('zeros: NaN dim', function () { torch.zeros([NaN]); });
