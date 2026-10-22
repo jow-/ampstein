@@ -3667,9 +3667,24 @@ export function create(model, opts) {
 	 * fails at load with a clear message instead of in the middle of the
 	 * first long request, and requests afterwards reuse reserved blocks
 	 * (no cudaMalloc on the serving path). The caches are reset after. */
+	// AMP_VRAM_LOG=1: allocator state of every GPU around the warm-up (sizing --chunk / --expert-resident)
+	function vram_log(tag) {
+		if (!getenv('AMP_VRAM_LOG'))
+			return;
+
+		for (let d = 0; d < torch.device_count(); d++) {
+			let mi = torch.mem_info(d);
+
+			warn(sprintf('engine: vram %s: GPU %d allocated %.2f, reserved %.2f, free %.2f of %.2f GiB\n', tag, d,
+				mi[0] / 1073741824.0, mi[1] / 1073741824.0, mi[2] / 1073741824.0, mi[3] / 1073741824.0));
+		}
+	}
+
 	function warmup() {
 		if (opts.warmup == false)
 			return;
+
+		vram_log('before warm-up');
 
 		let t0 = now_ms();
 		let W = mtp_w, H = hid_w;
@@ -3727,6 +3742,7 @@ export function create(model, opts) {
 
 		reset_state();
 		warn(`engine: warm-up done in ${sprintf('%.1f', (now_ms() - t0) / 1000.0)} s\n`);
+		vram_log('after warm-up');
 	}
 
 	warmup();
