@@ -41,6 +41,10 @@
 // Also: a `write` of what a recent `write` just put into another file of the same
 // directory is dropped (the copy under a new name changes nothing).
 //
+// Also: a `write` whose whole content (minus shebang, comments, blanks) is one command
+// running a file the file the previous call `write`-wrote (`bash /tmp/a.sh` into /tmp/a1.sh) is dropped,
+// with a note to call `bash` directly; Qwen otherwise chains a1.sh, a2.sh, ...
+//
 // A third one: a `bash` call that sleeps longer than SLEEP_MAX seconds
 // (`sleep 600`, `sleep 5m`, `sleep 1h 30m`, `sleep infinity`; also inside `bash -c '...'`
 // and in a script the conversation wrote with `write` and now runs) is dropped, with a
@@ -326,6 +330,98 @@ if (call.name == 'write') {
 			return `\n[call guard] That \`write\` call was not sent: ${b.path} already holds exactly this ` +
 				`content (written ${length(history) - i} call(s) ago). Writing it again under another ` +
 				`name changes nothing. Use that file: run it, or read it, and go on from there.\n`;
+		}
+	}
+}
+
+// A `write` that only runs a file a recent `write` created: the model wrote
+// /tmp/a.sh, meant to run it, and wrote /tmp/a1.sh holding `bash /tmp/a.sh`, then
+// /tmp/a2.sh holding `bash /tmp/a1.sh`, ... (Qwen: the intent to run the script
+// is carried out with the wrong tool). After dropping comments, shebang and blank
+// lines the new file is one line, and its command is the file the immediately
+// preceding call wrote. A multi-file write (a project's files) never matches: its
+// contents are not a call of the file before it.
+const RUNNERS = /^(exec|sudo|env|time|nohup|command|source|\.|(ba|z|da|k)?sh|-[A-Za-z-]+)$/;
+
+// The one command a script consists of once its setup is taken away: comments, blank
+// lines, and the `cd dir`, `set -e`, `export X=1` steps around it (`cd /x/y && bash a.sh`
+// is the same wrapper as `bash /x/y/a.sh`). null when the script holds more than one
+// command, or none.
+const SETUP = /^(cd|pushd|popd|set|export|umask|true|:)$/;
+
+function sole_command(content) {
+	let cmd = null;
+
+	for (let l in split(content, /\r?\n/)) {
+		l = trim(l);
+
+		if (l == '' || substr(l, 0, 1) == '#')
+			continue;
+
+		// (`a && b`, `a; b`, `(a)`: the parts of a line; a pipe or redirect stays with its command)
+		for (let seg in split(l, /(&&|\|\||[;()])/)) {
+			seg = trim(seg);
+
+			if (seg == '' || match(split(seg, /[[:space:]]+/)[0], SETUP))
+				continue;
+
+			if (cmd != null)
+				return null;
+
+			cmd = seg;
+		}
+	}
+
+	return cmd;
+}
+
+// The file such a command runs, with the shell around it taken off (`exec bash -x ./a.sh x`).
+function runs_file(line) {
+	for (let w in split(line, /[[:space:]]+/)) {
+		if (match(w, RUNNERS))
+			continue;
+
+		w = replace(w, /^['"]|['";&|]+$|['"]$/g, '');
+
+		return replace(w, /^\.\//, '');
+	}
+
+	return null;
+}
+
+if (call.name == 'write') {
+	let a = null;
+
+	try {
+		a = json(call.arguments);
+	}
+	catch (e) {
+		a = null;
+	}
+
+	let line = (type(a) == 'object' && type(a.content) == 'string') ? sole_command(a.content) : null;
+	let target = line ? runs_file(line) : null;
+
+	if (target) {
+		let past = [ ...history, ...(calls ?? []) ];
+
+		let h = length(past) ? past[length(past) - 1] : null, b = null;
+
+		if (h?.name == 'write') {
+			try {
+				b = json(h.arguments);
+			}
+			catch (e) {
+				b = null;
+			}
+		}
+
+		if (type(b?.path) == 'string' && b.path != a.path &&
+		    (b.path == target || substr(b.path, -(length(target) + 1)) == '/' + target) &&
+		    !(h.result != null && match(h.result, FAILED))) {
+			return `\n[call guard] That \`write\` call was not sent: ${a.path ?? 'the file'} would only contain ` +
+				`\`${head(line, 80)}\`, and ${b.path} already exists. A file that just runs another file is not ` +
+				`what you want: to run ${b.path}, call the \`bash\` tool with that command.\n`;
 		}
 	}
 }
