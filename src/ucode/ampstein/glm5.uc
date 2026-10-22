@@ -901,6 +901,9 @@ function moe_forward_fused(cfg, M, y) {
 	let sh = M.shared ? side(M.dev, 1, () => shared_out(cfg, M, y).contiguous()) : null;
 	let r = moe_route(cfg, M, y);
 
+	if (M.sellog)
+		M.sellog(r.idx);        // host-resident experts: the picks of this step, for the residency manager (expert_dyn.uc)
+
 	if (sh)
 		join(M.dev, 1);
 

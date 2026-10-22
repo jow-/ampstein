@@ -6,6 +6,7 @@
 // Env: AMP_MODEL_QWEN4, AMP_QWEN4_LAYERS=N (default 8), AMP_QWEN4_HOST_FRAC (resident fraction, default 0.4).
 
 import * as qwen4_tp from 'ampstein.qwen4_tp';
+import * as glm5 from 'ampstein.glm5';
 import * as math from 'math';
 import { stat, writefile } from 'fs';
 
@@ -43,19 +44,85 @@ for (let i = 0; i < 60; i++)
 let ids = tk.encode(text + ' Expert streaming keeps cold experts in host memory.', false);
 const DECODE = [101, 202, 303, 404, 505];
 
+let exact = true, planned = 0;
+
+// one MoE layer on a one-row input: the decode kernel is deterministic, so exchanging experts between VRAM and
+// host memory (the same bytes, other addresses) must not change one bit of its output
+function layer_out(m, L, r) {
+	let M = m.layers[L][r].moe, dv = 'cuda:' + M.dev, H = m.cfg.hidden_size;
+	let xs = [];
+
+	for (let i = 0; i < H; i++)
+		push(xs, ((i * 2654435761 + L * 97) % 1000) / 20000.0 - 0.025);
+
+	let y = torch.from_array(xs, 'float32', dv).to('float16').reshape([1, H]);
+
+	return glm5.moe_finish(m.cfg, M, glm5.moe_begin(m.cfg, M, y)).cpu();
+}
+
+// exchange the first cold expert with the first resident one of every layer and rank
+function swap_all(m) {
+	for (let L = 0; L < NL; L++)
+		for (let r = 0; r < m.Gs; r++) {
+			let ex = m.layers[L][r].moe.experts, jc = -1, jh = -1;
+
+			for (let j = 0; j < length(ex); j++) {
+				if (ex[j].slot != null && jc < 0)
+					jc = j;
+				else if (ex[j].slot == null && jh < 0)
+					jh = j;
+			}
+
+			if (jc < 0 || jh < 0)
+				continue;
+
+			// the experts the layer's one-row input picks matter little: force the exchange of the first pair and
+			// of the pair it was made from, then check that nothing moved
+			let before = layer_out(m, L, r);
+
+			m.dyn.force(L, r, jc, jh);
+
+			if (layer_out(m, L, r).sub(before).abs().max().item() != 0)
+				exact = false;
+
+			m.dyn.force(L, r, jh, jc);      // back: the original resident expert returns, the cold one leaves
+
+			if (layer_out(m, L, r).sub(before).abs().max().item() != 0)
+				exact = false;
+
+			m.dyn.force(L, r, jc, jh);
+		}
+}
+
 function run(host) {
 	let m = qwen4_tp.load(MODEL, { devices: 2, layers: NL, host_experts: host });
-	let cache = m.new_cache(length(ids) + 64);
+	let out = [];
 
-	cache.trace = { blocks: [] };
-	m.forward(ids, cache, null);
+	for (let pass = 0; pass < 2; pass++) {
+		let cache = m.new_cache(length(ids) + 64);
 
-	for (let t in DECODE)
-		m.forward([t], cache, null);
+		cache.trace = { blocks: [] };
+		m.forward(ids, cache, null);
 
-	let out = map(cache.trace.blocks, (b) => b.cpu());
+		if (m.dyn && pass == 0)
+			swap_all(m);      // the second pass prefills on the exchanged (and re-staged) experts
+
+		for (let t in DECODE) {
+			m.forward([t], cache, null);
+
+			if (m.dyn)
+				m.dyn.after(1);
+		}
+
+		out = [ ...out, ...map(cache.trace.blocks, (b) => b.cpu()) ];
+	}
 
 	torch.synchronize();
+
+	if (m.dyn) {
+		printf('planned exchanges: %d in %d plans\n', m.dyn.stats.swaps, m.dyn.stats.plans);
+		planned = m.dyn.stats.swaps;
+	}
 
 	return out;
 }
@@ -91,26 +158,38 @@ let base2 = run(null);
 gc();
 
 let hosted = run({ frac: FRAC, profile: PROFILE });
-let ok = length(base) == length(hosted) && length(base) == length(base2) && length(base) > 0;
+
+gc();
+
+// dynamic residency: exchanges forced in every layer, then a plan after every decode step
+// (a near-zero prior: whatever the steps pick beats the resident experts, so planned exchanges do happen)
+let dynr = run({ frac: FRAC, profile: PROFILE, swaps: 2, interval: 1, prior: 0.001 });
+let ok = length(base) == length(hosted) && length(base) == length(base2) && length(base) == length(dynr) && length(base) > 0;
 let floor = ok ? worst_rel(base, base2) : 1.0;
-let diff = ok ? worst_rel(base, hosted) : 1.0;
-
-printf('%d blocks compared, %d layers, resident fraction %.2f: run-to-run rel-rms %.2e, hosted vs VRAM %.2e\n',
-	length(base), NL, FRAC, floor, diff);
-
-if (getenv("AMP_TEST_VERBOSE"))
-	for (let i = 0; i < length(base); i++)
-		printf("  block %2d floor %.2e hosted %.2e\n", i, rel_rms(base[i], base2[i]), rel_rms(base[i], hosted[i]));
 
 // the first two blocks of each forward have not amplified the atomics' rounding noise yet
-let early = 0.0;
+function early_of(a, b) {
+	let w = 0.0;
 
-for (let i = 0; ok && i < length(base); i++)
-	if (i % NL < 2 && rel_rms(base[i], hosted[i]) > early)
-		early = rel_rms(base[i], hosted[i]);
+	for (let i = 0; i < length(a); i++)
+		if (i % NL < 2 && rel_rms(a[i], b[i]) > w)
+			w = rel_rms(a[i], b[i]);
 
-printf('first two blocks of each forward: worst rel-rms %.2e\n', early);
+	return w;
+}
 
-ok = ok && diff <= 3 * floor + 1e-6 && early < 1e-3;
+for (let v in [ [ 'static host experts', hosted ], [ 'dynamic residency', dynr ] ]) {
+	let diff = ok ? worst_rel(base, v[1]) : 1.0;
+	let early = ok ? early_of(base, v[1]) : 1.0;
+
+	printf('%s: %d blocks, %d layers, resident fraction %.2f: run-to-run rel-rms %.2e, vs VRAM %.2e, first two blocks of each forward %.2e\n',
+		v[0], length(base), NL, FRAC, floor, diff, early);
+
+	ok = ok && diff <= 3 * floor + 1e-6 && early < 1e-3;
+}
+
+printf('layer output unchanged by exchanges (bit for bit): %s\n', exact ? 'yes' : 'NO');
+
+ok = ok && exact && planned > 0;
 print(ok ? 'qwen4_host_experts ok\n' : 'qwen4_host_experts FAILED\n');
 exit(ok ? 0 : 1);

@@ -43,6 +43,8 @@ function usage() {
 	printf("  --expert-resident F   Qwen3.8-Flash-Next --tp: keep the fraction F (0..1) of the experts in VRAM, the rest\n");
 	printf("                        in pinned host memory (needs --expert-profile; default 1 = all in VRAM)\n");
 	printf("  --expert-profile FILE routing profile (JSON, counts[layer][expert]) ranking the experts for --expert-resident\n");
+	printf("  --expert-swaps N      exchange up to N experts per decode step between VRAM and host memory, following the\n");
+	printf("                        routing of the requests (default 0 = the profile's set stays)\n");
 	printf("  --name NAME           served model name (default: basename of --model)\n");
 	printf("  --cache-ram GiB       page-locked host RAM for parked states (default 32, 0 off)\n");
 	printf("  --slots N|auto        resident device slots, DeepSeek-V4 (default auto)\n");
@@ -178,6 +180,7 @@ function parse_args() {
 		case '--tp-share': a.tp_share = +v; i++; break;
 		case '--expert-resident': a.expert_resident = +v; i++; break;
 		case '--expert-profile': a.expert_profile = v; i++; break;
+		case '--expert-swaps': a.expert_swaps = +v; i++; break;
 		case '--stages': a.stages = int(v); i++; break;
 		case '--dspark-window': a.dspark_window = int(v); i++; break;
 		case '--layer-split': a.layer_split = true; break;

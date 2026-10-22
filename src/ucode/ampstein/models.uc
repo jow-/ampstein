@@ -108,7 +108,10 @@ export function LinearEXL3(ws, key, dev) {
  * arena, see qwen4_tp host_experts). The fused MoE kernels read it through the
  * pointer tables over the host link; suh / svh are the small per-matrix scale
  * vectors and live on the device. forward() is the rare composite fallback: it
- * copies the trellis to the device for the call. */
+ * copies the trellis to the device for the call. Without `host` the trellis is
+ * uploaded to the device: the resident twin of a cold expert, which the dynamic
+ * residency manager (expert_dyn.uc) exchanges for one by swapping the two handles
+ * (trellis: where the tables point, dev_trellis: the device copy or null). */
 export function LinearEXL3Cold(ws, key, dev, host) {
 	let s = ws.info(key + '.trellis').shape;
 	let mul1 = ws.has(key + '.mul1') ? true : false;
@@ -117,8 +120,10 @@ export function LinearEXL3Cold(ws, key, dev, host) {
 	if (mul1 && mcg)
 		die(`LinearEXL3Cold: ${key}: both .mul1 and .mcg marker tensors present`);
 
+	let dt = host ? null : ws.gpu(key + '.trellis', dev);
+
 	return {
-		trellis: host,
+		trellis: host ?? dt,
 		suh: ws.gpu(key + '.suh', dev),
 		svh: ws.gpu(key + '.svh', dev),
 		bias: null,
@@ -127,7 +132,7 @@ export function LinearEXL3Cold(ws, key, dev, host) {
 		mcg: mcg,
 		dev: dev_of(dev),
 		host: true,
-		dev_trellis: null,
+		dev_trellis: dt,
 		in_features: s[0] * 16,
 		out_features: s[1] * 16,
 

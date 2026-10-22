@@ -3,8 +3,8 @@
 Status: GLM / DeepSeek-V4: investigation, nothing shipped (measurements on jai, 6x RTX A5000, PCIe gen3 x4 per
 GPU, 2026-10-13). Qwen3.8-Flash-Next: **shipped as an opt-in** (`--expert-resident`, static residency, see
 "Qwen3.8-Flash-Next on j7" at the end): a 4.05 bpw quant that does not fit in 48 GB, 45% of its experts in
-VRAM, prefill 1.3-1.55k tok/s and decode 36-65 tok/s on j7 (2x RTX 3090, PCIe 4.0 x8). The dynamic cache is
-the open part.
+VRAM, prefill 1.3-1.55k tok/s and decode 36-65 tok/s on j7 (2x RTX 3090, PCIe 4.0 x8); 6.05 bpw runs at 24%
+resident (prefill 1.5k, decode 22-30 tok/s) and `--expert-swaps 4` adds 13-21% decode.
 
 ## Summary
 
@@ -323,11 +323,53 @@ resident experts (OOM in warm-up / the first chunk on GPU 0): VRAM, not the link
 Ways to buy room without giving up resident experts: a balanced cold count per layer (the staging buffers are
 sized for the largest layer, 1.42 GiB), staging only the experts a chunk uses, a smaller ctx.
 
-### Open
+### Chunk 8192 (6.05 bpw)
 
-- A dynamic cache for decode: a host thread keeping decayed counts, rewriting table entries between graph
-  replays and promoting experts with async copies (the sketch above). The simulation says 0.93 hits at 40%
-  resident against 0.81 for the static set.
+VRAM sets the chunk, not the link. `AMP_VRAM_LOG=1` prints the allocator state around the engine's warm-up: at chunk
+4096 and 28% resident 1.7-1.9 GiB are free before the warm-up and its working set is 1.3 GiB (0.65 GiB left); at 8192 the
+working set is 2.5 GiB on GPU 0 (1.9 on GPU 1), so 8192 needs about 1.1 GiB more than 28% resident leaves. For 6.05 bpw
+one point of resident fraction is 0.43 GiB per GPU, so `--expert-resident 0.24 --chunk 8192` fits (3.3 GiB free before the
+warm-up, 0.8 left on GPU 0). A smaller `--ctx` does not help (the KV cache is small); the staging buffers (1.4 GiB) are
+already the double-buffer minimum. Prefill with prefill-only requests (1 output token): 16k prompt 10.7 s = 1.5k tok/s,
+9.4k prompt 8.2 s = 1.15k tok/s (its last chunk is a short, copy-bound remainder; splitting evenly costs the same).
+Decode is unchanged by the lower fraction (22 tok/s on code).
+
+### Dynamic residency (`--expert-swaps N`, `expert_dyn.uc`)
+
+The profile's set is only a start. With `--expert-swaps N` the router's picks of every decode step are logged inside the
+step (a copy per layer, captured in the graphs), added on the device to a decayed score per (layer, expert), and every
+8 steps the cold expert with the highest score of a layer replaces the resident one with the lowest if it leads by 25%
+(at most N exchanges per step on average, split over the ranks). An exchange stays inside a layer, so the cold counts, the
+arenas and the staging buffers never change, and it is `H2D(A -> spare slot)`, `D2H(B -> A's arena slot)`, then the two
+entries of the decode pointer tables rewritten in place (the graphs are untouched; the prefill tables are rebuilt at the
+next staged chunk). It runs on the compute stream between two replays, so a replay never sees a half-done exchange, and
+no weight is copied by the CPU. Scoring and the choice of candidates (top-1 per layer) are device tensor ops: a plan costs
+~0.3 ms of host time and a step has no host sync. First version scanned the scores in ucode: 33 ms per plan.
+
+Simulation first (`tests/oracle`-style trace replay, hit rate with swaps inside a layer, starting from the leave-one-out
+profile): at 28% resident 0.69 static, 0.78 with 4 swaps per token, 0.83 with 16; the swaps cost as much link time as the
+misses they save beyond ~4 per token, so the gain saturates early.
+
+Measured, 6.05 bpw, 24% resident, chunk 8192, six different prompts twice, 400 greedy tokens each (tok/s over the
+round; round 2 has seen every prompt once):
+
+| | round 1 | round 2 |
+|---|---|---|
+| static | 21.9 | 22.6 |
+| 4 swaps per step | 24.8 (+13%) | 27.3 (+21%) |
+| 8 swaps per step | 25.1 (+15%) | 27.0 (+19%) |
+| 16 swaps per step | 26.0 (+19%) | 26.7 (+18%) |
+
+So `--expert-swaps 4` is the setting. One prompt repeated gains up to +40% (30-32 tok/s), and the benefit fades when other
+content displaces the experts (decay 0.99 per step: `AMP_EXPERT_DYN_DECAY`, plan interval `AMP_EXPERT_DYN_INTERVAL`, margin
+`AMP_EXPERT_DYN_MARGIN`, prior of the profile `AMP_EXPERT_DYN_PRIOR`, live miss rate in the log with
+`AMP_EXPERT_DYN_LOG=N`). Single stage only. Test: `tests/qwen4_host_experts.uc` forces exchanges in every layer and checks
+that a layer's output does not change by one bit, then runs planned exchanges and a staged prefill against the VRAM
+model at its own run-to-run noise.
+
+### Open
 - Route tail skip (`Strata`: skip a missed expert that every token of the window ranks 7th or lower).
-- The 6.05 bpw quant (85 GiB of experts, 40% resident); `--expert-resident` autosizing from free VRAM.
+- `--expert-resident` autosizing from free VRAM (today the fraction is found by trying: ~0.43 GiB per GPU per point at 6.05 bpw).
+- Exchanges on a side stream overlapping the next replay (today they run between replays, ~0.6 ms each at 6.05 bpw).
+- The 4.05 bpw configuration at chunk 8192 (probably ~0.42 resident), and 3-stage TP with host experts.
 - Loading cold experts by sequential `read()` into the arenas (L40) instead of copying from the mmap'd files.

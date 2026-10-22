@@ -305,7 +305,8 @@ export function serve(args) {
 
 		model = args.tp ? qwen4_tp.load(args.model, {devices: args.gpus, mtp: args.mtp > 0,
 			prefill_rows: args.chunk, stages: args.stages,
-			host_experts: args.expert_resident != null ? {frac: args.expert_resident, profile: args.expert_profile} : null}) :
+			host_experts: args.expert_resident != null ? {frac: args.expert_resident, profile: args.expert_profile,
+				swaps: args.expert_swaps} : null}) :
 			qwen4.load(args.model, {devices: args.gpus, mtp: args.mtp > 0});
 	}
 	else {

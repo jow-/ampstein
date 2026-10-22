@@ -48,6 +48,7 @@ import * as weights from './weights.uc';
 import * as models from './models.uc';
 import * as glm5 from './glm5.uc';
 import * as expert_host from './expert_host.uc';
+import * as expert_dyn from './expert_dyn.uc';
 import * as qwen35 from './qwen35.uc';
 import * as qwen4 from './qwen4.uc';
 
@@ -311,6 +312,10 @@ export function load(model_dir, opts) {
 	// every expert is uploaded to its rank's device as before.
 	let cold = null, n_cold = 0;
 	let hx = opts.host_experts;
+	let dyn = (hx && hx.swaps > 0 && hx.frac != null && hx.frac < 1.0) ? true : false;     // dynamic residency (expert_dyn.uc)
+
+	if (dyn && NS != 1)
+		die('qwen4_tp: dynamic expert residency needs a single stage');
 
 	if (hx && hx.frac != null && hx.frac < 1.0) {
 		let prof = json(readfile(hx.profile)).counts;
@@ -484,7 +489,17 @@ export function load(model_dir, opts) {
 
 			for (let e = e0; e < e0 + en; e++) {
 				if (!(cold_l && cold_l[e])) {
-					push(ex, glm5.build_mlp(ws, `${mkey}.experts.${e}`, dev));
+					// (dynamic residency: a resident expert is the same kind of object as a cold one, see models.LinearEXL3Cold)
+					if (dyn && cold_l)
+						push(ex, {
+							slot: null,
+							gate: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.gate_proj`, dev, null),
+							up: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.up_proj`, dev, null),
+							down: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.down_proj`, dev, null)
+						});
+					else
+						push(ex, glm5.build_mlp(ws, `${mkey}.experts.${e}`, dev));
+
 					continue;
 				}
 
@@ -1000,6 +1015,10 @@ export function load(model_dir, opts) {
 					barrier(st);     // rank 0 waits for prior work on the others
 					st.graph.replay();
 					barrier(st);     // the others wait for the replay
+
+					if (tp.dyn)
+						tp.dyn.after(S);       // host-resident experts: count the picks, swap some in and out
+
 					cache.length = pos + S;
 					cache.stack = st.h[0];
 					cache.hidden = qwen4.flat_stack_of(tp, st.h[0]);
@@ -1448,6 +1467,13 @@ export function load(model_dir, opts) {
 			cache.ple.ids = out;
 		}
 	};
+
+	if (dyn) {
+		tp.dyn = expert_dyn.create(tp, layers, nl, cfg, hx);
+
+		warn(sprintf('qwen4_tp: dynamic expert residency: up to %d swaps per decode step, plan every %d steps\n',
+			tp.dyn.swaps_per_step, tp.dyn.interval));
+	}
 
 	return tp;
 }

@@ -740,3 +740,16 @@ timing against the all-resident baseline, not in tokens/s; (2) the all-VRAM mode
 (the synchronous prefill MoE accumulates with atomics), so a whole-model "bit-exact" test is the wrong
 criterion: check the kernel bit for bit and the model against its own run-to-run noise
 (`tests/qwen4_host_experts.uc`). Details and numbers: `docs/EXPERT_STREAMING.md`.
+
+## L172 — Dynamic expert residency: price every swap, keep the scan on the device
+
+Swapping the hot set during decode only pays for experts that are reused: a swap moves an expert both ways, so past
+~4 swaps per step the extra transfers cost what the saved misses save (measured and simulated; `--expert-swaps 4` gave
++13-21% decode on 6.05 bpw, 8 and 16 gave no more). Three details: (1) exchanges inside a layer keep the cold counts, the
+arenas and the staging buffers fixed, and queued on the compute stream between two replays they need no events and no
+CPU copy (spare device slot: H2D first, then D2H over the freed arena slot, the freed device slot is the next spare);
+(2) the scores and the "best cold / worst resident per layer" selection must be device tensor ops: the same logic as a
+ucode loop over 24k scores cost 33 ms per plan against 0.3 ms; (3) ucode's `/` on two integers divides as integers, so a
+rate computed as `misses / picks` printed 0.000 and looked like a perfect cache. `AMP_VRAM_LOG=1` (allocator around the
+warm-up) is how chunk 8192 was sized. Details: `docs/EXPERT_STREAMING.md`.
+

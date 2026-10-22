@@ -157,3 +157,7 @@ profile) and the rest in pinned host RAM, for quants that do not fit in VRAM (4.
 131072). Prefill stages the cold experts layer by layer behind the compute; decode reads them over PCIe from inside
 the kernels. Without the flag nothing changes. See `docs/EXPERT_STREAMING.md` (Qwen3.8-Flash-Next on j7) for numbers,
 `tests/qwen4_host_experts.uc` for the test and L171.
+
+`--expert-swaps N` (with `--expert-resident`) lets the resident set follow the requests: up to N experts per decode step
+are exchanged with host memory (N = 4: +13-21% decode on 6.05 bpw). 6.05 bpw: `--expert-resident 0.24 --chunk 8192`.
+
