@@ -50,7 +50,7 @@ function usage() {
 	printf("                        accuracy for speed; default 0 = off)\n");
 	printf("  --worker              run as an RPC worker for a GLM pipeline split over hosts (docs/RPC.md); needs --connect\n");
 	printf("  --rpc-listen ADDR:PORT  GLM --tp: the first stages of the pipeline run on a --worker host that dials in here;\n");
-	printf("                        --gpus / --stages are then this host's share (--cache-ram and --slots are off)\n");
+	printf("                        --gpus / --stages are then this host's share (--slots is off; the host-RAM store, MTP, --lookup work)\n");
 	printf("  --rpc-workers N       how many workers to wait for (default and maximum so far: 1)\n");
 	printf("  --rpc-rejoin-wait S   when the worker is gone at the start of a request, wait up to S seconds for it to dial\n");
 	printf("                        in again (default 300); its caches are empty then, the request starts from scratch\n");

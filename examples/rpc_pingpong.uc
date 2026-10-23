@@ -137,7 +137,7 @@ function native_echo(fd) {
 }
 
 if (mode == 'serve') {
-	let l = socket.listen(bind, port, null, 16);
+	let l = socket.listen(bind, port, null, 16, true);
 
 	if (!l)
 		die(`listen ${bind}:${port}: ${socket.error()}\n`);

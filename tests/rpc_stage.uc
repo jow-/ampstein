@@ -5,6 +5,7 @@
 //   ucode -L <build-dir>/lib -L src/ucode -ltorch=ampstein.torch tests/rpc_stage.uc
 
 import * as socket from 'socket';
+import * as fs from 'fs';
 import * as rpc from 'ampstein.rpc';
 import * as stage from 'ampstein.rpc_stage';
 
@@ -66,7 +67,15 @@ let mock = {
 	}
 };
 
-let resets = 0, captured = null, packed = {}, zeroed = [], specs = [];
+let resets = 0, captured = null, packed = {}, zeroed = [], specs = [], unpacked = [];
+
+// entries (a conversation parked on the worker): two tensors per entry
+mock.entry_pack = function (cache, n) {
+	return { n: n, bytes: 40, tensors: { 'l0.ckv': torch.arange(n * 2).to('float32').reshape([ n, 2 ]), 'l1.r0.rec': torch.arange(3).to('float32') } };
+};
+mock.entry_unpack = function (cache, blob, start, live) {
+	push(unpacked, [ blob.n, start, live, join(',', blob.tensors['l0.ckv'].tolist()[0]), join(',', blob.tensors['l1.r0.rec'].tolist()) ]);
+};
 
 mock.spec_alloc = (cache, W) => push(specs, `alloc ${W}`);
 mock.spec_restore = (cache, a) => push(specs, `restore ${a}`);
@@ -158,6 +167,33 @@ check('a step size without a graph is an error', raises(() => K.forward(cid, 4, 
 K.spec_alloc(cid, 4);
 K.spec_restore(cid, 2);
 check('spec_alloc / spec_restore reach the model', join(',', specs) == 'alloc 4,restore 2');
+
+// entries: parked on the worker, restored, dropped, saved to a file and loaded back
+let ex = K.entry_export(cid, 5, '5:11:22');
+
+check('entry_export answers an id and the bytes', type(ex.entry) == 'int' && ex.bytes == 40);
+K.entry_import(cid, ex.entry, 3, true);
+check('entry_import hands the blob, start and live flag to the model', join(';', map(unpacked[0], (x) => `${x}`)) == '5;3;true;0,1;0,1,2');
+check('an unknown entry is an error', raises(() => K.entry_import(cid, 999, 1, false), 'no entry 999'));
+
+let sv = K.entry_save(ex.entry, 'unit-test');
+
+check('entry_save writes a file and reports the bytes', sv.bytes == 40 && fs.stat('/tmp/Ampstein-wcache-unit-test.safetensors') != null);
+K.entry_drop(ex.entry);
+check('...the dropped entry is gone', raises(() => K.entry_import(cid, ex.entry, 1, false), 'no entry'));
+
+check('entry_load refuses another conversation (checksum) and consumes the file',
+	raises(() => K.entry_load('unit-test', 5, '5:99:99'), 'another conversation') && fs.stat('/tmp/Ampstein-wcache-unit-test.safetensors') == null);
+
+K.entry_save(K.entry_export(cid, 5, '5:11:22').entry, 'unit-test2');
+
+let ld = K.entry_load('unit-test2', 5, '5:11:22');
+
+check('entry_load restores the entry and consumes the file', ld.bytes == 40 && fs.stat('/tmp/Ampstein-wcache-unit-test2.safetensors') == null);
+K.entry_import(cid, ld.entry, 5, true);
+check('...with the saved tensors', join(';', map(unpacked[length(unpacked) - 1], (x) => `${x}`)) == '5;5;true;0,1;0,1,2');
+check('a bad key is an error', raises(() => K.entry_load('../etc', 5, 'x'), 'bad key'));
+check('a missing file is an error', raises(() => K.entry_load('nothing-here', 5, 'x'), 'no saved entry'));
 
 // recurrent state of a layer travels as bytes
 check('state_get returns the packed bytes of a layer', join(',', K.state_get(cid, 4).tolist()) == '4,7,8,9,200,255');

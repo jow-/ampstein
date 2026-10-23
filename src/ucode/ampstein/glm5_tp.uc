@@ -347,6 +347,21 @@ function unpack_states(holders, bytes) {
 		die(`glm5_tp: the packed states are ${bytes.numel()} bytes, expected ${off}`);
 }
 
+const ELEM_BYTES = { bool: 1, uint8: 1, int8: 1, int16: 2, float16: 2, bfloat16: 2, int32: 4, float32: 4, int64: 8, float64: 8 };
+
+/* A checksum of a token history, to tell the two halves of a saved conversation (the coordinator's and
+ * the worker's) from those of another: the length and two independent polynomial hashes mod 2^31 - 1 */
+function ids_check(ids) {
+	let a = 7, b = 11;
+
+	for (let t in ids) {
+		a = (a * 31 + t + 1) % 2147483647;
+		b = (b * 131 + t + 7) % 2147483647;
+	}
+
+	return `${length(ids)}:${a}:${b}`;
+}
+
 /* largest all-reduce payload in rows through the P2P kernel */
 const P2P_ROWS = 16;
 
@@ -732,6 +747,119 @@ export function load(model_dir, opts) {
 				remote.state_zero(cache.remote, i);
 			else
 				die(`glm5_tp: remote_states: unknown operation ${op}`);
+		},
+
+		/* ---- entries: the layers built here, as a conversation parked in host RAM or saved to a file ----
+		 * (what the engine does itself for a local model; with stages on a worker host each side
+		 * does its own half). An entry holds rows [0, n) of the latent cache of every attention layer
+		 * (one replica: they are identical), and the recurrent states of every KDA layer. */
+		entry_pack: function (cache, n) {
+			let T = {}, bytes = 0, P = int(n / cfg.index_kpool);
+
+			function put(name, t) {
+				let h = t.cpu().contiguous();
+
+				T[name] = h;
+				bytes += h.numel() * ELEM_BYTES[h.dtype()];
+			}
+
+			for (let i = 0; i < nl; i++) {
+				let row = cache.layers[i];
+
+				if (!row)
+					continue;
+
+				if (cfg.layer_types[i] == 'linear_attention') {
+					for (let g = 0; g < length(row); g++) {
+						put(`l${i}.r${g}.rec`, row[g].rec_state);
+						put(`l${i}.r${g}.conv`, row[g].conv_state);
+					}
+
+					continue;
+				}
+
+				let c = row[0];
+
+				for (let f in [ 'ckv', 'qk', 'qs', 'plane' ])
+					if (c[f] != null)
+						put(`l${i}.${f}`, c[f].narrow(0, 0, n));
+
+				if (P > 0)
+					put(`l${i}.pools`, c.pools.narrow(0, 0, P));
+			}
+
+			return {n: n, tensors: T, bytes: bytes};
+		},
+
+		/* write an entry back: the first `start` rows of the caches; the KDA states only when `live`
+		 * (restoring the state at the entry's end; else the engine loads its own snapshot afterwards) */
+		entry_unpack: function (cache, blob, start, live) {
+			let T = blob.tensors, P = int(start / cfg.index_kpool);
+
+			for (let i = 0; i < nl; i++) {
+				let row = cache.layers[i];
+
+				if (!row)
+					continue;
+
+				if (cfg.layer_types[i] == 'linear_attention') {
+					if (!live)
+						continue;
+
+					for (let g = 0; g < length(row); g++) {
+						if (!T[`l${i}.r${g}.rec`])
+							die(`glm5_tp: the entry has no state for layer ${i} (another stage assignment?)`);
+
+						row[g].rec_state.copy_(T[`l${i}.r${g}.rec`]);
+						row[g].conv_state.copy_(T[`l${i}.r${g}.conv`]);
+					}
+
+					continue;
+				}
+
+				for (let c in row) {
+					for (let f in [ 'ckv', 'qk', 'qs', 'plane' ])
+						if (c[f] != null) {
+							if (!T[`l${i}.${f}`])
+								die(`glm5_tp: the entry has no ${f} for layer ${i} (another stage assignment or cache mode?)`);
+
+							c[f].narrow(0, 0, start).copy_(T[`l${i}.${f}`].narrow(0, 0, start));
+						}
+
+					if (P > 0)
+						c.pools.narrow(0, 0, P).copy_(T[`l${i}.pools`].narrow(0, 0, P));
+				}
+			}
+		},
+
+		/* the same for the engine, for the layers on the worker: 'handles' are what the worker returns */
+		remote_layer: function (i) {
+			return stages[stage_of[i]].remote ? true : false;
+		},
+
+		remote_export: function (cache, n, ids) {
+			if (cache.remote == null)
+				return null;
+
+			return remote.entry_export(cache.remote, n, ids_check(ids));
+		},
+
+		remote_import: function (cache, r, start, live) {
+			remote.entry_import(cache.remote, r.entry, start, live);
+		},
+
+		remote_drop: function (r) {
+			if (r && r.entry != null && remote)
+				remote.entry_drop(r.entry);
+		},
+
+		/* hot reload: the worker writes the entry to a file of its own (key names it) */
+		remote_save: function (r, key) {
+			return remote.entry_save(r.entry, key);
+		},
+
+		remote_load: function (key, n, ids) {
+			return remote.entry_load(key, n, ids_check(ids));
 		},
 
 		/* the same bytes for the worker's side: the states of layer i built here */

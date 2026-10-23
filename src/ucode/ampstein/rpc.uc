@@ -425,7 +425,7 @@ export function listen(opts) {
 	if (!opts?.bind)
 		die('rpc: listen: bind address required');
 
-	let sock = socket.listen(opts.bind, opts.port ?? 0, null, 16);
+	let sock = socket.listen(opts.bind, opts.port ?? 0, null, 16, true);
 
 	if (!sock)
 		die(`rpc: listen ${opts.bind}:${opts.port}: ${socket.error()}`);

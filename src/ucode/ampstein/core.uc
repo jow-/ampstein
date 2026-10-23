@@ -338,12 +338,11 @@ export function serve(args) {
 			exit(1);
 		}
 
-		// not available when stages live on another host: parking and slots of states in host RAM
-		// (MTP and --lookup work: the worker keeps the per-position states of its layers)
-		if (args.cache_ram !== 0 || args.slots !== 0)
-			warn('ampstein: with --rpc-listen: --cache-ram and --slots are off\n');
+		// device slots are not available when stages live on another host; the host-RAM store is (the
+		// worker parks its own half), and so are MTP, --lookup and the hot reload
+		if (args.slots !== 0)
+			warn('ampstein: with --rpc-listen: --slots is off\n');
 
-		args.cache_ram = 0;
 		args.slots = 0;
 
 		let ex = rpc_coord.attach({ listen: args.rpc_listen, workers: args.rpc_workers ?? 1, model: args.model,
@@ -446,6 +445,7 @@ export function serve(args) {
 		draft_vocab: args.draft_vocab,
 		warmup: args.warmup,
 		cache_ram: args.cache_ram,
+		remote_key: `${args.port}`,           // names the worker's half of a saved state (hot reload)
 		cache_quant: args.cache_quant,
 		slots: args.slots,
 		slot_margin: args.slot_margin,
@@ -497,12 +497,6 @@ export function serve(args) {
 			return;     // no saved state
 		}
 
-		// (a state saved by an earlier run cannot be valid: the worker's half of it is not in the file)
-		if (model.remote) {
-			warn('ampstein: ignoring saved cache state (stages on a worker host)\n');
-			return;
-		}
-
 		if (meta.format != 1 || meta.model != args.model) {
 			warn('ampstein: ignoring saved cache state ' +
 				'(model or format changed)\n');
@@ -527,6 +521,7 @@ export function serve(args) {
 			try {
 				unlink(CACHE_ST);
 				unlink(CACHE_META);
+				unlink(CACHE_ST + '.tree');
 			} catch (e2) {}
 		}
 	})();
@@ -1861,10 +1856,6 @@ export function serve(args) {
 		try {
 			if (DS || D41)
 				die('not supported for this architecture yet');
-
-			// the KV and the states of the worker's layers are on the worker, not in what this saves
-			if (model.remote)
-				die('not supported with stages on a worker host');
 
 			let n = eng.save_state(CACHE_ST);
 

@@ -853,8 +853,8 @@ export function create(model, opts) {
 	function store_supported() {
 		let kv = false;
 
-		// layers on a worker host: their states and KV are not here to park in host RAM or to slot
-		if (model.remote)
+		// layers on a worker host: the worker parks its own half (model.remote_export), else no store
+		if (model.remote && !model.remote_export)
 			return false;
 
 		// the model exports / imports its whole cache itself (DeepSeek-V4: compressed
@@ -865,6 +865,9 @@ export function create(model, opts) {
 		// recurrent state outside the layer entries (qwen4's PLE layer): aux_get / aux_set tensors and plain
 		// values, stored with the entry (aux_to_host)
 		for (let i = 0; i < cfg.num_hidden_layers; i++) {
+			if (model.remote_layer && model.remote_layer(i))
+				continue;
+
 			let sts = states(i);
 
 			if (is_gdn(i)) {
@@ -1287,7 +1290,15 @@ export function create(model, opts) {
 		if (model.cache_bytes)
 			return model.cache_bytes(cache, n);
 
+		let nremote = 0;
+
 		for (let i = 0; i < cfg.num_hidden_layers; i++) {
+			// (layers on a worker host: counted below by proportion)
+			if (model.remote_layer && model.remote_layer(i)) {
+				nremote++;
+				continue;
+			}
+
 			let sts = states(i);
 
 			if (!is_gdn(i) && kv_holder(sts)) {
@@ -1310,6 +1321,9 @@ export function create(model, opts) {
 			}
 		}
 
+		if (nremote)
+			b = int(b * cfg.num_hidden_layers / (cfg.num_hidden_layers - nremote));
+
 		if (mtp_mla() && draft_len > 0)
 			b += mla_bytes(mtp_mla()[0], draft_len);
 		else if (cache.mtp && draft_len > 0) {
@@ -1327,6 +1341,14 @@ export function create(model, opts) {
 
 	function store_drop(k) {
 		store_bytes -= store[k].bytes;
+
+		if (store[k].remote) {
+			try {
+				model.remote_drop(store[k].remote);
+			}
+			catch (err) {
+			}
+		}
 
 		if (store[k].slot)
 			push(slots_free, store[k].slot);
@@ -1537,7 +1559,16 @@ export function create(model, opts) {
 				return true;
 			}
 
+			// the layers on a worker host are parked there, in its host RAM
+			if (model.remote_export) {
+				e.remote = model.remote_export(cache, n, ids);
+				e.bytes += e.remote.bytes;
+			}
+
 			for (let i = 0; i < cfg.num_hidden_layers; i++) {
+				if (model.remote_layer && model.remote_layer(i))
+					continue;
+
 				let sts = states(i);
 
 				if (slot) {
@@ -1627,6 +1658,14 @@ export function create(model, opts) {
 			if (slot)
 				push(slots_free, slot);
 
+			if (e.remote) {
+				try {
+					model.remote_drop(e.remote);
+				}
+				catch (err2) {
+				}
+			}
+
 			return false;
 		}
 
@@ -1690,7 +1729,17 @@ export function create(model, opts) {
 			return;
 		}
 
+		// the worker's half (and its host RAM entry is consumed with this restore)
+		if (e.remote) {
+			model.remote_import(cache, e.remote, start, live);
+			model.remote_drop(e.remote);
+			e.remote = null;
+		}
+
 		for (let i = 0; i < cfg.num_hidden_layers; i++) {
+			if (model.remote_layer && model.remote_layer(i))
+				continue;
+
 			let sts = states(i);
 
 			for (let r = 0; r < length(sts); r++) {
@@ -2226,8 +2275,10 @@ export function create(model, opts) {
 		// stages on a worker host: is it still there? (else wait for it; what it held is gone)
 		if (model.remote_recover) {
 			try {
-				if (model.remote_recover(cache))
+				if (model.remote_recover(cache)) {
 					reset_state();
+					drop_remote_entries();
+				}
 			}
 			catch (e) {
 				return fail('worker unavailable: ' + e.message);
@@ -3423,6 +3474,34 @@ export function create(model, opts) {
 	}
 
 	// a parked job that was cancelled while it waited: free its entry
+	/* The worker came back empty: the halves of the stored entries that lived in its host RAM are gone,
+	 * and so are the entries (a parked request is lost with its entry). */
+	function drop_remote_entries() {
+		for (let k = length(store) - 1; k >= 0; k--) {
+			let e = store[k];
+
+			if (!e.remote)
+				continue;
+
+			e.remote = null;
+
+			let o = e.owner;
+
+			store_drop(k);
+
+			if (o) {
+				let pi = index(parked, o);
+
+				if (pi >= 0)
+					splice(parked, pi, 1);
+
+				o.park = null;
+				o.pend_logits = null;
+				o.on_error('the worker restarted: the parked request is lost');
+			}
+		}
+	}
+
 	function release_parked(j) {
 		for (let k = 0; k < length(store); k++)
 			if (store[k] == j.park) {
@@ -3809,6 +3888,15 @@ export function create(model, opts) {
 
 		store_bytes -= e.bytes;
 
+		// the worker's half goes to a file on the worker's host (named by the key); this file records
+		// where, and the checksum of the token history that ties the two together
+		if (e.remote) {
+			let r = model.remote_save(e.remote, opts.remote_key ?? 'default');
+
+			model.remote_drop(e.remote);
+			e.remote = {file: opts.remote_key ?? 'default', bytes: r.bytes, n: e.n};
+		}
+
 		let ents = [];
 		let tree = tree_pack({...e, slot: null}, ents);
 
@@ -3845,6 +3933,20 @@ export function create(model, opts) {
 		e.slot = null;
 		e.owner = null;
 		e.bytes = 0;
+
+		if (model.remote_export && !e.remote)
+			die('engine.restore_state: this state was saved without the worker half');
+
+		if (!model.remote_export && e.remote)
+			die('engine.restore_state: this state was saved with stages on a worker host');
+
+		// the worker loads its half from its own file, if it belongs to these tokens
+		if (e.remote) {
+			let r = model.remote_load(e.remote.file, e.n, e.ids);
+
+			e.remote = {entry: r.entry, bytes: r.bytes};
+		}
+
 		store_restore(e, e.n);
 
 		return e.n;

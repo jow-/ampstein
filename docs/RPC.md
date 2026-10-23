@@ -216,16 +216,32 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    ucode `signal()` handlers that set a flag its loops look at (twice a second), and exits ~1 s after
    SIGTERM. The coordinator does not send `bye` when it stops, so a worker rejoins a restarted
    coordinator by itself.
-   **Hot reload** (the server saves its live conversation to `/tmp/Ampstein-cache-<port>.safetensors` on
-   SIGINT / SIGTERM and restores it at the next start) is switched off for a remote model: the KV and
-   the recurrent states of the worker's layers are not in what the coordinator can save, and a restore
-   of the rest would claim cached tokens whose worker half is empty. The server refuses to save, and
-   ignores a file left by an earlier run.
-   **To do:** host parking and slots of states that live on the worker
-   (`cache_export` / `cache_import` per worker); hot reload for a remote model (the worker would
-   have to save and restore its own half, to a file of its own, and the two be matched by a token
-   hash); more than one worker;
-   a rejoin that keeps the worker's caches when only the link blipped.
+   **Host parking and hot reload (done, verified): each side keeps its own half.** The engine's store
+   (`--cache-ram`, default 32 GiB) parks a conversation in host RAM when an unrelated request replaces
+   it, and swaps it back when a request continues it; hot reload writes the same entry to a file at
+   SIGTERM and reads it at the next start. For a remote model an entry has two halves: the
+   coordinator's (its own layers, the snapshots, the draft cache, as before) and a `remote` handle to
+   the worker's, which lives in the WORKER's host RAM, so a parked conversation costs no network
+   transfer. Worker commands: `entry_export {cache, n, ck}` (rows [0, n) of the latent cache of every
+   attention layer, one replica of it, and the KDA states of every KDA layer), `entry_import {cache,
+   entry, start, live}` (the KDA states only when restoring the entry's end, else the engine loads
+   its snapshot), `entry_drop`, and for hot reload `entry_save {entry, key}` / `entry_load {key, n,
+   ck}`: the worker writes `/tmp/Ampstein-wcache-<key>.safetensors` on ITS host (key = the server's
+   port), and `entry_load` consumes the file and refuses it unless the length and a checksum of the
+   token history (`ck`, two polynomial hashes) match the coordinator's file. A restore whose halves
+   disagree (a missing or foreign worker file, another stage assignment) fails with the reason and
+   the server starts empty. When the worker comes back empty (rejoin) the entries that pointed at its
+   old RAM are dropped, and a parked request that depended on one fails. Device slots stay off.
+   **Result (2026-10-23)**, real server over 10 GbE: conversation A (5.5k tokens) parked in 876 ms
+   (0.5 GiB with the worker's half), an unrelated B, then A's follow-up restored 5165 tokens in 235 ms
+   and answered `13-SSORTABLA` for `ALBATROSS-31` backwards. Hot reload: SIGTERM wrote 474 MB on jai
+   and 68 MB on j7; the new server (the worker rejoined by itself) restored 5224 tokens in 268 ms,
+   the next request reused 5189 of 5191 prompt tokens (0.8 s against 4.9 s cold) with the same
+   answer; with the worker's file removed the restore failed cleanly and the server started empty.
+   Found on the way: the listener lacked SO_REUSEADDR, so a restart within the TIME_WAIT of the
+   previous server's worker connection failed to bind.
+   **To do:** device slots for a remote model; more than one worker; a rejoin that keeps the worker's
+   caches when only the link blipped.
 8. Other model families (`qwen4_tp`, `dsv41_tp`, `gemma4_tp`) after GLM works.
 
 ## Phase 0 result (2026-10-23): go

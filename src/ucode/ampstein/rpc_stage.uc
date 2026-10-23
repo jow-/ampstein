@@ -19,6 +19,12 @@
 //   reset {cache}            -> ok            (zero the recurrent states, length 0)
 //   spec_alloc {cache, W}    -> ok            (per-position states for verify windows up to W rows; before graphs)
 //   spec_restore {cache, a}  -> ok            (restore the states after token a of the last verify window)
+//   entry_export {cache, n, ck}  -> ok {entry, bytes}   (park rows [0, n) of the worker's layers in ITS host RAM)
+//   entry_import {cache, entry, start, live}  -> ok     (write an entry back: `start` rows; states if `live`)
+//   entry_drop {entry}           -> ok
+//   entry_save {entry, key}      -> ok {bytes}          (hot reload: the entry to a file on the worker's host)
+//   entry_load {key, n, ck}      -> ok {entry, bytes}   (... and back; refused unless n and the checksum ck of
+//                                                        the token history match what was saved; the file is consumed)
 //   state_get {cache, layer}        -> state + bytes   (the recurrent state of one layer, all its ranks)
 //   state_put {cache, layer} + bytes -> ok             (set it)
 //   state_zero {cache, layer}       -> ok
@@ -32,13 +38,31 @@
 // same few methods.
 
 import * as rpc from './rpc.uc';
+import * as fs from 'fs';
 
 /* ---- worker ---------------------------------------------------------------------------------- */
 
 /* worker(conn, model): { step(frame) -> null | 'bye', serve() -> 'bye' | (raises on a lost connection),
  *                        caches } */
 export function worker(c, model) {
-	let W = { caches: {}, graphs: {}, next: 1, forwards: 0, tokens: 0, replays: 0 };
+	let W = { caches: {}, graphs: {}, entries: {}, next: 1, next_entry: 1, forwards: 0, tokens: 0, replays: 0 };
+
+	// the worker's own files of saved entries: a key names one (letters, digits, ._- only)
+	function entry_path(key) {
+		if (type(key) != 'string' || !match(key, /^[A-Za-z0-9._-]{1,80}$/))
+			die('entry: bad key');
+
+		return `/tmp/Ampstein-wcache-${key}.safetensors`;
+	}
+
+	function entry_of(m) {
+		let e = W.entries[m.entry];
+
+		if (!e)
+			die(`no entry ${m.entry}`);
+
+		return e;
+	}
 
 	function ok(extra) {
 		c.send({ t: 'ok', ...(extra ?? {}) });
@@ -83,6 +107,66 @@ export function worker(c, model) {
 		state_zero: function (f) {
 			model.state_zero(cache_of(f.meta), f.meta.layer);
 			ok();
+		},
+
+		entry_export: function (f) {
+			let m = f.meta, blob = model.entry_pack(cache_of(m), m.n);
+			let id = W.next_entry++;
+
+			W.entries[id] = {blob: blob, n: m.n, ck: m.ck};
+			ok({ entry: id, bytes: blob.bytes });
+		},
+
+		entry_import: function (f) {
+			model.entry_unpack(cache_of(f.meta), entry_of(f.meta).blob, f.meta.start, f.meta.live ? true : false);
+			ok();
+		},
+
+		entry_drop: function (f) {
+			delete W.entries[f.meta.entry];
+			ok();
+		},
+
+		entry_save: function (f) {
+			let e = entry_of(f.meta), path = entry_path(f.meta.key), pairs = [];
+
+			for (let name in keys(e.blob.tensors))
+				push(pairs, [ name, e.blob.tensors[name] ]);
+
+			torch.st_save(path, pairs);
+			fs.writefile(path + '.json', sprintf('%J', { n: e.n, ck: e.ck, bytes: e.blob.bytes, names: keys(e.blob.tensors) }));
+			ok({ bytes: e.blob.bytes });
+		},
+
+		entry_load: function (f) {
+			let m = f.meta, path = entry_path(m.key), meta = null;
+
+			try {
+				meta = json(fs.readfile(path + '.json'));
+			}
+			catch (e) {
+				die(`no saved entry ${m.key}`);
+			}
+
+			if (meta.n != m.n || meta.ck != m.ck) {
+				// not ours: the other half of another conversation. Consume it so it cannot be offered again.
+				fs.unlink(path);
+				fs.unlink(path + '.json');
+				die(`the saved entry ${m.key} is for another conversation (${meta.n} tokens, checksum ${meta.ck}; wanted ${m.n}, ${m.ck})`);
+			}
+
+			let st = torch.st(path), T = {};
+
+			for (let name in meta.names)
+				T[name] = st.tensor(name);
+
+			let id = W.next_entry++;
+
+			// (the mapping outlives the unlink: the pages stay until the tensors are dropped)
+			W.entries[id] = {blob: {n: meta.n, tensors: T, bytes: meta.bytes, keep: st}, n: meta.n, ck: meta.ck};
+			fs.unlink(path);
+			fs.unlink(path + '.json');
+			ok({ entry: id, bytes: meta.bytes });
 		},
 
 		spec_alloc: function (f) {
@@ -158,7 +242,7 @@ export function worker(c, model) {
 		},
 
 		stats: function (f) {
-			ok({ caches: length(keys(W.caches)), forwards: W.forwards, tokens: W.tokens, replays: W.replays });
+			ok({ entries: length(keys(W.entries)), caches: length(keys(W.caches)), forwards: W.forwards, tokens: W.tokens, replays: W.replays });
 		}
 	};
 
@@ -280,6 +364,35 @@ export function client(c) {
 	K.state_zero = function (cache, layer) {
 		c.send({ t: 'state_zero', cache: cache, layer: layer });
 		answer('ok');
+	};
+
+	/* entries: conversations parked on the worker's host (see the commands above) */
+	K.entry_export = function (cache, n, ck) {
+		c.send({ t: 'entry_export', cache: cache, n: n, ck: ck });
+
+		return answer('ok').meta;
+	};
+
+	K.entry_import = function (cache, entry, start, live) {
+		c.send({ t: 'entry_import', cache: cache, entry: entry, start: start, live: live ? true : false });
+		answer('ok');
+	};
+
+	K.entry_drop = function (entry) {
+		c.send({ t: 'entry_drop', entry: entry });
+		answer('ok');
+	};
+
+	K.entry_save = function (entry, key) {
+		c.send({ t: 'entry_save', entry: entry, key: key });
+
+		return answer('ok', 600000).meta;
+	};
+
+	K.entry_load = function (key, n, ck) {
+		c.send({ t: 'entry_load', key: key, n: n, ck: ck });
+
+		return answer('ok', 600000).meta;
 	};
 
 	K.spec_alloc = function (cache, W) {
