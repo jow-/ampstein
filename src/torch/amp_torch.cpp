@@ -4498,15 +4498,27 @@ torch_mem_info(uc_vm_t *vm, size_t nargs)
 
 	try {
 		c10::cuda::CUDAGuard g((c10::DeviceIndex)dev);
-		auto st = c10::cuda::CUDACachingAllocator::getDeviceStats(dev);
+		int64_t alloc = 0, reserved = 0;
+
+		// (the allocator knows a device only after its first tensor: until then there is nothing
+		// allocated, and asking raises "Invalid device argument")
+		try {
+			auto st = c10::cuda::CUDACachingAllocator::getDeviceStats(dev);
+
+			alloc = (int64_t)st.allocated_bytes[0].current;
+			reserved = (int64_t)st.reserved_bytes[0].current;
+		}
+		catch (const std::exception &) {
+		}
+
 		size_t fr = 0, tot = 0;
 
 		cudaMemGetInfo(&fr, &tot);
 
 		uc_value_t *a = ucv_array_new_length(vm, 4);
 
-		ucv_array_push(a, ucv_int64_new((int64_t)st.allocated_bytes[0].current));
-		ucv_array_push(a, ucv_int64_new((int64_t)st.reserved_bytes[0].current));
+		ucv_array_push(a, ucv_int64_new(alloc));
+		ucv_array_push(a, ucv_int64_new(reserved));
 		ucv_array_push(a, ucv_int64_new((int64_t)fr));
 		ucv_array_push(a, ucv_int64_new((int64_t)tot));
 
