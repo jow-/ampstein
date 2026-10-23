@@ -17,6 +17,8 @@
 //   graphs {cache, sizes}    -> ok            (capture the decode graphs of these step sizes; clobbers the
 //                                              cache like glm5_tp.graphs: follow with reset)
 //   reset {cache}            -> ok            (zero the recurrent states, length 0)
+//   spec_alloc {cache, W}    -> ok            (per-position states for verify windows up to W rows; before graphs)
+//   spec_restore {cache, a}  -> ok            (restore the states after token a of the last verify window)
 //   state_get {cache, layer}        -> state + bytes   (the recurrent state of one layer, all its ranks)
 //   state_put {cache, layer} + bytes -> ok             (set it)
 //   state_zero {cache, layer}       -> ok
@@ -80,6 +82,16 @@ export function worker(c, model) {
 
 		state_zero: function (f) {
 			model.state_zero(cache_of(f.meta), f.meta.layer);
+			ok();
+		},
+
+		spec_alloc: function (f) {
+			model.spec_alloc(cache_of(f.meta), f.meta.W);
+			ok();
+		},
+
+		spec_restore: function (f) {
+			model.spec_restore(cache_of(f.meta), f.meta.a);
 			ok();
 		},
 
@@ -255,6 +267,16 @@ export function client(c) {
 
 	K.state_zero = function (cache, layer) {
 		c.send({ t: 'state_zero', cache: cache, layer: layer });
+		answer('ok');
+	};
+
+	K.spec_alloc = function (cache, W) {
+		c.send({ t: 'spec_alloc', cache: cache, W: W });
+		answer('ok');
+	};
+
+	K.spec_restore = function (cache, a) {
+		c.send({ t: 'spec_restore', cache: cache, a: a });
 		answer('ok');
 	};
 

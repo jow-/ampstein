@@ -180,11 +180,27 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    correctly ("PELICAN-77" recalled; "77-NACILEP" spelled backwards after a snapshot restore, also
    after a detour to an unrelated conversation); a needle in 8499 tokens is found, with prefill at
    1623 tok/s and decode at 51.7 tok/s as the server reports them.
-   **7b (to do):** speculative windows (MTP, `--lookup`): per-position KDA state rollback and the
-   draft block's cache over the hop; host parking and slots of states that live on the worker
+   **7b-spec (done, verified): MTP and `--lookup` over the hop.** The worker's layers keep the
+   per-position states of verify windows: `spec_alloc {cache, W}` (what the engine does itself
+   for local layers, sent before the graphs are captured) and `spec_restore {cache, a}` when a
+   window is accepted only up to token a (`model.remote_spec('setup' | 'rollback')`, called by
+   two hooks in the engine; the mirror holders are skipped there). The draft block stays with the
+   last stage on the coordinator, which also loads the embedding table (+1.2 GiB on its first GPU)
+   because the draft embeds the tokens it drafts; `run_dev` (ids on the device) falls back to
+   a host copy of the ids. **Result**, j7 + jai, real server, `--lookup 11`: decode 72.7 tok/s on
+   a 700-token generation (69% of the MTP drafts accepted, 2.62 tokens per round) against 50.6 tok/s
+   without speculation; a copy task reaches 111 tok/s (86% of 395 lookup drafts accepted). The same
+   suite on a plain local server on jai: 74.8 / 101 / 72 tok/s, 70% accepted, 2.66 tokens per
+   round, so the hop costs about 3% with speculation. Outputs at temperature 0: for the three
+   test prompts the remote MTP, remote plain and local MTP runs reach the same answers (the
+   password is found in all) but diverge in the wording of the model's reasoning after a few hundred
+   characters, between ANY two of the three; one pair is identical over 700 tokens. That is the
+   noise of batched verify against single-token kernels on GLM (see the 0.033 run-to-run rel-rms
+   above), not specific to the remote path.
+   **7b (to do):** host parking and slots of states that live on the worker
    (`cache_export` / `cache_import` per worker); hot reload; a worker that drops and rejoins
    while the server runs (today the in-flight request fails with the connection error and the
-   coordinator must be restarted); more than one worker.
+   coordinator must be restarted); a clean shutdown of the worker on SIGTERM; more than one worker.
 8. Other model families (`qwen4_tp`, `dsv41_tp`, `gemma4_tp`) after GLM works.
 
 ## Phase 0 result (2026-10-23): go

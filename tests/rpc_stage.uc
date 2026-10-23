@@ -66,7 +66,10 @@ let mock = {
 	}
 };
 
-let resets = 0, captured = null, packed = {}, zeroed = [];
+let resets = 0, captured = null, packed = {}, zeroed = [], specs = [];
+
+mock.spec_alloc = (cache, W) => push(specs, `alloc ${W}`);
+mock.spec_restore = (cache, a) => push(specs, `restore ${a}`);
 
 // the states of layer 1 on the worker: a byte tensor that travels both ways
 mock.state_pack = (cache, i) => torch.from_array([ i, 7, 8, 9, 200, 255 ], 'uint8');
@@ -150,6 +153,11 @@ let g3 = K.forward(cid, 1, [ 1, 2, 3 ], true).h.tolist()[2][0][0];
 check('a graph replay answers the same streams as the eager layers', g1 == 4 + 111 && g3 == 3 + 0.5 + 111);
 check('...and counts as a replay', K.stats().replays == 2);
 check('a step size without a graph is an error', raises(() => K.forward(cid, 4, [ 1, 2 ], true), 'no graph for 2'));
+
+// speculative windows: per-position states allocated once, restored after a rejection
+K.spec_alloc(cid, 4);
+K.spec_restore(cid, 2);
+check('spec_alloc / spec_restore reach the model', join(',', specs) == 'alloc 4,restore 2');
 
 // recurrent state of a layer travels as bytes
 check('state_get returns the packed bytes of a layer', join(',', K.state_get(cid, 4).tolist()) == '4,7,8,9,200,255');

@@ -323,13 +323,11 @@ export function serve(args) {
 			exit(1);
 		}
 
-		// not (yet) available when stages live on another host: speculative drafts (the recurrent-state
-		// rollback of the worker's layers) and parking / slots of states in host RAM
-		if (args.mtp > 0 || args.lookup > 0 || args.cache_ram !== 0 || args.slots !== 0)
-			warn('ampstein: with --rpc-listen: MTP, --lookup, --cache-ram and --slots are off\n');
+		// not available when stages live on another host: parking and slots of states in host RAM
+		// (MTP and --lookup work: the worker keeps the per-position states of its layers)
+		if (args.cache_ram !== 0 || args.slots !== 0)
+			warn('ampstein: with --rpc-listen: --cache-ram and --slots are off\n');
 
-		args.mtp = 0;
-		args.lookup = 0;
 		args.cache_ram = 0;
 		args.slots = 0;
 

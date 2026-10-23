@@ -528,6 +528,10 @@ export function create(model, opts) {
 
 		for (let k in gdn_layers)
 			for (let cl in states(k)) {
+				// (a mirror of a layer on a worker host: the worker keeps the real per-position states)
+				if (cl.mirror)
+					continue;
+
 				let dev = 'cuda:' + cl.dev;
 
 				cl.spec_w = SPEC_N;
@@ -541,6 +545,10 @@ export function create(model, opts) {
 					push(rollback[a].s, cl.spec_states.narrow(0, a, 1), cl.spec_conv[a]);
 				}
 			}
+
+		// the same for the layers on a worker host
+		if (model.remote_spec)
+			model.remote_spec('setup', cache, SPEC_N);
 
 		// model-owned rollback state (qwen4: the PLE conv tail) next to the GDN states
 		if (model.spec_bufs) {
@@ -2650,6 +2658,10 @@ export function create(model, opts) {
 			// rolls back with the length, and row a of the verify output
 			// is the accepted prefix's hidden (causal)
 			torch.copy_many(rollback[a].d, rollback[a].s);
+
+			if (model.remote_spec)
+				model.remote_spec('rollback', cache, a);
+
 			cache.length = p + a + 2;
 			H = vhidden.narrow(1, a, 1);
 

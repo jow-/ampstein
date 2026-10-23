@@ -625,10 +625,14 @@ export function load(model_dir, opts) {
 	let first = stages[0], last = stages[NS - 1];
 	let own_first = !first.remote, own_last = !last.remote;
 
+	// the draft block embeds the tokens it drafts: with the first stages on a worker the table is
+	// also needed here (on the first local device, 1.2 GiB), next to the draft block
+	let need_embed = own_first || (own_last && has_mtp);
+
 	// embedding on the first stage's rank 0; lm_head sharded by vocabulary
 	// over the last stage
 	ws.upload(function (key) {
-		if (own_first && index(key, 'model.language_model.embed_tokens') == 0)
+		if (need_embed && index(key, 'model.language_model.embed_tokens') == 0)
 			return devs[0];
 
 		if (own_last && (index(key, 'model.language_model.norm') == 0 || index(key, 'lm_head') == 0))
@@ -639,7 +643,7 @@ export function load(model_dir, opts) {
 
 	let embed_t = null, lm_heads = null, norm_w = null;
 
-	if (own_first) {
+	if (need_embed) {
 		embed_t = ws.gpu16('model.language_model.embed_tokens.weight', devs[0]);
 
 		ws.release('model.language_model.embed_tokens.weight', devs[0]);
@@ -744,6 +748,56 @@ export function load(model_dir, opts) {
 			}
 		},
 
+		/* Per-position states for speculative verify windows of up to W rows on the layers built
+		 * here (what the engine does itself for a local model): spec_states / spec_conv per
+		 * holder, written by the verify graph, and cache.spec[a] = the batched copy that restores
+		 * the states after token a. Called on the worker, before graphs() */
+		spec_alloc: function (cache, W) {
+			let rb = [];
+
+			for (let a = 0; a < W - 1; a++)
+				push(rb, {d: [], s: []});
+
+			for (let i = 0; i < nl; i++)
+				for (let cl in (cache.layers[i] ?? []))
+					if (cl.rec_state) {
+						let dev = 'cuda:' + cl.dev;
+
+						cl.spec_w = W;
+						cl.spec_states = torch.zeros([ W - 1, ...cl.rec_state.shape() ], 'float32', dev);
+						cl.spec_conv = [];
+
+						for (let a = 0; a < W - 1; a++) {
+							push(cl.spec_conv, torch.zeros(cl.conv_state.shape(), 'float16', dev));
+							push(rb[a].d, cl.rec_state, cl.conv_state);
+							push(rb[a].s, cl.spec_states.narrow(0, a, 1), cl.spec_conv[a]);
+						}
+					}
+
+			cache.spec = rb;
+		},
+
+		spec_restore: function (cache, a) {
+			if (!cache.spec || a < 0 || a >= length(cache.spec))
+				die(`glm5_tp: no speculative state ${a}`);
+
+			torch.copy_many(cache.spec[a].d, cache.spec[a].s);
+		},
+
+		/* the same for the layers on the worker, for the engine: 'setup' (arg: W) before graphs(),
+		 * 'rollback' (arg: a) when a verify window is accepted only up to token a */
+		remote_spec: function (op, cache, arg) {
+			if (cache.remote == null)
+				return;
+
+			if (op == 'setup')
+				remote.spec_alloc(cache.remote, arg);
+			else if (op == 'rollback')
+				remote.spec_restore(cache.remote, arg);
+			else
+				die(`glm5_tp: remote_spec: unknown operation ${op}`);
+		},
+
 		remote: first.remote ? true : false,       // the engine: no host parking / slots of states that live elsewhere
 
 		new_cache: function (max_seq) {
@@ -764,6 +818,7 @@ export function load(model_dir, opts) {
 							let n = S.plan.kda[g][1], d = devs[g];
 
 							push(ms, {
+								mirror: true,
 								dev: d,
 								conv_state: torch.zeros([1, 3 * n * la.head_dim, la.short_conv_kernel_size - 1], 'float16', 'cuda:' + d),
 								rec_state: torch.zeros([n, la.head_dim, la.head_dim], 'float32', 'cuda:' + d)
@@ -1190,8 +1245,9 @@ export function load(model_dir, opts) {
 				/* ids_dev: int64 (1, S) on the first device (the draft chain's
 				 * device-side token ids) */
 				run_dev: function (ids_dev, pos) {
+					// the worker needs the ids on the host: one small device-to-host copy
 					if (rem_in)
-						die('glm5_tp: run_dev needs the token ids on this host (the first stages are remote)');
+						return this.run(ids_dev.cpu().reshape([ -1 ]).tolist(), pos);
 
 					let S = ids_dev.shape()[1];
 					let ent = by_size[S];
