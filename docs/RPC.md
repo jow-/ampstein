@@ -279,10 +279,14 @@ included: they are streamed from disk on whichever host runs the Engram layer).
   `wo_a` is one matrix per group, the compressor projections go through `cmm32` / `cmm16`) and routes the
   Engram tables of `ngram_tables-*.safetensors`, which the index omits (`weights.open`). The routed experts are
   all 2.5 bpw: the coop kernels' half-integer instances serve them (`glm5.moe_begin` builds the uniform tables).
-  **Measured (jai 6 x 24 GB + j7 2 x 24 GB):** the pack is 158 GB without the tables; 8 layers on the 3090s
-  (22 GB planned) leave jai 127 GB for 6 GPUs of 23.5 GiB, and the load works but nothing is left for the
-  prefill and the graphs (0.1 GiB free on two GPUs). The 3090s would take two more layers, but a cut inside
-  a pool group needs the layer's compressed pool rows and top-k picks to cross the hop (a few KB a token).
+  **Measured (jai 6 x 24 GB + j7 2 x 24 GB):** the pack is 158 GB without the tables. With the cut on a group
+  boundary (8 layers on the 3090s) jai has nothing left for the prefill and the graphs; a cut inside a group
+  (the group source's new pool rows and its indexer picks cross the hop: `hop_unpack`, the stub pool entry
+  `cache.pools[src].owner`, `tk0` in the graph buckets) lets j7 take 9 layers (20.9 GB of 24 on each 3090). Running:
+  `--rpc-layers 9 --ctx 16384 --chunk 512`, `AMP_DSV41_TP_SIZES=1 AMP_DSV41_TP_BUCKETS=16384` (2.2 / 0.4 GiB free
+  per GPU after the graphs): a 4856-token prompt prefilled and answered in 10.8 s (recall of a code word from the
+  start: right), decode 26.5 tok/s over the hop, no drafter. `remote_plan` still reserves 5 GiB of working set and
+  picks 7: force the count.
 - Test: `tests/dsv41_split.uc` (4 GPUs, one process, worker and coordinator over loopback) against the whole
   partial model.
 
