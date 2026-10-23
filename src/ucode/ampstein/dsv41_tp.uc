@@ -554,7 +554,7 @@ function dsv41_tp_graphs(model, allreduce) {
 				}
 			}
 
-			let h = nr ? null : model.embed_tokens.index(idt.cuda(ed, true)).to('float32').reshape([S, 1, H]).expand([S, 4, H]).contiguous();
+			let h = nr ? null : model.embed_tokens.index((type(model.embed_tokens) == 'object') ? idt : idt.cuda(ed, true)).to('float32').reshape([S, 1, H]).expand([S, 4, H]).contiguous();
 			let taps = [], logits = null, am = null, prev = null, hidden = null;
 
 			sp_lap('pre');
@@ -828,7 +828,7 @@ function dsv41_tp_methods(model) {
 				model.remote_client.forward_begin(cache.rcache, pos0, token_ids);
 		}
 		else {
-			let e = model.embed_tokens.index(idt.cuda(ed, true));
+			let e = model.embed_tokens.index((type(model.embed_tokens) == 'object') ? idt : idt.cuda(ed, true));
 
 			h0 = e.to('float32').reshape([T, 1, H]).expand([T, 4, H]).contiguous();
 		}
@@ -1686,8 +1686,7 @@ export function load(model_dir, opts) {
 		if (err)
 			die(`dsv41_tp: the worker cannot take ${nr} layers: ${err}`);
 
-		if (opts.spark)
-			die('dsv41_tp: the DSpark drafter is not available with remote layers yet');
+		// (the drafter taps the last layers, which this host holds; it embeds its tokens from a host copy of the table)
 	}
 
 	// a worker that stops inside a pool group sends that group's new pool rows and its picks with the streams
@@ -1695,7 +1694,7 @@ export function load(model_dir, opts) {
 
 	let max_seq = opts.max_seq || 262144;
 	// with the drafter (opts.spark) every pipeline stage also holds one of its 3 stages, sharded over the pair
-	let sb = (opts.spark && cfg.dspark_block && ws.has('mtp.0.main_proj.weight') && cfg.num_mtp_layers == NS) ?
+	let sb = (opts.spark && cfg.dspark_block && (ws.has('mtp.0.main_proj.weight') || ws.has('mtp.0.main_proj.trellis')) && cfg.num_mtp_layers == NS) ?
 		map(dsv41.spark_stage_bytes(ws, cfg), (b) => b / Gs) : null;
 	let stage_of = dsv41.plan_devices(ws, cfg, NS, max_seq, 1000000000, 1000000000, sb, Gs, nr);
 	let spark_stages = sb ? dsv41.SPARK_DEVS : null;
@@ -1884,7 +1883,7 @@ export function load(model_dir, opts) {
 
 	ws.upload(function (key) {
 		if (key == 'embed.weight')
-			return remote ? null : ed;
+			return (remote || no_head) ? null : ed;
 
 		if ((substr(key, 0, 5) == 'head.' || key == 'norm.weight') && !no_head)
 			return last.devs[0];
@@ -1892,11 +1891,20 @@ export function load(model_dir, opts) {
 		return null;
 	});
 
-	// (with remote layers the worker embeds: this process never sees the table)
-	let embed_t = remote ? null : ws.gpu16('embed.weight', ed);
+	// The embedding table (1.3 GiB) stays in host RAM on a worker (it only gathers rows) and, with the drafter, on a
+	// coordinator without the first layers: ~0.1 ms a decode token instead of a GPU's memory.
+	let embed_host = (no_head || (remote && opts.spark)) && !getenv('AMP_DSV41_EMBED_GPU');
+	let embed_t = null;
 
-	if (!remote)
+	if (embed_host) {
+		let table = ws.fp16('embed.weight');
+
+		embed_t = {host: table, index: function (idt) {return this.host.index(idt.cpu()).cuda(ed);}};
+	}
+	else if (!remote) {
+		embed_t = ws.gpu16('embed.weight', ed);
 		ws.release('embed.weight', ed);
+	}
 
 	let head_full = no_head ? null : models.linear(ws, 'head', false, last.devs[0]);
 	// rank g multiplies its vocabulary slice: the head is a dense fp16 matrix (1.59bpw pack) or EXL3 (1017 packs)

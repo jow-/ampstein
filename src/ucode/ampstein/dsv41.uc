@@ -2019,7 +2019,7 @@ export function load(model_dir, opts) {
 	let spark_devs = null, spark_load = {};
 
 	if (type(devs) != 'array') {
-		let sb = (opts.spark && cfg.dspark_block && ws.has('mtp.0.main_proj.weight')) ? spark_stage_bytes(ws, cfg) : null;
+		let sb = (opts.spark && cfg.dspark_block && (ws.has('mtp.0.main_proj.weight') || ws.has('mtp.0.main_proj.trellis'))) ? spark_stage_bytes(ws, cfg) : null;
 
 		devs = plan_devices(ws, cfg, devs, opts.max_seq || 262144, 1000000000, 2000000000, sb);   // first device: Engram + chunk working set
 		spark_devs = SPARK_DEVS;

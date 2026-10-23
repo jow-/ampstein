@@ -70,6 +70,16 @@ function expert_set(ws, key, e0, n, dev) {
 	return t;
 }
 
+/* the EXL3 experts [e0, e0 + n) of a stage on dev (1017 packs) */
+function exl3_experts(ws, key, e0, n, dev) {
+	let ex = [];
+
+	for (let e = e0; e < e0 + n; e++)
+		push(ex, dsv41.build_expert(ws, `${key}.experts.${e}`, dev));
+
+	return ex;
+}
+
 function hc_copy(hc, dev) {
 	return {fn: hc.fn.cuda(dev), fn_pre_t: hc.fn_pre_t.cuda(dev), base: hc.base.cuda(dev), base_pre: hc.base_pre.cuda(dev),
 		scale: hc.scale.cuda(dev), scale_pre: hc.scale_pre.cuda(dev)};
@@ -86,7 +96,7 @@ export function load(model, opts) {
 	let I = cfg.moe_intermediate_size;
 	let sdev = opts.stages || [ 0, 1, 2 ];                     // drafter stage b -> pipeline stage (GPU pair)
 
-	if (!nb || !B || !ws.has('mtp.0.main_proj.weight'))
+	if (!nb || !B || !(ws.has('mtp.0.main_proj.weight') || ws.has('mtp.0.main_proj.trellis')))
 		die('dsv41_spark_tp: the checkpoint has no drafter');
 
 	if (length(sdev) != nb || E % Gs || I % (32 * Gs))
@@ -106,6 +116,7 @@ export function load(model, opts) {
 		dcfg[k] = cfg[k];
 
 	dcfg.num_experts_per_tok = topk;
+	dcfg.n_routed_experts = E;
 
 	let pairs = map(sdev, (s) => model.stages[s].devs);
 	let dlast = pairs[nb - 1][0];
@@ -145,6 +156,7 @@ export function load(model, opts) {
 		let bias = ws.gpu(mk + '.gate.bias', st).to('float32').reshape([1, -1]).contiguous();
 		let shared = dsv41.build_mlp8(ws, mk + '.shared_experts', st);
 		let ranks = [];
+		let exl3 = ws.has(`${mk}.experts.0.w1.trellis`);          // 1017 packs: EXL3 experts, the first pack: FP4
 
 		for (let g = 0; g < Gs; g++) {
 			let dev = pr[g], dv = 'cuda:' + dev;
@@ -161,7 +173,10 @@ export function load(model, opts) {
 					sinks: A.sinks.narrow(0, g * nh, nh).contiguous().cuda(dev)
 				},
 				M: {
-					dev: dev, router: 'sqrtsp', ex: expert_set(ws, mk, g * Eloc, Eloc, dev), e0: g * Eloc,
+					dev: dev, router: 'sqrtsp', e0: g * Eloc,
+					ex: exl3 ? null : expert_set(ws, mk, g * Eloc, Eloc, dev), e1: (g + 1) * Eloc,
+					experts: exl3 ? exl3_experts(ws, mk, g * Eloc, Eloc, dev) : null,
+					async_moe: exl3, fused_prep: exl3,
 					gate_t: gate_t.cuda(dev), bias: bias.cuda(dev), bias_vl: null, tid2eid: null, ids: null, vlon: false,
 					shared: {
 						gate: dsv41.lin8_rows(shared.gate, shared_split[g][0], shared_split[g][1], dev),
@@ -174,6 +189,10 @@ export function load(model, opts) {
 				ring: torch.zeros([RING, D], 'float16', dv)
 			});
 		}
+
+		if (exl3)
+			for (let R in ranks)
+				R.M.coop = (getenv('AMP_DSV41_NO_COOP') ? null : dsv41.build_coop(dcfg, R.M)) || false;
 
 		push(stages, {b: b, S: model.stages[sdev[b]], ranks: ranks});
 
@@ -194,8 +213,11 @@ export function load(model, opts) {
 	let main_proj = dsv41.lin8(ws, 'mtp.0.main_proj', d0);
 	let main_norm = ws.gpu16('mtp.0.main_norm.weight', d0);
 	let dnorm = ws.gpu16(last + '.norm.weight', dl);
-	let mk_embed = ws.gpu16(last + '.markov_head.embed.weight', dl);
-	let mk_head_t = ws.gpu16(last + '.markov_head.head.weight', dl).t().contiguous();
+	// (the 2.50bpw pack names the two Markov matrices markov_w1 / markov_w2)
+	let mk1 = ws.has(last + '.markov_head.embed.weight') ? '.markov_head.embed.weight' : '.markov_head.markov_w1.weight';
+	let mk2 = ws.has(last + '.markov_head.head.weight') ? '.markov_head.head.weight' : '.markov_head.markov_w2.weight';
+	let mk_embed = ws.gpu16(last + mk1, dl);
+	let mk_head_t = ws.gpu16(last + mk2, dl).t().contiguous();
 	let confw = ws.gpu(last + '.confidence_head.proj.weight', dl).to('float32').reshape([-1, 1]).contiguous();
 
 	let costs = getenv('AMP_DSPARK_COSTS') ? map(split(getenv('AMP_DSPARK_COSTS'), ','), (x) => +x) :
@@ -263,6 +285,10 @@ export function load(model, opts) {
 		let M = R.M, ex = M.ex;
 		let n = y.shape()[0];
 		let lim = cfg.swiglu_limit + 0.0;
+
+		if (M.experts)
+			return glm5.moe_forward(dcfg, M, y);
+
 		let rt = glm5.moe_route(dcfg, M, y);
 		let dv = 'cuda:' + R.dev;
 		let loc = rt.idx.sub(torch.full([1], M.e0, 'int64', dv));

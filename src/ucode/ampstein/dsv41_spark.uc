@@ -102,7 +102,7 @@ export function load(model, opts) {
 	let E = cfg.dspark_experts, topk = cfg.dspark_topk;
 	let I = cfg.moe_intermediate_size;
 
-	if (!nb || !B || !ws.has('mtp.0.main_proj.weight'))
+	if (!nb || !B || !(ws.has('mtp.0.main_proj.weight') || ws.has('mtp.0.main_proj.trellis')))
 		die('dsv41_spark: the checkpoint has no drafter');
 
 	if (length(devs) != nb)
@@ -115,6 +115,7 @@ export function load(model, opts) {
 		dcfg[k] = cfg[k];
 
 	dcfg.num_experts_per_tok = topk;
+	dcfg.n_routed_experts = E;
 
 	ws.upload(function (key) {
 		if (index(key, 'mtp.') != 0)
@@ -147,14 +148,28 @@ export function load(model, opts) {
 			sinks: ws.gpu(key + '.attn_sink', dev).to('float32').contiguous()
 		};
 		let mk = `${p}.ffn`;
-		let ex = build_expert_set(ws, mk, E, dev);
+		// the 1017 packs quantize the drafter's experts like the trunk's (EXL3, mixed K); the first pack kept them FP4
+		let exl3 = ws.has(`${mk}.experts.0.w1.trellis`);
+		let experts = null;
+
+		if (exl3) {
+			experts = [];
+
+			for (let e = 0; e < E; e++)
+				push(experts, dsv41.build_expert(ws, `${mk}.experts.${e}`, dev));
+		}
+
 		let M = {
-			type: 'moe', dev: dev, router: 'sqrtsp', ex: ex,
+			type: 'moe', dev: dev, router: 'sqrtsp', ex: exl3 ? null : build_expert_set(ws, mk, E, dev), experts: experts,
+			async_moe: exl3, fused_prep: exl3,
 			gate_t: dsv41.mat32(ws, mk + '.gate', dev),
 			bias: ws.gpu(mk + '.gate.bias', dev).to('float32').reshape([1, -1]).contiguous(),
 			bias_vl: null, tid2eid: null, ids: null, vlon: false,
 			shared: dsv41.build_mlp8(ws, mk + '.shared_experts', dev)
 		};
+
+		if (exl3)
+			M.coop = (getenv('AMP_DSV41_NO_COOP') ? null : dsv41.build_coop(dcfg, M)) || false;
 
 		push(stages, {
 			dev: dev, A: A, M: M,
@@ -171,8 +186,11 @@ export function load(model, opts) {
 	let main_proj = dsv41.lin8(ws, 'mtp.0.main_proj', d0);
 	let main_norm = ws.gpu16('mtp.0.main_norm.weight', d0);
 	let dnorm = ws.gpu16(last + '.norm.weight', dl);
-	let mk_embed = ws.gpu16(last + '.markov_head.embed.weight', dl);                   // (V, rank)
-	let mk_head_t = ws.gpu16(last + '.markov_head.head.weight', dl).t().contiguous();  // (rank, V)
+	// (the 2.50bpw pack names the two Markov matrices markov_w1 / markov_w2)
+	let mk1 = ws.has(last + '.markov_head.embed.weight') ? '.markov_head.embed.weight' : '.markov_head.markov_w1.weight';
+	let mk2 = ws.has(last + '.markov_head.head.weight') ? '.markov_head.head.weight' : '.markov_head.markov_w2.weight';
+	let mk_embed = ws.gpu16(last + mk1, dl);                   // (V, rank)
+	let mk_head_t = ws.gpu16(last + mk2, dl).t().contiguous();  // (rank, V)
 	let confw = ws.gpu(last + '.confidence_head.proj.weight', dl).to('float32').reshape([-1, 1]).contiguous();
 
 	// ms of a verify step of 1 .. 6 rows (measured: examples/dsv41_verify_bench.uc) plus the drafter's own time
@@ -213,6 +231,10 @@ export function load(model, opts) {
 		let M = S.M, ex = M.ex;
 		let R = y.shape()[0];
 		let lim = cfg.swiglu_limit + 0.0;
+
+		if (M.experts)
+			return glm5.moe_forward(dcfg, M, y);
+
 		let rt = glm5.moe_route(dcfg, M, y);
 		let ids = rt.idx.reshape([-1]).contiguous();
 		let g = torch.fp4_moe_gemv(y, ids, ex.w1, ex.s1, I, topk);

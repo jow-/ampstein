@@ -388,7 +388,7 @@ export function serve(args) {
 	}
 	else if (D41 && args.tp) {
 		model = dsv41_tp.load(args.model, {devices: args.gpus, stages: args.stages, max_seq: args.ctx,
-			prefill_rows: args.chunk, spark: D41_SPARK && args.stages == cfg.num_mtp_layers && !args.rpc_listen,
+			prefill_rows: args.chunk, spark: D41_SPARK && args.stages == cfg.num_mtp_layers,
 			...rpc_load});
 
 		if (model.spark_stages) {
