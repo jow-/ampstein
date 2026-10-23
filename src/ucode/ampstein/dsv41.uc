@@ -700,6 +700,14 @@ function pool_copy(D, S, a, k) {
 	}
 }
 
+/* The owner entry of a pool whose rows are written from elsewhere (a source layer on a worker host, docs/RPC.md): the
+ * pool and index keys of cache.pools[src].owner on dev, filled by the host from what the worker sends. */
+export function new_pool_stub(cfg, ratio, max_seq, dev) {
+	let cap = int(max_seq / ratio) + 2, dv = 'cuda:' + dev;
+
+	return {dev: dev, n: 0, pool: pool_new('pool', cap, cfg.head_dim, dv), kidx: pool_new('kidx', cap, cfg.index_head_dim, dv)};
+}
+
 /* per-layer window ring + (for kv sources) the pool, index keys and the half-built pair */
 export function new_layer_cache(cfg, A, max_seq) {
 	let dv = 'cuda:' + A.dev;

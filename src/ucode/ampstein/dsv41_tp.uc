@@ -96,11 +96,41 @@ function ffn_partial(y) {
 	return y.mul(1.0 / FFN_SCALE).clamp(-65504.0, 65504.0).to('float16');
 }
 
+/* ---- a worker host's cut (docs/RPC.md) ---- */
+
+/* The cut after layer nr - 1 inside a pool group, when the layers behind it read the pool and the top-k picks of a source
+ * layer before it: {src, ratio}; null for a cut between groups. */
+function cut_info(cfg, nr) {
+	let first_c = -1;
+
+	for (let i = nr; i < length(cfg.ratios) && first_c < 0; i++)
+		if (cfg.ratios[i] > 0)
+			first_c = i;
+
+	if (first_c < 0 || cfg.src[first_c] >= nr)
+		return null;
+
+	return {src: cfg.src[first_c], ratio: cfg.ratios[cfg.src[first_c]]};
+}
+
+/* why a cut inside a group does not work (a string), or null */
+function cut_check(cfg, nr, cut) {
+	if (index(cfg.kv_sources, cut.src) < 0 || index(cfg.index_sources, cut.src) < 0)
+		return `layer ${cut.src}, whose pool the next layers read, is not a pool and index source`;
+
+	// the candidate blocks of the candidate source layer would have to cross as well
+	if (cfg.candidate_source >= 0 && nr > cfg.candidate_source)
+		return `the cut would be behind the candidate source layer ${cfg.candidate_source}`;
+
+	return null;
+}
+
 /* ---- recurrent state outside the KV rows (engine snapshots), rollback of speculative rows ---- */
 
 function dsv41_tp_state(model, allreduce) {
 	let cfg = model.cfg, layers = model.layers, Gs = model.Gs, nl = model.nl;
 	let nr = model.nr;            // layers 0 .. nr-1 live on the worker (docs/RPC.md): their state is fetched from / sent to it
+	let cut = model.cut;          // a cut inside a pool group: this host holds a copy of the group source's pool
 	let W = cfg.window - 1;
 
 	/* per lane, per layer: the pool entry count, the half-built pair of the ratio-2 compressors and a copy of the
@@ -127,12 +157,18 @@ function dsv41_tp_state(model, allreduce) {
 			push(out, row);
 		}
 
-		return nr ? {lanes: out, remote: model.remote_client.aux_get(cache.rcache, cache.length)} : out;
+		return nr ? {lanes: out, remote: model.remote_client.aux_get(cache.rcache, cache.length),
+			cut_n: cut ? cache.lanes[0].pools[cut.src].owner.n : 0} : out;
 	};
 
 	model.aux_set = function (cache, snap) {
 		if (nr) {
 			model.remote_client.aux_put(cache.rcache, snap.remote, cache.length);
+
+			if (cut)
+				for (let g = 0; g < Gs; g++)
+					dsv41.set_pool_n(cache.lanes[g], cut.src, snap.cut_n);
+
 			snap = snap.lanes;
 		}
 
@@ -165,6 +201,10 @@ function dsv41_tp_state(model, allreduce) {
 
 		cache.cids = [];
 
+		if (cut)
+			for (let g = 0; g < Gs; g++)
+				dsv41.set_pool_n(cache.lanes[g], cut.src, 0);
+
 		if (nr)
 			model.remote_client.reset(cache.rcache);
 	};
@@ -181,6 +221,9 @@ function dsv41_tp_state(model, allreduce) {
 
 		for (let g = 0; g < Gs; g++) {
 			let lane = cache.lanes[g];
+
+			if (cut)
+				dsv41.set_pool_n(lane, cut.src, int(L / cut.ratio));
 
 			for (let i = nr; i < nl; i++) {
 				let A = layers[i][g].attn;
@@ -215,6 +258,7 @@ function dsv41_tp_graphs(model, allreduce) {
 	let nr = model.nr;                             // layers 0 .. nr-1 run on the worker host (docs/RPC.md)
 	let no_head = model.no_head;                   // this is the worker: its graphs end with the streams
 	let first_s = nr ? stage_of[nr] : 0;           // the first stage of this process
+	let cut = model.cut;                           // a cut inside a pool group (the group source's pool and picks come over the hop)
 
 	// AMP_DSV41_TP_STEPPROF=1: seconds per phase of a decode step (synchronizes after the graph replays)
 	let SPR = getenv('AMP_DSV41_TP_STEPPROF') ? model.stepprof = {} : null;
@@ -337,8 +381,20 @@ function dsv41_tp_graphs(model, allreduce) {
 				let ctxs = [];
 				let items = [];
 
-				for (let g = 0; g < Gs; g++)
-					push(ctxs, {topk: null, cand: null, dst: {}, lk: {}});
+				for (let g = 0; g < Gs; g++) {
+					let tk = null;
+
+					// behind a cut inside a pool group the picks of the group source arrive in a persistent buffer
+					if (cut) {
+						let d0 = stages[first_s].devs[g];
+
+						tk = {dev: d0, id: 'p' + cut.src,
+							t: torch.zeros([S, min(cfg.index_topk, caps[cut.ratio])], 'int32', 'cuda:' + d0)};
+					}
+
+					// (tk0: the layers after the cut read it again at every run of a body, a later index source replaces ctx.topk)
+					push(ctxs, {topk: tk, tk0: tk, cand: null, dst: {}, lk: {}});
+				}
 
 				for (let s = 0; s < NS; s++) {
 					let Sg = stages[s];
@@ -363,6 +419,10 @@ function dsv41_tp_graphs(model, allreduce) {
 					let stg = map(Sg.devs, (d) => sts[d]);
 
 					it.taps = [];
+
+					if (cut && it.s == first_s)
+						for (let g = 0; g < Gs; g++)
+							ctxs[g].topk = ctxs[g].tk0;
 
 					for (let i = it.first; i < it.end; i++) {
 						if (engrams[i])
@@ -507,11 +567,28 @@ function dsv41_tp_graphs(model, allreduce) {
 
 				// (stands in for the previous stage: its streams, on every rank of the first local stage)
 				let s0 = stages[first_s];
-				let W = 4 * H + 4, R = int(r.packed.shape()[1] / W);
-				let pks = map(s0.devs, (d, g) => r.packed.narrow(1, (g % R) * W, W).contiguous().cuda(d));
+				let u = model.hop_unpack(r, cache, s0.devs);
+				let W = 4 * H + 4, R = int(u.packed.shape()[1] / W);
+				let pks = map(s0.devs, (d, g) => u.packed.narrow(1, (g % R) * W, W).contiguous().cuda(d));
 
 				prev = {h_out: map(pks, (pk) => pk.narrow(1, 0, 4 * H).contiguous().view([S, 4, H])),
 					pre_out: map(pks, (pk) => pk.narrow(1, 4 * H, 4).contiguous())};
+
+				if (cut) {
+					// the picks of the group source go into the graphs' input buffers; its new pool rows to the mirrors
+					// on the other stages' devices (the graphs of the first stage read the stub pool itself)
+					for (let g = 0; g < Gs; g++) {
+						let tb = b.ctxs[g].tk0.t;
+
+						if (u.topk[g] == null || join(',', tb.shape()) != join(',', u.topk[g].shape()))
+							die(`dsv41_tp: the worker's picks (${u.topk[g] ? join(',', u.topk[g].shape()) : 'none'}) do not fit the graph's (${join(',', tb.shape())})`);
+
+						tb.copy_(u.topk[g]);
+
+						for (let j = u.a; j < u.b; j++)
+							dsv41.mirror_entry(cache.lanes[g], cut.src, j);
+					}
+				}
 				sp_lap('worker');
 			}
 
@@ -561,7 +638,7 @@ function dsv41_tp_graphs(model, allreduce) {
 					am = it.am;
 
 					if (no_head)
-						hidden = {h: it.h_out, pre: it.pre_out};
+						hidden = {h: it.h_out, pre: it.pre_out, topk: map(b.ctxs, (x) => x.topk ? x.topk.t : null)};
 				}
 
 				prev = it;
@@ -602,6 +679,8 @@ function dsv41_tp_methods(model) {
 	let ENG0 = {};                                 // layer -> the rank-0 copy (the table reader)
 	let nr = model.nr;                             // layers 0 .. nr-1 run on the worker host (docs/RPC.md)
 	let first_s = nr ? stage_of[nr] : 0;           // the first stage of this process
+	let cut = model.cut;                           // a cut inside a pool group: the group source's pool is filled from the hop
+	let wcut = model.wcut;                         // (the worker's side of it)
 
 	for (let l in keys(engrams))
 		ENG0[l] = engrams[l][0];
@@ -627,6 +706,10 @@ function dsv41_tp_methods(model) {
 				if (layers[i][g].attn.kv_source)
 					lane.pools[i] = {owner: cl, mirrors: []};
 			}
+
+			// the pool of the group source on the worker: an owner entry here that the hop fills (hop_unpack)
+			if (cut)
+				lane.pools[cut.src] = {owner: dsv41.new_pool_stub(cfg, cut.ratio, max_seq, stages[first_s].devs[g]), mirrors: []};
 
 			push(lanes, lane);
 		}
@@ -654,6 +737,62 @@ function dsv41_tp_methods(model) {
 
 		return dsv4_tp.allreduce(S, p);
 	}
+
+	/* ---- the worker's reply ---- */
+
+	/* The reply of a forward: the streams (float32 [n, ranks * (4 * hidden + 4)], one replica per worker rank) and, behind a
+	 * cut inside a pool group, that group source's new pool rows [a, b) and the picks of its indexer for the n rows, per
+	 * worker rank (see rpc_forward). The rows are written to the lanes' stub pools (the entry count moves to b), the picks
+	 * are copied to the ranks' devices devs[g]. Returns {packed, topk: per rank an int32 (n, K) tensor or null, a, b}. */
+	model.hop_unpack = function (r, cache, devs) {
+		let m = r.meta, D = cfg.head_dim;
+		let W = 4 * H + 4, R = m.R;
+		let out = {packed: r.blob.narrow(0, 0, m.hb).view_dtype('float32').view([r.n, R * W]), topk: [], a: 0, b: 0};
+
+		for (let g = 0; g < length(devs); g++)
+			push(out.topk, null);
+
+		if (!cut)
+			return out;
+
+		if (m.b == null)
+			die('dsv41_tp: the worker sent no pool rows of the group source');
+
+		let owner0 = cache.lanes[0].pools[cut.src].owner;
+
+		if (m.q8 != (type(owner0.pool) == 'object'))
+			die('dsv41_tp: the worker and this host keep the pool in different formats (AMP_DSV41_KV)');
+
+		let k = m.b - m.a;
+
+		out.a = m.a;
+		out.b = m.b;
+
+		for (let g = 0; g < length(devs); g++) {
+			let off = m.hb + (g % R) * (m.pb + m.tb);
+			let lane = cache.lanes[g], owner = lane.pools[cut.src].owner;
+
+			dsv41.set_pool_n(lane, cut.src, m.a);
+
+			if (k > 0) {
+				if (m.q8) {
+					owner.pool.q.narrow(0, m.a, k).copy_(r.blob.narrow(0, off, k * D).view_dtype('int8').view([k, D]).cuda(owner.dev));
+					owner.pool.s.narrow(0, m.a, k).copy_(r.blob.narrow(0, off + k * D, k * D / 16).view_dtype('float16')
+						.view([k, D / 32]).cuda(owner.dev));
+				}
+				else {
+					owner.pool.narrow(0, m.a, k).copy_(r.blob.narrow(0, off, k * D * 2).view_dtype('float16').view([k, D]).cuda(owner.dev));
+				}
+			}
+
+			owner.n = m.b;
+
+			if (m.K > 0)
+				out.topk[g] = r.blob.narrow(0, off + m.pb, m.tb).view_dtype('int32').view([r.n, m.K]).cuda(devs[g]);
+		}
+
+		return out;
+	};
 
 	/* ---- prefill (eager) ---- */
 
@@ -1014,7 +1153,7 @@ function dsv41_tp_methods(model) {
 	}
 
 	/* the chunk through stage s: copies the streams to the stage's ranks when it comes from another stage */
-	model.chunk_stage_begin = function (c, s) {
+	model.chunk_stage_begin = function (c, s, cache) {
 		let S = stages[s];
 
 		if (c.stage == -1) {
@@ -1024,13 +1163,18 @@ function dsv41_tp_methods(model) {
 			if (r.n != c.T || r.pos != c.pos0)
 				die(`dsv41_tp: the worker answered ${r.n} rows at ${r.pos}, expected ${c.T} at ${c.pos0}`);
 
-			let W = 4 * H + 4, R = int(r.packed.shape()[1] / W);
+			let W = 4 * H + 4;
+			let u = model.hop_unpack(r, cache, S.devs), R = int(u.packed.shape()[1] / W);
 
 			for (let g = 0; g < Gs; g++) {
-				let pk = r.packed.narrow(1, (g % R) * W, W).contiguous().cuda(S.devs[g]);
+				let pk = u.packed.narrow(1, (g % R) * W, W).contiguous().cuda(S.devs[g]);
 
 				push(c.h, pk.narrow(1, 0, 4 * H).contiguous().view([c.T, 4, H]));
 				push(c.pre, pk.narrow(1, 4 * H, 4).contiguous());
+
+				// the picks of the group source on the worker, for the layers of its group on this host
+				if (u.topk[g])
+					c.ctx[g].topk = {dev: S.devs[g], t: u.topk[g]};
 			}
 
 			c.stage = s;
@@ -1056,7 +1200,7 @@ function dsv41_tp_methods(model) {
 	};
 
 	model.chunk_stage = function (c, cache, s) {
-		model.chunk_stage_begin(c, s);
+		model.chunk_stage_begin(c, s, cache);
 
 		for (let i = stages[s].first; i < stages[s].end; i++)
 			layer_run(i, c, cache);
@@ -1070,7 +1214,7 @@ function dsv41_tp_methods(model) {
 		let n = 0;
 
 		for (let e in cs) {
-			model.chunk_stage_begin(e.c, e.s);
+			model.chunk_stage_begin(e.c, e.s, cache);
 			n = max(n, stages[e.s].end - stages[e.s].first);
 		}
 
@@ -1357,19 +1501,27 @@ function dsv41_tp_methods(model) {
 	};
 
 	/* The worker's side. rows `ids` at `pos` through this (partial) model, the way the coordinator's chunk_begin and
-	 * run_rows continue from them: eagerly, or by replaying the captured graph set G. The reply is one host tensor,
-	 * float32 [n, ranks * (4 * hidden + 4)]: the four residual streams and the four mHC pre-weights of every row, per rank. */
+	 * run_rows continue from them: eagerly, or by replaying the captured graph set G. The reply is {tensor, meta}: bytes
+	 * and their layout (hop_unpack). First float32 [n, ranks * (4 * hidden + 4)]: the four residual streams and the four
+	 * mHC pre-weights of every row, per rank (the ranks' replicas differ in the last bits: each rank of the coordinator's
+	 * first stage continues from its own, as on one host). When the model stops inside a pool group (wcut), per rank
+	 * behind that: the group source's new pool rows [a, b) (q8: codes, scales; else fp16) and the n rows' picks of its
+	 * indexer, int32 (n, K) -- what the layers of the group on the other host read. */
 	model.rpc_forward = function (cache, ids, pos, G) {
-		let n = length(ids), h = null, pre = null;
+		let n = length(ids), h = null, pre = null, tk = null;
+		let a = wcut ? cache.lanes[0].layers[wcut.src].n : 0;
 
 		if (G) {
 			let r = G.run(ids, pos).hidden;
 
 			h = r.h;
 			pre = r.pre;
+			tk = r.topk;
 		}
 		else {
 			cache.length = pos;
+
+			a = wcut ? cache.lanes[0].layers[wcut.src].n : 0;
 
 			let c = model.chunk_begin(ids, cache);
 
@@ -1378,16 +1530,49 @@ function dsv41_tp_methods(model) {
 
 			h = c.h;
 			pre = c.pre;
+			tk = map(c.ctx, (x) => x.topk ? x.topk.t : null);
 		}
 
-		// (the ranks' replicas of the streams differ in the last bits: each rank's copy is sent, so that the ranks of the
-		// coordinator's first stage continue from their own, as in a model on one host)
-		let parts = [];
+		let R = length(h), parts = [];
 
-		for (let g = 0; g < length(h); g++)
+		for (let g = 0; g < R; g++)
 			push(parts, torch.cat([ h[g].reshape([n, 4 * H]), pre[g] ], 1).cpu());
 
-		return torch.cat(parts, 1).contiguous();
+		let hb = torch.cat(parts, 1).contiguous();
+		let segs = [ hb.reshape([-1]).view_dtype('uint8') ];
+		let meta = {packed: true, hb: n * R * (4 * H + 4) * 4, R: R};
+
+		if (wcut) {
+			let b = cache.lanes[0].layers[wcut.src].n, k = b - a, D = cfg.head_dim;
+			let K = (tk && tk[0]) ? tk[0].shape()[1] : 0;
+			let q8 = (type(cache.lanes[0].layers[wcut.src].pool) == 'object');
+
+			for (let g = 0; g < R; g++) {
+				let P = cache.lanes[g].layers[wcut.src].pool;
+
+				if (k > 0) {
+					if (q8) {
+						push(segs, P.q.narrow(0, a, k).contiguous().cpu().reshape([-1]).view_dtype('uint8'));
+						push(segs, P.s.narrow(0, a, k).contiguous().cpu().reshape([-1]).view_dtype('uint8'));
+					}
+					else {
+						push(segs, P.narrow(0, a, k).contiguous().cpu().reshape([-1]).view_dtype('uint8'));
+					}
+				}
+
+				if (K > 0)
+					push(segs, tk[g].contiguous().cpu().reshape([-1]).view_dtype('uint8'));
+			}
+
+			meta.a = a;
+			meta.b = b;
+			meta.K = K;
+			meta.q8 = q8;
+			meta.pb = (k > 0) ? (q8 ? k * (D + D / 16) : k * D * 2) : 0;
+			meta.tb = n * K * 4;
+		}
+
+		return {tensor: torch.cat(segs, 0), meta: meta};
 	};
 
 	/* The state outside the pools that a snapshot of the cache holds (aux_get), as bytes for the connection:
@@ -1486,20 +1671,27 @@ export function load(model_dir, opts) {
 	let nr = opts.remote ? (opts.remote_layers || 0) : 0;
 	let remote = nr ? opts.remote : null;
 
+	// A cut inside a pool group (the layers behind it read the compressed pool and the top-k picks of a source layer on the
+	// worker): those cross the hop, a few KB a token (cut = {src, ratio}).
+	let cut = null;
+
 	if (nr) {
-		// the hop carries only the streams: a layer behind it must not read the compressed pool or the top-k picks of one before it
-		let first_c = -1;
+		if (nr >= nl)
+			die(`dsv41_tp: the worker cannot take ${nr} of ${nl} layers`);
 
-		for (let i = nr; i < nl && first_c < 0; i++)
-			if (cfg.ratios[i] > 0)
-				first_c = i;
+		cut = cut_info(cfg, nr);
 
-		if (nr >= nl || (first_c >= 0 && (index(cfg.kv_sources, first_c) < 0 || index(cfg.index_sources, first_c) < 0)))
-			die(`dsv41_tp: the worker cannot take ${nr} layers: layer ${first_c} would read the pool of a layer on the worker (a boundary at a layer in ${join(',', cfg.kv_sources)} works)`);
+		let err = cut ? cut_check(cfg, nr, cut) : null;
+
+		if (err)
+			die(`dsv41_tp: the worker cannot take ${nr} layers: ${err}`);
 
 		if (opts.spark)
 			die('dsv41_tp: the DSpark drafter is not available with remote layers yet');
 	}
+
+	// a worker that stops inside a pool group sends that group's new pool rows and its picks with the streams
+	let wcut = (opts.no_head && nl < length(cfg.ratios)) ? cut_info(cfg, nl) : null;
 
 	let max_seq = opts.max_seq || 262144;
 	// with the drafter (opts.spark) every pipeline stage also holds one of its 3 stages, sharded over the pair
@@ -1751,7 +1943,7 @@ export function load(model_dir, opts) {
 		stages: stages, stage_of: stage_of, last: last, engrams: engrams, meta: meta, spark_stages: spark_stages,
 		embed_tokens: embed_t, embed_dev: ed, lm_heads: lm_heads, lm_head: lm_heads[0],
 		norm: no_head ? [] : map(last.devs, (d) => norm_w.cuda(d)),
-		nr: nr, remote_client: remote, remote_rejoin: opts.recover, no_head: no_head
+		nr: nr, remote_client: remote, remote_rejoin: opts.recover, no_head: no_head, cut: cut, wcut: wcut
 	};
 
 	dsv41_tp_methods(model);
@@ -1761,8 +1953,9 @@ export function load(model_dir, opts) {
 
 /* How many layers a worker host takes (docs/RPC.md): the first `nr`, the largest count that fits the worker's GPUs
  * (weights split over its ranks, the pools of its source layers, the embedding on its first GPU, and a working set for
- * graphs, communicators and the prefill chunk), and ends where a new compressed-pool group starts (layer 2, 8, 14, ...:
- * the hop carries only the streams). o: {gpus: [total bytes of each worker GPU], max_seq, layers (a forced count)}.
+ * graphs, communicators and the prefill chunk). A cut inside a pool group is fine up to the candidate source layer
+ * (the group source's new pool rows and picks then cross the hop). o: {gpus: [total bytes of each worker GPU],
+ * max_seq, layers (a forced count)}.
  * Returns {nr, per_gpu: bytes of the busiest worker GPU}. */
 export function remote_plan(model_dir, o) {
 	let cfg = dsv41.load_config(model_dir);
@@ -1775,7 +1968,9 @@ export function remote_plan(model_dir, o) {
 	let best = 0, best_cost = 0;
 
 	for (let b = 1; b < cfg.num_hidden_layers; b++) {
-		if (index(cfg.kv_sources, b) < 0 || index(cfg.index_sources, b) < 0)
+		let cut = cut_info(cfg, b);
+
+		if (cut && cut_check(cfg, b, cut))
 			continue;
 
 		let cost = dsv41.seg_cost(cfg, bytes, 0, b, o.max_seq) + embed + work;
@@ -1787,7 +1982,7 @@ export function remote_plan(model_dir, o) {
 	}
 
 	if (!best)
-		die(o.layers ? `dsv41_tp: ${o.layers} layers cannot be a worker's share (a boundary at ${join(',', cfg.kv_sources)})` :
+		die(o.layers ? `dsv41_tp: ${o.layers} layers cannot be a worker's share` :
 			'dsv41_tp: the worker\'s GPUs cannot hold even the first layers');
 
 	return {nr: best, per_gpu: best_cost, budget: budget};

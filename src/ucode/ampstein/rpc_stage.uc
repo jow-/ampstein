@@ -248,7 +248,11 @@ export function worker(c, model) {
 				if (m.graph)
 					W.replays++;
 
-				c.send({ t: 'h', n: m.n, pos: m.pos, packed: true }, host);
+				// (an object: {tensor, meta}, the bytes and what they hold)
+				if (type(host) == 'object')
+					c.send({ t: 'h', n: m.n, pos: m.pos, ...host.meta }, host.tensor);
+				else
+					c.send({ t: 'h', n: m.n, pos: m.pos, packed: true }, host);
 
 				return;
 			}
@@ -488,6 +492,10 @@ export function client(c) {
 		let f = answer('h', timeout_ms);
 
 		K.inflight--;
+
+		// (a reply with more than the streams, DeepSeek-V4.1 behind a cut inside a pool group: the raw bytes and the layout)
+		if (f.meta.hb != null)
+			return { n: f.meta.n, pos: f.meta.pos, blob: f.tensor, meta: f.meta };
 
 		if (f.meta.packed)
 			return { n: f.meta.n, pos: f.meta.pos, packed: f.tensor.view_dtype('float32').view([ f.meta.n, -1 ]) };
