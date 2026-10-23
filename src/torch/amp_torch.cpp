@@ -4485,6 +4485,42 @@ torch_mem_info(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+/*
+ * device_props(dev): { name, major, minor, total, sm_count } of CUDA device
+ * `dev` (cudaGetDeviceProperties) — the identity an RPC worker announces in
+ * its hello (docs/RPC.md). Does not create a context on the device.
+ */
+static uc_value_t *
+torch_device_props(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *dv = uc_fn_arg(0);
+	int n = 0;
+
+	if (nargs != 1 || !dv || ucv_type(dv) != UC_INTEGER)
+		RAISE("device_props: expected (device index)");
+
+	int dev = (int)ucv_int64_get(dv);
+
+	if (cudaGetDeviceCount(&n) != cudaSuccess || dev < 0 || dev >= n)
+		RAISE("device_props: no such CUDA device");
+
+	cudaDeviceProp pr;
+	cudaError_t e = cudaGetDeviceProperties(&pr, dev);
+
+	if (e != cudaSuccess)
+		RAISE(cudaGetErrorString(e));
+
+	uc_value_t *o = ucv_object_new(vm);
+
+	ucv_object_add(o, "name", ucv_string_new(pr.name));
+	ucv_object_add(o, "major", ucv_int64_new(pr.major));
+	ucv_object_add(o, "minor", ucv_int64_new(pr.minor));
+	ucv_object_add(o, "total", ucv_int64_new((int64_t)pr.totalGlobalMem));
+	ucv_object_add(o, "sm_count", ucv_int64_new(pr.multiProcessorCount));
+
+	return o;
+}
+
 /* torch.empty_cache(): give the caching allocator's free blocks (on every device) back to the driver */
 static uc_value_t *
 torch_empty_cache(uc_vm_t *vm, size_t nargs)
@@ -10633,6 +10669,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "idx_score",	torch_idx_score },
 	{ "dsa_select",	torch_dsa_select },
 	{ "mem_info",	torch_mem_info },
+	{ "device_props",	torch_device_props },
 	{ "empty_cache",	torch_empty_cache },
 	{ "kv_q8_put",	torch_kv_q8_put },
 	{ "kv_q8_get",	torch_kv_q8_get },

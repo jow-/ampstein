@@ -240,6 +240,10 @@ expect_raise('exl3_reconstruct: one arg', function () {
 	torch.exl3_reconstruct(xc);
 });
 
+expect_raise('device_props: no args', function () { torch.device_props(); });
+expect_raise('device_props: not an index', function () { torch.device_props('0'); });
+expect_raise('device_props: no such device', function () { torch.device_props(999); });
+
 /* --- fds ---------------------------------------------------------------------- */
 
 expect_raise('fd_write: no args', function () { torch.fd_write(); });

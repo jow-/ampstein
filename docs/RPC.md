@@ -60,10 +60,31 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    the existing `copy_async` / `copy_h2d_async`. `rpc_pingpong.uc --native`
    times it (loopback: 100 KB RTT 55 us; the wire figures with the native path
    are still to be measured on jai).
-2. **`rpc.uc` transport.** Frames `[type, seq, len]` + payload on one
-   persistent connection: JSON for control, raw bytes for tensors. Coordinator
-   side non-blocking on `uloop`; worker side a plain blocking loop. Keep-alive
-   and a connection-loss path.
+2. **`rpc.uc` transport** (done). Frames are a 32-byte header (magic, seq, json
+   length, tensor length), a JSON metadata object (`t` is the type) and the raw
+   tensor bytes, on one persistent TCP connection (`TCP_NODELAY`, keep-alive,
+   `TCP_USER_TIMEOUT` 15 s). `conn.send(meta, tensor?)` blocks until the frame is
+   out (30 s without progress raises); `conn.recv(ms)` waits for a frame, and
+   `conn.pump()` takes what has arrived without waiting, for a `uloop` handler.
+   The tensor of a received frame is a view of a reusable pinned buffer of the
+   connection (valid until the next tensor frame; an `alloc(meta, n)` hook lets
+   the caller provide the destination, e.g. the stage's input buffer): allocating
+   pinned memory per frame cost ~0.8 ms. `ping`/`pong` is answered inside `recv`;
+   `conn.ping()` returns the round trip.
+   The coordinator `rpc.listen({bind, port, manifest})` (an explicit bind address
+   is required) takes dial-ins: `accept_one(ms)` (from a `uloop` handle on
+   `fd()` for rejoins), `wait(n, seconds)` at start-up. The handshake checks the
+   protocol version, the manifest id (`rpc.manifest(dir)`: sizes of all files, hash
+   of every `.safetensors` header and small `.json`) and an optional `check`
+   callback; a refused worker is told why. A worker with a known name replaces its
+   old connection. The worker side is `rpc.worker({connect, name, manifest,
+   serve})`: dial with back-off, hello (name, manifest, GPUs from
+   `torch.device_props`: name, capability, memory), welcome, `serve(conn, welcome)`,
+   and again after a drop; a refusal is fatal. Tested in `tests/rpc_transport.uc`
+   (framing, byte-wise reassembly, bad and oversize frames, close, the handshake and
+   all its refusals, rejoin, manifest) and with `examples/rpc_demo.uc` between two
+   processes: on loopback a 64 B echo takes 112 us, 100 KB 138 us, 2 MB 562 us
+   (the link figures are still to be measured on jai).
 3. **Partial load** of `glm5_tp`: `load(dir, {layers: [a, b)})` builds only the
    layers (and embedding / head when owned), their caches and KDA state. It also
    makes the worker's start-up proportional to its share.
