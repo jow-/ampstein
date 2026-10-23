@@ -100,6 +100,7 @@ function ffn_partial(y) {
 
 function dsv41_tp_state(model, allreduce) {
 	let cfg = model.cfg, layers = model.layers, Gs = model.Gs, nl = model.nl;
+	let nr = model.nr;            // layers 0 .. nr-1 live on the worker (docs/RPC.md): their state is fetched from / sent to it
 	let W = cfg.window - 1;
 
 	/* per lane, per layer: the pool entry count, the half-built pair of the ratio-2 compressors and a copy of the
@@ -113,6 +114,11 @@ function dsv41_tp_state(model, allreduce) {
 			for (let cl in lane.layers) {
 				let n = min(cache.length, W);
 
+				if (!cl) {
+					push(row, null);
+					continue;
+				}
+
 				push(row, {n: cl.n, pk: (cl.pk && cache.length % 2 == 1) ? cl.pk.add(0.0) : null,
 					pg: (cl.pk && cache.length % 2 == 1) ? cl.pg.add(0.0) : null,
 					kw: n > 0 ? dsv41.ring_rows(cl, cache.length - n, cache.length).add(0.0) : null});
@@ -121,14 +127,19 @@ function dsv41_tp_state(model, allreduce) {
 			push(out, row);
 		}
 
-		return out;
+		return nr ? {lanes: out, remote: model.remote_client.aux_get(cache.rcache)} : out;
 	};
 
 	model.aux_set = function (cache, snap) {
+		if (nr) {
+			model.remote_client.aux_put(cache.rcache, snap.remote);
+			snap = snap.lanes;
+		}
+
 		for (let g = 0; g < Gs; g++) {
 			let lane = cache.lanes[g];
 
-			for (let i = 0; i < nl; i++) {
+			for (let i = nr; i < nl; i++) {
 				let cl = lane.layers[i], v = snap[g][i];
 
 				if (layers[i][g].attn.kv_source) {
@@ -148,11 +159,14 @@ function dsv41_tp_state(model, allreduce) {
 
 	model.aux_reset = function (cache) {
 		for (let g = 0; g < Gs; g++)
-			for (let i = 0; i < nl; i++)
+			for (let i = nr; i < nl; i++)
 				if (cache.lanes[g].layers[i].pool)
 					dsv41.set_pool_n(cache.lanes[g], i, 0);
 
 		cache.cids = [];
+
+		if (nr)
+			model.remote_client.reset(cache.rcache);
 	};
 
 	/* take back the rows of the last multi-row step beyond the length L (p0 < L <= p0 + S) */
@@ -162,10 +176,13 @@ function dsv41_tp_state(model, allreduce) {
 		if (!lr || L < lr.pos + 1 || L > lr.pos + lr.S)
 			die(`dsv41_tp: rollback to ${L} is outside the last step`);
 
+		if (nr)
+			model.remote_client.rollback(cache.rcache, L);
+
 		for (let g = 0; g < Gs; g++) {
 			let lane = cache.lanes[g];
 
-			for (let i = 0; i < nl; i++) {
+			for (let i = nr; i < nl; i++) {
 				let A = layers[i][g].attn;
 
 				if (!A.kv_source)
@@ -195,6 +212,9 @@ function dsv41_tp_graphs(model, allreduce) {
 	let engrams = model.engrams, meta = model.meta, last = model.last;
 	let H = cfg.hidden_size, eps = cfg.rms_norm_eps;
 	let ed = model.embed_dev;
+	let nr = model.nr;                             // layers 0 .. nr-1 run on the worker host (docs/RPC.md)
+	let no_head = model.no_head;                   // this is the worker: its graphs end with the streams
+	let first_s = nr ? stage_of[nr] : 0;           // the first stage of this process
 
 	// AMP_DSV41_TP_STEPPROF=1: seconds per phase of a decode step (synchronizes after the graph replays)
 	let SPR = getenv('AMP_DSV41_TP_STEPPROF') ? model.stepprof = {} : null;
@@ -283,6 +303,12 @@ function dsv41_tp_graphs(model, allreduce) {
 		if (sz != 'full')
 			sizes = filter(map(split(sz, ','), (x) => +x), (x) => index(sizes || [ 1 ], x) >= 0 || x == 1);
 
+		// (the worker captures first: its warm-up clobbers its caches like ours; both are reset afterwards)
+		if (nr) {
+			model.remote_sizes = sizes || [ 1 ];
+			model.remote_client.graphs(cache.rcache, model.remote_sizes);
+		}
+
 		dsv41.mem_report(devs, 'before graphs (caches allocated)');
 
 		let sets = {};
@@ -352,7 +378,10 @@ function dsv41_tp_graphs(model, allreduce) {
 					it.h_out = h;
 					it.pre_out = pre;
 
-					if (it.s == NS - 1) {
+					if (it.s == NS - 1 && no_head) {
+						// (nothing to do: the streams h / pre are the result)
+					}
+					else if (it.s == NS - 1) {
 						let xs = [];
 
 						for (let g = 0; g < last.G; g++)
@@ -433,6 +462,10 @@ function dsv41_tp_graphs(model, allreduce) {
 				else
 					dsv41.dec_set_rows(cfg, gs.sts[d], pos);
 
+			// (with remote layers the worker starts on its share at once: it embeds and runs them while this prepares)
+			if (nr)
+				model.remote_client.forward_begin(cache.rcache, pos, ids, true);
+
 			let idt = torch.from_array(ids, 'int64');
 			let cn = meta.token_map.index(idt).view([-1]).tolist();
 			let hist = [];
@@ -450,7 +483,7 @@ function dsv41_tp_graphs(model, allreduce) {
 			for (let li = 0; li < length(cfg.engram_layers); li++) {
 				let l = cfg.engram_layers[li];
 
-				if (l < nl) {
+				if (l >= nr && l < nl) {
 					let emb = dsv41.engram_rows(cfg, meta, engrams[l][0], li, hist_t, S);
 
 					for (let g = 0; g < Gs; g++) {
@@ -461,10 +494,25 @@ function dsv41_tp_graphs(model, allreduce) {
 				}
 			}
 
-			let h = model.embed_tokens.index(idt.cuda(ed, true)).to('float32').reshape([S, 1, H]).expand([S, 4, H]).contiguous();
-			let taps = [], logits = null, am = null, prev = null;
+			let h = nr ? null : model.embed_tokens.index(idt.cuda(ed, true)).to('float32').reshape([S, 1, H]).expand([S, 4, H]).contiguous();
+			let taps = [], logits = null, am = null, prev = null, hidden = null;
 
 			sp_lap('pre');
+
+			if (nr) {
+				let r = model.remote_client.forward_end(1800000);
+
+				if (r.n != S || r.pos != pos)
+					die(`dsv41_tp: the worker answered ${r.n} rows at ${r.pos}, expected ${S} at ${pos}`);
+
+				// (stands in for the previous stage: its streams, on every rank of the first local stage)
+				let s0 = stages[first_s];
+				let pks = map(s0.devs, (d) => r.packed.cuda(d));
+
+				prev = {h_out: map(pks, (pk) => pk.narrow(1, 0, 4 * H).contiguous().view([S, 4, H])),
+					pre_out: map(pks, (pk) => pk.narrow(1, 4 * H, 4).contiguous())};
+				sp_lap('worker');
+			}
 
 			for (let it in b.items) {
 				let Sg = stages[it.s];
@@ -510,13 +558,16 @@ function dsv41_tp_graphs(model, allreduce) {
 				if (it.s == NS - 1) {
 					logits = it.logits;
 					am = it.am;
+
+					if (no_head)
+						hidden = {h: it.h_out[0], pre: it.pre_out[0]};
 				}
 
 				prev = it;
 			}
 
 			for (let g = 0; g < Gs; g++)
-				for (let i = 0; i < nl; i++) {
+				for (let i = nr; i < nl; i++) {
 					let A = layers[i][g].attn;
 
 					if (A.kv_source)
@@ -528,7 +579,7 @@ function dsv41_tp_graphs(model, allreduce) {
 
 			let dt = length(taps) ? taps[0].dev : 0;
 
-			return {logits: logits, am: am, hidden: null,
+			return {logits: logits, am: am, hidden: hidden,
 				taps: length(taps) ? torch.cat(map(taps, (t) => (t.dev == dt) ? t.t : t.t.cuda(dt)), 1) : null};
 		}
 
@@ -548,6 +599,8 @@ function dsv41_tp_methods(model) {
 	let H = cfg.hidden_size, eps = cfg.rms_norm_eps;
 	let ed = model.embed_dev;
 	let ENG0 = {};                                 // layer -> the rank-0 copy (the table reader)
+	let nr = model.nr;                             // layers 0 .. nr-1 run on the worker host (docs/RPC.md)
+	let first_s = nr ? stage_of[nr] : 0;           // the first stage of this process
 
 	for (let l in keys(engrams))
 		ENG0[l] = engrams[l][0];
@@ -561,6 +614,11 @@ function dsv41_tp_methods(model) {
 			let lane = {max_seq: max_seq, length: 0, layers: [], pools: {}, cids: []};
 
 			for (let i = 0; i < nl; i++) {
+				if (i < nr) {
+					push(lane.layers, null);
+					continue;
+				}
+
 				let cl = dsv41.new_layer_cache(cfg, layers[i][g].attn, max_seq);
 
 				push(lane.layers, cl);
@@ -572,7 +630,20 @@ function dsv41_tp_methods(model) {
 			push(lanes, lane);
 		}
 
-		return {max_seq: max_seq, length: 0, cids: [], toks: [], lanes: lanes, layers: lanes[0].layers, pools: lanes[0].pools};
+		let cache = {max_seq: max_seq, length: 0, cids: [], toks: [], lanes: lanes, layers: lanes[0].layers, pools: lanes[0].pools};
+
+		// the caches of layers 0 .. nr-1 are the worker's: this holds their id
+		if (nr)
+			cache.rcache = model.remote_client.new_cache(max_seq);
+
+		return cache;
+	};
+
+	model.free_cache = function (cache) {
+		if (nr && cache.rcache != null) {
+			model.remote_client.free(cache.rcache);
+			cache.rcache = null;
+		}
 	};
 
 	/* sum of one fp16 partial per rank -> per-rank sums (saturated like every fp16 hand-off of the model) */
@@ -586,7 +657,7 @@ function dsv41_tp_methods(model) {
 	/* ---- prefill (eager) ---- */
 
 	/* A chunk in flight: embedded token ids on every rank of stage 0, the Engram history, the mHC state. */
-	model.chunk_begin = function (token_ids, cache) {
+	model.chunk_begin = function (token_ids, cache, issued) {
 		let T = length(token_ids);
 		let pos0 = cache.length;
 
@@ -609,10 +680,21 @@ function dsv41_tp_methods(model) {
 		for (let c in cn)
 			push(cache.cids, c);
 
-		let e = model.embed_tokens.index(idt.cuda(ed, true));
-		let h0 = e.to('float32').reshape([T, 1, H]).expand([T, 4, H]).contiguous();
-		let s0 = stages[stage_of[0]];
-		let c = {T: T, pos0: pos0, end: pos0 + T, stage: stage_of[0], h: [], pre: [], ctx: [], taps: null,
+		let h0 = null;
+
+		if (nr) {
+			// the worker embeds and runs layers 0 .. nr-1 (issued already by a pipelined prefill)
+			if (!issued)
+				model.remote_client.forward_begin(cache.rcache, pos0, token_ids);
+		}
+		else {
+			let e = model.embed_tokens.index(idt.cuda(ed, true));
+
+			h0 = e.to('float32').reshape([T, 1, H]).expand([T, 4, H]).contiguous();
+		}
+
+		let s0 = stages[first_s];
+		let c = {T: T, pos0: pos0, end: pos0 + T, stage: nr ? -1 : stage_of[0], h: [], pre: [], ctx: [], taps: null,
 			hist_t: torch.from_array(hist, 'int64').view([1, -1]), eg: {}};
 
 		// the Engram rows are read from disk by a worker thread while the other chunks are issued
@@ -620,13 +702,17 @@ function dsv41_tp_methods(model) {
 			c.eg[l] = dsv41.engram_start(cfg, meta, ENG0[l], index(cfg.engram_layers, +l), c.hist_t, T);
 
 		for (let g = 0; g < Gs; g++) {
+			push(c.ctx, {topk: null, cand: null});
+
+			if (nr)
+				continue;
+
 			let dv = 'cuda:' + s0.devs[g];
 			let pre = torch.zeros([T, 4], 'float32', dv);
 
 			pre.narrow(1, 0, 1).fill_(1.0);
 			push(c.h, (s0.devs[g] == ed) ? h0 : h0.cuda(s0.devs[g], true));
 			push(c.pre, pre);
-			push(c.ctx, {topk: null, cand: null});
 		}
 
 		cache.length = pos0 + T;
@@ -930,6 +1016,25 @@ function dsv41_tp_methods(model) {
 	model.chunk_stage_begin = function (c, s) {
 		let S = stages[s];
 
+		if (c.stage == -1) {
+			// the streams come from the worker (hc * hidden floats and the hc pre-weights per row)
+			let r = model.remote_client.forward_end(1800000);
+
+			if (r.n != c.T || r.pos != c.pos0)
+				die(`dsv41_tp: the worker answered ${r.n} rows at ${r.pos}, expected ${c.T} at ${c.pos0}`);
+
+			for (let g = 0; g < Gs; g++) {
+				let pk = r.packed.cuda(S.devs[g]);
+
+				push(c.h, pk.narrow(1, 0, 4 * H).contiguous().view([c.T, 4, H]));
+				push(c.pre, pk.narrow(1, 4 * H, 4).contiguous());
+			}
+
+			c.stage = s;
+
+			return;
+		}
+
 		if (c.stage != s) {
 			for (let g = 0; g < Gs; g++) {
 				c.h[g] = c.h[g].cuda(S.devs[g], true);
@@ -1085,6 +1190,24 @@ function dsv41_tp_methods(model) {
 
 		prefetch(min(total, ahead * chunk));
 
+		/* With remote layers the worker runs the chunks one command each, in order, and is kept two chunks ahead: it
+		 * computes chunk n + 1 while this host is busy with chunk n. Not past the snapshot boundary though (the state
+		 * the engine snapshots there is the worker's too: its answer must not include the chunks behind the cut). */
+		let reqs = 0;
+
+		function issue() {
+			// (called by admit() after it took chunk next - 1: that one and the one behind it are requested)
+			while (nr && reqs < length(bounds) && reqs < next + 1) {
+				let pos = reqs ? bounds[reqs - 1] : start;
+
+				if (reqs >= next && snap_at && pos >= snap_at)
+					break;
+
+				model.remote_client.forward_begin(cache.rcache, pos, slice(ids, pos - start, bounds[reqs] - start));
+				reqs++;
+			}
+		}
+
 		function admit() {
 			if (active[0] != null || next >= length(bounds))
 				return;
@@ -1103,7 +1226,12 @@ function dsv41_tp_methods(model) {
 
 			let t1 = clock(true);
 			let last_c = (end == start + total);
-			let c = model.chunk_begin(slice(ids, prev_end - start, end - start), cache);
+
+			issue();
+
+			let c = model.chunk_begin(slice(ids, prev_end - start, end - start), cache, nr ? true : false);
+
+			issue();
 			let t2 = clock(true);
 
 			if (getenv('AMP_DSV41_TP_HOSTPROF'))
@@ -1191,6 +1319,123 @@ function dsv41_tp_methods(model) {
 		};
 	};
 
+	/* ---- split over hosts (docs/RPC.md) ---- */
+
+	model.remote = nr > 0;
+	model.remote_layer = (i) => i < nr;
+
+	/* The worker is gone (its host, the process or the link)? Wait for it to dial in again and give it empty caches;
+	 * the engine then discards everything it cached. Also drops the replies that an aborted prefill left unread
+	 * (the ping). false: nothing happened. Raises when the worker does not come back in time. */
+	model.remote_recover = function (cache) {
+		if (!nr || !model.remote_client || model.remote_client.alive(3000))
+			return false;
+
+		if (!model.remote_rejoin)
+			die('dsv41_tp: the worker is gone');
+
+		warn('dsv41_tp: the worker is gone, waiting for it to dial in again\n');
+
+		model.remote_client = model.remote_rejoin(model.remote_client);
+		cache.rcache = model.remote_client.new_cache(cache.max_seq);
+
+		if (model.remote_sizes)
+			model.remote_client.graphs(cache.rcache, model.remote_sizes);
+
+		warn('dsv41_tp: the worker is back (empty caches)\n');
+
+		return true;
+	};
+
+	model.reset_cache = function (cache) {
+		model.aux_reset(cache);
+		cache.length = 0;
+		model.last_rows = null;
+	};
+
+	/* The worker's side. rows `ids` at `pos` through this (partial) model, the way the coordinator's chunk_begin and
+	 * run_rows continue from them: eagerly, or by replaying the captured graph set G. The reply is one host tensor,
+	 * float32 [n, 4 * hidden + 4]: the four residual streams and the four mHC pre-weights of every row. */
+	model.rpc_forward = function (cache, ids, pos, G) {
+		let n = length(ids), h = null, pre = null;
+
+		if (G) {
+			let r = G.run(ids, pos).hidden;
+
+			h = r.h;
+			pre = r.pre;
+		}
+		else {
+			cache.length = pos;
+
+			let c = model.chunk_begin(ids, cache);
+
+			for (let s = 0; s < NS; s++)
+				model.chunk_stage(c, cache, s);
+
+			h = c.h[0];
+			pre = c.pre[0];
+		}
+
+		return torch.cat([ h.reshape([n, 4 * H]), pre ], 1).cpu().contiguous();
+	};
+
+	/* The state outside the pools that a snapshot of the cache holds (aux_get), as bytes for the connection:
+	 * {layout, bytes}; and back. */
+	model.aux_pack = function (cache) {
+		let snap = model.aux_get(cache), lay = [], parts = [];
+
+		for (let row in snap)
+			for (let v in row) {
+				push(lay, [ v.n, v.pk ? 1 : 0, v.kw ? v.kw.shape()[0] : 0 ]);
+
+				if (v.pk) {
+					push(parts, v.pk.reshape([-1]).cpu().view_dtype('uint8'));
+					push(parts, v.pg.reshape([-1]).cpu().view_dtype('uint8'));
+				}
+
+				if (v.kw)
+					push(parts, v.kw.contiguous().reshape([-1]).cpu().view_dtype('uint8'));
+			}
+
+		return {layout: lay, bytes: length(parts) ? torch.cat(parts, 0) : torch.zeros([0], 'uint8')};
+	};
+
+	model.aux_unpack = function (cache, layout, bytes) {
+		let D = cfg.head_dim, off = 0, k = 0, snap = [];
+
+		function take(n, dtype, shape) {
+			let t = bytes.narrow(0, off, n).view_dtype(dtype).view(shape);
+
+			off += n;
+
+			return t;
+		}
+
+		for (let g = 0; g < Gs; g++) {
+			let row = [];
+
+			for (let i = 0; i < nl; i++) {
+				let q = layout[k++], dev = cache.lanes[g].layers[i].dev;
+				let v = {n: q[0], pk: null, pg: null, kw: null};
+
+				if (q[1]) {
+					v.pk = take(4 * D, 'float32', [ 1, D ]).cuda(dev);
+					v.pg = take(4 * D, 'float32', [ 1, D ]).cuda(dev);
+				}
+
+				if (q[2])
+					v.kw = take(2 * D * q[2], 'float16', [ q[2], D ]).cuda(dev);
+
+				push(row, v);
+			}
+
+			push(snap, row);
+		}
+
+		model.aux_set(cache, snap);
+	};
+
 	dsv41_tp_state(model, allreduce);
 	dsv41_tp_graphs(model, allreduce);
 }
@@ -1226,22 +1471,45 @@ export function load(model_dir, opts) {
 	if (cfg.num_q_heads % Gs || cfg.o_groups % Gs || cfg.n_routed_experts % Gs)
 		die(`dsv41_tp: ${Gs} ranks per stage do not divide heads / groups / experts`);
 
+	// Split over hosts (docs/RPC.md): the first `nr` layers run on a worker host (opts.remote: the rpc_stage client),
+	// this process holds the rest. A worker is itself a partial model: opts.layers = nr, opts.stages = 1, opts.no_head.
+	let nr = opts.remote ? (opts.remote_layers || 0) : 0;
+	let remote = nr ? opts.remote : null;
+
+	if (nr) {
+		// the hop carries only the streams: a layer behind it must not read the compressed pool or the top-k picks of one before it
+		let first_c = -1;
+
+		for (let i = nr; i < nl && first_c < 0; i++)
+			if (cfg.ratios[i] > 0)
+				first_c = i;
+
+		if (nr >= nl || (first_c >= 0 && (index(cfg.kv_sources, first_c) < 0 || index(cfg.index_sources, first_c) < 0)))
+			die(`dsv41_tp: the worker cannot take ${nr} layers: layer ${first_c} would read the pool of a layer on the worker (a boundary at a layer in ${join(',', cfg.kv_sources)} works)`);
+
+		if (opts.spark)
+			die('dsv41_tp: the DSpark drafter is not available with remote layers yet');
+	}
+
 	let max_seq = opts.max_seq || 262144;
 	// with the drafter (opts.spark) every pipeline stage also holds one of its 3 stages, sharded over the pair
 	let sb = (opts.spark && cfg.dspark_block && ws.has('mtp.0.main_proj.weight') && cfg.num_mtp_layers == NS) ?
 		map(dsv41.spark_stage_bytes(ws, cfg), (b) => b / Gs) : null;
-	let stage_of = dsv41.plan_devices(ws, cfg, NS, max_seq, 1000000000, 1000000000, sb, Gs);
+	let stage_of = dsv41.plan_devices(ws, cfg, NS, max_seq, 1000000000, 1000000000, sb, Gs, nr);
 	let spark_stages = sb ? dsv41.SPARK_DEVS : null;
 
 	// AMP_DSV41_TP_SPLIT=13,13,14: layers per stage (and AMP_DSV41_TP_SPARK=0,2,1: the stage of each drafter stage),
 	// for hand-tuning the memory balance; 'auto' keeps the planner's. 13,13,14 is the default for 40 layers on 3
 	// stages: the last stage's ratio-1 layers cost the most prefill time, and it fits at 256k context, chunk 1536
-	let spl = getenv('AMP_DSV41_TP_SPLIT') || ((NS == 3 && nl == 40) ? '13,13,14' : 'auto');
+	let spl = getenv('AMP_DSV41_TP_SPLIT') || ((NS == 3 && nl == 40 && !nr) ? '13,13,14' : 'auto');
 
 	if (spl != 'auto') {
 		let sz = map(split(spl, ','), (x) => +x), at = 0;
 
 		stage_of = [];
+
+		for (let k = 0; k < nr; k++)         // (layers per stage: of the layers on this host)
+			push(stage_of, -1);
 
 		for (let s = 0; s < length(sz); s++)
 			for (let k = 0; k < sz[s]; k++)
@@ -1256,10 +1524,10 @@ export function load(model_dir, opts) {
 	let bounds = '';
 
 	for (let i = 1; i < nl; i++)
-		if (stage_of[i] != stage_of[i - 1])
+		if (stage_of[i] != stage_of[i - 1] && stage_of[i] >= 0)
 			bounds += ' ' + i;
 
-	warn(`dsv41_tp: ${NS} stage(s) x ${Gs} ranks; stages start at layers 0${bounds}\n`);
+	warn(`dsv41_tp: ${NS} stage(s) x ${Gs} ranks; stages start at layers ${nr}${bounds}${nr ? ` (layers 0..${nr - 1} on the worker)` : ''}\n`);
 
 	let cg = {...cfg, num_q_heads: int(cfg.num_q_heads / Gs), o_groups: int(cfg.o_groups / Gs)};
 	let H = cfg.hidden_size;
@@ -1289,7 +1557,7 @@ export function load(model_dir, opts) {
 		push(stages, S);
 	}
 
-	for (let i = 0; i < nl; i++) {
+	for (let i = nr; i < nl; i++) {
 		let S = stages[stage_of[i]];
 
 		if (S.first < 0)
@@ -1305,7 +1573,12 @@ export function load(model_dir, opts) {
 	let engrams = {};
 	let t_load = time();
 
-	for (let i = 0; i < nl; i++) {
+	// (the layers on the worker: stubs that say what the layer is, for the loops over all layers)
+	for (let i = 0; i < nr; i++)
+		push(layers, map(slice(devs, 0, Gs), () => ({remote: true, idx: i,
+			attn: {kv_source: index(cfg.kv_sources, i) >= 0, ratio: cfg.ratios[i], remote: true}})));
+
+	for (let i = nr; i < nl; i++) {
 		let S = stages[stage_of[i]];
 		let st = S.devs[i % Gs];                  // staging device of the layer's replicated / sliced tensors
 		let pfx = `layers.${i}.`;
@@ -1403,32 +1676,41 @@ export function load(model_dir, opts) {
 	let last = stages[stage_of[nl - 1]];
 
 	let ed = devs[0];
+	let no_head = opts.no_head ? true : false;       // a worker: the embedding, no head
 
 	ws.upload(function (key) {
 		if (key == 'embed.weight')
-			return ed;
+			return remote ? null : ed;
 
-		if (key == 'head.weight' || key == 'norm.weight')
+		if ((substr(key, 0, 5) == 'head.' || key == 'norm.weight') && !no_head)
 			return last.devs[0];
 
 		return null;
 	});
 
-	let embed_t = ws.gpu16('embed.weight', ed);
+	// (with remote layers the worker embeds: this process never sees the table)
+	let embed_t = remote ? null : ws.gpu16('embed.weight', ed);
 
-	ws.release('embed.weight', ed);
+	if (!remote)
+		ws.release('embed.weight', ed);
 
-	let head_full = models.linear(ws, 'head', false, last.devs[0]);
-	// the head is a dense fp16 matrix in this pack: rank g multiplies its rows (vocabulary slice)
-	let lm_heads = map(last.devs, function (d, g) {
+	let head_full = no_head ? null : models.linear(ws, 'head', false, last.devs[0]);
+	// rank g multiplies its vocabulary slice: the head is a dense fp16 matrix (1.59bpw pack) or EXL3 (1017 packs)
+	let lm_heads = no_head ? [] : map(last.devs, function (d, g) {
+		if (head_full.trellis)
+			return models.cols(head_full, [ [ plan.vocab[g][0], plan.vocab[g][1] ] ], d);
+
 		let wg = head_full.weight.narrow(0, plan.vocab[g][0], plan.vocab[g][1]).contiguous().cuda(d);
 
 		return {weight: wg, in_features: wg.shape()[1], out_features: wg.shape()[0],
 			forward: function (x) {return torch.matmul(x, this.weight.t());}};
 	});
-	let norm_w = ws.gpu16('norm.weight', last.devs[0]);
+	let norm_w = no_head ? null : ws.gpu16('norm.weight', last.devs[0]);
 
-	ws.release('head.weight', last.devs[0]);
+	if (!no_head)
+		for (let sfx in [ 'weight', 'trellis', 'suh', 'svh', 'mul1' ])
+			ws.release('head.' + sfx, last.devs[0]);
+
 	head_full = null;
 	gc();
 
@@ -1456,10 +1738,45 @@ export function load(model_dir, opts) {
 		cfg: cfg, cg: cg, layers: layers, devs: devs, G: G, tp: true, nl: nl, ws: ws, plan: plan, Gs: Gs, NS: NS,
 		stages: stages, stage_of: stage_of, last: last, engrams: engrams, meta: meta, spark_stages: spark_stages,
 		embed_tokens: embed_t, embed_dev: ed, lm_heads: lm_heads, lm_head: lm_heads[0],
-		norm: map(last.devs, (d) => norm_w.cuda(d))
+		norm: no_head ? [] : map(last.devs, (d) => norm_w.cuda(d)),
+		nr: nr, remote_client: remote, remote_rejoin: opts.recover, no_head: no_head
 	};
 
 	dsv41_tp_methods(model);
 
 	return model;
+}
+
+/* How many layers a worker host takes (docs/RPC.md): the first `nr`, the largest count that fits the worker's GPUs
+ * (weights split over its ranks, the pools of its source layers, the embedding on its first GPU, and a working set for
+ * graphs, communicators and the prefill chunk), and ends where a new compressed-pool group starts (layer 2, 8, 14, ...:
+ * the hop carries only the streams). o: {gpus: [total bytes of each worker GPU], max_seq, layers (a forced count)}.
+ * Returns {nr, per_gpu: bytes of the busiest worker GPU}. */
+export function remote_plan(model_dir, o) {
+	let cfg = dsv41.load_config(model_dir);
+	let ws = weights.open(model_dir);
+	let Gw = length(o.gpus);
+	let bytes = map(dsv41.layer_bytes(ws, cfg), (b) => b / Gw);
+	let embed = ws.info('embed.weight').nbytes;
+	let work = 5 * 1073741824;
+	let budget = min(...o.gpus) * 0.93;
+	let best = 0, best_cost = 0;
+
+	for (let b = 1; b < cfg.num_hidden_layers; b++) {
+		if (index(cfg.kv_sources, b) < 0 || index(cfg.index_sources, b) < 0)
+			continue;
+
+		let cost = dsv41.seg_cost(cfg, bytes, 0, b, o.max_seq) + embed + work;
+
+		if (o.layers ? b == o.layers : cost <= budget) {
+			best = b;
+			best_cost = cost;
+		}
+	}
+
+	if (!best)
+		die(o.layers ? `dsv41_tp: ${o.layers} layers cannot be a worker's share (a boundary at ${join(',', cfg.kv_sources)})` :
+			'dsv41_tp: the worker\'s GPUs cannot hold even the first layers');
+
+	return {nr: best, per_gpu: best_cost, budget: budget};
 }

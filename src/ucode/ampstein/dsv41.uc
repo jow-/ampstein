@@ -1516,7 +1516,7 @@ export function build_mlp8(ws, key, dev) {
 	};
 }
 
-function build_expert(ws, key, dev) {
+export function build_expert(ws, key, dev) {
 	return {
 		gate: models.linear(ws, key + '.w1', false, dev),
 		up: models.linear(ws, key + '.w3', false, dev),
@@ -1681,7 +1681,7 @@ export function pool_bytes(cfg, src, max_seq) {
 }
 
 /* checkpoint bytes of every layer (the Engram tables excluded) */
-function layer_bytes(ws, cfg) {
+export function layer_bytes(ws, cfg) {
 	let nl = cfg.num_hidden_layers;
 	let bytes = [];
 
@@ -1702,7 +1702,7 @@ function layer_bytes(ws, cfg) {
 
 /* bytes of layers [a, b) on one device: weights, the pools of its source layers and a mirror of every pool
  * its layers read from another device */
-function seg_cost(cfg, bytes, a, b, max_seq) {
+export function seg_cost(cfg, bytes, a, b, max_seq) {
 	let c = 0, own = {}, mir = {};
 
 	for (let i = a; i < b; i++) {
@@ -1752,8 +1752,9 @@ export let SPARK_DEVS = null;
  * embedding table goes to the least loaded device afterwards (embed_device). With `spark` (bytes of each
  * drafter stage) every stage also takes a device of its own choosing: all assignments are tried and the
  * best one is left in SPARK_DEVS. Returns the per-layer device array. */
-export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last, spark, shard) {
+export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last, spark, shard, first) {
 	let nl = cfg.num_hidden_layers;
+	let a0 = first || 0;          // layers below this one live on another host: -1 in the result
 	let bytes = layer_bytes(ws, cfg);
 
 	// tensor-parallel stages: every GPU of a stage holds 1 / shard of the layers' weights
@@ -1765,7 +1766,7 @@ export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last, sp
 		push(ct, []);
 
 		for (let b = 0; b <= nl; b++)
-			push(ct[a], (b > a) ? seg_cost(cfg, bytes, a, b, max_seq) + (a == 0 ? (extra_first || 0) : 0) +
+			push(ct[a], (b > a) ? seg_cost(cfg, bytes, a, b, max_seq) + (a == a0 ? (extra_first || 0) : 0) +
 				(b == nl ? (extra_last || 0) : 0) : 0);
 	}
 
@@ -1779,14 +1780,14 @@ export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last, sp
 			push(from, []);
 
 			for (let i = 0; i <= nl; i++) {
-				push(best[d], (d == 0 && i == 0) ? 0 : 1e30);
+				push(best[d], (d == 0 && i == a0) ? 0 : 1e30);
 				push(from[d], -1);
 			}
 		}
 
 		for (let d = 1; d <= ngpu; d++)
-			for (let i = 1; i <= nl; i++)
-				for (let a = d - 1; a < i; a++) {
+			for (let i = a0 + 1; i <= nl; i++)
+				for (let a = a0 + d - 1; a < i; a++) {
 					if (best[d - 1][a] >= 1e30)
 						continue;
 
@@ -1801,7 +1802,7 @@ export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last, sp
 		let devs = [];
 
 		for (let i = 0; i < nl; i++)
-			push(devs, 0);
+			push(devs, i < a0 ? -1 : 0);
 
 		for (let d = ngpu, i = nl; d >= 1; d--) {
 			let a = from[d][i];
@@ -1961,7 +1962,7 @@ export function load(model_dir, opts) {
 		if (key == 'embed.weight')
 			return ed;
 
-		if (key == 'head.weight' || key == 'norm.weight')
+		if (substr(key, 0, 5) == 'head.' || key == 'norm.weight')
 			return last;
 
 		return null;      // mtp / vision: not part of the text model yet
@@ -1992,7 +1993,8 @@ export function load(model_dir, opts) {
 
 	let lm_head = models.linear(ws, 'head', false, last);
 
-	ws.release('head.weight', last);               // lm_head holds the fp16 copy
+	for (let sfx in [ 'weight', 'trellis', 'suh', 'svh', 'mul1' ])      // lm_head holds its own copy
+		ws.release('head.' + sfx, last);
 
 	let model = {
 		cfg: cfg, devs: devs, spark_devs: spark_devs, ws: ws, layers: layers, engrams: engrams, meta: meta, embed_tokens: embed_t, embed_dev: ed,

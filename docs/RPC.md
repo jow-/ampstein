@@ -242,7 +242,39 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    previous server's worker connection failed to bind.
    **To do:** device slots for a remote model; more than one worker; a rejoin that keeps the worker's
    caches when only the link blipped.
-8. Other model families (`qwen4_tp`, `dsv41_tp`, `gemma4_tp`) after GLM works.
+8. Other model families (`qwen4_tp`, `gemma4_tp`) after GLM works; DeepSeek-V4.1 is next below.
+
+### DeepSeek-V4.1 (`dsv41_tp`)
+
+`ampstein --model DSV41 --tp --gpus 6 --stages 3 --rpc-listen ADDR:PORT` and, on the worker,
+`ampstein --worker --connect ADDR:PORT --model DSV41` (same model copy on both hosts, the ngram tables
+included: they are streamed from disk on whichever host runs the Engram layer).
+
+- **Split.** The worker takes the first `nr` layers as ONE stage over all its GPUs (a partial `dsv41_tp`
+  model: `layers: nr, stages: 1, no_head`) and the embedding; the coordinator holds the rest (its stages
+  are planned from layer `nr` on, `plan_devices(..., first)`), the head and the Engram tables of its layers.
+  `nr` is the largest count that fits the worker's GPUs (`remote_plan`: weights over its ranks, the pools of
+  its source layers, the embedding, 5 GiB of working set), `--rpc-layers N` forces it.
+- **Where the cut may be.** A layer reads the compressed pool and the top-k picks of the last pool-source
+  layer before it (`cfg.src`, `ctx.topk`, `ctx.cand`). To keep the hop down to the residual streams the cut
+  must sit where a new group starts: a layer in both `kv_source_layer_ids` and `index_source_layer_ids`
+  (2, 8, 14, 20 for V4.1-Flash). `load` refuses any other. 8 layers is what fits two 3090s with the 2.50bpw
+  pack; 14 does not.
+- **The hop.** One `forward {cache, pos, n, graph?}` + the token ids; the reply is `h {packed}` + float32
+  `[n, 4 * hidden + 4]`: the four residual streams and the four mHC pre-weights of every row (64 KiB + 16 B a
+  decode token). The worker computes the Engram history (`cids`) and embedding itself; both sides track the
+  token history by position, as the local model does.
+- **Decode graphs.** The worker captures its own set (`graphs`), the coordinator its local stages; a step is
+  `forward_begin` (the worker starts at once), the coordinator's Engram rows, `forward_end`, then the local
+  graphs from those streams.
+- **Prefill.** The wavefront gets the worker as stage -1: requests are issued two chunks ahead
+  (`issue()` in `prefill_pipeline`), never past the snapshot boundary.
+- **State.** `rollback`, the snapshot of the window rows / half-built compressor pairs (`aux_get` / `aux_set`
+  as bytes through the coordinator, ~1 MB), `aux_reset` and `remote_recover` (rejoin) go to the worker too.
+  No host-RAM store or hot reload yet (the DSV4.1 engine has none either), no DSpark drafter in remote mode
+  (it needs the taps of the worker's layers and the drafter stages on the pipeline stages).
+- Test: `tests/dsv41_split.uc` (4 GPUs, one process, worker and coordinator over loopback) against the whole
+  partial model.
 
 ## Phase 0 result (2026-10-23): go
 

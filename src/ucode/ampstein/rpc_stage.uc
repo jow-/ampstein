@@ -29,13 +29,18 @@
 //   state_put {cache, layer} + bytes -> ok             (set it)
 //   state_zero {cache, layer}       -> ok
 // (the engine's snapshots of recurrent state, restores and resets reach the worker's layers this way)
+//   rollback {cache, L}      -> ok            (DeepSeek-V4.1: take back the rows of the last multi-row step beyond L)
+//   aux_get {cache}          -> aux {layout} + bytes   (DeepSeek-V4.1: the state outside the pools, for a snapshot)
+//   aux_put {cache, layout} + bytes -> ok             (... and back)
 //   stats {}                 -> ok {...}      (what the worker holds, for logs)
 //   bye {}                   (the worker's serve loop returns 'bye')
 //
 // A failing command answers `error {message}` and the coordinator side raises it; the
 // connection stays up. The model the worker passes is the partial glm5_tp model of its stages
 // (own_layers, new_cache, embed, layer, handoff, stage_of); the unit tests pass a mock with the
-// same few methods.
+// same few methods. A model with rpc_forward(cache, ids, pos, graphs) (dsv41_tp) runs the
+// forward itself and answers one host tensor float32 [n, width]: the streams and the mHC
+// pre-weights of every row ('h' with `packed`).
 
 import * as rpc from './rpc.uc';
 import * as fs from 'fs';
@@ -169,6 +174,23 @@ export function worker(c, model) {
 			ok({ entry: id, bytes: meta.bytes });
 		},
 
+		rollback: function (f) {
+			model.rollback(cache_of(f.meta), f.meta.L);
+			ok();
+		},
+
+		aux_get: function (f) {
+			let a = model.aux_pack(cache_of(f.meta));
+
+			c.send({ t: 'aux', layout: a.layout }, a.bytes);
+		},
+
+		aux_put: function (f) {
+			// (a snapshot of an empty cache is no bytes at all)
+			model.aux_unpack(cache_of(f.meta), f.meta.layout, f.tensor ?? torch.zeros([ 0 ], 'uint8'));
+			ok();
+		},
+
 		spec_alloc: function (f) {
 			model.spec_alloc(cache_of(f.meta), f.meta.W);
 			ok();
@@ -200,6 +222,25 @@ export function worker(c, model) {
 				die('forward: expected n token ids');
 
 			let ids = f.tensor.view_dtype('int64').tolist();       // the frame's buffer is reused: take the ids now
+
+			if (model.rpc_forward) {
+				let G = m.graph ? W.graphs[m.cache] : null;
+
+				if (m.graph && (!G || !G.has(m.n)))
+					die(`forward: no graph for ${m.n} token(s) on cache ${m.cache}`);
+
+				let host = model.rpc_forward(cache, ids, m.pos, G);
+
+				W.forwards++;
+				W.tokens += m.n;
+
+				if (m.graph)
+					W.replays++;
+
+				c.send({ t: 'h', n: m.n, pos: m.pos, packed: true }, host);
+
+				return;
+			}
 
 			if (m.graph) {
 				let G = W.graphs[m.cache];
@@ -405,6 +446,25 @@ export function client(c) {
 		answer('ok');
 	};
 
+	K.rollback = function (cache, L) {
+		c.send({ t: 'rollback', cache: cache, L: L });
+		answer('ok');
+	};
+
+	/* the worker's snapshot state: {layout, bytes} with bytes a private copy */
+	K.aux_get = function (cache) {
+		c.send({ t: 'aux_get', cache: cache });
+
+		let f = answer('aux');
+
+		return { layout: f.meta.layout, bytes: f.tensor ? torch.cat([ f.tensor ], 0) : torch.zeros([ 0 ], 'uint8') };
+	};
+
+	K.aux_put = function (cache, a) {
+		c.send({ t: 'aux_put', cache: cache, layout: a.layout }, a.bytes);
+		answer('ok');
+	};
+
 	K.reset = function (cache) {
 		c.send({ t: 'reset', cache: cache });
 		answer('ok');
@@ -417,6 +477,9 @@ export function client(c) {
 		let f = answer('h', timeout_ms);
 
 		K.inflight--;
+
+		if (f.meta.packed)
+			return { n: f.meta.n, pos: f.meta.pos, packed: f.tensor.view_dtype('float32').view([ f.meta.n, -1 ]) };
 
 		return { n: f.meta.n, pos: f.meta.pos, h: f.tensor.view_dtype('float32').view([ f.meta.n, f.meta.hc, f.meta.hidden ]) };
 	};

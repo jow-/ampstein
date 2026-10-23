@@ -3,7 +3,8 @@
 // attach({listen, model, gpus, stages, max_seq, kv_bits, prefill_rows, workers, wait}) listens for
 // the worker(s) to dial in, hands each the first stages of the pipeline (as many as its GPUs make
 // up, `gpus / stages` GPUs per stage like here), waits until it has loaded them, and returns the
-// extra options for glm5_tp.load of the remaining stages on this host:
+// extra options for glm5_tp.load of the remaining stages on this host (o.family 'dsv41': the worker
+// takes the first `remote_plan` layers as one stage over all its GPUs, load: {remote, remote_layers}):
 //
 //   let ex = rpc_coord.attach({listen: '192.168.41.2:7700', model: dir, gpus: 6, stages: 3, ...});
 //   let m = glm5_tp.load(dir, {devices: 6, ...ex.load});     // stages / own / stage_end / remote
@@ -14,6 +15,7 @@
 import * as rpc from './rpc.uc';
 import * as stage from './rpc_stage.uc';
 import * as glm5_tp from './glm5_tp.uc';
+import * as dsv41_tp from './dsv41_tp.uc';
 
 function now_ms() {
 	let t = clock(true);
@@ -44,6 +46,17 @@ export function attach(o) {
 		// pipeline is made here and handed over, so that both sides cut the layers the same way
 		welcome: function (hello) {
 			let n = length(hello.gpus ?? []);
+
+			if (o.family == 'dsv41') {
+				let p = dsv41_tp.remote_plan(o.model, { gpus: map(hello.gpus, (g) => g.total), max_seq: o.max_seq, layers: o.layers });
+
+				warn(sprintf('rpc: %s takes layers 0..%d of DeepSeek-V4.1 on its %d GPU(s), %.1f GiB planned per GPU of %.1f GiB\n',
+					hello.name, p.nr - 1, n, p.per_gpu / 1073741824, min(...map(hello.gpus, (g) => g.total)) / 1073741824));
+
+				assign = { family: 'dsv41', nr: p.nr, own: [ 0, p.nr ], max_seq: o.max_seq, prefill_rows: o.prefill_rows };
+
+				return assign;
+			}
 
 			if (n < Gs || n % Gs)
 				die(`the worker has ${n} GPUs, stages are ${Gs} GPUs wide`);
@@ -121,6 +134,12 @@ export function attach(o) {
 			return stage.client(w2.conn);
 		}
 	}
+
+	if (o.family == 'dsv41')
+		return {
+			listener: L, worker: w, client: K, assign: assign, recover: recover,
+			load: { remote: K, remote_layers: assign.nr, recover: recover }
+		};
 
 	return {
 		listener: L, worker: w, client: K, assign: assign, recover: recover,

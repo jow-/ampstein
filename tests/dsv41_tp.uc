@@ -7,7 +7,7 @@ import * as dsv41_tp from 'ampstein.dsv41_tp';
 import * as math from 'math';
 import { stat } from 'fs';
 
-const MODEL = getenv('AMP_MODEL_DSV41') || '/data/models/DSV4.1-Flash-SAGE-EXL3-1.59bpw';
+const MODEL = getenv('AMP_MODEL_DSV41') || '/data/models/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw';
 
 if (!stat(MODEL + '/model.safetensors.index.json')) {
 	warn('skip: DSV4.1 model dir missing\n');

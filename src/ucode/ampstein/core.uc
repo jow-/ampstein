@@ -114,10 +114,17 @@ export function worker(args) {
 		exit(1);
 	}
 
-	let cfg = glm5.load_config(args.model);
+	let arch = '';
 
-	if (!cfg.layer_types) {
-		warn('ampstein: --worker supports the GLM family only so far\n');
+	try {
+		arch = '' + (json(readfile(args.model + '/config.json')).architectures || [''])[0];
+	}
+	catch (e) {}
+
+	const D41 = (index(arch, 'DeepseekV41') == 0);
+
+	if (!D41 && !glm5.load_config(args.model).layer_types) {
+		warn('ampstein: --worker supports the GLM and DeepSeek-V4.1 families only so far\n');
 		exit(1);
 	}
 
@@ -142,7 +149,7 @@ export function worker(args) {
 			// (the caches of an earlier session are garbage now)
 			gc();
 
-			let k = sprintf('%J', [ w.stages, w.own, w.stage_end, w.max_seq, w.kv_bits, w.prefill_rows ]);
+			let k = sprintf('%J', [ w.family, w.stages, w.own, w.stage_end, w.max_seq, w.kv_bits, w.prefill_rows ]);
 
 			if (k != key) {
 				loaded = null;
@@ -150,12 +157,28 @@ export function worker(args) {
 				gc();
 				torch.empty_cache();
 
-				warn(`ampstein: worker: stages ${w.own[0]}..${w.own[1] - 1} of ${w.stages}\n`);
+				if (w.family == 'dsv41') {
+					if (!D41) {
+						warn('ampstein: worker: the coordinator serves DeepSeek-V4.1, this model is not\n');
+						exit(1);
+					}
 
-				loaded = glm5_tp.load(args.model, {
-					devices: gpus, stages: w.stages, own: w.own, stage_end: w.stage_end, max_seq: w.max_seq,
-					kv_bits: w.kv_bits, prefill_rows: w.prefill_rows, mtp: false
-				});
+					warn(`ampstein: worker: layers 0..${w.nr - 1} of DeepSeek-V4.1\n`);
+
+					loaded = dsv41_tp.load(args.model, {
+						devices: gpus, stages: 1, layers: w.nr, no_head: true, max_seq: w.max_seq, prefill_rows: w.prefill_rows
+					});
+					loaded.own_layers = [ 0, w.nr ];
+				}
+				else {
+					warn(`ampstein: worker: stages ${w.own[0]}..${w.own[1] - 1} of ${w.stages}\n`);
+
+					loaded = glm5_tp.load(args.model, {
+						devices: gpus, stages: w.stages, own: w.own, stage_end: w.stage_end, max_seq: w.max_seq,
+						kv_bits: w.kv_bits, prefill_rows: w.prefill_rows, mtp: false
+					});
+				}
+
 				key = k;
 			}
 
@@ -333,8 +356,8 @@ export function serve(args) {
 	if (args.rpc_listen) {
 		// the first stages of the pipeline run on a worker host (docs/RPC.md): this host listens, the
 		// worker dials in and takes them; this host loads the rest (--gpus / --stages are ITS share)
-		if (!GLM || !args.tp) {
-			warn('ampstein: --rpc-listen needs a GLM model with --tp\n');
+		if (!(GLM || D41) || !args.tp) {
+			warn('ampstein: --rpc-listen needs a GLM or DeepSeek-V4.1 model with --tp\n');
 			exit(1);
 		}
 
@@ -347,7 +370,7 @@ export function serve(args) {
 
 		let ex = rpc_coord.attach({ listen: args.rpc_listen, workers: args.rpc_workers ?? 1, model: args.model,
 			gpus: args.gpus, stages: args.stages ?? 1, max_seq: args.ctx, kv_bits: kv_bits, prefill_rows: args.chunk,
-			rejoin_wait: args.rpc_rejoin_wait });
+			rejoin_wait: args.rpc_rejoin_wait, family: D41 ? 'dsv41' : null, layers: args.rpc_layers });
 
 		rpc_load = ex.load;
 	}
@@ -365,7 +388,8 @@ export function serve(args) {
 	}
 	else if (D41 && args.tp) {
 		model = dsv41_tp.load(args.model, {devices: args.gpus, stages: args.stages, max_seq: args.ctx,
-			prefill_rows: args.chunk, spark: D41_SPARK && args.stages == cfg.num_mtp_layers});
+			prefill_rows: args.chunk, spark: D41_SPARK && args.stages == cfg.num_mtp_layers && !args.rpc_listen,
+			...rpc_load});
 
 		if (model.spark_stages) {
 			model.dspark = dsv41_spark_tp.load(model, {stages: model.spark_stages});
