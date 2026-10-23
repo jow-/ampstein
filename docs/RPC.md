@@ -164,9 +164,9 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    `serve()` listens, waits for the worker (`rpc_coord.attach`: plans with `plan_only` for the
    worker's GPU count, hands over the stage assignment, waits for `ready`), loads its own stages
    with `remote: client`, and runs the unchanged engine on top: pipelined prefill, split decode
-   graphs, chat templates, tools, reasoning. `--gpus` / `--stages` are this host's share. Off in
-   this mode: MTP, `--lookup`, `--cache-ram` and `--slots` (the engine's host parking and slots are
-   switched off by `model.remote`).
+   graphs, chat templates, tools, reasoning. `--gpus` / `--stages` are this host's share. Device
+   slots (`--slots`) are off in this mode; MTP and `--lookup` (7b below), the host-RAM store and the hot
+   reload work.
    The recurrent (KDA) state of the worker's layers is kept honest by a **mirror**: the coordinator
    holds tensors of the same shapes for each remote KDA layer, and the engine's four state helpers
    (`snap_bufs`, `save_states`, `load_states`, `zero_states`) call `model.remote_states('pull' |
