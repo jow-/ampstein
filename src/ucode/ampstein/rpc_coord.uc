@@ -15,6 +15,12 @@ import * as rpc from './rpc.uc';
 import * as stage from './rpc_stage.uc';
 import * as glm5_tp from './glm5_tp.uc';
 
+function now_ms() {
+	let t = clock(true);
+
+	return t[0] * 1000 + int(t[1] / 1000000);
+}
+
 export function attach(o) {
 	let m = match(o.listen ?? '', /^(.*):([0-9]+)$/);
 
@@ -71,8 +77,54 @@ export function attach(o) {
 
 	let K = stage.client(w.conn);
 
+	// the worker dropped (its host, the process or the link): wait until a worker dials in again — the
+	// same assignment is sent in the welcome — and has loaded its stages; returns a client on the new
+	// connection. The old worker's caches are gone with its connection.
+	function recover(old) {
+		try {
+			old.conn.close();
+		}
+		catch (e) {
+		}
+
+		let wait = o.rejoin_wait ?? 300;
+		let deadline = now_ms() + wait * 1000;
+
+		for (;;) {
+			let left = deadline - now_ms();
+
+			if (left <= 0)
+				die(`rpc: the worker did not come back within ${wait} s`);
+
+			let w2 = L.accept_one(left > 1000 ? 1000 : left);
+
+			if (!w2)
+				continue;
+
+			// (a connection from a worker that has died since — it lay in the backlog — fails here: keep waiting)
+			let ready = null;
+
+			try {
+				ready = w2.conn.recv(deadline - now_ms() > 0 ? deadline - now_ms() : 1000);
+			}
+			catch (e) {
+				warn(`rpc: a worker connection failed before it was ready (${e}); waiting for another\n`);
+			}
+
+			if (!ready || ready.meta.t != 'ready') {
+				w2.conn.close();
+				continue;
+			}
+
+			warn(`rpc: worker ${w2.name} is back with layers ${ready.meta.layers[0]}..${ready.meta.layers[1] - 1}\n`);
+
+			return stage.client(w2.conn);
+		}
+	}
+
 	return {
-		listener: L, worker: w, client: K, assign: assign,
-		load: { stages: assign.stages, own: [ assign.own[1], assign.stages ], stage_end: assign.stage_end, remote: K }
+		listener: L, worker: w, client: K, assign: assign, recover: recover,
+		load: { stages: assign.stages, own: [ assign.own[1], assign.stages ], stage_end: assign.stage_end, remote: K,
+			recover: recover }
 	};
 }

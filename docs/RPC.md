@@ -197,10 +197,28 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    characters, between ANY two of the three; one pair is identical over 700 tokens. That is the
    noise of batched verify against single-token kernels on GLM (see the 0.033 run-to-run rel-rms
    above), not specific to the remote path.
-   **7b (to do):** host parking and slots of states that live on the worker
-   (`cache_export` / `cache_import` per worker); hot reload; a worker that drops and rejoins
-   while the server runs (today the in-flight request fails with the connection error and the
-   coordinator must be restarted); a clean shutdown of the worker on SIGTERM; more than one worker.
+   **7b-rejoin (done, verified): the worker may drop and come back.** Before every job the engine
+   asks the model `remote_recover(cache)`: it pings the worker (`client.alive`, which also drains
+   stale replies of an earlier failed request) and, when the worker is gone, waits up to
+   `--rpc-rejoin-wait` seconds (default 300) for one to dial in again — the welcome carries the same
+   assignment, and the worker keeps its loaded stages when its process survived, else reloads —
+   then creates fresh caches on it, re-captures its graphs and speculative buffers, and tells the
+   engine, which discards everything it had cached (`reset_state`): the worker's KV and states are
+   gone, the request starts from scratch. A connection from a worker that died meanwhile (it can
+   lie in the listen backlog) is dropped and the wait goes on. A worker that does not come back
+   fails the job with `worker unavailable`; a crash in the middle of a request fails that request
+   (HTTP 500, `rpc: connection closed by the peer`) and the next one recovers. Verified with the real
+   server: worker stopped cleanly then a request sent (it waits, the restarted worker joins, the
+   answer is right), worker SIGKILLed while idle, worker SIGKILLed during an 8.5k-token request,
+   needle and code-word recall afterwards.
+   **Clean worker shutdown**: importing `uloop` makes SIGTERM / SIGINT non-fatal (the handler only
+   flags a cancel that nothing reads), which is why a worker ignored them; the worker now installs
+   ucode `signal()` handlers that set a flag its loops look at (twice a second), and exits ~1 s after
+   SIGTERM. The coordinator does not send `bye` when it stops, so a worker rejoins a restarted
+   coordinator by itself.
+   **To do:** host parking and slots of states that live on the worker
+   (`cache_export` / `cache_import` per worker); hot reload for a remote model; more than one worker;
+   a rejoin that keeps the worker's caches when only the link blipped.
 8. Other model families (`qwen4_tp`, `dsv41_tp`, `gemma4_tp`) after GLM works.
 
 ## Phase 0 result (2026-10-23): go

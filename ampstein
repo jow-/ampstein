@@ -52,6 +52,8 @@ function usage() {
 	printf("  --rpc-listen ADDR:PORT  GLM --tp: the first stages of the pipeline run on a --worker host that dials in here;\n");
 	printf("                        --gpus / --stages are then this host's share (--cache-ram and --slots are off)\n");
 	printf("  --rpc-workers N       how many workers to wait for (default and maximum so far: 1)\n");
+	printf("  --rpc-rejoin-wait S   when the worker is gone at the start of a request, wait up to S seconds for it to dial\n");
+	printf("                        in again (default 300); its caches are empty then, the request starts from scratch\n");
 	printf("  --connect HOST:PORT   the coordinator a --worker dials in to (plain TCP: use a VPN / overlay)\n");
 	printf("  --rpc-name NAME       the worker's name for the coordinator (default: the host name)\n");
 	printf("  --name NAME           served model name (default: basename of --model)\n");
@@ -197,6 +199,7 @@ function parse_args() {
 		case '--worker': a.worker = true; break;
 		case '--rpc-listen': a.rpc_listen = v; i++; break;
 		case '--rpc-workers': a.rpc_workers = int(v); i++; break;
+		case '--rpc-rejoin-wait': a.rpc_rejoin_wait = int(v); i++; break;
 		case '--connect': a.connect = v; i++; break;
 		case '--rpc-name': a.rpc_name = v; i++; break;
 		case '--dspark-window': a.dspark_window = int(v); i++; break;

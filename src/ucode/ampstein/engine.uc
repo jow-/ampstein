@@ -2223,6 +2223,17 @@ export function create(model, opts) {
 		if (length(j.ids) >= max_ctx)
 			return fail('context_length_exceeded');
 
+		// stages on a worker host: is it still there? (else wait for it; what it held is gone)
+		if (model.remote_recover) {
+			try {
+				if (model.remote_recover(cache))
+					reset_state();
+			}
+			catch (e) {
+				return fail('worker unavailable: ' + e.message);
+			}
+		}
+
 		if (j.sampling && j.sampling.seed != null)
 			math.srand(j.sampling.seed);
 

@@ -126,12 +126,22 @@ export function worker(args) {
 	let name = args.rpc_name ?? trim(readfile('/proc/sys/kernel/hostname') ?? 'worker');
 	let loaded = null, key = null;
 
+	// (importing uloop makes SIGTERM / SIGINT non-fatal: a flag the loops below look at)
+	let stopping = false;
+
+	signal('SIGTERM', () => { stopping = true; });
+	signal('SIGINT', () => { stopping = true; });
+
 	warn(`ampstein: worker ${name}: ${gpus} GPU(s), ${length(man.files)} model files, dialing ${args.connect}\n`);
 
 	rpc.worker({
 		connect: args.connect, name: name, manifest: man,
 		gpus: slice(rpc.gpus(), 0, gpus),
+		stop: () => stopping,
 		serve: function (c, w) {
+			// (the caches of an earlier session are garbage now)
+			gc();
+
 			let k = sprintf('%J', [ w.stages, w.own, w.stage_end, w.max_seq, w.kv_bits, w.prefill_rows ]);
 
 			if (k != key) {
@@ -152,7 +162,12 @@ export function worker(args) {
 			c.send({ t: 'ready', layers: loaded.own_layers });
 			warn(`ampstein: worker ready: layers ${loaded.own_layers[0]}..${loaded.own_layers[1] - 1}\n`);
 
-			return rpc_stage.worker(c, loaded).serve();
+			let rv = rpc_stage.worker(c, loaded).serve(() => stopping);
+
+			if (stopping)
+				warn('ampstein: worker: stopping\n');
+
+			return rv;
 		}
 	});
 }
@@ -332,7 +347,8 @@ export function serve(args) {
 		args.slots = 0;
 
 		let ex = rpc_coord.attach({ listen: args.rpc_listen, workers: args.rpc_workers ?? 1, model: args.model,
-			gpus: args.gpus, stages: args.stages ?? 1, max_seq: args.ctx, kv_bits: kv_bits, prefill_rows: args.chunk });
+			gpus: args.gpus, stages: args.stages ?? 1, max_seq: args.ctx, kv_bits: kv_bits, prefill_rows: args.chunk,
+			rejoin_wait: args.rpc_rejoin_wait });
 
 		rpc_load = ex.load;
 	}

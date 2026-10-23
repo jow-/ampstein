@@ -184,11 +184,23 @@ export function worker(c, model) {
 		return null;
 	};
 
-	W.serve = function () {
+	/* serve(stop): until the coordinator says bye, the connection fails (raises), or stop() turns
+	 * true (a signal handler's flag, checked twice a second): then 'bye' */
+	W.serve = function (stop) {
 		for (;;) {
-			let f = c.recv(-1);
+			let f = c.recv(500);
+
+			if (!f) {
+				if (stop && stop())
+					return 'bye';
+
+				continue;
+			}
 
 			if (W.step(f) == 'bye')
+				return 'bye';
+
+			if (stop && stop())
 				return 'bye';
 		}
 	};
@@ -300,6 +312,20 @@ export function client(c) {
 		K.forward_begin(cache, pos, ids, graph);
 
 		return K.forward_end();
+	};
+
+	/* is the worker there: a ping answered within the timeout (a dead connection raises or times out) */
+	K.alive = function (timeout_ms) {
+		try {
+			// (replies of requests that failed earlier arrive before the pong and are dropped here)
+			c.ping(timeout_ms ?? 3000);
+			K.inflight = 0;
+
+			return true;
+		}
+		catch (e) {
+			return false;
+		}
 	};
 
 	K.bye = function () {

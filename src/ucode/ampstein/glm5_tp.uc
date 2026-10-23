@@ -374,6 +374,8 @@ export function load(model_dir, opts) {
 	// (stage_of) the same way; the coordinator hands its stage_end to the workers.
 	let own = opts.own || [ 0, NS ];
 	let n_own = own[1] - own[0];
+	let recover = opts.recover;            // function (old client) -> a client on a worker that dialed in again
+	let g_sizes = null, spec_W = null;     // what the worker was told (graphs, speculative windows), to tell it again after a rejoin
 	let remote = opts.remote;              // rpc_stage.client: the worker that owns the stages before `own` (stage 0 remote)
 
 	if (own[0] < 0 || n_own < 1 || own[1] > NS)
@@ -790,12 +792,41 @@ export function load(model_dir, opts) {
 			if (cache.remote == null)
 				return;
 
-			if (op == 'setup')
+			if (op == 'setup') {
+				spec_W = arg;
 				remote.spec_alloc(cache.remote, arg);
+			}
 			else if (op == 'rollback')
 				remote.spec_restore(cache.remote, arg);
 			else
 				die(`glm5_tp: remote_spec: unknown operation ${op}`);
+		},
+
+		/* Called by the engine before every job: is the worker still there? If not, wait for it to dial
+		 * in again (recover), give it fresh caches, graphs and speculative buffers, and return true: the
+		 * engine then discards everything it cached, since the worker's KV and states are gone. false:
+		 * nothing happened. Raises when the worker does not come back in time. */
+		remote_recover: function (cache) {
+			if (!first.remote || !remote || remote.alive(3000))
+				return false;
+
+			if (!recover)
+				die('glm5_tp: the worker is gone');
+
+			warn('glm5_tp: the worker is gone, waiting for it to dial in again\n');
+
+			remote = recover(remote);
+			cache.remote = remote.new_cache(cache.max_seq);
+
+			if (spec_W)
+				remote.spec_alloc(cache.remote, spec_W);
+
+			if (g_sizes)
+				remote.graphs(cache.remote, g_sizes);
+
+			warn('glm5_tp: the worker is back (empty caches)\n');
+
+			return true;
 		},
 
 		remote: first.remote ? true : false,       // the engine: no host parking / slots of states that live elsewhere
@@ -1094,8 +1125,10 @@ export function load(model_dir, opts) {
 				die('glm5_tp: the first stages are remote: a client is needed for graphs');
 
 			// (the worker captures its graphs first: their warm-up clobbers its cache like ours)
-			if (rem_in)
+			if (rem_in) {
+				g_sizes = sizes;
 				remote.graphs(cache.remote, sizes);
+			}
 
 			let P = cfg.index_kpool;
 			let by_size = {};
