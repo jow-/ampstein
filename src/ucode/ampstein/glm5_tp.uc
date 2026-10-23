@@ -1376,10 +1376,14 @@ export function load(model_dir, opts) {
 		 * attention halves are enqueued before any stage reads its MoE
 		 * counts), so with S stages S chunks are in flight, one per stage */
 		prefill_pipeline: function (cache, ids, opts) {
-			if (first.remote)
-				die('glm5_tp: prefill_pipeline does not support remote stages yet (docs/RPC.md phase 6)');
+			if (first.remote && (!remote || cache.remote == null))
+				die('glm5_tp: the first stages are remote: a client and a cache of it are needed');
+
+			if (first.remote && cache.mm)
+				die('glm5_tp: images are not supported with remote stages');
 
 			let tp = this;
+			let s0 = own[0];                   // the first stage built here (the ones before it are on the worker)
 			let chunk = opts.chunk || 512;
 			let start = cache.length, total = length(ids);
 			let bounds = [];
@@ -1402,7 +1406,44 @@ export function load(model_dir, opts) {
 
 			let next = 0, prev_end = start, done = 0, logits = null, parts = [];
 
+			// Remote first stages: the worker runs a chunk through all of them in one command, so the
+			// coordinator keeps two requests in flight: the worker computes chunk n + 1 while the stages
+			// here are busy with chunk n, and a reply is the entry of the first local stage
+			let reqs = [], issued = 0;
+
+			function issue() {
+				while (first.remote && issued < length(bounds) && length(reqs) < 2) {
+					let end = bounds[issued], pos = issued ? bounds[issued - 1] : start;
+
+					remote.forward_begin(cache.remote, pos, slice(ids, pos - start, end - start));
+					push(reqs, {pos: pos, T: end - pos, end: end});
+					issued++;
+				}
+			}
+
 			function admit() {
+				if (first.remote) {
+					if (active[s0] != null || next >= length(bounds))
+						return;
+
+					issue();
+
+					let q = shift(reqs);
+					let r = remote.forward_end(1800000);
+
+					if (r.n != q.T || r.pos != q.pos)
+						die(`glm5_tp: the worker answered ${r.n} rows at ${r.pos}, expected ${q.T} at ${q.pos}`);
+
+					next++;
+					prev_end = q.end;
+					active[s0] = {pos: [ q.pos ], Ts: [ q.T ], end: q.end, layer: stages[s0].first, ctx: null, ar: null,
+						sync: opts.ov_sync, hs: [ map(stages[s0].devs, (d) => r.h.cuda(d)) ]};
+
+					issue();
+
+					return;
+				}
+
 				if (active[0] != null || next >= length(bounds))
 					return;
 

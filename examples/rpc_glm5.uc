@@ -18,7 +18,7 @@ import * as stage from 'ampstein.rpc_stage';
 import * as glm5_tp from 'ampstein.glm5_tp';
 
 let bind = null, port = 7700, model_dir = null, gpus = null, stages = 3, steps = 32, single = false;
-let max_seq = 2048, kv_bits = null, use_graphs = false, chunk = 512, repeat = 1, prompt = 'What is the capital of France? Answer in one sentence.';
+let max_seq = 2048, kv_bits = null, use_graphs = false, chunk = 512, repeat = 1, pipeline = false, prompt = 'What is the capital of France? Answer in one sentence.';
 let argv = ARGV, st = index(argv, '--');
 
 if (st >= 0)
@@ -39,13 +39,14 @@ for (let i = 0; i < length(argv); i++) {
 	else if (a == '--single') single = true;
 	else if (a == '--graphs') use_graphs = true;
 	else if (a == '--chunk') chunk = int(argv[++i]);
+	else if (a == '--pipeline') pipeline = true;
 	else if (a == '--repeat') repeat = int(argv[++i]);
 	else
 		die(`unknown option ${a}\n`);
 }
 
 if (!model_dir || (!bind && !single))
-	die('usage: --bind ADDR --port N --model DIR [--gpus N] [--stages N] [--steps N] [--prompt TEXT] [--graphs] [--chunk N] [--repeat N] | --single --model DIR\n');
+	die('usage: --bind ADDR --port N --model DIR [--gpus N] [--stages N] [--steps N] [--prompt TEXT] [--graphs] [--chunk N] [--repeat N] [--pipeline] | --single --model DIR\n');
 
 gpus ??= torch.device_count();
 
@@ -138,10 +139,21 @@ warn(`rpc_glm5: prompt of ${length(ids)} tokens\n`);
 let t0 = now();
 let lg;
 
-for (let at = 0; at < length(ids); at += chunk) {
-	let part = slice(ids, at, at + chunk);
+if (pipeline) {
+	// the engine's prefill: a wavefront over the stages (the worker's stages run ahead on their host)
+	let pp = model.prefill_pipeline(cache, ids, { chunk: chunk });
 
-	lg = model.forward_chunk(part, cache, (at + chunk >= length(ids)) ? 1 : 0);
+	while (pp.step(4))
+		;
+
+	lg = pp.logits();
+}
+else {
+	for (let at = 0; at < length(ids); at += chunk) {
+		let part = slice(ids, at, at + chunk);
+
+		lg = model.forward_chunk(part, cache, (at + chunk >= length(ids)) ? 1 : 0);
+	}
 }
 
 torch.synchronize();

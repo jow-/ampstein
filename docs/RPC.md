@@ -150,9 +150,15 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    sparse variant), against 18.2 and 17.4 ms/token for the same run on jai alone (3 stages):
    the hop costs ~0.4-0.5 ms per token. The 32 generated token ids are identical to the
    single-host run for both prompts. Eager decode over RPC was 83 ms/token.
-6. **Pipelined prefill** across the hop: chunk n on the next stage while chunk
-   n+1 runs on the previous one (the existing `prefill_pipeline` wavefront with
-   one boundary on the network).
+6. **Pipelined prefill** (done, verified): `prefill_pipeline` accepts remote first stages.
+   The worker runs a chunk through all of its layers in one `forward` command; the
+   coordinator keeps two requests in flight (`forward_begin`), so the worker computes chunk
+   n + 1 while the local stages work on chunk n, and each reply is the entry of the first
+   local stage of the wavefront (copied to every rank of that stage). The reply of a 512-token
+   chunk is 33.5 MB (~30 ms on the link, hidden behind the compute). **Result**: the 3011-token
+   prompt prefills in 2.36 s (1276 tok/s) over j7 + jai, against 4.78 s one chunk at a time over
+   RPC (`forward_chunk`) and 2.61 s on jai alone with 3 stages (the pipeline has a fourth stage
+   here); the generated tokens are identical. `examples/rpc_glm5.uc --pipeline`.
 7. **Speculation, store, slots, hot reload.** MTP and `--lookup` drafts run on
    the coordinator; verify rows (up to 12) go through the hop like any step.
    Rollback (`kda` per-position state restore) is a command to each worker.
