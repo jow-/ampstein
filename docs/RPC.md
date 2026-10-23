@@ -79,6 +79,33 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    coordinator checks that positions agree on rejoin.
 8. Other model families (`qwen4_tp`, `dsv41_tp`, `gemma4_tp`) after GLM works.
 
+## Phase 0 result (2026-10-23): go
+
+`examples/rpc_pingpong.uc` between j7 (`onboard10g`, 192.168.41.1) and jai
+(`eno1np0`, 192.168.41.2): a direct 10 GbE cable, no switch, MTU 1500, plain
+TCP with `TCP_NODELAY`, the ucode `socket` module with strings (the native
+bindings of phase 1 will only be faster). The server echoes after receiving the
+whole message, so a round trip is two serial transfers.
+
+| payload | RTT p50 | RTT p99 | max |
+|---|---|---|---|
+| 64 B | 110 us | 138 us | 223 us |
+| 40 KB (Qwen4-sized hop) | 275 us | 349 us | 381 us |
+| 100 KB (GLM-sized hop) | 561 us | 840 us | 977 us |
+| 2 MB | 4.6 ms | 8.5 ms | 10.8 ms |
+| 20 MB (prefill chunk slice) | 51 ms | 92 ms | 93 ms |
+
+Device side on j7 (pinned buffer, D2H or H2D plus synchronize): 100 KB 13-15 us,
+2 MB 162 us, 20 MB 1.5 ms (13 GB/s).
+
+Reading: one way is about half an RTT, so a 100 KB hop costs ~0.3 ms (p99
+~0.45 ms) plus ~30 us of copies: under 1% of a 37 ms GLM token, ~2% of a 17 ms
+Qwen4 token. The p99 is far below the 2 ms bar. Large payloads run at ~0.75 GB/s
+per direction through ucode strings, so a 2048-token GLM chunk (~200 MB) is
+~0.3 s on this path; fine for prefill, and where the native bindings and jumbo
+frames (MTU 9000 on both ends) would help. Not measured: the link under load
+from a running model (interrupt and CPU contention); repeat when phase 5 runs.
+
 ## Planner
 
 Extend the stage planner with per-host capacity weights (VRAM, bandwidth) and
