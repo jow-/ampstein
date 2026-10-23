@@ -142,7 +142,7 @@ cl[0].close();
 check('a closed peer raises', raises(() => cl[1].recv(1000), 'closed'));
 
 // --- the handshake
-let M1 = { id: 'aaaa' }, M2 = { id: 'bbbb' };
+let M1 = { id: 'a.bin:10:\nb.bin:20:\n', strong: 'sss1' }, M2 = { id: 'a.bin:10:\nb.bin:21:\n', strong: 'sss1' };
 let L = rpc.listen({ bind: '127.0.0.1', port: 0, manifest: M1, welcome: { layers: [ 0, 10 ] } });
 let addr = `127.0.0.1:${L.port}`;
 
@@ -164,11 +164,21 @@ let w2 = rpc.dial(addr);
 
 rpc.hello(w2, { name: 'bad', manifest: M2 });
 check('a different manifest is not accepted', L.accept_one(1000) == null && length(L.workers) == 1);
-check('...and the worker is told why', raises(() => rpc.welcome(w2, 1000), 'model directory differs'));
+check('...and the worker is told why, naming the file', raises(() => rpc.welcome(w2, 1000), 'b.bin:21:'));
+
+let M3 = { id: M1.id, strong: 'sss2' }, w2b = rpc.dial(addr);
+
+rpc.hello(w2b, { name: 'bad2', manifest: M3 });
+check('same files, other header hash: not accepted', L.accept_one(1000) == null && raises(() => rpc.welcome(w2b, 1000), 'other contents'));
+
+let w2c = rpc.dial(addr);
+
+rpc.hello(w2c, { name: 'nodigest', manifest: { id: M1.id } });
+check('a worker without a digest module still joins on the id', L.accept_one(1000)?.name == 'nodigest' && length(L.workers) == 2);
 
 let w3 = rpc.dial(addr);
 
-w3.send({ t: 'hello', proto: 99, name: 'old', manifest: 'aaaa' });
+w3.send({ t: 'hello', proto: 99, name: 'old', manifest: M1.id });
 check('a different protocol is not accepted', L.accept_one(1000) == null);
 check('...and the worker is told why (protocol)', raises(() => rpc.welcome(w3, 1000), 'protocol 99'));
 
@@ -187,7 +197,7 @@ check('the check callback can refuse', L2.accept_one(1000) == null && raises(() 
 let w6 = rpc.dial(addr);
 
 rpc.hello(w6, { name: 'j7', manifest: M1 });
-check('a rejoin replaces the worker of that name', L.accept_one(1000)?.name == 'j7' && length(L.workers) == 1 && rpc.welcome(w6, 1000).t == 'welcome');
+check('a rejoin replaces the worker of that name', L.accept_one(1000)?.name == 'j7' && length(L.workers) == 2 && rpc.welcome(w6, 1000).t == 'welcome');
 check('...and the old connection is closed', raises(() => w.recv(1000)));
 
 check('wait raises when nobody comes', raises(() => L2.wait(1, 0), 'workers joined'));
@@ -223,16 +233,23 @@ fs.writefile(`${dir}/.hidden`, 'x');
 let m1 = rpc.manifest(dir);
 
 check('manifest lists the files, not the hidden ones', join(',', map(m1.files, (x) => x.name)) == 'config.json,model.safetensors');
-check('manifest id is stable', rpc.manifest(dir).id == m1.id);
+check('manifest id is stable', rpc.manifest(dir).id == m1.id && rpc.manifest(dir).strong == m1.strong);
 
 fs.writefile(`${dir}/config.json`, '{"a":2}');
-check('manifest changes with a config edit', rpc.manifest(dir).id != m1.id);
+check('a same-size config edit keeps the id and changes the strong hash', rpc.manifest(dir).id == m1.id && (m1.strong == null || rpc.manifest(dir).strong != m1.strong));
 
 fs.writefile(`${dir}/config.json`, '{"a":1}');
-check('...and is back with it', rpc.manifest(dir).id == m1.id);
+check('...and is back with it', rpc.manifest(dir).strong == m1.strong);
 
+fs.writefile(`${dir}/config.json`, '{"a":1, "b":2}');
+check('a size change changes the id', rpc.manifest(dir).id != m1.id);
+
+fs.writefile(`${dir}/config.json`, '{"a":1}');
 fs.writefile(`${dir}/model.safetensors`, rpc_u64(length(hdrjson)) + replace(hdrjson, 'F16', 'F32') + 'xxxx');
-check('manifest changes with a tensor header edit', rpc.manifest(dir).id != m1.id);
+check('a tensor header edit changes the strong hash', rpc.manifest(dir).strong != m1.strong || m1.strong == null);
+
+fs.writefile(`${dir}/model.safetensors`, rpc_u64(length(hdrjson) + 1) + hdrjson + ' xxxx');
+check('a header length change changes the id', rpc.manifest(dir).id != m1.id);
 
 for (let n in fs.lsdir(dir))
 	fs.unlink(`${dir}/${n}`);

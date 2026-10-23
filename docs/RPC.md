@@ -74,8 +74,7 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    The coordinator `rpc.listen({bind, port, manifest})` (an explicit bind address
    is required) takes dial-ins: `accept_one(ms)` (from a `uloop` handle on
    `fd()` for rejoins), `wait(n, seconds)` at start-up. The handshake checks the
-   protocol version, the manifest id (`rpc.manifest(dir)`: sizes of all files, hash
-   of every `.safetensors` header and small `.json`) and an optional `check`
+   protocol version, the manifest (`rpc.manifest(dir)`: `id` = name, size and safetensors header length of every file as text, computable on every host; `strong` = sha256 of those plus every header and small json, compared only when both hosts have `digest.so`, which jai lacks) and an optional `check`
    callback; a refused worker is told why. A worker with a known name replaces its
    old connection. The worker side is `rpc.worker({connect, name, manifest,
    serve})`: dial with back-off, hello (name, manifest, GPUs from

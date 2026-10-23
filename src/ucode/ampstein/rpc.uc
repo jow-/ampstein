@@ -328,13 +328,17 @@ export function conn(sock, opts) {
 	return c;
 }
 
-/* The files of a model directory as an identity: size of every file, and a hash of the
- * header of each .safetensors file (names, dtypes, shapes, offsets) and of each small .json.
- * Two hosts with the same id hold the same weights for all practical purposes. */
+/* The files of a model directory as an identity.
+ *   id      names and sizes of every file and the header length of each .safetensors, as text
+ *           ("name:size:headerlen" per line): computable on every host (no digest module needed),
+ *           identical for copies of one model directory
+ *   strong  sha256 of the above plus the hash of every .safetensors header (names, dtypes, shapes,
+ *           offsets) and small .json; null when this host has no digest.so
+ * The handshake refuses a worker whose id differs, and one whose strong differs when both have one. */
 export function manifest(dir) {
 	let names = sort(filter(fs.lsdir(dir) ?? [], (n) => substr(n, 0, 1) != '.'));
 	let files = [];
-	let text = '';
+	let weak = '', strong = '';
 
 	for (let n in names) {
 		let path = `${dir}/${n}`;
@@ -343,34 +347,31 @@ export function manifest(dir) {
 		if (!st || st.type != 'file')
 			continue;
 
-		let h = '';
+		let len = '', h = '';
 
 		if (match(n, /\.safetensors$/)) {
 			let f = fs.open(path, 'r');
 
 			if (f) {
-				let len = require('struct').unpack('<Q', f.read(8))[0];
+				let l = require('struct').unpack('<Q', f.read(8))[0];
 
-				if (len > 0 && len < (1 << 28)) {
-					let head = f.read(len);
+				len = `${l}`;
 
-					h = sha256 ? sha256(head) : `${len}`;
-				}
+				if (sha256 && l > 0 && l < (1 << 28))
+					h = sha256(f.read(l));
 
 				f.close();
 			}
 		}
-		else if (match(n, /\.json$/) && st.size < (1 << 24)) {
-			let body = fs.readfile(path);
+		else if (sha256 && match(n, /\.json$/) && st.size < (1 << 24))
+			h = sha256(fs.readfile(path));
 
-			h = sha256 ? sha256(body) : `${st.size}`;
-		}
-
-		push(files, { name: n, size: st.size, hash: h });
-		text += `${n}:${st.size}:${h}\n`;
+		push(files, { name: n, size: st.size, header: len, hash: h });
+		weak += `${n}:${st.size}:${len}\n`;
+		strong += `${n}:${st.size}:${len}:${h}\n`;
 	}
 
-	return { id: sha256 ? sha256(text) : text, files: files };
+	return { id: weak, strong: sha256 ? sha256(strong) : null, files: files };
 }
 
 /* The GPUs of this host: name, compute capability, total memory. With `mem` also the free memory,
@@ -398,6 +399,17 @@ function split_addr(addr) {
 		die(`rpc: "${addr}": expected HOST:PORT`);
 
 	return { host: m[1], port: int(m[2]) };
+}
+
+/* the first line where two manifest texts differ, for a refusal message */
+function first_difference(mine, theirs) {
+	let a = split(`${mine}`, '\n'), b = split(`${theirs}`, '\n');
+
+	for (let i = 0; i < (length(a) > length(b) ? length(a) : length(b)); i++)
+		if (a[i] != b[i])
+			return `coordinator ${a[i] ?? 'no such file'}, worker ${b[i] ?? 'no such file'}`;
+
+	return 'unknown';
 }
 
 /* ---- coordinator side ------------------------------------------------------------------------ */
@@ -474,7 +486,10 @@ export function listen(opts) {
 			return refuse(c, `protocol ${hello.proto}, this coordinator speaks ${PROTO}`), null;
 
 		if (opts.manifest && hello.manifest != opts.manifest.id)
-			return refuse(c, `the model directory differs (manifest ${substr(`${hello.manifest}`, 0, 12)} against ${substr(opts.manifest.id, 0, 12)})`), null;
+			return refuse(c, `the model directory differs (${first_difference(opts.manifest.id, hello.manifest)})`), null;
+
+		if (opts.manifest?.strong && hello.strong && hello.strong != opts.manifest.strong)
+			return refuse(c, 'the model directory differs (same files and sizes, other contents of a header or json file)'), null;
 
 		let reason = opts.check ? opts.check(hello) : null;
 
@@ -567,7 +582,7 @@ export function dial(addr, opts) {
 /* introduce a worker: send the hello */
 export function hello(c, opts) {
 	c.send({
-		t: 'hello', proto: PROTO, name: opts.name, manifest: opts.manifest?.id,
+		t: 'hello', proto: PROTO, name: opts.name, manifest: opts.manifest?.id, strong: opts.manifest?.strong,
 		gpus: opts.gpus ?? (torch.device_count ? gpus() : []), ...(opts.hello ?? {})
 	});
 }

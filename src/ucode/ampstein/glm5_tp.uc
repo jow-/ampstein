@@ -434,6 +434,18 @@ export function load(model_dir, opts) {
 		warn(`glm5_tp: ${NS} stages x ${Gs} ranks, planned GiB per GPU:${line}; stages start at layers 0${bounds}\n`);
 	}
 
+	// opts.plan_only: just the plan, before anything is uploaded. A coordinator sends it as
+	// `stage_end` to the workers, which then plan nothing themselves (docs/RPC.md)
+	if (opts.plan_only) {
+		let ends = [];
+
+		for (let i = 1; i < nl; i++)
+			if (stage_of[i] != stage_of[i - 1])
+				push(ends, i);
+
+		return {stage_of: stage_of, stage_end: ends, stages: NS};
+	}
+
 	let stages = [];
 	let cap = P2P_ROWS * cfg.hidden_size;
 	let cap_pf = (opts.prefill_rows || 1024) * cfg.hidden_size;

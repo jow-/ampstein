@@ -37,7 +37,7 @@ if (!model || (!listen && !connect))
 
 let man = rpc.manifest(model);
 
-warn(`manifest ${substr(man.id, 0, 16)} (${length(man.files)} files)\n`);
+warn(`manifest: ${length(man.files)} files, strong ${man.strong ? substr(man.strong, 0, 16) : 'n/a (no digest module)'}\n`);
 
 function now() {
 	let t = clock(true);
