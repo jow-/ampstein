@@ -85,9 +85,22 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    all its refusals, rejoin, manifest) and with `examples/rpc_demo.uc` between two
    processes: on loopback a 64 B echo takes 112 us, 100 KB 138 us, 2 MB 562 us
    (the link figures are still to be measured on jai).
-3. **Partial load** of `glm5_tp`: `load(dir, {layers: [a, b)})` builds only the
-   layers (and embedding / head when owned), their caches and KDA state. It also
-   makes the worker's start-up proportional to its share.
+3. **Partial load** of `glm5_tp` (implemented, not yet run on GPUs). `load(dir,
+   {devices, stages: NS, own: [first, end), stage_end})`: `stages` is the global
+   pipeline, `own` the stages this process builds, `devices` only its local GPUs
+   (Gs per owned stage). Layers, caches (`new_cache`), communicators, the embedding
+   (stage 0), the head, final norm and MTP block (last stage) exist only on the
+   owner; the rest are `null` / `{remote: true}` stubs, so a worker's start-up and
+   memory are proportional to its share (the weights are mmap'ed and uploaded by
+   key, so nothing else is read). Every host plans the whole pipeline the same
+   way; the coordinator passes its `stage_of` as `stage_end` to the workers so a
+   different GPU mix cannot make them disagree. `model.own_layers` is the owned
+   layer range. The per-layer API (`embed`, `layer`, `handoff`, `head`) is what the
+   RPC runs on each side. `tests/glm5_split.uc` loads the whole model, then two
+   halves (stage 0 / the rest), hands the residual streams over through the host
+   as the RPC will, and requires bit-identical logits; it skips (125) without the
+   model or ~18 GiB free per GPU, so it has not run yet (all GPUs of both hosts
+   are in use by servers): it needs a window with six free GPUs on jai.
 4. **Eager path over RPC.** An `rpc_model` proxy exposes the interface the
    engine already calls (`new_cache`, `forward_chunk`, `prefill_pipeline`,
    `graphs`, `mtp_*`, `states`, `cache_export` / `cache_import`, `new_slot`),

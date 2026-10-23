@@ -40,6 +40,8 @@ amp_test(bindings_errors)
 amp_test(fd_tensor)
 # rpc_transport: framing, handshake and manifest of the cross-host transport (rpc.uc), loopback, RPC phase 2
 amp_test(rpc_transport)
+# glm5_split: GLM-TP built as two halves owning different stages vs the whole model (RPC phase 3); skips without the GPUs
+amp_test(glm5_split)
 
 # --- EXL3 kernels and the llama-family model
 # exl3: exl3_gemm vs a torch reference, synthetic tensors

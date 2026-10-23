@@ -332,11 +332,21 @@ export function load(model_dir, opts) {
 	let G = length(devs);
 	let NS = opts.stages || 1;
 
-	if (G % NS)
-		die(`glm5_tp: ${G} devices do not split into ${NS} stages`);
+	// opts.own = [first, end): the stages of the (global) pipeline this process builds. The
+	// others live on another host (docs/RPC.md): their layers are not loaded, and `devices`
+	// lists only the local GPUs, Gs per owned stage. Every host plans the whole pipeline
+	// (stage_of) the same way; the coordinator hands its stage_end to the workers.
+	let own = opts.own || [ 0, NS ];
+	let n_own = own[1] - own[0];
 
-	let Gs = G / NS;                       // ranks per stage
-	let has_mtp = (opts.mtp != false && stat(model_dir + '/mtp.safetensors'));
+	if (own[0] < 0 || n_own < 1 || own[1] > NS)
+		die(`glm5_tp: stages ${own[0]}..${own[1]} out of ${NS}`);
+
+	if (G % n_own)
+		die(`glm5_tp: ${G} devices do not split into ${n_own} stages`);
+
+	let Gs = G / n_own;                    // ranks per stage
+	let has_mtp = (opts.mtp != false && own[1] == NS && stat(model_dir + '/mtp.safetensors'));
 
 	// per-rank shares inside a stage. Rank 0 of the first stage also holds
 	// the embedding table (1.2 GiB) and the gathered logits / staging: shed
@@ -428,7 +438,12 @@ export function load(model_dir, opts) {
 	let cap_pf = (opts.prefill_rows || 1024) * cfg.hidden_size;
 
 	for (let s = 0; s < NS; s++) {
-		let sd = slice(devs, s * Gs, (s + 1) * Gs);
+		if (s < own[0] || s >= own[1]) {
+			push(stages, {id: s, remote: true, G: Gs, first: -1, end: -1});
+			continue;
+		}
+
+		let sd = slice(devs, (s - own[0]) * Gs, (s - own[0] + 1) * Gs);
 		let plan = plan_of(cfg, stage_weights(s));
 		let S = {
 			id: s, devs: sd, G: Gs, plan: plan, first: -1, end: -1, expert_dev: {},
@@ -461,6 +476,12 @@ export function load(model_dir, opts) {
 
 	for (let i = 0; i < nl; i++) {
 		let S = stages[stage_of[i]];
+
+		if (S.remote) {
+			push(layers, null);
+			continue;
+		}
+
 		let plan = S.plan;
 		let st = S.devs[i % Gs];
 		let pfx = `${LP}${i}.`;
@@ -552,28 +573,36 @@ export function load(model_dir, opts) {
 	gc();
 
 	let first = stages[0], last = stages[NS - 1];
+	let own_first = !first.remote, own_last = !last.remote;
 
 	// embedding on the first stage's rank 0; lm_head sharded by vocabulary
 	// over the last stage
 	ws.upload(function (key) {
-		if (index(key, 'model.language_model.embed_tokens') == 0)
+		if (own_first && index(key, 'model.language_model.embed_tokens') == 0)
 			return devs[0];
 
-		if (index(key, 'model.language_model.norm') == 0 || index(key, 'lm_head') == 0)
+		if (own_last && (index(key, 'model.language_model.norm') == 0 || index(key, 'lm_head') == 0))
 			return last.devs[0];
 
 		return null;
 	});
 
-	let embed_t = ws.gpu16('model.language_model.embed_tokens.weight', devs[0]);
+	let embed_t = null, lm_heads = null, norm_w = null;
 
-	ws.release('model.language_model.embed_tokens.weight', devs[0]);
+	if (own_first) {
+		embed_t = ws.gpu16('model.language_model.embed_tokens.weight', devs[0]);
 
-	let head_full = models.linear(ws, 'lm_head', false, last.devs[0]);
-	let lm_heads = map(last.devs, (d, g) => models.cols(head_full, [ last.plan.vocab[g] ], d));
-	let norm_w = ws.gpu16('model.language_model.norm.weight', last.devs[0]);
+		ws.release('model.language_model.embed_tokens.weight', devs[0]);
+	}
 
-	head_full = null;
+	if (own_last) {
+		let head_full = models.linear(ws, 'lm_head', false, last.devs[0]);
+
+		lm_heads = map(last.devs, (d, g) => models.cols(head_full, [ last.plan.vocab[g] ], d));
+		norm_w = ws.gpu16('model.language_model.norm.weight', last.devs[0]);
+		head_full = null;
+	}
+
 	gc();
 
 	// the draft block lives with the last stage (its logits come from the
@@ -586,10 +615,16 @@ export function load(model_dir, opts) {
 		gc();
 	}
 
-	warn(sprintf('glm5_tp: %d ranks (%d stage%s) loaded in %.0fs%s\n', G, NS, NS > 1 ? 's' : '',
+	let own_layers = [ stages[own[0]].first, stages[own[1] - 1].end ];
+
+	warn(sprintf('glm5_tp: %d ranks (%d stage%s%s) loaded in %.0fs%s\n', G, n_own, n_own > 1 ? 's' : '',
+		n_own < NS ? sprintf(' of %d: stages %d..%d, layers %d..%d', NS, own[0], own[1] - 1, own_layers[0], own_layers[1] - 1) : '',
 		time() - t_load, mtp ? ' (with the MTP head)' : ''));
 
 	for (let S in stages) {
+		if (S.remote)
+			continue;
+
 		S.comm = torch.p2p_comm(S.devs, cap);
 		// prefill chunks: a second communicator sized for the largest chunk
 		S.comm_pf = getenv('AMP_GLM5_TP_COPY_AR') ? null : torch.p2p_comm(S.devs, cap_pf);
@@ -607,11 +642,12 @@ export function load(model_dir, opts) {
 	return {
 		cfg: cfg, layers: layers, devs: devs, G: G, tp: true,
 		stages: stages, stage_of: stage_of, last: last,
+		own: own, own_layers: own_layers,   // the stages / layers [first, end) built here (all of them unless split over hosts)
 		comm: first.comm, comm_cap: cap,
 		embed_tokens: embed_t,
-		norm: map(last.devs, (d) => norm_w.cuda(d)),
+		norm: own_last ? map(last.devs, (d) => norm_w.cuda(d)) : null,
 		lm_heads: lm_heads,
-		lm_head: lm_heads[0],     // engine: "the model has a head" (logits come from the shards)
+		lm_head: lm_heads ? lm_heads[0] : null,     // engine: "the model has a head" (logits come from the shards)
 		mtp: mtp, kv_bits: opts.kv_bits,
 		spec_any: true,           // the step graphs keep per-position KDA states for any window up to the engine's largest (glm5.kda_forward)
 
@@ -629,6 +665,11 @@ export function load(model_dir, opts) {
 			for (let i = 0; i < nl; i++) {
 				let S = stages[stage_of[i]];
 				let row = [];
+
+				if (S.remote) {
+					push(cache.layers, null);
+					continue;
+				}
 
 				for (let g = 0; g < Gs; g++) {
 					let dev = S.devs[g];
