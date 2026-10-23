@@ -42,25 +42,53 @@ function check(what, ok, extra) {
 	warn(`ok: ${what}\n`);
 }
 
-// the whole model
-let full = glm5.load(MODEL, { devices: NGPU, stages: NS, max_seq: 1024 });
-let ends = [];
+function rel_rms(a, b) {
+	let d = a.to('float32').sub(b.to('float32'));
 
-for (let i = 1; i < length(full.stage_of); i++)
-	if (full.stage_of[i] != full.stage_of[i - 1])
-		push(ends, i);
+	return math.sqrt(d.mul(d).mean().item() / b.to('float32').mul(b.to('float32')).mean().item());
+}
 
-push(ends, length(full.stage_of));
+// the whole model: its logits, and the run-to-run noise (a second forward of the same model).
+// AMP_GLM5_REF=file keeps both, so that a rerun skips loading the whole model
+const REF = getenv('AMP_GLM5_REF');
+let ref, noise = null, ends = [], stage_of;
 
-let ref = full.forward_chunk(ids, full.new_cache(512), n).cpu();
+if (REF && stat(REF)) {
+	let fx = torch.st(REF);
 
-check('reference logits', ref.shape()[ref.shape().length - 1] > 1000);
+	ref = fx.tensor('ref');
+	noise = fx.tensor('noise').tolist()[0];
+	stage_of = fx.tensor('stage_of').tolist();
+	ends = fx.tensor('ends').tolist();
+	warn(`reference from ${REF} (run-to-run rel-rms ${noise})\n`);
+}
+else {
+	let full = glm5.load(MODEL, { devices: NGPU, stages: NS, max_seq: 1024 });
 
-let stage_of = full.stage_of;
+	for (let i = 1; i < length(full.stage_of); i++)
+		if (full.stage_of[i] != full.stage_of[i - 1])
+			push(ends, i);
 
-full = null;
-gc();
-torch.empty_cache();
+	push(ends, length(full.stage_of));
+
+	ref = full.forward_chunk(ids, full.new_cache(512), n).cpu();
+
+	let again = full.forward_chunk(ids, full.new_cache(512), n).cpu();
+
+	noise = rel_rms(again, ref);
+	stage_of = full.stage_of;
+
+	check('reference logits', ref.shape()[ref.shape().length - 1] > 1000);
+	warn(`run-to-run rel-rms of the whole model: ${noise}\n`);
+
+	if (REF)
+		torch.st_save(REF, [ [ 'ref', ref ], [ 'noise', torch.from_array([ noise ], 'float32') ],
+			[ 'stage_of', torch.from_array(stage_of, 'int64') ], [ 'ends', torch.from_array(ends, 'int64') ] ]);
+
+	full = null;
+	gc();
+	torch.empty_cache();
+}
 
 // the halves: stage 0 on the first Gs GPUs, the others on the rest
 let devs = [];
@@ -103,9 +131,12 @@ for (let i = 0; i < length(stage_of); i++) {
 }
 
 let got = B.head(h, n).cpu();
-let d = got.to('float32').sub(ref.to('float32'));
+let e = rel_rms(got, ref);
 
-check('same logits as the whole model', d.abs().max().item() == 0, sprintf('max |diff| %g', d.abs().max().item()));
+warn(`split against whole: rel-rms ${e}, max |diff| ${got.to('float32').sub(ref.to('float32')).abs().max().item()}\n`);
+
+// the same computation up to the run-to-run noise of the kernels (MoE accumulation order)
+check('same logits as the whole model, within the noise of the model itself', e <= (noise > 1e-4 ? 3 * noise : 1e-3), `${e} against noise ${noise}`);
 check('same greedy token', got.reshape([-1, got.shape()[got.shape().length - 1]]).argmax(-1).tolist()[n - 1] ==
 	ref.reshape([-1, ref.shape()[ref.shape().length - 1]]).argmax(-1).tolist()[n - 1]);
 

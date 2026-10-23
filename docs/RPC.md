@@ -84,7 +84,7 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    all its refusals, rejoin, manifest) and with `examples/rpc_demo.uc` between two
    processes: on loopback a 64 B echo takes 112 us, 100 KB 138 us, 2 MB 562 us
    (the link figures are still to be measured on jai).
-3. **Partial load** of `glm5_tp` (implemented, not yet run on GPUs). `load(dir,
+3. **Partial load** of `glm5_tp` (done, verified on GPUs). `load(dir,
    {devices, stages: NS, own: [first, end), stage_end})`: `stages` is the global
    pipeline, `own` the stages this process builds, `devices` only its local GPUs
    (Gs per owned stage). Layers, caches (`new_cache`), communicators, the embedding
@@ -96,11 +96,16 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    different GPU mix cannot make them disagree. `model.own_layers` is the owned
    layer range. The per-layer API (`embed`, `layer`, `handoff`, `head`) is what the
    RPC runs on each side. `tests/glm5_split.uc` loads the whole model, then two
-   halves (stage 0 / the rest), hands the residual streams over through the host
-   as the RPC will, and requires bit-identical logits; it skips (125) without the
-   model or ~18 GiB free per GPU, so it has not run yet (all GPUs of both hosts
-   are in use by servers): it needs a window with six free GPUs on jai.
-4. **Eager path over RPC** (implemented; the GPU runs are pending). The worker owns the
+   halves (stage 0 / the rest), hands the residual streams over through the host as the
+   RPC will, and compares the logits. It skips (125) without the model or ~18 GiB free per
+   GPU. Result on jai (6 x A5000/A5500, 3 stages x 2): the split model differs from the
+   whole one by rel-rms 0.042, while two forwards of the whole model differ from each other by
+   0.033 (the GLM eager path is not bit-deterministic, so the test requires the split to
+   stay within 3x that noise), and the greedy token is the same. A stage 0 of 4 loaded
+   alone on j7 (2 x RTX 3090) in 58 s with 14.8 / 13.8 GiB, layers 0-12 only, and the two
+   ranks' output replicas are bit-identical, which the one-replica hop relies on.
+
+4. **Eager path over RPC** (done, verified across the two hosts). The worker owns the
    FIRST stages, so the embedding and the first layers run there and one hop carries the
    streams to the coordinator, which owns the rest and the head (a single hop per
    token; the sampled token needs no way back). `rpc_stage.uc`: the worker's command loop
@@ -117,8 +122,16 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    load its stages with the client, prefill and decode greedily with `forward_chunk`).
    `tests/rpc_stage.uc` runs the protocol against a CPU mock. The plan for 4 stages x 2
    ranks is 13.5 / 14.6 / 14.6 / 13.5 GiB per GPU, stages starting at layers 0, 13, 24, 35
-   (45 layers). Still to do here: compare the token ids against the same run on one host
-   (`rpc_glm5.uc --single`), which needs the GPUs.
+   (45 layers).
+   **Result (2026-10-23)**, worker on j7 (stage 0, layers 0-12, loaded in 8 s from the page
+   cache), coordinator on jai (stages 1-3, 6 GPUs, loaded in 85 s), over the direct 10 GbE
+   link: "What is the capital of France?" gives "The capital of France is Paris." Prefill of
+   19 tokens 1.85 s, eager decode 83.2 ms/token. The same prompt on jai alone (3 stages,
+   `--single`): prefill 1.72 s, decode 88.5 ms/token, and the same first 29 token ids (the run
+   then diverges at token 30, within the model's own run-to-run noise). So the network hop
+   costs nothing measurable in eager mode: the 4-stage pipeline is not slower than the
+   3-stage one on the same prompt. Decode is still eager (every layer launched from ucode);
+   the CUDA-graph decode of the single host is phase 5.
 5. **Split the step graph.** Today a decode step is one multi-GPU CUDA graph
    over all stages. Each host captures its own segment graph with persistent
    input / output buffers: receive, async H2D, replay, D2H, send. Position-
