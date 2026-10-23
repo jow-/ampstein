@@ -13,8 +13,7 @@
 // whole model on the local GPUs, the stage count taken as the TOTAL then).
 // Plain TCP, no TLS: bind to the address of a VPN / overlay or of a private link.
 
-import * as rpc from 'ampstein.rpc';
-import * as stage from 'ampstein.rpc_stage';
+import * as coord from 'ampstein.rpc_coord';
 import * as glm5_tp from 'ampstein.glm5_tp';
 
 let bind = null, port = 7700, model_dir = null, gpus = null, stages = 3, steps = 32, single = false;
@@ -50,61 +49,16 @@ if (!model_dir || (!bind && !single))
 
 gpus ??= torch.device_count();
 
-let model, K = null, assign = null;
+let model, K = null;
 
 if (single) {
 	model = glm5_tp.load(model_dir, { devices: gpus, stages: stages, max_seq: max_seq, kv_bits: kv_bits, mtp: false });
 }
 else {
-	let Gs = gpus / stages;
+	let ex = coord.attach({ listen: `${bind}:${port}`, model: model_dir, gpus: gpus, stages: stages, max_seq: max_seq, kv_bits: kv_bits });
 
-	if (gpus % stages)
-		die(`${gpus} GPUs do not split into ${stages} stages\n`);
-
-	let L = rpc.listen({
-		bind: bind, port: port, manifest: rpc.manifest(model_dir),
-
-		// the assignment: the worker takes the first stages its GPUs make up; the plan of the whole
-		// pipeline is made here and handed over, so that both sides cut the layers the same way
-		welcome: function (hello) {
-			let n = length(hello.gpus ?? []);
-
-			if (n < Gs || n % Gs)
-				die(`the worker has ${n} GPUs, stages are ${Gs} GPUs wide`);
-
-			let ws = n / Gs, total = stages + ws;
-			let devs = [];
-
-			for (let i = 0; i < total * Gs; i++)
-				push(devs, i);
-
-			let plan = glm5_tp.load(model_dir, { devices: devs, stages: total, max_seq: max_seq, kv_bits: kv_bits,
-				mtp: false, plan_only: true });
-
-			warn(`rpc_glm5: ${ws} stage(s) for ${hello.name}, ${total} in total, stages start at layers ${join(' ', plan.stage_end)}\n`);
-
-			assign = { stages: total, own: [ 0, ws ], stage_end: plan.stage_end, max_seq: max_seq, kv_bits: kv_bits };
-
-			return assign;
-		}
-	});
-
-	warn(`rpc_glm5: waiting for a worker on ${bind}:${L.port}\n`);
-
-	let w = L.wait(1, 3600)[0];
-	let ready = w.conn.recv(3600000);
-
-	if (!ready || ready.meta.t != 'ready')
-		die('rpc_glm5: the worker did not report ready\n');
-
-	warn(`rpc_glm5: worker ${w.name} ready with layers ${ready.meta.layers[0]}..${ready.meta.layers[1] - 1}\n`);
-
-	K = stage.client(w.conn);
-
-	model = glm5_tp.load(model_dir, {
-		devices: gpus, stages: assign.stages, own: [ assign.own[1], assign.stages ], stage_end: assign.stage_end,
-		max_seq: max_seq, kv_bits: kv_bits, mtp: false, remote: K
-	});
+	K = ex.client;
+	model = glm5_tp.load(model_dir, { devices: gpus, max_seq: max_seq, kv_bits: kv_bits, mtp: false, ...ex.load });
 }
 
 function now() {

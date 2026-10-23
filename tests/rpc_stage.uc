@@ -66,7 +66,14 @@ let mock = {
 	}
 };
 
-let resets = 0, captured = null;
+let resets = 0, captured = null, packed = {}, zeroed = [];
+
+// the states of layer 1 on the worker: a byte tensor that travels both ways
+mock.state_pack = (cache, i) => torch.from_array([ i, 7, 8, 9, 200, 255 ], 'uint8');
+mock.state_unpack = function (cache, i, bytes) {
+	packed[i] = bytes.tolist();
+};
+mock.state_zero = (cache, i) => push(zeroed, i);
 
 mock.reset_cache = function (cache) {
 	resets++;
@@ -143,6 +150,14 @@ let g3 = K.forward(cid, 1, [ 1, 2, 3 ], true).h.tolist()[2][0][0];
 check('a graph replay answers the same streams as the eager layers', g1 == 4 + 111 && g3 == 3 + 0.5 + 111);
 check('...and counts as a replay', K.stats().replays == 2);
 check('a step size without a graph is an error', raises(() => K.forward(cid, 4, [ 1, 2 ], true), 'no graph for 2'));
+
+// recurrent state of a layer travels as bytes
+check('state_get returns the packed bytes of a layer', join(',', K.state_get(cid, 4).tolist()) == '4,7,8,9,200,255');
+K.state_put(cid, 3, torch.from_array([ 1, 2, 3, 250 ], 'uint8'));
+check('state_put hands the bytes to the model', join(',', packed[3]) == '1,2,3,250');
+K.state_zero(cid, 5);
+check('state_zero reaches the model', join(',', zeroed) == '5');
+check('state_put without bytes is an error', raises(() => { A.send({ t: 'state_put', cache: cid, layer: 3 }); K.pump(); let f = A.recv(1000); if (f.meta.t == 'error') die(f.meta.message); }, 'no bytes'));
 
 K.free(cid);
 check('free drops the cache', raises(() => K.forward(cid, 0, [ 1 ]), 'no cache'));

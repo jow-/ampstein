@@ -46,6 +46,7 @@ import * as dspark_tp from './dspark_tp.uc';
 import * as dflash from './dflash.uc';
 import * as rpc from './rpc.uc';
 import * as rpc_stage from './rpc_stage.uc';
+import * as rpc_coord from './rpc_coord.uc';
 import { tool_history } from './toolhist.uc';
 import { repeated as repeated_calls, clean_messages } from './callguard.uc';
 
@@ -312,9 +313,35 @@ export function serve(args) {
 
 	let model;
 
+	let rpc_load = {};
+
+	if (args.rpc_listen) {
+		// the first stages of the pipeline run on a worker host (docs/RPC.md): this host listens, the
+		// worker dials in and takes them; this host loads the rest (--gpus / --stages are ITS share)
+		if (!GLM || !args.tp) {
+			warn('ampstein: --rpc-listen needs a GLM model with --tp\n');
+			exit(1);
+		}
+
+		// not (yet) available when stages live on another host: speculative drafts (the recurrent-state
+		// rollback of the worker's layers) and parking / slots of states in host RAM
+		if (args.mtp > 0 || args.lookup > 0 || args.cache_ram !== 0 || args.slots !== 0)
+			warn('ampstein: with --rpc-listen: MTP, --lookup, --cache-ram and --slots are off\n');
+
+		args.mtp = 0;
+		args.lookup = 0;
+		args.cache_ram = 0;
+		args.slots = 0;
+
+		let ex = rpc_coord.attach({ listen: args.rpc_listen, workers: args.rpc_workers ?? 1, model: args.model,
+			gpus: args.gpus, stages: args.stages ?? 1, max_seq: args.ctx, kv_bits: kv_bits, prefill_rows: args.chunk });
+
+		rpc_load = ex.load;
+	}
+
 	if (GLM) {
 		model = args.tp ? glm5_tp.load(args.model, {devices: args.gpus, kv_bits: kv_bits, mtp: args.mtp > 0,
-			stages: args.stages, max_seq: args.ctx, prefill_rows: args.chunk}) :
+			stages: args.stages, max_seq: args.ctx, prefill_rows: args.chunk, ...rpc_load}) :
 			glm5.load(args.model, {devices: args.gpus, mtp: args.mtp > 0, kv_bits: kv_bits,
 				max_seq: args.ctx});
 	}

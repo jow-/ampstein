@@ -159,11 +159,32 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    prompt prefills in 2.36 s (1276 tok/s) over j7 + jai, against 4.78 s one chunk at a time over
    RPC (`forward_chunk`) and 2.61 s on jai alone with 3 stages (the pipeline has a fourth stage
    here); the generated tokens are identical. `examples/rpc_glm5.uc --pipeline`.
-7. **Speculation, store, slots, hot reload.** MTP and `--lookup` drafts run on
-   the coordinator; verify rows (up to 12) go through the hop like any step.
-   Rollback (`kda` per-position state restore) is a command to each worker.
-   Store, slots and hot reload work per worker (each saves its own layers); the
-   coordinator checks that positions agree on rejoin.
+7. **The server, in two cuts.**
+   **7a (done, verified): `ampstein --rpc-listen ADDR:PORT` serves a remote-stage GLM.**
+   `serve()` listens, waits for the worker (`rpc_coord.attach`: plans with `plan_only` for the
+   worker's GPU count, hands over the stage assignment, waits for `ready`), loads its own stages
+   with `remote: client`, and runs the unchanged engine on top: pipelined prefill, split decode
+   graphs, chat templates, tools, reasoning. `--gpus` / `--stages` are this host's share. Off in
+   this mode: MTP, `--lookup`, `--cache-ram` and `--slots` (the engine's host parking and slots are
+   switched off by `model.remote`).
+   The recurrent (KDA) state of the worker's layers is kept honest by a **mirror**: the coordinator
+   holds tensors of the same shapes for each remote KDA layer, and the engine's four state helpers
+   (`snap_bufs`, `save_states`, `load_states`, `zero_states`) call `model.remote_states('pull' |
+   'push' | 'zero', cache, layer)` around their copies, which moves the layer's bytes over
+   `state_get` / `state_put` / `state_zero` (a layer is two ranks of `rec_state` float32 and
+   `conv_state` float16, ~2 MB). So prefix reuse via snapshots, the turn checkpoint and resets
+   work unchanged; attention KV needs no sync (the worker writes it at the `pos` of each command,
+   so a rewind by length is implicit).
+   **Result (2026-10-23)**, j7 + jai over the 10 GbE link, the real server: a multi-turn chat reuses
+   its prefix (`cached 22 via snapshot`, a 44-token snapshot on the next turn) and answers
+   correctly ("PELICAN-77" recalled; "77-NACILEP" spelled backwards after a snapshot restore, also
+   after a detour to an unrelated conversation); a needle in 8499 tokens is found, with prefill at
+   1623 tok/s and decode at 51.7 tok/s as the server reports them.
+   **7b (to do):** speculative windows (MTP, `--lookup`): per-position KDA state rollback and the
+   draft block's cache over the hop; host parking and slots of states that live on the worker
+   (`cache_export` / `cache_import` per worker); hot reload; a worker that drops and rejoins
+   while the server runs (today the in-flight request fails with the connection error and the
+   coordinator must be restarted); more than one worker.
 8. Other model families (`qwen4_tp`, `dsv41_tp`, `gemma4_tp`) after GLM works.
 
 ## Phase 0 result (2026-10-23): go

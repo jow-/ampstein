@@ -311,6 +311,42 @@ function load_mtp(model_dir, cfg, plan, devs, expert_dev) {
 	return {dev: devs[0], ranks: ranks};
 }
 
+/* The recurrent states of one layer (per rank: rec_state float32, conv_state float16) as one
+ * byte tensor on the host, and back: how a layer's state travels between the worker and the
+ * coordinator's mirror (docs/RPC.md) */
+function pack_states(holders) {
+	let parts = [];
+
+	for (let cl in holders) {
+		push(parts, cl.rec_state.cpu().contiguous().reshape([ -1 ]).view_dtype('uint8'));
+		push(parts, cl.conv_state.cpu().contiguous().reshape([ -1 ]).view_dtype('uint8'));
+	}
+
+	return torch.cat(parts, 0);
+}
+
+function unpack_states(holders, bytes) {
+	let off = 0;
+
+	function take(t, dt) {
+		let n = t.numel() * (dt == 'float32' ? 4 : 2);
+
+		if (off + n > bytes.numel())
+			die('glm5_tp: the packed states are too short');
+
+		t.copy_(bytes.narrow(0, off, n).view_dtype(dt).view(t.shape()));
+		off += n;
+	}
+
+	for (let cl in holders) {
+		take(cl.rec_state, 'float32');
+		take(cl.conv_state, 'float16');
+	}
+
+	if (off != bytes.numel())
+		die(`glm5_tp: the packed states are ${bytes.numel()} bytes, expected ${off}`);
+}
+
 /* largest all-reduce payload in rows through the P2P kernel */
 const P2P_ROWS = 16;
 
@@ -452,7 +488,8 @@ export function load(model_dir, opts) {
 
 	for (let s = 0; s < NS; s++) {
 		if (s < own[0] || s >= own[1]) {
-			push(stages, {id: s, remote: true, G: Gs, first: -1, end: -1});
+			// (the plan of a remote stage: the shapes of its recurrent states, mirrored here)
+			push(stages, {id: s, remote: true, G: Gs, first: -1, end: -1, plan: plan_of(cfg, stage_weights(s))});
 			continue;
 		}
 
@@ -666,13 +703,51 @@ export function load(model_dir, opts) {
 
 		mm_build: glm5.mm_build,
 
-		/* KDA state holders of layer i: one per rank of its stage */
+		/* KDA state holders of layer i: one per rank of its stage. For a layer on the worker these are
+		 * a local MIRROR (same shapes, on this host): remote_states() fills it from the worker or
+		 * sends it there, around the engine's snapshot copies */
 		states: function (cache, i) {
-			return cache.layers[i];
+			return cache.layers[i] ?? cache.mirror[i];
 		},
 
+		/* the recurrent state of a layer on the worker, as the engine's snapshot helpers need it:
+		 *   'pull' refresh the mirror from the worker   'push' send the mirror to the worker
+		 *   'zero' zero the state on the worker
+		 * Nothing for a layer built here (its states are the real ones). */
+		remote_states: function (op, cache, i) {
+			if (cache.layers[i] != null || cache.remote == null || !cache.mirror[i])
+				return;
+
+			if (op == 'pull')
+				unpack_states(cache.mirror[i], remote.state_get(cache.remote, i));
+			else if (op == 'push')
+				remote.state_put(cache.remote, i, pack_states(cache.mirror[i]));
+			else if (op == 'zero')
+				remote.state_zero(cache.remote, i);
+			else
+				die(`glm5_tp: remote_states: unknown operation ${op}`);
+		},
+
+		/* the same bytes for the worker's side: the states of layer i built here */
+		state_pack: function (cache, i) {
+			return pack_states(cache.layers[i]);
+		},
+
+		state_unpack: function (cache, i, bytes) {
+			unpack_states(cache.layers[i], bytes);
+		},
+
+		state_zero: function (cache, i) {
+			for (let cl in cache.layers[i]) {
+				cl.rec_state.fill_(0);
+				cl.conv_state.fill_(0);
+			}
+		},
+
+		remote: first.remote ? true : false,       // the engine: no host parking / slots of states that live elsewhere
+
 		new_cache: function (max_seq) {
-			let cache = {max_seq: max_seq, length: 0, layers: []};
+			let cache = {max_seq: max_seq, length: 0, layers: [], mirror: {}};
 			let kvb = this.kv_bits;
 
 			for (let i = 0; i < nl; i++) {
@@ -681,6 +756,23 @@ export function load(model_dir, opts) {
 
 				if (S.remote) {
 					push(cache.layers, null);
+
+					if (cfg.layer_types[i] == 'linear_attention') {
+						let la = cfg.kda, ms = [];
+
+						for (let g = 0; g < Gs; g++) {
+							let n = S.plan.kda[g][1], d = devs[g];
+
+							push(ms, {
+								dev: d,
+								conv_state: torch.zeros([1, 3 * n * la.head_dim, la.short_conv_kernel_size - 1], 'float16', 'cuda:' + d),
+								rec_state: torch.zeros([n, la.head_dim, la.head_dim], 'float32', 'cuda:' + d)
+							});
+						}
+
+						cache.mirror[i] = ms;
+					}
+
 					continue;
 				}
 

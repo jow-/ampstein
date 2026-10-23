@@ -391,6 +391,10 @@ export function create(model, opts) {
 
 	/* copy the GDN states of layer i into buffers b (save) or back */
 	function save_states(i, b) {
+		// (a layer on a worker host: refresh its local mirror first)
+		if (model.remote_states)
+			model.remote_states('pull', cache, i);
+
 		let st = states(i);
 
 		for (let n = 0; n < length(st); n++) {
@@ -406,14 +410,22 @@ export function create(model, opts) {
 			st[n].rec_state.copy_(b[n][0]);
 			st[n].conv_state.copy_(b[n][1]);
 		}
+
+		// (a layer on a worker host: send the mirror there)
+		if (model.remote_states)
+			model.remote_states('push', cache, i);
 	}
 
 	function zero_states() {
-		for (let k in gdn_layers)
+		for (let k in gdn_layers) {
 			for (let cl in states(k)) {
 				cl.rec_state.fill_(0);
 				cl.conv_state.fill_(0);
 			}
+
+			if (model.remote_states)
+				model.remote_states('zero', cache, k);
+		}
 
 		// recurrent state outside the layer entries (qwen4: PLE conv tail +
 		// n-gram id context)
@@ -832,6 +844,10 @@ export function create(model, opts) {
 
 	function store_supported() {
 		let kv = false;
+
+		// layers on a worker host: their states and KV are not here to park in host RAM or to slot
+		if (model.remote)
+			return false;
 
 		// the model exports / imports its whole cache itself (DeepSeek-V4: compressed
 		// pools + compressor / window aux state + drafter ring)

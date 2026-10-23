@@ -17,6 +17,10 @@
 //   graphs {cache, sizes}    -> ok            (capture the decode graphs of these step sizes; clobbers the
 //                                              cache like glm5_tp.graphs: follow with reset)
 //   reset {cache}            -> ok            (zero the recurrent states, length 0)
+//   state_get {cache, layer}        -> state + bytes   (the recurrent state of one layer, all its ranks)
+//   state_put {cache, layer} + bytes -> ok             (set it)
+//   state_zero {cache, layer}       -> ok
+// (the engine's snapshots of recurrent state, restores and resets reach the worker's layers this way)
 //   stats {}                 -> ok {...}      (what the worker holds, for logs)
 //   bye {}                   (the worker's serve loop returns 'bye')
 //
@@ -59,6 +63,23 @@ export function worker(c, model) {
 			let cache = cache_of(f.meta);
 
 			W.graphs[f.meta.cache] = model.graphs(cache, f.meta.sizes);
+			ok();
+		},
+
+		state_get: function (f) {
+			c.send({ t: 'state', layer: f.meta.layer }, model.state_pack(cache_of(f.meta), f.meta.layer));
+		},
+
+		state_put: function (f) {
+			if (!f.tensor)
+				die('state_put: no bytes');
+
+			model.state_unpack(cache_of(f.meta), f.meta.layer, f.tensor);
+			ok();
+		},
+
+		state_zero: function (f) {
+			model.state_zero(cache_of(f.meta), f.meta.layer);
 			ok();
 		},
 
@@ -217,6 +238,24 @@ export function client(c) {
 	K.graphs = function (cache, sizes) {
 		c.send({ t: 'graphs', cache: cache, sizes: sizes });
 		answer('ok', 1800000);
+	};
+
+	/* the packed recurrent state of one worker layer: bytes in the connection's reusable buffer,
+	 * valid until the next frame with a tensor — unpack at once */
+	K.state_get = function (cache, layer) {
+		c.send({ t: 'state_get', cache: cache, layer: layer });
+
+		return answer('state').tensor;
+	};
+
+	K.state_put = function (cache, layer, bytes) {
+		c.send({ t: 'state_put', cache: cache, layer: layer }, bytes);
+		answer('ok');
+	};
+
+	K.state_zero = function (cache, layer) {
+		c.send({ t: 'state_zero', cache: cache, layer: layer });
+		answer('ok');
 	};
 
 	K.reset = function (cache) {

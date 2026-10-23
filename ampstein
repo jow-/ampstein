@@ -49,6 +49,9 @@ function usage() {
 	printf("  --expert-skip N       decode: drop picks of host-resident experts at router rank >= N (0-9; approximate, trades\n");
 	printf("                        accuracy for speed; default 0 = off)\n");
 	printf("  --worker              run as an RPC worker for a GLM pipeline split over hosts (docs/RPC.md); needs --connect\n");
+	printf("  --rpc-listen ADDR:PORT  GLM --tp: the first stages of the pipeline run on a --worker host that dials in here;\n");
+	printf("                        --gpus / --stages are then this host's share (MTP, --lookup, --cache-ram, --slots are off)\n");
+	printf("  --rpc-workers N       how many workers to wait for (default and maximum so far: 1)\n");
 	printf("  --connect HOST:PORT   the coordinator a --worker dials in to (plain TCP: use a VPN / overlay)\n");
 	printf("  --rpc-name NAME       the worker's name for the coordinator (default: the host name)\n");
 	printf("  --name NAME           served model name (default: basename of --model)\n");
@@ -192,6 +195,8 @@ function parse_args() {
 		case '--expert-skip': a.expert_skip = +v; i++; break;
 		case '--stages': a.stages = int(v); i++; break;
 		case '--worker': a.worker = true; break;
+		case '--rpc-listen': a.rpc_listen = v; i++; break;
+		case '--rpc-workers': a.rpc_workers = int(v); i++; break;
 		case '--connect': a.connect = v; i++; break;
 		case '--rpc-name': a.rpc_name = v; i++; break;
 		case '--dspark-window': a.dspark_window = int(v); i++; break;

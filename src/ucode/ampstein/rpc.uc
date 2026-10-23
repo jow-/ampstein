@@ -635,7 +635,7 @@ export function worker(opts) {
 			if (opts.once)
 				die(`${e}`);
 
-			warn(`rpc: ${e}; retrying in ${wait} ms\n`);
+			warn(`${e}; retrying in ${wait} ms\n`);
 			sleep(wait);
 			wait = (wait * 2 > hi) ? hi : wait * 2;
 
