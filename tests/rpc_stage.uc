@@ -66,6 +66,29 @@ let mock = {
 	}
 };
 
+let resets = 0, captured = null;
+
+mock.reset_cache = function (cache) {
+	resets++;
+	cache.length = 0;
+};
+mock.graphs = function (cache, sizes) {
+	captured = sizes;
+
+	return {
+		has: (n) => index(sizes, n) >= 0,
+		run: function (ids, pos) {
+			cache.length = pos + length(ids);
+
+			// "replay": the same arithmetic as the eager layers 0..2 on the embedded ids
+			let n = length(ids);
+			let h = torch.from_array(ids, 'float32').reshape([ n, 1, 1 ]).add(pos * 0.5 + 111).expand([ n, HC, HID ]).contiguous();
+
+			return { h: h };
+		}
+	};
+};
+
 let p = pair(), A = p[0], B = p[1];
 let W = stage.worker(B, mock), K = stage.client(A);
 
@@ -104,6 +127,22 @@ K.pump = () => W.step(B.recv(1000));
 check('an unknown cache raises on the coordinator, naming it', raises(() => K.forward(99, 0, [ 1 ]), 'no cache 99'));
 check('a position the cache is not at is the model\'s error, reported', raises(() => K.forward(cid, 100, [ 1 ]), 'cache at'));
 check('...and the connection still works', K.stats().forwards == 4, sprintf('%J', K.stats()));
+
+// graphs: captured on request, replayed with the graph flag, reset on demand
+check('forward with graph before capture is an error', raises(() => K.forward(cid, 0, [ 1 ], true), 'no graph'));
+K.graphs(cid, [ 1, 3 ]);
+check('graphs captured the sizes asked for', join(',', captured) == '1,3');
+
+K.reset(cid);
+check('reset reaches the model', resets == 1);
+
+// (the streams are a view of the connection's buffer: read each before the next call)
+let g1 = K.forward(cid, 0, [ 4 ], true).h.tolist()[0][3][7];
+let g3 = K.forward(cid, 1, [ 1, 2, 3 ], true).h.tolist()[2][0][0];
+
+check('a graph replay answers the same streams as the eager layers', g1 == 4 + 111 && g3 == 3 + 0.5 + 111);
+check('...and counts as a replay', K.stats().replays == 2);
+check('a step size without a graph is an error', raises(() => K.forward(cid, 4, [ 1, 2 ], true), 'no graph for 2'));
 
 K.free(cid);
 check('free drops the cache', raises(() => K.forward(cid, 0, [ 1 ]), 'no cache'));

@@ -18,7 +18,7 @@ import * as stage from 'ampstein.rpc_stage';
 import * as glm5_tp from 'ampstein.glm5_tp';
 
 let bind = null, port = 7700, model_dir = null, gpus = null, stages = 3, steps = 32, single = false;
-let max_seq = 2048, kv_bits = null, prompt = 'What is the capital of France? Answer in one sentence.';
+let max_seq = 2048, kv_bits = null, use_graphs = false, chunk = 512, repeat = 1, prompt = 'What is the capital of France? Answer in one sentence.';
 let argv = ARGV, st = index(argv, '--');
 
 if (st >= 0)
@@ -37,12 +37,15 @@ for (let i = 0; i < length(argv); i++) {
 	else if (a == '--max-seq') max_seq = int(argv[++i]);
 	else if (a == '--kv-q8') kv_bits = 8;
 	else if (a == '--single') single = true;
+	else if (a == '--graphs') use_graphs = true;
+	else if (a == '--chunk') chunk = int(argv[++i]);
+	else if (a == '--repeat') repeat = int(argv[++i]);
 	else
 		die(`unknown option ${a}\n`);
 }
 
 if (!model_dir || (!bind && !single))
-	die('usage: --bind ADDR --port N --model DIR [--gpus N] [--stages N] [--steps N] [--prompt TEXT] | --single --model DIR\n');
+	die('usage: --bind ADDR --port N --model DIR [--gpus N] [--stages N] [--steps N] [--prompt TEXT] [--graphs] [--chunk N] [--repeat N] | --single --model DIR\n');
 
 gpus ??= torch.device_count();
 
@@ -103,20 +106,43 @@ else {
 	});
 }
 
-let tok = torch.tokenizer(model_dir);
-let ids = tok.encode(`[gMASK]<sop><|user|>\n${prompt}<|assistant|>\n</think>`, true);
-let cache = model.new_cache(max_seq);
-
-warn(`rpc_glm5: prompt of ${length(ids)} tokens\n`);
-
 function now() {
 	let t = clock(true);
 
 	return t[0] + t[1] / 1e9;
 }
 
+let tok = torch.tokenizer(model_dir);
+// --repeat N: the prompt text N times (a long context, to take the sparse-attention graph)
+let body = '';
+
+for (let i = 0; i < repeat; i++)
+	body += (repeat > 1 ? `(${i}) ` : '') + prompt + '\n';
+
+let ids = tok.encode(`[gMASK]<sop><|user|>\n${body}<|assistant|>\n</think>`, true);
+let cache = model.new_cache(max_seq);
+let G = null;
+
+if (use_graphs) {
+	// the graphs of the step (the worker captures its own first): their warm-up clobbers the caches
+	let tg = now();
+
+	G = model.graphs(cache, [ 1 ]);
+	model.reset_cache(cache);
+	torch.synchronize();
+	warn(sprintf('rpc_glm5: decode graphs captured in %.1f s\n', now() - tg));
+}
+
+warn(`rpc_glm5: prompt of ${length(ids)} tokens\n`);
+
 let t0 = now();
-let lg = model.forward_chunk(ids, cache, 1);
+let lg;
+
+for (let at = 0; at < length(ids); at += chunk) {
+	let part = slice(ids, at, at + chunk);
+
+	lg = model.forward_chunk(part, cache, (at + chunk >= length(ids)) ? 1 : 0);
+}
 
 torch.synchronize();
 
@@ -129,7 +155,7 @@ for (let k = 0; k < steps; k++) {
 	let t = lg.reshape([-1]).argmax().item();
 
 	push(out, t);
-	lg = model.forward_chunk([t], cache, 1);
+	lg = G ? G.run([ t ], cache.length).logits : model.forward_chunk([t], cache, 1);
 }
 
 torch.synchronize();
@@ -137,7 +163,7 @@ torch.synchronize();
 let t_dec = now() - t0;
 
 printf('prefill %d tokens: %.2f s\n', length(ids), t_prefill);
-printf('decode %d tokens: %.2f s (%.1f ms/token)\n', steps, t_dec, t_dec * 1000.0 / steps);
+printf('decode %d tokens%s: %.2f s (%.1f ms/token)\n', steps, G ? ' (graphs)' : '', t_dec, t_dec * 1000.0 / steps);
 printf('tokens: %s\n', join(',', out));
 printf('text: %s\n', tok.decode(out));
 

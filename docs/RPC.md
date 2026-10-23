@@ -132,11 +132,24 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    costs nothing measurable in eager mode: the 4-stage pipeline is not slower than the
    3-stage one on the same prompt. Decode is still eager (every layer launched from ucode);
    the CUDA-graph decode of the single host is phase 5.
-5. **Split the step graph.** Today a decode step is one multi-GPU CUDA graph
-   over all stages. Each host captures its own segment graph with persistent
-   input / output buffers: receive, async H2D, replay, D2H, send. Position-
-   dependent buffers are rebuilt on the worker from the frame header (pos, ids,
-   mm), never shipped.
+5. **Split the step graph** (done, verified). Each process captures the graph of its own stages:
+   `glm5_tp.graphs` now handles a partial model. The worker's graph runs from token ids
+   (persistent device buffer) through the embedding and its layers and ends with the streams
+   of its last stage; the coordinator's graph starts from persistent per-rank input buffers
+   (`hin`) that the host fills from the worker's reply before each replay, and ends with the
+   head as before. The position broadcast among the ranks and the dense / sparse variant
+   choice (`pos + S > index_topk`) depend only on `pos`, so both sides always replay the
+   same variant. Protocol: `graphs {cache, sizes}` makes the worker capture (the coordinator
+   asks it first: the warm-up clobbers the cache, so `model.reset_cache(cache)` follows and
+   resets the remote cache too, `reset {cache}`), `forward {..., graph: true}` replays.
+   Decode over the hop is: ids to the worker, one replay there, the streams (160 KB for one
+   token) back, H2D into the input buffers, one replay here. Speculative windows (S > 1
+   with state rollback) and the draft block are phase 7.
+   **Result (2026-10-23)**, j7 stage 0 + jai stages 1-3, over the direct 10 GbE link:
+   decode 18.6 ms/token (short prompt) and 17.9 ms/token (3011-token prompt, which takes the
+   sparse variant), against 18.2 and 17.4 ms/token for the same run on jai alone (3 stages):
+   the hop costs ~0.4-0.5 ms per token. The 32 generated token ids are identical to the
+   single-host run for both prompts. Eager decode over RPC was 83 ms/token.
 6. **Pipelined prefill** across the hop: chunk n on the next stage while chunk
    n+1 runs on the previous one (the existing `prefill_pipeline` wavefront with
    one boundary on the network).

@@ -717,6 +717,22 @@ export function load(model_dir, opts) {
 			return cache;
 		},
 
+		/* zero the recurrent states of the layers built here (and of the remote stages): a fresh
+		 * context, e.g. after graphs() clobbered the cache with its warm-up */
+		reset_cache: function (cache) {
+			for (let i = 0; i < nl; i++)
+				for (let cl in (cache.layers[i] ?? []))
+					if (cl.rec_state) {
+						cl.rec_state.fill_(0);
+						cl.conv_state.fill_(0);
+					}
+
+			cache.length = 0;
+
+			if (cache.remote != null)
+				remote.reset(cache.remote);
+		},
+
 		/* release the cache of the remote stages (the local ones go with the object) */
 		free_cache: function (cache) {
 			if (cache.remote != null) {
@@ -918,10 +934,22 @@ export function load(model_dir, opts) {
 		 * states. Returns {has(S), run(ids, pos) -> {logits (1, V) on the
 		 * last stage's rank 0}}. */
 		graphs: function (cache, sizes) {
-			if (first.remote)
-				die('glm5_tp: graphs do not support remote stages yet (docs/RPC.md phase 5)');
-
 			let tp = this;
+
+			// Split over hosts (docs/RPC.md phase 5): the graph of a process covers its own stages.
+			// rem_in: the first stages are remote, the graph starts from persistent input buffers
+			// (hin, filled from the worker's streams before each replay); rem_out: the last stages
+			// are remote (this is the worker), the graph ends with the streams of its last stage
+			let rem_in = first.remote, rem_out = last.remote;
+			let from = own_layers[0], to = own_layers[1];
+
+			if (rem_in && !remote)
+				die('glm5_tp: the first stages are remote: a client is needed for graphs');
+
+			// (the worker captures its graphs first: their warm-up clobbers its cache like ours)
+			if (rem_in)
+				remote.graphs(cache.remote, sizes);
+
 			let P = cfg.index_kpool;
 			let by_size = {};
 			let pool = null;     // the graphs replay one at a time: one shared private pool
@@ -932,7 +960,8 @@ export function load(model_dir, opts) {
 				if (S > P2P_ROWS)
 					continue;
 
-				let ent = {S: S, ids: torch.zeros([S], 'int64', 'cuda:' + devs[0]), bar: []};
+				let ent = {S: S, ids: rem_in ? null : torch.zeros([S], 'int64', 'cuda:' + devs[0]), bar: [],
+					hin: rem_in ? map(stages[stage_of[from]].devs, (d) => torch.zeros([S, 4, H], 'float32', 'cuda:' + d)) : null};
 
 				for (let g = 0; g < G; g++)
 					push(ent.bar, torch.zeros([1], 'float32', 'cuda:' + devs[g]));
@@ -964,21 +993,27 @@ export function load(model_dir, opts) {
 						for (let g = 0; g < G; g++)
 							glm5.mla_dev_prepare(cfg, st[g], devs[g]);
 
-						let h0 = tp.embed_tokens.index(ent.ids).to('float32')
-							.reshape([S, 1, H]).expand([S, 4, H]).contiguous();
-						let h = map(first.devs, (d, g) => (g == 0) ? h0 : h0.cuda(d));
-						let cur = 0;
+						let h, cur = stage_of[from];
 
-						for (let i = 0; i < nl; i++) {
+						if (rem_in)
+							h = ent.hin;
+						else {
+							let h0 = tp.embed_tokens.index(ent.ids).to('float32')
+								.reshape([S, 1, H]).expand([S, 4, H]).contiguous();
+
+							h = map(first.devs, (d, g) => (g == 0) ? h0 : h0.cuda(d));
+						}
+
+						for (let i = from; i < to; i++) {
 							if (stage_of[i] != cur) {
 								h = tp.handoff(h, cur, stage_of[i]);
 								cur = stage_of[i];
 							}
 
-							h = tp.layer(i, h, cache, 0, slice(st, cur * Gs, (cur + 1) * Gs));
+							h = tp.layer(i, h, cache, 0, slice(st, (cur - own[0]) * Gs, (cur - own[0] + 1) * Gs));
 						}
 
-						ent['out' + variant] = tp.head(h, S, true);
+						ent['out' + variant] = rem_out ? {h: h[0]} : tp.head(h, S, true);
 					};
 
 					st[0].pos.fill_(0);
@@ -1022,6 +1057,9 @@ export function load(model_dir, opts) {
 
 				let o = ent['out' + v];
 
+				if (rem_out)
+					return {h: o.h};
+
 				cache.hidden = o.hidden.view([1, S, H]);
 
 				return {logits: o.logits, hidden: cache.hidden};
@@ -1043,7 +1081,16 @@ export function load(model_dir, opts) {
 					if (!ent)
 						die(`glm5_tp: no graph captured for step size ${S}`);
 
-					ent.ids.copy_(torch.from_array(ids, 'int64', 'cuda:' + devs[0]));
+					if (rem_in) {
+						// the worker's graph computes the streams of its last stage; they land here
+						// in the connection's pinned buffer and go to every rank of our first stage
+						let r = remote.forward(cache.remote, pos, ids, true);
+
+						for (let g = 0; g < Gs; g++)
+							ent.hin[g].copy_(r.h);
+					}
+					else
+						ent.ids.copy_(torch.from_array(ids, 'int64', 'cuda:' + devs[0]));
 
 					return replay(ent, pos);
 				},
@@ -1051,6 +1098,9 @@ export function load(model_dir, opts) {
 				/* ids_dev: int64 (1, S) on the first device (the draft chain's
 				 * device-side token ids) */
 				run_dev: function (ids_dev, pos) {
+					if (rem_in)
+						die('glm5_tp: run_dev needs the token ids on this host (the first stages are remote)');
+
 					let S = ids_dev.shape()[1];
 					let ent = by_size[S];
 

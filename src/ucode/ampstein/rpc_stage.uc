@@ -13,7 +13,10 @@
 //
 //   new_cache {max_seq}      -> ok {cache}
 //   free {cache}             -> ok
-//   forward {cache, pos, n}  + ids -> h {n} + streams
+//   forward {cache, pos, n, graph?} + ids -> h {n} + streams    (graph: replay the captured decode graph)
+//   graphs {cache, sizes}    -> ok            (capture the decode graphs of these step sizes; clobbers the
+//                                              cache like glm5_tp.graphs: follow with reset)
+//   reset {cache}            -> ok            (zero the recurrent states, length 0)
 //   stats {}                 -> ok {...}      (what the worker holds, for logs)
 //   bye {}                   (the worker's serve loop returns 'bye')
 //
@@ -29,7 +32,7 @@ import * as rpc from './rpc.uc';
 /* worker(conn, model): { step(frame) -> null | 'bye', serve() -> 'bye' | (raises on a lost connection),
  *                        caches } */
 export function worker(c, model) {
-	let W = { caches: {}, next: 1, forwards: 0, tokens: 0 };
+	let W = { caches: {}, graphs: {}, next: 1, forwards: 0, tokens: 0, replays: 0 };
 
 	function ok(extra) {
 		c.send({ t: 'ok', ...(extra ?? {}) });
@@ -52,9 +55,22 @@ export function worker(c, model) {
 			ok({ cache: id });
 		},
 
+		graphs: function (f) {
+			let cache = cache_of(f.meta);
+
+			W.graphs[f.meta.cache] = model.graphs(cache, f.meta.sizes);
+			ok();
+		},
+
+		reset: function (f) {
+			model.reset_cache(cache_of(f.meta));
+			ok();
+		},
+
 		free: function (f) {
 			cache_of(f.meta);
 			delete W.caches[f.meta.cache];
+			delete W.graphs[f.meta.cache];
 			gc();
 			ok();
 		},
@@ -67,6 +83,24 @@ export function worker(c, model) {
 				die('forward: expected n token ids');
 
 			let ids = f.tensor.view_dtype('int64').tolist();       // the frame's buffer is reused: take the ids now
+
+			if (m.graph) {
+				let G = W.graphs[m.cache];
+
+				if (!G || !G.has(m.n))
+					die(`forward: no graph for ${m.n} token(s) on cache ${m.cache}`);
+
+				let host = G.run(ids, m.pos).h.cpu().contiguous();
+				let sh = host.shape();
+
+				W.forwards++;
+				W.replays++;
+				W.tokens += m.n;
+				c.send({ t: 'h', n: m.n, pos: m.pos, hc: sh[1], hidden: sh[2] }, host);
+
+				return;
+			}
+
 			let h = model.embed(ids, null, m.pos);
 			let cur = model.stage_of[model.own_layers[0]];
 
@@ -91,7 +125,7 @@ export function worker(c, model) {
 		},
 
 		stats: function (f) {
-			ok({ caches: length(keys(W.caches)), forwards: W.forwards, tokens: W.tokens });
+			ok({ caches: length(keys(W.caches)), forwards: W.forwards, tokens: W.tokens, replays: W.replays });
 		}
 	};
 
@@ -174,9 +208,20 @@ export function client(c) {
 	};
 
 	/* forward_begin(cache, pos, ids): queue the request (ids: an array of token ids) */
-	K.forward_begin = function (cache, pos, ids) {
-		c.send({ t: 'forward', cache: cache, pos: pos, n: length(ids) }, torch.from_array(ids, 'int64'));
+	K.forward_begin = function (cache, pos, ids, graph) {
+		c.send({ t: 'forward', cache: cache, pos: pos, n: length(ids), graph: graph ? true : false }, torch.from_array(ids, 'int64'));
 		K.inflight++;
+	};
+
+	/* the worker captures its decode graphs for these step sizes (slow: seconds to a minute) */
+	K.graphs = function (cache, sizes) {
+		c.send({ t: 'graphs', cache: cache, sizes: sizes });
+		answer('ok', 1800000);
+	};
+
+	K.reset = function (cache) {
+		c.send({ t: 'reset', cache: cache });
+		answer('ok');
 	};
 
 	/* forward_end(timeout_ms): the oldest request's streams: {n, pos, h} with h a float32 host
@@ -190,8 +235,8 @@ export function client(c) {
 		return { n: f.meta.n, pos: f.meta.pos, h: f.tensor.view_dtype('float32').view([ f.meta.n, f.meta.hc, f.meta.hidden ]) };
 	};
 
-	K.forward = function (cache, pos, ids) {
-		K.forward_begin(cache, pos, ids);
+	K.forward = function (cache, pos, ids, graph) {
+		K.forward_begin(cache, pos, ids, graph);
 
 		return K.forward_end();
 	};
