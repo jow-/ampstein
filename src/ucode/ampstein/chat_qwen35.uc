@@ -382,8 +382,8 @@ export function render(messages, tools, opts) {
  * so the model sees the objection as a tool result and answers it. */
 /* Constrained generation of this format's tool calls (--call-guard): see
  * callguard.uc. null without tool definitions. */
-export function call_guard(tools, thinking, ban) {
-	return callguard.qwen(tools, thinking, ban);
+export function call_guard(tools, thinking, ban, seen) {
+	return callguard.qwen(tools, thinking, ban, seen);
 }
 
 export function tool_feedback(text, thinking) {

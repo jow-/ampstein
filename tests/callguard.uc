@@ -160,12 +160,22 @@ let E3 = hcall('edit', {path: '/x', edits: [{oldText: 'c', newText: 'd'}]});
 let B1 = hcall('bash', {command: 'ls'});
 
 check('one edit: no ban', length(callguard.repeated([E1])) == 0);
-check('the same edit twice: ban edit', join(',', callguard.repeated([B1, E1, E1])) == 'edit');
+check('the same edit twice: no ban', length(callguard.repeated([B1, E1, E1])) == 0);
 check('two different edits: no ban', length(callguard.repeated([E1, E3])) == 0);
-check('A B A B cycling: ban edit', join(',', callguard.repeated([E1, E2, E1, E2])) == 'edit');
+check('A B A B edit cycling: no ban', length(callguard.repeated([E1, E2, E1, E2])) == 0);
 check('three different edits in a row: no ban', length(callguard.repeated([E1, E3, E2, hcall('edit', {path: '/y'})])) == 0);
 check('bash polling repeated: no ban', length(callguard.repeated([B1, B1, B1])) == 0);
 check('a bash between breaks the cycle', length(callguard.repeated([E1, E2, B1, E1])) == 0);
+let N1 = hcall('edit', {path: '/x', edits: [{oldText: 'a', newText: 'a'}]});
+let N2 = hcall('edit', {path: '/dev/null', edits: []});
+let N3 = hcall('edit', {path: '/x', edits: sprintf('%J', [{oldText: 'q', newText: 'q'}])});
+check('one no-op edit: no ban', length(callguard.repeated([B1, N1])) == 0);
+check('two no-op edits: ban edit', join(',', callguard.repeated([B1, N1, N2])) == 'edit');
+check('no-ops, string form of edits', join(',', callguard.repeated([N3, B1, E1, N1])) == 'edit');
+check('two no-ops, a call between: ban', join(',', callguard.repeated([N1, B1, N2])) == 'edit');
+check('two no-ops too far apart: no ban', length(callguard.repeated([N1, B1, B1, B1, N2])) == 0);
+check('a real edit after the no-ops: ban still holds only when last is edit', length(callguard.repeated([N1, N2, B1])) == 0);
+check('different edits are not no-ops', length(callguard.repeated([E1, E3])) == 0);
 let W5 = hcall('write', {path: '/tmp/stat5.sh', content: '#!/bin/bash\npgrep x\necho 5\n'});
 let W6 = hcall('write', {path: '/tmp/stat6.sh', content: '#!/bin/bash\npgrep x\necho 6\n'});
 let W7 = hcall('write', {path: '/tmp/stat7.sh', content: '#!/bin/bash\npgrep x\necho 7\n'});
@@ -217,6 +227,17 @@ g = callguard.qwen([TOOLS[2]], false, ['edit']);
 g.feed('<tool_call>\n<function=');
 check('the only tool is never banned', g.veto([], 'edit>') == false);
 
+// a ban leaves only tools the conversation has called: `write` refused must not
+// leave `web_*` (same first letter) as the way out
+let WEB = [...TOOLS, {type: 'function', function: {name: 'web_close_tab', parameters: {type: 'object', properties: {}}}}];
+g = callguard.qwen(WEB, false, ['write', 'edit'], ['bash', 'write', 'edit']);
+g.feed('<tool_call>\n<function=');
+check('ban + seen: unused web_ tool refused', g.veto([], 'web') == true);
+check('ban + seen: bash still allowed', g.veto([], 'bash>') == false);
+g = callguard.qwen(WEB, false, ['write', 'edit']);
+g.feed('<tool_call>\n<function=');
+check('ban without seen: web_ reachable (old behaviour)', g.veto([], 'web') == false);
+
 // the conversation as the model sees it: stray arguments of earlier calls are dropped
 let TOOLDEFS = [{type: 'function', function: {name: 'write', parameters: {type: 'object',
 	properties: {path: {type: 'string'}, content: {type: 'string'}}, required: ['path', 'content']}}}];
@@ -240,6 +261,19 @@ check('clean: other messages shared', cl[0] === conv[0] && cl[2] === conv[2]);
 check('clean: nothing to drop returns the same array',
 	callguard.clean_messages([{role: 'user', content: 'x'}], TOOLDEFS) != null &&
 	callguard.clean_messages(null, TOOLDEFS) == null && callguard.clean_messages(conv, null) === conv);
+
+// a refused edit/write sends the model to the tools it announces (bash, read)
+let T3 = map(['bash', 'read', 'edit', 'write', 'web_fetch'], (n) => ({type: 'function', function: {name: n, parameters: {properties: {x: {type: 'string'}}, required: []}}}));
+g = callguard.qwen(T3, false, ['write'], ['write', 'edit', 'bash', 'read']);
+g.feed('<tool_call>\n<function=');
+check('write banned: edit not offered', g.veto([], 'edit') == true);
+check('write banned: bash offered', g.veto([], 'bash') == false);
+g = callguard.qwen(T3, false, ['write'], ['write', 'edit']);
+check('write banned, bash never used: edit still not offered', (g.feed('<tool_call>\n<function='), g.veto([], 'edit')) == true);
+g = callguard.qwen(T3, false, ['edit'], ['write', 'edit']);
+g.feed('<tool_call>\n<function=');
+check('edit banned, no bash seen: write still not offered', g.veto([], 'write') == true);
+check('edit banned, no bash seen: another tool is', g.veto([], 'bash') == false);
 
 if (fails) {
 	warn(fails + ' failures\n');

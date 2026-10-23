@@ -490,6 +490,15 @@ Add new lessons at the end of the matching section.
   the window prefix (the state advanced twice, `w`+`rite` became `wwrite`), and
   a guard must let go once it cannot be satisfied, instead of vetoing
   everything after an invalid name.
+  Later narrowed: only `write` is watched (the script-again-under-a-new-name
+  loop); identical or A/B-cycling `edit`s are no longer banned, since the ban
+  fired on legitimate sequences and pushed the model into worse calls.
+  A no-op `edit` (`/dev/null`, empty `edits`, `oldText == newText`) twice within
+  four calls bans `edit`: the model announces a shell command and emits `edit`
+  with placeholders (seen 53x on 10-22, 70x on 10-23). **Design rule: a ban
+  fails into `bash`/`read`, never into a writing tool**: while a ban is active
+  the allowed set is `bash`/`read` if the conversation used them, else
+  everything but `edit`/`write`.
 - **L143 — Tolerated junk is a seed.** The `write`/`path` loop of the
   openwrt-minibuild session began as one stray `content2: ""` at 15:53:44 that
   the model itself called "a typo ... the tool probably ignores it". The harness

@@ -1139,13 +1139,14 @@ export function serve(args) {
 
 		// Constrained tool calls (--call-guard): the guard follows the emitted text and
 		// the engine asks it about every token it is about to accept (job.veto)
-		let ban = (args.call_guard && chat.call_guard) ? repeated_calls(tool_history(msgs)) : [];
+		let thist = (args.call_guard && chat.call_guard) ? tool_history(msgs) : [];
+		let ban = repeated_calls(thist);
 
 		if (length(ban))
 			warn(`chat ${id}: call guard: the conversation repeats its last ${join(', ', ban)} call, ` +
 				`banning the name in this response\n`);
 
-		let guard = (args.call_guard && chat.call_guard) ? chat.call_guard(body.tools, r.thinking, ban) : null;
+		let guard = (args.call_guard && chat.call_guard) ? chat.call_guard(body.tools, r.thinking, ban, uniq(map(thist, (h) => h.name))) : null;
 		let pieces = {}, vetoes = 0;
 
 		function piece_of(t) {

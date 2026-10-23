@@ -39,11 +39,33 @@ const T_PARAM = '<parameter=';
 const T_ENDPARAM = '</parameter>';
 const T_ENDTHINK = '</think>';
 
-function schemas(tools, ban) {
+function schemas(tools, ban, seen) {
 	let m = {}, any = false;
 
-	// names in `ban` are left out (not when that would leave no tool at all)
+	// names in `ban` are left out (not when that would leave no tool at all);
+	// so are tools the conversation never called: a model that is refused `write`
+	// would otherwise be pushed by the shared first token onto `web_*` (the
+	// refused name's lexical neighbours), not onto the tool it was using
 	let others = filter(tools ?? [], (t) => index(ban ?? [], (t.function ?? t).name) < 0);
+
+	if (length(ban) && length(seen)) {
+		let used = filter(others, (t) => index(seen, (t.function ?? t).name) >= 0);
+		let safe = filter(others, (t) => index(['edit', 'write'], (t.function ?? t).name) < 0);
+
+		if (length(used) > 0)
+			others = used;
+
+		// a ban means the model is looping or confused, and a wrong call is then
+		// safest where it cannot change anything: the shell and `read` first (a
+		// model refused `write` mostly announced a command), otherwise anything
+		// but the file writers
+		let run = filter(used, (t) => index(['bash', 'read'], (t.function ?? t).name) >= 0);
+
+		if (length(run) > 0)
+			others = run;
+		else if (length(safe) > 0)
+			others = safe;
+	}
 
 	if (length(others) > 0)
 		tools = others;
@@ -404,11 +426,60 @@ export function clean_messages(messages, tools) {
 	return out ?? messages;
 }
 
-/* Mutating tools whose repetition is a loop: an `edit` that was just made again,
- * or four of them in a row cycling between two variants of one edit (a model that
- * flips a trailing newline in and out), each answered by "Successfully replaced"
- * so that no failure policy ever sees them. */
-const REPEAT_TOOLS = ['edit', 'write'];
+/* Besides no-op `edit`s (see noop_edit), only `write` is watched: a model that writes the same script again and again
+ * under a new name (each answered by success, so no failure policy sees it).
+ * Repeated `edit`s are not banned: they are legitimate often enough (many
+ * similar fixes, probing after a failed match), and a ban there cost more than
+ * it saved. */
+const REPEAT_TOOLS = ['write'];
+
+/* An `edit` that cannot change anything: no replacement at all, `/dev/null` as
+ * the target, or every `newText` equal to its `oldText`. A model that announces
+ * another tool and emits `edit` anyway fills the call with such placeholders;
+ * they fail ("No changes made") or are refused one by one, which no equality of
+ * arguments sees. One alone happens, two within a few calls are the loop. */
+function noop_edit(h) {
+	if (h.name != 'edit')
+		return false;
+
+	let a = null;
+
+	try {
+		a = json(h.arguments);
+	}
+	catch (e) {
+		return false;
+	}
+
+	if (type(a) != 'object')
+		return false;
+
+	if (a.path == '/dev/null')
+		return true;
+
+	let e = a.edits;
+
+	if (type(e) == 'string') {
+		try {
+			e = json(e);
+		}
+		catch (err) {
+			return false;
+		}
+	}
+
+	if (type(e) != 'array')
+		return false;
+
+	if (length(e) == 0)
+		return true;
+
+	for (let r in e)
+		if (type(r) != 'object' || r.oldText != r.newText)
+			return false;
+
+	return true;
+}
 
 /* A call's arguments without its target and with digits folded: what is being
  * done, not to which numbered file. null when not an object. */
@@ -529,13 +600,22 @@ function same_file_again(a, b) {
 export function repeated(history) {
 	let n = length(history ?? []);
 
+	// two no-op edits among the last four calls
+	if (n >= 2 && history[n - 1].name == 'edit') {
+		let k = 0;
+
+		for (let i = (n > 4) ? n - 4 : 0; i < n; i++)
+			if (noop_edit(history[i]))
+				k++;
+
+		if (k >= 2)
+			return ['edit'];
+	}
+
 	if (n < 2 || index(REPEAT_TOOLS, history[n - 1].name) < 0)
 		return [];
 
 	let a = history[n - 1], b = history[n - 2];
-
-	if (a.name == b.name && a.arguments == b.arguments)
-		return [a.name];
 
 	// the same content written again to a nearly identical path (`/tmp/pyval.sh`,
 	// `/tmp/pyval2.sh`): a model that announces "now I run it" and copies its
@@ -553,37 +633,15 @@ export function repeated(history) {
 			return [a.name];
 	}
 
-	if (n >= 4) {
-		let sigs = {}, names = {}, count = 0;
-
-		for (let i = n - 4; i < n; i++) {
-			let h = history[i];
-
-			if (index(REPEAT_TOOLS, h.name) < 0)
-				return [];
-
-			let k = h.name + ' ' + h.arguments;
-
-			if (!sigs[k]) {
-				sigs[k] = true;
-				count++;
-			}
-
-			names[h.name] = true;
-		}
-
-		if (count <= 2)
-			return keys(names);
-	}
-
 	return [];
 }
 
 /* tools: the request's tool list (OpenAI form); thinking: generation starts
- * inside a reasoning block; ban: tool names not to be called in this response.
- * Returns null without tool definitions. */
-export function qwen(tools, thinking, ban) {
-	let tl = schemas(tools, ban);
+ * inside a reasoning block; ban: tool names not to be called in this response;
+ * seen: names of the tools the conversation has called (a ban then leaves only
+ * those). Returns null without tool definitions. */
+export function qwen(tools, thinking, ban, seen) {
+	let tl = schemas(tools, ban, seen);
 
 	if (tl == null)
 		return null;
