@@ -338,6 +338,7 @@ export function load(model_dir, opts) {
 	// (stage_of) the same way; the coordinator hands its stage_end to the workers.
 	let own = opts.own || [ 0, NS ];
 	let n_own = own[1] - own[0];
+	let remote = opts.remote;              // rpc_stage.client: the worker that owns the stages before `own` (stage 0 remote)
 
 	if (own[0] < 0 || n_own < 1 || own[1] > NS)
 		die(`glm5_tp: stages ${own[0]}..${own[1]} out of ${NS}`);
@@ -697,7 +698,19 @@ export function load(model_dir, opts) {
 					layers: map(mst.devs, (d) => glm5.new_mla_cache(cfg, max_seq, d, kvb))};
 			}
 
+			// the layers of the remote first stages keep their caches on the worker
+			if (first.remote && remote)
+				cache.remote = remote.new_cache(max_seq);
+
 			return cache;
+		},
+
+		/* release the cache of the remote stages (the local ones go with the object) */
+		free_cache: function (cache) {
+			if (cache.remote != null) {
+				remote.free(cache.remote);
+				cache.remote = null;
+			}
 		},
 
 		/* The replicated streams of stage `from`, copied to every rank of
@@ -893,6 +906,9 @@ export function load(model_dir, opts) {
 		 * states. Returns {has(S), run(ids, pos) -> {logits (1, V) on the
 		 * last stage's rank 0}}. */
 		graphs: function (cache, sizes) {
+			if (first.remote)
+				die('glm5_tp: graphs do not support remote stages yet (docs/RPC.md phase 5)');
+
 			let tp = this;
 			let P = cfg.index_kpool;
 			let by_size = {};
@@ -1253,10 +1269,27 @@ export function load(model_dir, opts) {
 		 * last `rows` positions (default 1); rows == 0: none. */
 		forward_chunk: function (ids, cache, rows, on_layer, want_hidden) {
 			let pos = cache.length;
-			let h = this.embed(ids, cache.mm, pos);
-			let cur = 0;
+			let h, cur = 0, from = 0;
 
-			for (let i = 0; i < nl; i++) {
+			if (first.remote) {
+				// the worker runs the embedding and its layers; what comes back is one replica of
+				// the streams of its last stage, copied to every rank of the first local stage
+				if (!remote || cache.remote == null)
+					die('glm5_tp: the first stages are remote: a client and a cache of it are needed');
+
+				if (cache.mm)
+					die('glm5_tp: images are not supported with remote stages');
+
+				let r = remote.forward(cache.remote, pos, ids);
+
+				from = own_layers[0];
+				cur = stage_of[from];
+				h = map(stages[cur].devs, (d) => r.h.cuda(d));
+			}
+			else
+				h = this.embed(ids, cache.mm, pos);
+
+			for (let i = from; i < nl; i++) {
 				if (stage_of[i] != cur) {
 					h = this.handoff(h, cur, stage_of[i]);
 					cur = stage_of[i];
@@ -1281,6 +1314,9 @@ export function load(model_dir, opts) {
 		 * attention halves are enqueued before any stage reads its MoE
 		 * counts), so with S stages S chunks are in flight, one per stage */
 		prefill_pipeline: function (cache, ids, opts) {
+			if (first.remote)
+				die('glm5_tp: prefill_pipeline does not support remote stages yet (docs/RPC.md phase 6)');
+
 			let tp = this;
 			let chunk = opts.chunk || 512;
 			let start = cache.length, total = length(ids);

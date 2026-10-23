@@ -1530,6 +1530,38 @@ tensor_view_impl(uc_vm_t *vm, size_t nargs, bool strict)
 	}
 }
 
+/*
+ * view_dtype(dtype): torch.tensor
+ *
+ * The same bytes read as another dtype (a bit reinterpretation, no copy): a
+ * contiguous tensor whose last dimension times the element size is a multiple
+ * of the new element size. The receiver of an RPC frame gets raw bytes and
+ * views them as the float32 streams or the int64 ids they were (docs/RPC.md).
+ */
+static uc_value_t *
+tensor_view_dtype(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *t = tensor_this(vm);
+	at::ScalarType dt;
+
+	if (!t)
+		return NULL;
+
+	if (nargs != 1 || !arg_dtype(vm, uc_fn_arg(0), &dt)) {
+		if (nargs != 1)
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE, "view_dtype: expected (dtype)");
+
+		return NULL;
+	}
+
+	try {
+		return tensor_wrap(vm, t->view(dt), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 static uc_value_t *
 tensor_view(uc_vm_t *vm, size_t nargs)
 {
@@ -10603,6 +10635,7 @@ static const uc_function_list_t tensor_methods[] = {
 	{ "cpu",	tensor_cpu },
 	{ "to",		tensor_to },
 	{ "view",	tensor_view },
+	{ "view_dtype",	tensor_view_dtype },
 	{ "reshape",	tensor_reshape },
 	{ "transpose",	tensor_transpose },
 	{ "t",		tensor_t },

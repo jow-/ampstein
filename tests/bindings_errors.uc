@@ -244,6 +244,10 @@ expect_raise('device_props: no args', function () { torch.device_props(); });
 expect_raise('device_props: not an index', function () { torch.device_props('0'); });
 expect_raise('device_props: no such device', function () { torch.device_props(999); });
 
+expect_raise('view_dtype: no args', function () { torch.zeros([4], 'uint8').view_dtype(); });
+expect_raise('view_dtype: bad dtype', function () { torch.zeros([4], 'uint8').view_dtype('nope'); });
+expect_raise('view_dtype: size not a multiple', function () { torch.zeros([3], 'uint8').view_dtype('int64'); });
+
 /* --- fds ---------------------------------------------------------------------- */
 
 expect_raise('fd_write: no args', function () { torch.fd_write(); });
