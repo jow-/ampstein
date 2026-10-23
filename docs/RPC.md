@@ -216,8 +216,15 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    ucode `signal()` handlers that set a flag its loops look at (twice a second), and exits ~1 s after
    SIGTERM. The coordinator does not send `bye` when it stops, so a worker rejoins a restarted
    coordinator by itself.
+   **Hot reload** (the server saves its live conversation to `/tmp/Ampstein-cache-<port>.safetensors` on
+   SIGINT / SIGTERM and restores it at the next start) is switched off for a remote model: the KV and
+   the recurrent states of the worker's layers are not in what the coordinator can save, and a restore
+   of the rest would claim cached tokens whose worker half is empty. The server refuses to save, and
+   ignores a file left by an earlier run.
    **To do:** host parking and slots of states that live on the worker
-   (`cache_export` / `cache_import` per worker); hot reload for a remote model; more than one worker;
+   (`cache_export` / `cache_import` per worker); hot reload for a remote model (the worker would
+   have to save and restore its own half, to a file of its own, and the two be matched by a token
+   hash); more than one worker;
    a rejoin that keeps the worker's caches when only the link blipped.
 8. Other model families (`qwen4_tp`, `dsv41_tp`, `gemma4_tp`) after GLM works.
 

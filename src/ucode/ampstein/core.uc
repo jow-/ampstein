@@ -497,6 +497,12 @@ export function serve(args) {
 			return;     // no saved state
 		}
 
+		// (a state saved by an earlier run cannot be valid: the worker's half of it is not in the file)
+		if (model.remote) {
+			warn('ampstein: ignoring saved cache state (stages on a worker host)\n');
+			return;
+		}
+
 		if (meta.format != 1 || meta.model != args.model) {
 			warn('ampstein: ignoring saved cache state ' +
 				'(model or format changed)\n');
@@ -1855,6 +1861,10 @@ export function serve(args) {
 		try {
 			if (DS || D41)
 				die('not supported for this architecture yet');
+
+			// the KV and the states of the worker's layers are on the worker, not in what this saves
+			if (model.remote)
+				die('not supported with stages on a worker host');
 
 			let n = eng.save_state(CACHE_ST);
 
