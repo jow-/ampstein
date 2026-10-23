@@ -292,6 +292,31 @@ included: they are streamed from disk on whichever host runs the Engram layer).
 - Test: `tests/dsv41_split.uc` (4 GPUs, one process, worker and coordinator over loopback) against the whole
   partial model.
 
+## Launching
+
+`scripts/rpc/glm53` and `scripts/rpc/dsv41` hold the settings below; run `leader` on jai and `worker` on j7
+(start them together: the worker retries until the leader listens). Plain commands, for jai (the leader, which
+serves the API on :8041, link address 192.168.41.2) and j7:
+
+```sh
+# GLM-5.3-Flash 3.05bpw: stage 0 (layers 0-12) on j7, the rest, the head and the MTP block on jai
+jai$ ampstein --model /data/models/GLM-5.3-Flash-exl3-3.05bpw --tp --gpus 6 --stages 3 \
+         --rpc-listen 192.168.41.2:7740 --host 0.0.0.0 --port 8041 --ctx 65536
+j7$  ampstein --worker --connect 192.168.41.2:7740 --model /data/models/GLM-5.3-Flash-exl3-3.05bpw --rpc-name j7
+
+# DeepSeek-V4.1 2.50bpw (Derpyhue): layers 0-9 on j7, 10-39 on jai, 256k context, DSpark drafter
+jai$ ampstein --model /data/models/DSV4.1-Flash-1017-exl3-2.50bpw-H5-HQ5bpw-SH --tp --gpus 6 --stages 3 \
+         --rpc-listen 192.168.41.2:7757 --rpc-layers 10 --host 0.0.0.0 --port 8041 --ctx 262144 --chunk 512
+j7$  ampstein --worker --connect 192.168.41.2:7757 --model /data/models/DSV4.1-Flash-1017-exl3-2.50bpw-H5-HQ5bpw-SH --rpc-name j7
+```
+
+`--gpus` / `--stages` are the leader's own (the worker takes the GPUs it has); `--rpc-layers` is DeepSeek-V4.1 only
+(the layers on the worker: `remote_plan` would pick fewer, it keeps 5 GiB of working set per GPU free). The model
+loads in ~7 (DeepSeek) to ~10 minutes (GLM), SIGTERM is ignored until it has; after that it saves the state of the
+conversations (GLM) and exits. Both hosts need the same model directory (names and sizes are checked at the
+handshake); the DeepSeek pack's `ngram_tables-*` are read from disk on the host that runs the Engram layer, so
+the worker needs layer 1's, the leader layer 14's (hard links to the 1.62bpw pack's shards 16 / 17 do).
+
 ## Phase 0 result (2026-10-23): go
 
 `examples/rpc_pingpong.uc` between j7 (`onboard10g`, 192.168.41.1) and jai

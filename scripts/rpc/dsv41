@@ -1,0 +1,35 @@
+#!/bin/sh
+# DeepSeek-V4.1 (2.50bpw pack) over two hosts: the leader serves the HTTP API and holds layers 10-39 on its six GPUs,
+# the worker holds layers 0-9 on two. Same model directory on both hosts (docs/RPC.md).
+#
+#   jai:  scripts/rpc/dsv41 leader      (loads for ~7 min, then serves on :8041)
+#   j7:   scripts/rpc/dsv41 worker      (start it with the leader: it dials in and retries until it is up)
+#
+# Overrides (environment): AMPSTEIN (the ampstein script), MODEL, LINK (the leader's address on the link),
+# RPC_PORT, PORT, CTX, CHUNK, RPC_LAYERS, EXTRA (more options for the leader).
+# The settings are the tightest that fit: 262144 tokens of context, the DSpark drafter and all graph sizes leave
+# ~1 GiB per jai GPU. Stop with SIGTERM (kill PID); it is ignored while the model loads, wait for the load to end.
+
+AMPSTEIN=${AMPSTEIN:-ampstein}
+MODEL=${MODEL:-/data/models/DSV4.1-Flash-1017-exl3-2.50bpw-H5-HQ5bpw-SH}
+LINK=${LINK:-192.168.41.2}
+RPC_PORT=${RPC_PORT:-7757}
+PORT=${PORT:-8041}
+CTX=${CTX:-262144}
+CHUNK=${CHUNK:-512}
+RPC_LAYERS=${RPC_LAYERS:-10}
+
+case "$1" in
+leader)
+	exec $AMPSTEIN --model "$MODEL" --tp --gpus 6 --stages 3 \
+		--rpc-listen $LINK:$RPC_PORT --rpc-layers $RPC_LAYERS \
+		--host 0.0.0.0 --port $PORT --ctx $CTX --chunk $CHUNK $EXTRA
+	;;
+worker)
+	exec $AMPSTEIN --worker --connect $LINK:$RPC_PORT --model "$MODEL" --rpc-name "$(hostname)"
+	;;
+*)
+	echo "usage: $0 leader|worker" >&2
+	exit 1
+	;;
+esac
