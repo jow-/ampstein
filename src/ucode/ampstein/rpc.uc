@@ -418,7 +418,8 @@ function first_difference(mine, theirs) {
  *   bind     the address to listen on (required: there is no default, see the header)
  *   manifest rpc.manifest(dir) of the coordinator's model; a worker with another id is refused
  *   check    function (hello) -> null or a reason string to refuse the worker
- *   welcome  extra fields for the welcome message
+ *   welcome  extra fields for the welcome message: an object, or a function (hello) -> object (e.g. the
+ *            assignment of stages, made from what the worker announced; raising refuses it)
  * Returns {port, fd(), workers (array of {name, conn, hello}), accept_one(ms), wait(n, seconds), close()}. */
 export function listen(opts) {
 	if (!opts?.bind)
@@ -508,7 +509,9 @@ export function listen(opts) {
 		let w = { name: name, conn: c, hello: hello, peer: peer };
 
 		try {
-			c.send({ t: 'welcome', name: name, ...(opts.welcome ?? {}) });
+			let extra = (type(opts.welcome) == 'function') ? opts.welcome(hello) : opts.welcome;
+
+			c.send({ t: 'welcome', name: name, ...(extra ?? {}) });
 		}
 		catch (e) {
 			c.close();

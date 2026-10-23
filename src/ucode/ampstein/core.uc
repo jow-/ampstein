@@ -44,6 +44,8 @@ import * as dsv4_tp from './dsv4_tp.uc';
 import * as dsv4_vision from './dsv4_vision.uc';
 import * as dspark_tp from './dspark_tp.uc';
 import * as dflash from './dflash.uc';
+import * as rpc from './rpc.uc';
+import * as rpc_stage from './rpc_stage.uc';
 import { tool_history } from './toolhist.uc';
 import { repeated as repeated_calls, clean_messages } from './callguard.uc';
 
@@ -98,6 +100,60 @@ function utf8_complete(s) {
 	}
 
 	return n;
+}
+
+/* --worker --connect HOST:PORT --model DIR [--gpus N] [--rpc-name NAME]: an RPC worker
+ * (docs/RPC.md). It dials in to a coordinator, receives which stages of the GLM pipeline it owns
+ * (the first ones) and loads only those from its own copy of the model, then answers forward
+ * commands until the coordinator says bye. After a drop it dials in again and keeps its weights
+ * when the assignment is the same. Plain TCP, no TLS: put a VPN / overlay under it. */
+export function worker(args) {
+	if (!args.connect) {
+		warn('ampstein: --worker needs --connect HOST:PORT\n');
+		exit(1);
+	}
+
+	let cfg = glm5.load_config(args.model);
+
+	if (!cfg.layer_types) {
+		warn('ampstein: --worker supports the GLM family only so far\n');
+		exit(1);
+	}
+
+	let gpus = args.gpus ?? torch.device_count();
+	let man = rpc.manifest(args.model);
+	let name = args.rpc_name ?? trim(readfile('/proc/sys/kernel/hostname') ?? 'worker');
+	let loaded = null, key = null;
+
+	warn(`ampstein: worker ${name}: ${gpus} GPU(s), ${length(man.files)} model files, dialing ${args.connect}\n`);
+
+	rpc.worker({
+		connect: args.connect, name: name, manifest: man,
+		gpus: slice(rpc.gpus(), 0, gpus),
+		serve: function (c, w) {
+			let k = sprintf('%J', [ w.stages, w.own, w.stage_end, w.max_seq, w.kv_bits, w.prefill_rows ]);
+
+			if (k != key) {
+				loaded = null;
+				key = null;
+				gc();
+				torch.empty_cache();
+
+				warn(`ampstein: worker: stages ${w.own[0]}..${w.own[1] - 1} of ${w.stages}\n`);
+
+				loaded = glm5_tp.load(args.model, {
+					devices: gpus, stages: w.stages, own: w.own, stage_end: w.stage_end, max_seq: w.max_seq,
+					kv_bits: w.kv_bits, prefill_rows: w.prefill_rows, mtp: false
+				});
+				key = k;
+			}
+
+			c.send({ t: 'ready', layers: loaded.own_layers });
+			warn(`ampstein: worker ready: layers ${loaded.own_layers[0]}..${loaded.own_layers[1] - 1}\n`);
+
+			return rpc_stage.worker(c, loaded).serve();
+		}
+	});
 }
 
 export function serve(args) {

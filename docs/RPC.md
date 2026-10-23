@@ -100,12 +100,25 @@ activations would halve this but are not bit-exact; at most an opt-in later.
    as the RPC will, and requires bit-identical logits; it skips (125) without the
    model or ~18 GiB free per GPU, so it has not run yet (all GPUs of both hosts
    are in use by servers): it needs a window with six free GPUs on jai.
-4. **Eager path over RPC.** An `rpc_model` proxy exposes the interface the
-   engine already calls (`new_cache`, `forward_chunk`, `prefill_pipeline`,
-   `graphs`, `mtp_*`, `states`, `cache_export` / `cache_import`, `new_slot`),
-   each call becoming one command (`PREFILL`, `STEP`, `TRIM`, `RESET`, `SLOT`,
-   `SPEC_RESTORE`). Test against the single-host model: logits bit-identical,
-   identical greedy continuation (the oracle rule from AGENTS.md).
+4. **Eager path over RPC** (implemented; the GPU runs are pending). The worker owns the
+   FIRST stages, so the embedding and the first layers run there and one hop carries the
+   streams to the coordinator, which owns the rest and the head (a single hop per
+   token; the sampled token needs no way back). `rpc_stage.uc`: the worker's command loop
+   (`new_cache`, `free`, `forward {cache, pos, n}` + ids -> `h` + one replica of the
+   float32 streams, `stats`, `bye`; a failing command answers `error` and the
+   connection stays up) and the coordinator's `client` (begin/end halves so that several
+   forwards can be in flight). `glm5_tp.forward_chunk` starts from the worker's streams
+   when stage 0 is remote (`opts.remote`), copying the replica to every rank of its first
+   local stage; `graphs` and `prefill_pipeline` refuse remote stages until phases 5 and 6.
+   `ampstein --worker --connect HOST:PORT --model DIR` dials in, receives its assignment
+   (`stages`, `own`, `stage_end`, `max_seq`) in the welcome, loads only those stages,
+   reports `ready` and serves; the coordinator side so far is `examples/rpc_glm5.uc`
+   (listen, plan with `plan_only` for the worker's GPU count, hand over `stage_end`,
+   load its stages with the client, prefill and decode greedily with `forward_chunk`).
+   `tests/rpc_stage.uc` runs the protocol against a CPU mock. The plan for 4 stages x 2
+   ranks is 13.5 / 14.6 / 14.6 / 13.5 GiB per GPU, stages starting at layers 0, 13, 24, 35
+   (45 layers). Still to do here: compare the token ids against the same run on one host
+   (`rpc_glm5.uc --single`), which needs the GPUs.
 5. **Split the step graph.** Today a decode step is one multi-GPU CUDA graph
    over all stages. Each host captures its own segment graph with persistent
    input / output buffers: receive, async H2D, replay, D2H, send. Position-

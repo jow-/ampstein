@@ -48,6 +48,9 @@ function usage() {
 	printf("                        routing of the requests (default 0 = the profile's set stays)\n");
 	printf("  --expert-skip N       decode: drop picks of host-resident experts at router rank >= N (0-9; approximate, trades\n");
 	printf("                        accuracy for speed; default 0 = off)\n");
+	printf("  --worker              run as an RPC worker for a GLM pipeline split over hosts (docs/RPC.md); needs --connect\n");
+	printf("  --connect HOST:PORT   the coordinator a --worker dials in to (plain TCP: use a VPN / overlay)\n");
+	printf("  --rpc-name NAME       the worker's name for the coordinator (default: the host name)\n");
 	printf("  --name NAME           served model name (default: basename of --model)\n");
 	printf("  --cache-ram GiB       page-locked host RAM for parked states (default 32, 0 off)\n");
 	printf("  --slots N|auto        resident device slots, DeepSeek-V4 (default auto)\n");
@@ -188,6 +191,9 @@ function parse_args() {
 		case '--expert-swaps': a.expert_swaps = +v; i++; break;
 		case '--expert-skip': a.expert_skip = +v; i++; break;
 		case '--stages': a.stages = int(v); i++; break;
+		case '--worker': a.worker = true; break;
+		case '--connect': a.connect = v; i++; break;
+		case '--rpc-name': a.rpc_name = v; i++; break;
 		case '--dspark-window': a.dspark_window = int(v); i++; break;
 		case '--layer-split': a.layer_split = true; break;
 		default:
@@ -223,4 +229,7 @@ global.torch = require('ampstein.torch');
 
 const core = import('ampstein.core');
 
-core.serve(args);
+if (args.worker)
+	core.worker(args);
+else
+	core.serve(args);
