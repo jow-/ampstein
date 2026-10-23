@@ -288,7 +288,16 @@ included: they are streamed from disk on whichever host runs the Engram layer).
   coordinator's three stages (it taps layers 37-39, which are there), 0.7-1.1 GiB free per jai GPU afterwards.
   Prefill 820-1080 tok/s (78k and 211k token prompts), decode 41-45 tok/s with 54-69% of the drafts accepted
   (26.5 without a drafter and the lean settings, 35 without a drafter at 256k); the 211k-token prompt finds a secret
-  word at its start. `remote_plan` still reserves 5 GiB of working set and picks 7: force the count.
+  word at its start. `remote_plan` picks the 10 layers by itself (below).
+- **Planner (`remote_plan`).** The worker takes the largest number of layers that fits its GPUs, but no more than an
+  even share of the pipeline (it is one more stage, in proportion to its GPUs: 40 layers over 3 stages + the worker
+  = 10). A worker GPU holds its slice of the layers' weights (`seg_cost`: also the pools of its source layers at
+  `--ctx`), the embedding only with `AMP_DSV41_EMBED_GPU`, and a working set of 1 GiB + 1 MiB per prefill row
+  (`--chunk`; the CUDA context, communicators, graphs, chunk buffers; 1.5 GiB measured at 512), with 0.4 GiB left
+  free. The leader's side is estimated too (weights, head and drafter spread over its GPUs, the part of a layer that
+  the stages' whole-layer split leaves over, pools, 0.5 GiB + 0.5 MiB per row) and the plan line says by how much
+  its GPUs are short or have to spare. Measured on the 2.50bpw pack, 256k, drafter: estimated 0.3 GiB to spare,
+  found 0.7-1.1 GiB free after the graphs. The constants are calibrated on that one run.
 - Test: `tests/dsv41_split.uc` (4 GPUs, one process, worker and coordinator over loopback) against the whole
   partial model.
 
@@ -306,12 +315,12 @@ j7$  ampstein --worker --connect 192.168.41.2:7740 --model /data/models/GLM-5.3-
 
 # DeepSeek-V4.1 2.50bpw (Derpyhue): layers 0-9 on j7, 10-39 on jai, 256k context, DSpark drafter
 jai$ ampstein --model /data/models/DSV4.1-Flash-1017-exl3-2.50bpw-H5-HQ5bpw-SH --tp --gpus 6 --stages 3 \
-         --rpc-listen 192.168.41.2:7757 --rpc-layers 10 --host 0.0.0.0 --port 8041 --ctx 262144 --chunk 512
+         --rpc-listen 192.168.41.2:7757 --host 0.0.0.0 --port 8041 --ctx 262144 --chunk 512
 j7$  ampstein --worker --connect 192.168.41.2:7757 --model /data/models/DSV4.1-Flash-1017-exl3-2.50bpw-H5-HQ5bpw-SH --rpc-name j7
 ```
 
-`--gpus` / `--stages` are the leader's own (the worker takes the GPUs it has); `--rpc-layers` is DeepSeek-V4.1 only
-(the layers on the worker: `remote_plan` would pick fewer, it keeps 5 GiB of working set per GPU free). The model
+`--gpus` / `--stages` are the leader's own (the worker takes the GPUs it has); `--rpc-layers N` (DeepSeek-V4.1 only)
+forces the number of layers on the worker, else `remote_plan` picks it (see the planner below). The model
 loads in ~7 (DeepSeek) to ~10 minutes (GLM), SIGTERM is ignored until it has; after that it saves the state of the
 conversations (GLM) and exits. Both hosts need the same model directory (names and sizes are checked at the
 handshake); the DeepSeek pack's `ngram_tables-*` are read from disk on the host that runs the Engram layer, so

@@ -6,7 +6,7 @@
 #   j7:   scripts/rpc/dsv41 worker      (start it with the leader: it dials in and retries until it is up)
 #
 # Overrides (environment): AMPSTEIN (the ampstein script), MODEL, LINK (the leader's address on the link),
-# RPC_PORT, PORT, CTX, CHUNK, RPC_LAYERS, EXTRA (more options for the leader).
+# RPC_PORT, PORT, CTX, CHUNK, RPC_LAYERS (force the worker's share), EXTRA (more options for the leader).
 # The settings are the tightest that fit: 262144 tokens of context, the DSpark drafter and all graph sizes leave
 # ~1 GiB per jai GPU. Stop with SIGTERM (kill PID); it is ignored while the model loads, wait for the load to end.
 
@@ -17,12 +17,12 @@ RPC_PORT=${RPC_PORT:-7757}
 PORT=${PORT:-8041}
 CTX=${CTX:-262144}
 CHUNK=${CHUNK:-512}
-RPC_LAYERS=${RPC_LAYERS:-10}
+RPC_LAYERS=${RPC_LAYERS:-}                     # empty: the planner decides (10 for this pack)
 
 case "$1" in
 leader)
 	exec $AMPSTEIN --model "$MODEL" --tp --gpus 6 --stages 3 \
-		--rpc-listen $LINK:$RPC_PORT --rpc-layers $RPC_LAYERS \
+		--rpc-listen $LINK:$RPC_PORT ${RPC_LAYERS:+--rpc-layers $RPC_LAYERS} \
 		--host 0.0.0.0 --port $PORT --ctx $CTX --chunk $CHUNK $EXTRA
 	;;
 worker)

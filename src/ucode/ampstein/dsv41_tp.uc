@@ -1959,21 +1959,46 @@ export function load(model_dir, opts) {
 	return model;
 }
 
-/* How many layers a worker host takes (docs/RPC.md): the first `nr`, the largest count that fits the worker's GPUs
- * (weights split over its ranks, the pools of its source layers, the embedding on its first GPU, and a working set for
- * graphs, communicators and the prefill chunk). A cut inside a pool group is fine up to the candidate source layer
- * (the group source's new pool rows and picks then cross the hop). o: {gpus: [total bytes of each worker GPU],
- * max_seq, layers (a forced count)}.
- * Returns {nr, per_gpu: bytes of the busiest worker GPU}. */
+/* How many layers a worker host takes (docs/RPC.md): the first `nr`, the largest count that fits the worker's GPUs. A cut
+ * inside a pool group is fine up to the candidate source layer (the group source's new pool rows and picks then cross
+ * the hop). What a worker GPU holds: its share of the layers' weights (every layer is sliced over the worker's ranks),
+ * the pools of its source layers at `max_seq`, the embedding if it is kept on the GPU (AMP_DSV41_EMBED_GPU), and a
+ * working set: the CUDA context, the communicators and graphs (WORK_BASE) and the buffers of a prefill chunk
+ * (WORK_ROW per row), calibrated on the 2.50bpw pack at a chunk of 512 rows (1.5 GiB over the weights and pools). A
+ * reserve is left free for the allocator. Never more than an even share of the layers when the leader's GPUs are known
+ * (o.local, o.stages): the worker counts as one more stage, in proportion to its GPUs.
+ *
+ * o: {gpus: [bytes of each worker GPU], max_seq, prefill_rows, layers (a forced count)}; and for the check of the
+ * other side, {local: [bytes of each GPU of this host], stages (of this host), spark (the drafter is on)}.
+ * Returns {nr, per_gpu, budget, coord_short}: bytes of the busiest worker GPU and what is available there; the bytes
+ * a GPU of this host is short of (negative: has to spare), an estimate (weights spread evenly plus the part of a layer
+ * for the stages' integer split, the head, the drafter, the pools of every source layer, a working set), or null:
+ * calibrated on one run (the 2.50bpw pack, 256k, a drafter), so only a hint. */
+const WORK_BASE = 1073741824;
+const WORK_ROW = 1048576;
+const RESERVE = 429496730;
+// (a leader GPU, which holds no embedding or Engram buffers of its own: measured on the same run, 0.5 GiB over its
+// share of weights, drafter and pools at a chunk of 512)
+const COORD_BASE = 536870912;
+const COORD_ROW = 524288;
+
 export function remote_plan(model_dir, o) {
 	let cfg = dsv41.load_config(model_dir);
 	let ws = weights.open(model_dir);
 	let Gw = length(o.gpus);
-	let bytes = map(dsv41.layer_bytes(ws, cfg), (b) => b / Gw);
-	let embed = ws.info('embed.weight').nbytes;
-	let work = 5 * 1073741824;
-	let budget = min(...o.gpus) * 0.93;
+	let all = dsv41.layer_bytes(ws, cfg);
+	let bytes = map(all, (b) => b / Gw);
+	let work = WORK_BASE + WORK_ROW * (o.prefill_rows || 1024);
+	let embed = getenv('AMP_DSV41_EMBED_GPU') ? ws.info('embed.weight').nbytes : 0;
+	let budget = min(...o.gpus) - RESERVE;
 	let best = 0, best_cost = 0;
+	let share = cfg.num_hidden_layers;
+
+	if (o.local && length(o.local) && o.stages) {
+		let ws_ = Gw / (length(o.local) / o.stages);          // the worker's width in stages of this host
+
+		share = int(cfg.num_hidden_layers * ws_ / (ws_ + o.stages) + 0.5);
+	}
 
 	for (let b = 1; b < cfg.num_hidden_layers; b++) {
 		let cut = cut_info(cfg, b);
@@ -1983,7 +2008,9 @@ export function remote_plan(model_dir, o) {
 
 		let cost = dsv41.seg_cost(cfg, bytes, 0, b, o.max_seq) + embed + work;
 
-		if (o.layers ? b == o.layers : cost <= budget) {
+		// (not further than an even share of the work: the worker is one more stage of the pipeline, a stage with
+		// more layers than the others sets the pace of the prefill and adds its time to every decode step)
+		if (o.layers ? b == o.layers : (cost <= budget && b <= share)) {
 			best = b;
 			best_cost = cost;
 		}
@@ -1993,5 +2020,35 @@ export function remote_plan(model_dir, o) {
 		die(o.layers ? `dsv41_tp: ${o.layers} layers cannot be a worker's share` :
 			'dsv41_tp: the worker\'s GPUs cannot hold even the first layers');
 
-	return {nr: best, per_gpu: best_cost, budget: budget};
+	let short = null;
+
+	if (o.local && length(o.local)) {
+		let rest = 0, head = 0, spark = 0;
+
+		for (let i = best; i < length(all); i++)
+			rest += all[i];
+
+		for (let key in ws.list())
+			if (index(key, 'head.') == 0 || key == 'norm.weight')
+				head += ws.info(key).nbytes;
+
+		if (o.spark)
+			for (let b in dsv41.spark_stage_bytes(ws, cfg))
+				spark += b;
+
+		let pools = 0;
+
+		for (let src in cfg.kv_sources)
+			if (src >= best || cfg.src[best] == src)
+				pools += dsv41.pool_bytes(cfg, src, o.max_seq);
+
+		// the stages hold whole layers: ceil(layers / stages) of them at most, a fraction of a layer over the mean
+		let n = length(o.local), S = o.stages || 1, Gs = n / S, left = length(all) - best;
+		let over = (int((left + S - 1) / S) * 1.0 - left / S) * (rest / left) / Gs;
+		let need = (rest + head + spark) / n + over + pools + COORD_BASE + COORD_ROW * (o.prefill_rows || 1024);
+
+		short = need - (min(...o.local) - RESERVE);
+	}
+
+	return {nr: best, per_gpu: best_cost, budget: budget, coord_short: short};
 }

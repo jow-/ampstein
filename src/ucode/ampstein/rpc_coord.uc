@@ -48,10 +48,17 @@ export function attach(o) {
 			let n = length(hello.gpus ?? []);
 
 			if (o.family == 'dsv41') {
-				let p = dsv41_tp.remote_plan(o.model, { gpus: map(hello.gpus, (g) => g.total), max_seq: o.max_seq, layers: o.layers });
+				let p = dsv41_tp.remote_plan(o.model, { gpus: map(hello.gpus, (g) => g.total), max_seq: o.max_seq, layers: o.layers,
+					prefill_rows: o.prefill_rows, local: map(rpc.gpus(), (g) => g.total), stages: o.stages, spark: o.spark });
+				let GiB = 1073741824.0;
 
 				warn(sprintf('rpc: %s takes layers 0..%d of DeepSeek-V4.1 on its %d GPU(s), %.1f GiB planned per GPU of %.1f GiB\n',
-					hello.name, p.nr - 1, n, p.per_gpu / 1073741824, min(...map(hello.gpus, (g) => g.total)) / 1073741824));
+					hello.name, p.nr - 1, n, p.per_gpu / GiB, min(...map(hello.gpus, (g) => g.total)) / GiB));
+
+				// (an estimate, good to a few hundred MiB)
+				if (p.coord_short != null)
+					warn(sprintf('rpc: this host\'s GPUs: about %.1f GiB %s each%s\n', abs(p.coord_short) / GiB,
+						p.coord_short > 0 ? 'short' : 'to spare', p.coord_short > 268435456 ? ' -- expect an out-of-memory; a smaller --ctx, --chunk or no drafter (--mtp 0) helps' : ''));
 
 				assign = { family: 'dsv41', nr: p.nr, own: [ 0, p.nr ], max_seq: o.max_seq, prefill_rows: o.prefill_rows };
 

@@ -370,7 +370,8 @@ export function serve(args) {
 
 		let ex = rpc_coord.attach({ listen: args.rpc_listen, workers: args.rpc_workers ?? 1, model: args.model,
 			gpus: args.gpus, stages: args.stages ?? 1, max_seq: args.ctx, kv_bits: kv_bits, prefill_rows: args.chunk,
-			rejoin_wait: args.rpc_rejoin_wait, family: D41 ? 'dsv41' : null, layers: args.rpc_layers });
+			rejoin_wait: args.rpc_rejoin_wait, family: D41 ? 'dsv41' : null, layers: args.rpc_layers,
+			spark: D41_SPARK && args.stages == cfg.num_mtp_layers });
 
 		rpc_load = ex.load;
 	}
