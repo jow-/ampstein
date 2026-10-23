@@ -30,7 +30,7 @@
 // pinned-staged async transfer (torch.h2d) — the load-time path; the
 // per-tensor sync copies only run when upload() was not called.
 
-import {readfile, stat} from 'fs';
+import {readfile, stat, lsdir} from 'fs';
 
 const INDEX_NAME = 'model.safetensors.index.json';
 const SINGLE_NAME = 'model.safetensors';
@@ -55,6 +55,18 @@ export function open(model_dir, only_file) {
 
 		if (!map)
 			die(`weights: ${INDEX_NAME} has no weight_map`);
+
+		// Files the index does not list: the Engram tables of the 2.50bpw DeepSeek-V4.1 packs
+		// (ngram_tables-0000N-of-0000M.safetensors). The table rows are routed to them; the file also repeats small
+		// tensors (the FP8 engram.wkv, q / k weights) that the index puts in a model shard, in another format: not those.
+		for (let f in sort(lsdir(model_dir) ?? [])) {
+			if (!match(f, /^ngram_tables-.*\.safetensors$/))
+				continue;
+
+			for (let key in torch.st(model_dir + '/' + f).list())
+				if (!map[key] && index(key, '.engram.embed.') > 0)
+					map[key] = f;
+		}
 	} else {
 		single = torch.st(model_dir + '/' + SINGLE_NAME);
 		keylist = single.list();

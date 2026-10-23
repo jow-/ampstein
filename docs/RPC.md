@@ -261,9 +261,10 @@ included: they are streamed from disk on whichever host runs the Engram layer).
   (2, 8, 14, 20 for V4.1-Flash). `load` refuses any other. 8 layers is what fits two 3090s with the 2.50bpw
   pack; 14 does not.
 - **The hop.** One `forward {cache, pos, n, graph?}` + the token ids; the reply is `h {packed}` + float32
-  `[n, 4 * hidden + 4]`: the four residual streams and the four mHC pre-weights of every row (64 KiB + 16 B a
-  decode token). The worker computes the Engram history (`cids`) and embedding itself; both sides track the
-  token history by position, as the local model does.
+  `[n, ranks * (4 * hidden + 4)]`: the four residual streams and the four mHC pre-weights of every row, one
+  replica per worker rank (the ranks' copies differ in the last bits, so each rank of the coordinator's first
+  stage continues from its own: 128 KiB a decode token). The worker computes the Engram history (`cids`) and
+  embedding itself; both sides track the token history by position, as the local model does.
 - **Decode graphs.** The worker captures its own set (`graphs`), the coordinator its local stages; a step is
   `forward_begin` (the worker starts at once), the coordinator's Engram rows, `forward_end`, then the local
   graphs from those streams.
@@ -273,6 +274,15 @@ included: they are streamed from disk on whichever host runs the Engram layer).
   as bytes through the coordinator, ~1 MB), `aux_reset` and `remote_recover` (rejoin) go to the worker too.
   No host-RAM store or hot reload yet (the DSV4.1 engine has none either), no DSpark drafter in remote mode
   (it needs the taps of the worker's layers and the drafter stages on the pipeline stages).
+- **The 2.50bpw pack (Derpyhue, EXL3 attention).** The loader takes any of FP8 / EXL3 / dense for every
+  linear of the trunk (`dsv41.lin8` dispatches on the tensors present; the shards use `models.cols` / `rows`,
+  `wo_a` is one matrix per group, the compressor projections go through `cmm32` / `cmm16`) and routes the
+  Engram tables of `ngram_tables-*.safetensors`, which the index omits (`weights.open`). The routed experts are
+  all 2.5 bpw: the coop kernels' half-integer instances serve them (`glm5.moe_begin` builds the uniform tables).
+  **Measured (jai 6 x 24 GB + j7 2 x 24 GB):** the pack is 158 GB without the tables; 8 layers on the 3090s
+  (22 GB planned) leave jai 127 GB for 6 GPUs of 23.5 GiB, and the load works but nothing is left for the
+  prefill and the graphs (0.1 GiB free on two GPUs). The 3090s would take two more layers, but a cut inside
+  a pool group needs the layer's compressed pool rows and top-k picks to cross the hop (a few KB a token).
 - Test: `tests/dsv41_split.uc` (4 GPUs, one process, worker and coordinator over loopback) against the whole
   partial model.
 

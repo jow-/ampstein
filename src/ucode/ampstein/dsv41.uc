@@ -210,8 +210,16 @@ export function lin8_from(w, s, dev) {
 	};
 }
 
-/* Block-scaled FP8 linear (checkpoint key + '.weight' / '.scale'). x: (M, K) fp16 -> (M, N) fp16. */
+/* The linear under a checkpoint key, whatever the pack stores there: block-scaled FP8 (key + '.weight' / '.scale': the
+ * SAGE packs), EXL3 (key + '.trellis': the 2.50bpw packs) or a plain fp16 / bf16 matrix. The three behave alike:
+ * forward(x) with x (M, K) fp16 -> (M, N) fp16, in_features, out_features, and the tensor-parallel shards below. */
 export function lin8(ws, key, dev) {
+	if (ws.has(key + '.trellis'))
+		return models.LinearEXL3(ws, key, dev);
+
+	if (!ws.has(key + '.scale'))
+		return models.LinearFP16(ws, key, dev);
+
 	return lin8_from(ws.gpu(key + '.weight', dev), ws.gpu(key + '.scale', dev), dev);
 }
 
@@ -252,31 +260,95 @@ export function lin8g_from(w, s, G, dev) {
 	};
 }
 
+/* Grouped EXL3 linear (wo_a of the 2.50bpw packs: one matrix per group, key + '.slice.g'). */
+function lin3g_from(slices, dev) {
+	return {
+		slices: slices, dev: dev, groups: length(slices), rows: slices[0].out_features, in_features: slices[0].in_features,
+
+		forward: function (x) {
+			let K = this.in_features, parts = [];
+
+			for (let g = 0; g < this.groups; g++)
+				push(parts, this.slices[g].forward(x.narrow(1, g * K, K).contiguous()));
+
+			return (length(parts) == 1) ? parts[0] : torch.cat(parts, 1);
+		}
+	};
+}
+
 export function lin8g(ws, key, G, dev) {
+	if (ws.has(key + '.slice.0.trellis')) {
+		let sl = [];
+
+		for (let g = 0; g < G; g++)
+			push(sl, models.LinearEXL3(ws, `${key}.slice.${g}`, dev));
+
+		return lin3g_from(sl, dev);
+	}
+
 	return lin8g_from(ws.gpu(key + '.weight', dev), ws.gpu(key + '.scale', dev), G, dev);
 }
 
 /* tensor-parallel shards of FP8 linears (copies on dev) */
 export function lin8_to(l, dev) {
+	if (l.trellis)
+		return models.cols(l, [ [ 0, l.out_features ] ], dev);
+
+	if (l.weight)
+		return models.fp16_cols(l, 0, l.out_features, dev);
+
 	return lin8_from(l.w.cuda(dev), l.s.cuda(dev), dev);
 }
 
 /* output rows [r0, r0 + n) */
 export function lin8_rows(l, r0, n, dev) {
+	if (l.trellis)
+		return models.cols(l, [ [ r0, n ] ], dev);
+
+	if (l.weight)
+		return models.fp16_cols(l, r0, n, dev);
+
 	return lin8_from(l.w.narrow(0, r0, n).contiguous().cuda(dev), l.s.narrow(0, int(r0 / 32), int(n / 32)).contiguous().cuda(dev), dev);
 }
 
 /* input columns [c0, c0 + n): the partial sum of a row-parallel layer */
 export function lin8_cols(l, c0, n, dev) {
+	if (l.trellis)
+		return models.rows(l, c0, n, dev);
+
+	if (l.weight) {
+		let w = l.weight.narrow(1, c0, n).contiguous().cuda(dev);
+
+		return {weight: w, bias: null, in_features: n, out_features: w.shape()[0],
+			forward: function (x) {return torch.matmul(x, this.weight.t());}};
+	}
+
 	return lin8_from(l.w.narrow(1, c0, n).contiguous().cuda(dev), l.s.narrow(1, int(c0 / 32), int(n / 32)).contiguous().cuda(dev), dev);
 }
 
 /* groups [g0, g0 + n) of a grouped linear */
 export function lin8g_groups(l, g0, n, dev) {
+	if (l.slices)
+		return lin3g_from(map(slice(l.slices, g0, g0 + n), (s) => models.cols(s, [ [ 0, s.out_features ] ], dev)), dev);
+
 	let R = l.rows;
 
 	return lin8g_from(l.w.narrow(0, g0 * R, n * R).contiguous().cuda(dev),
 		l.s.narrow(0, int(g0 * R / 32), int(n * R / 32)).contiguous().cuda(dev), n, dev);
+}
+
+/* A compressor projection of xn (M, K) fp16 (x32: the same in fp32): the dense matrix (K, N) fp32 or an EXL3 linear */
+function cmm32(xn, x32, W) {
+	return (type(W) == 'object') ? W.forward(xn).to('float32') : torch.matmul(x32, W);
+}
+
+function cmm16(xn, W) {
+	return (type(W) == 'object') ? W.forward(xn) : torch.matmul(xn, W);
+}
+
+/* a copy of such a projection (matrix or linear) on dev */
+export function comp_to(W, dev) {
+	return (type(W) == 'object') ? lin8_to(W, dev) : W.cuda(dev);
 }
 
 /* bf16 / fp32 matrix used in fp32: x (M, K) -> (M, N) fp32 */
@@ -543,12 +615,16 @@ export function build_attn(ws, cfg, i, dev) {
 			wkv: null, wgate: null, wkv16: null
 		};
 
+		// (a dense matrix as before, or an EXL3 linear in the 2.50bpw packs: cmm32 / cmm16 below)
 		if (ratio > 1) {
-			A.comp.wkv = mat32(ws, key + '.compressor.wkv', dev);
-			A.comp.wgate = mat32(ws, key + '.compressor.wgate', dev);
+			A.comp.wkv = ws.has(key + '.compressor.wkv.trellis') ? models.LinearEXL3(ws, key + '.compressor.wkv', dev) :
+				mat32(ws, key + '.compressor.wkv', dev);
+			A.comp.wgate = ws.has(key + '.compressor.wgate.trellis') ? models.LinearEXL3(ws, key + '.compressor.wgate', dev) :
+				mat32(ws, key + '.compressor.wgate', dev);
 		}
 		else {
-			A.comp.wkv16 = ws.gpu16(key + '.compressor.wkv.weight', dev).t().contiguous();
+			A.comp.wkv16 = ws.has(key + '.compressor.wkv.trellis') ? models.LinearEXL3(ws, key + '.compressor.wkv', dev) :
+				ws.gpu16(key + '.compressor.wkv.weight', dev).t().contiguous();
 		}
 	}
 
@@ -714,12 +790,12 @@ function compress_chunk(cfg, A, cache, cl, xn, pos0) {
 	let base;                                         // absolute position of the first entry's first token
 
 	if (ratio == 1) {
-		lat = torch.rms_norm(torch.matmul(xn, C.wkv16), C.norm, eps);
+		lat = torch.rms_norm(cmm16(xn, C.wkv16), C.norm, eps);
 		base = pos0;
 	}
 	else {
 		let x32 = xn.to('float32');
-		let kv = torch.matmul(x32, C.wkv), g = torch.matmul(x32, C.wgate);
+		let kv = cmm32(xn, x32, C.wkv), g = cmm32(xn, x32, C.wgate);
 
 		if (pos0 % 2 == 1) {                          // the first token of the pair came with the last chunk
 			kv = torch.cat([cl.pk, kv], 0);
@@ -1103,13 +1179,13 @@ function comp_decode(cfg, A, cl, xn, st) {
 	let lat, posf, slot;
 
 	if (ratio == 1) {
-		lat = torch.rms_norm(torch.matmul(xn, C.wkv16), C.norm, eps);
+		lat = torch.rms_norm(cmm16(xn, C.wkv16), C.norm, eps);
 		posf = meta_i(st, 0);
 		slot = meta_i(st, 0);
 	}
 	else {
 		let x32 = xn.to('float32');
-		let kv = torch.matmul(x32, C.wkv), g = torch.matmul(x32, C.wgate);
+		let kv = cmm32(xn, x32, C.wkv), g = cmm32(xn, x32, C.wgate);
 		let m = torch.cat([cl.pg, g], 0).max(0, true);
 		let e0 = cl.pg.sub(m).exp(), e1 = g.sub(m).exp();
 		let pooled = cl.pk.mul(e0).add(kv.mul(e1)).div(e0.add(e1));
@@ -1360,13 +1436,13 @@ function comp_decode_rows(cfg, A, cl, xn, st) {
 	let lat, posf, slot;
 
 	if (ratio == 1) {
-		lat = torch.rms_norm(torch.matmul(xn, C.wkv16), C.norm, eps);
+		lat = torch.rms_norm(cmm16(xn, C.wkv16), C.norm, eps);
 		posf = col_i(st, 0);
 		slot = col_i(st, 0).reshape([-1]).contiguous();       // a strided view of the meta column otherwise
 	}
 	else {
 		let x32 = xn.to('float32');
-		let kv = torch.matmul(x32, C.wkv), g = torch.matmul(x32, C.wgate);
+		let kv = cmm32(xn, x32, C.wkv), g = cmm32(xn, x32, C.wgate);
 
 		// row s completes the pair (row s - 1, row s) when its position is odd; the partner of row 0 is the
 		// half-built pair of the cache
@@ -1596,7 +1672,9 @@ export function build_moe(ws, cfg, i, dev) {
 
 	// glm5.moe_forward then runs the fused decode kernel (<= 8 rows) and the token-sorted fused kernel
 	// (prefill chunks) with the per-expert bit widths
-	M.coop = (getenv('AMP_DSV41_NO_COOP') ? null : build_coop(cfg, M)) || false;
+	// (mixed integer widths: the per-expert tables; one half-integer width, the 2.50bpw packs: null, glm5.moe_begin
+	// builds the uniform-width tables on first use)
+	M.coop = getenv('AMP_DSV41_NO_COOP') ? false : (build_coop(cfg, M) || null);
 
 	return M;
 }

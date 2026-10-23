@@ -30,8 +30,8 @@
 //   state_zero {cache, layer}       -> ok
 // (the engine's snapshots of recurrent state, restores and resets reach the worker's layers this way)
 //   rollback {cache, L}      -> ok            (DeepSeek-V4.1: take back the rows of the last multi-row step beyond L)
-//   aux_get {cache}          -> aux {layout} + bytes   (DeepSeek-V4.1: the state outside the pools, for a snapshot)
-//   aux_put {cache, layout} + bytes -> ok             (... and back)
+//   aux_get {cache, len}     -> aux {layout} + bytes   (DeepSeek-V4.1: the state outside the pools, for a snapshot)
+//   aux_put {cache, layout, len} + bytes -> ok             (... and back)
 //   stats {}                 -> ok {...}      (what the worker holds, for logs)
 //   bye {}                   (the worker's serve loop returns 'bye')
 //
@@ -180,14 +180,25 @@ export function worker(c, model) {
 		},
 
 		aux_get: function (f) {
-			let a = model.aux_pack(cache_of(f.meta));
+			let cache = cache_of(f.meta);
+
+			if (f.meta.len != null)
+				cache.length = f.meta.len;
+
+			let a = model.aux_pack(cache);
 
 			c.send({ t: 'aux', layout: a.layout }, a.bytes);
 		},
 
 		aux_put: function (f) {
+			// (the snapshot is put back at the length the coordinator's cache has been rewound to)
+			let cache = cache_of(f.meta);
+
+			if (f.meta.len != null)
+				cache.length = f.meta.len;
+
 			// (a snapshot of an empty cache is no bytes at all)
-			model.aux_unpack(cache_of(f.meta), f.meta.layout, f.tensor ?? torch.zeros([ 0 ], 'uint8'));
+			model.aux_unpack(cache, f.meta.layout, f.tensor ?? torch.zeros([ 0 ], 'uint8'));
 			ok();
 		},
 
@@ -452,16 +463,16 @@ export function client(c) {
 	};
 
 	/* the worker's snapshot state: {layout, bytes} with bytes a private copy */
-	K.aux_get = function (cache) {
-		c.send({ t: 'aux_get', cache: cache });
+	K.aux_get = function (cache, len) {
+		c.send({ t: 'aux_get', cache: cache, len: len });
 
 		let f = answer('aux');
 
 		return { layout: f.meta.layout, bytes: f.tensor ? torch.cat([ f.tensor ], 0) : torch.zeros([ 0 ], 'uint8') };
 	};
 
-	K.aux_put = function (cache, a) {
-		c.send({ t: 'aux_put', cache: cache, layout: a.layout }, a.bytes);
+	K.aux_put = function (cache, a, len) {
+		c.send({ t: 'aux_put', cache: cache, layout: a.layout, len: len }, a.bytes);
 		answer('ok');
 	};
 

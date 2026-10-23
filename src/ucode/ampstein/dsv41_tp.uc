@@ -50,8 +50,8 @@ function shard_attn(cfg, A, g, Gs, dev) {
 	if (A.comp) {
 		let C = A.comp;
 
-		R.comp = {norm: C.norm.cuda(dev), wkv: C.wkv ? C.wkv.cuda(dev) : null, wgate: C.wgate ? C.wgate.cuda(dev) : null,
-			wkv16: C.wkv16 ? C.wkv16.cuda(dev) : null};
+		R.comp = {norm: C.norm.cuda(dev), wkv: C.wkv ? dsv41.comp_to(C.wkv, dev) : null, wgate: C.wgate ? dsv41.comp_to(C.wgate, dev) : null,
+			wkv16: C.wkv16 ? dsv41.comp_to(C.wkv16, dev) : null};
 	}
 
 	if (A.indexer) {
@@ -127,12 +127,12 @@ function dsv41_tp_state(model, allreduce) {
 			push(out, row);
 		}
 
-		return nr ? {lanes: out, remote: model.remote_client.aux_get(cache.rcache)} : out;
+		return nr ? {lanes: out, remote: model.remote_client.aux_get(cache.rcache, cache.length)} : out;
 	};
 
 	model.aux_set = function (cache, snap) {
 		if (nr) {
-			model.remote_client.aux_put(cache.rcache, snap.remote);
+			model.remote_client.aux_put(cache.rcache, snap.remote, cache.length);
 			snap = snap.lanes;
 		}
 
@@ -507,7 +507,8 @@ function dsv41_tp_graphs(model, allreduce) {
 
 				// (stands in for the previous stage: its streams, on every rank of the first local stage)
 				let s0 = stages[first_s];
-				let pks = map(s0.devs, (d) => r.packed.cuda(d));
+				let W = 4 * H + 4, R = int(r.packed.shape()[1] / W);
+				let pks = map(s0.devs, (d, g) => r.packed.narrow(1, (g % R) * W, W).contiguous().cuda(d));
 
 				prev = {h_out: map(pks, (pk) => pk.narrow(1, 0, 4 * H).contiguous().view([S, 4, H])),
 					pre_out: map(pks, (pk) => pk.narrow(1, 4 * H, 4).contiguous())};
@@ -560,7 +561,7 @@ function dsv41_tp_graphs(model, allreduce) {
 					am = it.am;
 
 					if (no_head)
-						hidden = {h: it.h_out[0], pre: it.pre_out[0]};
+						hidden = {h: it.h_out, pre: it.pre_out};
 				}
 
 				prev = it;
@@ -1023,8 +1024,10 @@ function dsv41_tp_methods(model) {
 			if (r.n != c.T || r.pos != c.pos0)
 				die(`dsv41_tp: the worker answered ${r.n} rows at ${r.pos}, expected ${c.T} at ${c.pos0}`);
 
+			let W = 4 * H + 4, R = int(r.packed.shape()[1] / W);
+
 			for (let g = 0; g < Gs; g++) {
-				let pk = r.packed.cuda(S.devs[g]);
+				let pk = r.packed.narrow(1, (g % R) * W, W).contiguous().cuda(S.devs[g]);
 
 				push(c.h, pk.narrow(1, 0, 4 * H).contiguous().view([c.T, 4, H]));
 				push(c.pre, pk.narrow(1, 4 * H, 4).contiguous());
@@ -1355,7 +1358,7 @@ function dsv41_tp_methods(model) {
 
 	/* The worker's side. rows `ids` at `pos` through this (partial) model, the way the coordinator's chunk_begin and
 	 * run_rows continue from them: eagerly, or by replaying the captured graph set G. The reply is one host tensor,
-	 * float32 [n, 4 * hidden + 4]: the four residual streams and the four mHC pre-weights of every row. */
+	 * float32 [n, ranks * (4 * hidden + 4)]: the four residual streams and the four mHC pre-weights of every row, per rank. */
 	model.rpc_forward = function (cache, ids, pos, G) {
 		let n = length(ids), h = null, pre = null;
 
@@ -1373,11 +1376,18 @@ function dsv41_tp_methods(model) {
 			for (let s = 0; s < NS; s++)
 				model.chunk_stage(c, cache, s);
 
-			h = c.h[0];
-			pre = c.pre[0];
+			h = c.h;
+			pre = c.pre;
 		}
 
-		return torch.cat([ h.reshape([n, 4 * H]), pre ], 1).cpu().contiguous();
+		// (the ranks' replicas of the streams differ in the last bits: each rank's copy is sent, so that the ranks of the
+		// coordinator's first stage continue from their own, as in a model on one host)
+		let parts = [];
+
+		for (let g = 0; g < length(h); g++)
+			push(parts, torch.cat([ h[g].reshape([n, 4 * H]), pre[g] ], 1).cpu());
+
+		return torch.cat(parts, 1).contiguous();
 	};
 
 	/* The state outside the pools that a snapshot of the cache holds (aux_get), as bytes for the connection:
@@ -1631,7 +1641,9 @@ export function load(model_dir, opts) {
 				async_moe: true, fused_prep: true, shared: shard_mlp8(shared, plan.shared[g], dev)
 			};
 
-			M.coop = (getenv('AMP_DSV41_NO_COOP') ? null : dsv41.build_coop(cfg, M)) || false;
+			// (mixed integer widths: the per-expert tables; one half-integer width, the 2.50bpw packs: null, glm5.moe_begin
+			// builds the uniform-width tables on first use)
+			M.coop = getenv('AMP_DSV41_NO_COOP') ? false : (dsv41.build_coop(cfg, M) || null);
 
 			push(row, {
 				dev: dev, idx: i,
