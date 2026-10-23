@@ -16,13 +16,16 @@
 // The wire part uses plain strings; the native send / receive bindings of
 // phase 1 will not be slower than this.
 //
+// --native moves the bytes with torch.fd_send_all / fd_recv_all between pinned
+// tensors (phase 1 bindings) instead of ucode strings; give it to both sides.
+//
 // No TLS, no authentication: bind to the link's address (--bind), not 0.0.0.0.
 
 import * as socket from 'socket';
 
 let mode = null, bind = '127.0.0.1', port = 7700, host = null;
 let sizes = [ 64, 40000, 100000, 2000000, 20000000 ];
-let iters = 2000, gpu = null;
+let iters = 2000, gpu = null, native = false;
 let argv = ARGV, st = index(argv, '--');
 
 if (st >= 0)
@@ -50,12 +53,13 @@ for (let i = 0; i < length(argv); i++) {
 	else if (a == '--sizes') sizes = map(split(argv[++i], ','), (x) => int(x));
 	else if (a == '--iters') iters = int(argv[++i]);
 	else if (a == '--gpu') gpu = int(argv[++i]);
+	else if (a == '--native') native = true;
 	else
 		die(`unknown option ${a}\n`);
 }
 
 if (!mode)
-	die('usage: --serve PORT [--bind ADDR] | --connect HOST:PORT [--sizes a,b] [--iters N] [--gpu D]\n');
+	die('usage: --serve PORT [--bind ADDR] | --connect HOST:PORT [--sizes a,b] [--iters N] [--gpu D] [--native]\n');
 
 function now() {
 	let t = clock(true);
@@ -98,6 +102,40 @@ function nodelay(s) {
 	s.setopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1);
 }
 
+let torch = null;
+
+if (gpu != null || native) {
+	torch = require('ampstein.torch');
+	torch.synchronize();
+}
+
+// native framing: an int64 length, then that many bytes; echoed whole
+function native_echo(fd) {
+	let hdr = torch.zeros([1], 'int64'), buf = null, cap = 0;
+
+	for (;;) {
+		try {
+			torch.fd_recv_all(fd, hdr);
+		}
+		catch (e) {
+			return;
+		}
+
+		let n = hdr.item();
+
+		if (n > cap) {
+			buf = torch.pinned_empty([n], 'uint8');
+			cap = n;
+		}
+
+		let v = buf.narrow(0, 0, n);
+
+		torch.fd_recv_all(fd, v);
+		torch.fd_send_all(fd, hdr);
+		torch.fd_send_all(fd, v);
+	}
+}
+
 if (mode == 'serve') {
 	let l = socket.listen(bind, port, null, 16);
 
@@ -113,6 +151,13 @@ if (mode == 'serve') {
 			continue;
 
 		nodelay(c);
+
+		if (native) {
+			native_echo(c.fileno());
+			c.close();
+			warn('rpc_pingpong: client done\n');
+			continue;
+		}
 
 		// each message: 8-byte decimal length, then the payload; echoed whole
 		for (;;) {
@@ -133,13 +178,6 @@ if (mode == 'serve') {
 	}
 }
 
-let torch = null;
-
-if (gpu != null) {
-	torch = require('ampstein.torch');
-	torch.synchronize();
-}
-
 let s = socket.connect(host, port);
 
 if (!s)
@@ -156,6 +194,35 @@ function pct(v, p) {
 printf('%-10s %-4s %9s %9s %9s %9s %10s\n', 'bytes', '', 'p50 us', 'p99 us', 'max us', 'mean us', 'MB/s');
 
 for (let size in sizes) {
+	if (native) {
+		let hdr = torch.from_array([size], 'int64'), back = torch.zeros([1], 'int64');
+		let tx = torch.pinned_empty([size], 'uint8'), rx = torch.pinned_empty([size], 'uint8');
+		let n = (size >= 2000000) ? (iters > 100 ? 100 : iters) : iters;
+		let rt = [];
+
+		for (let i = 0; i < n + 10; i++) {
+			let t0 = now();
+
+			torch.fd_send_all(s.fileno(), hdr);
+			torch.fd_send_all(s.fileno(), tx);
+			torch.fd_recv_all(s.fileno(), back);
+			torch.fd_recv_all(s.fileno(), rx);
+
+			if (i >= 10)
+				push(rt, now() - t0);
+		}
+
+		let sum = 0.0;
+
+		for (let v in rt)
+			sum += v;
+
+		printf('%-10d %-4s %9.0f %9.0f %9.0f %9.0f %10.0f\n', size, 'nat', pct(rt, 0.5), pct(rt, 0.99),
+			rt[length(rt) - 1], sum / length(rt), 2.0 * size / (sum / length(rt)));
+
+		continue;
+	}
+
 	let payload = '0123456789abcdef';
 
 	while (length(payload) < size)

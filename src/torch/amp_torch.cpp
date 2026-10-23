@@ -31,6 +31,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <climits>
 #include <cstring>
 #include <cstdio>
 #include <memory>
@@ -38,6 +39,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <poll.h>
+#include <errno.h>
+#include <time.h>
 #include <vector>
 #include <map>
 #include <sys/mman.h>
@@ -6272,6 +6277,230 @@ torch_copy_h2d_async(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * Raw bytes of a CPU tensor over a socket (docs/RPC.md, phase 1): the
+ * activations of a pipeline hop go from a pinned host buffer to the wire
+ * and back without passing through a ucode string.
+ *
+ *   fd_write(fd, t, off, n): int   one non-blocking send of n bytes at byte
+ *                                   offset off; returns the bytes written,
+ *                                   0 when the socket is full (EAGAIN)
+ *   fd_read(fd, t, off, n): int    one non-blocking receive into t; returns
+ *                                   the bytes read, 0 when nothing is there
+ *                                   (EAGAIN), -1 on an orderly shutdown
+ *   fd_send_all(fd, t, timeout_ms?): null   the whole tensor, polling while
+ *                                   the socket is full
+ *   fd_recv_all(fd, t, timeout_ms?): null   fills the whole tensor; raises
+ *                                   when the peer closes first
+ *
+ * fd is the integer of socket.fileno(); t a contiguous CPU tensor (a view
+ * from narrow() sends a slice). timeout_ms (default: none) bounds the whole
+ * call; a timeout, a reset connection or a bad fd raise. Nothing is
+ * retained: the bytes are read from / written to t's storage in place, so t
+ * must stay alive and unchanged until the call returns.
+ */
+static bool
+fd_buf_args(uc_vm_t *vm, const char *who, uc_value_t *fdv, uc_value_t *tv,
+            int *fd, char **base, size_t *size)
+{
+	at::Tensor *t;
+
+	if (ucv_type(fdv) != UC_INTEGER || ucv_int64_get(fdv) < 0 ||
+	    ucv_int64_get(fdv) > INT_MAX) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"%s: expected a file descriptor (integer >= 0)", who);
+		return false;
+	}
+
+	if (!(t = tensor_arg(vm, tv)))
+		return false;
+
+	if (t->device().type() != at::kCPU || !t->is_contiguous()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"%s: a contiguous CPU tensor is expected", who);
+		return false;
+	}
+
+	*fd = (int)ucv_int64_get(fdv);
+	*base = (char *)t->data_ptr();
+	*size = (size_t)t->numel() * t->element_size();
+
+	return true;
+}
+
+static bool
+fd_range_args(uc_vm_t *vm, const char *who, uc_value_t *offv, uc_value_t *nv,
+              size_t size, size_t *off, size_t *n)
+{
+	if (ucv_type(offv) != UC_INTEGER || ucv_type(nv) != UC_INTEGER ||
+	    ucv_int64_get(offv) < 0 || ucv_int64_get(nv) < 0 ||
+	    (uint64_t)ucv_int64_get(offv) > size ||
+	    (uint64_t)ucv_int64_get(nv) > size - (uint64_t)ucv_int64_get(offv)) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+			"%s: offset / length outside the tensor (%zu bytes)", who, size);
+		return false;
+	}
+
+	*off = (size_t)ucv_int64_get(offv);
+	*n = (size_t)ucv_int64_get(nv);
+
+	return true;
+}
+
+/* One send / recv attempt: bytes moved, 0 for EAGAIN, -1 for an orderly
+ * EOF (recv only); raises (returns -2) on every other error. */
+static ssize_t
+fd_once(uc_vm_t *vm, const char *who, int fd, char *p, size_t n, bool wr)
+{
+	for (;;) {
+		ssize_t r = wr ? send(fd, p, n, MSG_NOSIGNAL | MSG_DONTWAIT)
+		               : recv(fd, p, n, MSG_DONTWAIT);
+
+		if (r > 0 || (r == 0 && n == 0))
+			return r;
+
+		if (r == 0)
+			return -1;
+
+		if (errno == EINTR)
+			continue;
+
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return 0;
+
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, "%s: %s", who, strerror(errno));
+
+		return -2;
+	}
+}
+
+static uc_value_t *
+fd_step(uc_vm_t *vm, size_t nargs, const char *who, bool wr)
+{
+	int fd;
+	char *base;
+	size_t size, off, n;
+
+	if (nargs != 4) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "%s: expected (fd, tensor, offset, length)", who);
+		return NULL;
+	}
+
+	if (!fd_buf_args(vm, who, uc_fn_arg(0), uc_fn_arg(1), &fd, &base, &size) ||
+	    !fd_range_args(vm, who, uc_fn_arg(2), uc_fn_arg(3), size, &off, &n))
+		return NULL;
+
+	ssize_t r = fd_once(vm, who, fd, base + off, n, wr);
+
+	if (r == -2)
+		return NULL;
+
+	return ucv_int64_new(r);
+}
+
+static uc_value_t *
+torch_fd_write(uc_vm_t *vm, size_t nargs)
+{
+	return fd_step(vm, nargs, "fd_write", true);
+}
+
+static uc_value_t *
+torch_fd_read(uc_vm_t *vm, size_t nargs)
+{
+	return fd_step(vm, nargs, "fd_read", false);
+}
+
+static int64_t
+mono_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static uc_value_t *
+fd_all(uc_vm_t *vm, size_t nargs, const char *who, bool wr)
+{
+	int fd;
+	char *base;
+	size_t size, done = 0;
+	int64_t deadline = -1;
+
+	if (nargs < 2 || nargs > 3) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "%s: expected (fd, tensor, timeout_ms?)", who);
+		return NULL;
+	}
+
+	if (!fd_buf_args(vm, who, uc_fn_arg(0), uc_fn_arg(1), &fd, &base, &size))
+		return NULL;
+
+	if (nargs == 3 && ucv_type(uc_fn_arg(2)) != UC_NULL) {
+		if (ucv_type(uc_fn_arg(2)) != UC_INTEGER || ucv_int64_get(uc_fn_arg(2)) < 0) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"%s: timeout_ms must be an integer >= 0", who);
+			return NULL;
+		}
+
+		deadline = mono_ms() + ucv_int64_get(uc_fn_arg(2));
+	}
+
+	while (done < size) {
+		ssize_t r = fd_once(vm, who, fd, base + done, size - done, wr);
+
+		if (r == -2)
+			return NULL;
+
+		if (r < 0) {
+			uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+				"%s: connection closed after %zu of %zu bytes", who, done, size);
+			return NULL;
+		}
+
+		if (r > 0) {
+			done += (size_t)r;
+			continue;
+		}
+
+		int wait_ms = -1;
+
+		if (deadline >= 0) {
+			int64_t left = deadline - mono_ms();
+
+			if (left <= 0) {
+				uc_vm_raise_exception(vm, EXCEPTION_RUNTIME,
+					"%s: timeout after %zu of %zu bytes", who, done, size);
+				return NULL;
+			}
+
+			wait_ms = left > INT_MAX ? INT_MAX : (int)left;
+		}
+
+		struct pollfd pfd = { .fd = fd, .events = (short)(wr ? POLLOUT : POLLIN), .revents = 0 };
+		int pr = poll(&pfd, 1, wait_ms);
+
+		if (pr < 0 && errno != EINTR) {
+			uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, "%s: poll: %s", who, strerror(errno));
+			return NULL;
+		}
+	}
+
+	return NULL;
+}
+
+static uc_value_t *
+torch_fd_send_all(uc_vm_t *vm, size_t nargs)
+{
+	return fd_all(vm, nargs, "fd_send_all", true);
+}
+
+static uc_value_t *
+torch_fd_recv_all(uc_vm_t *vm, size_t nargs)
+{
+	return fd_all(vm, nargs, "fd_recv_all", false);
+}
+
+/*
  * common_prefix(a, b): int
  *
  * Length of the common prefix of two arrays of integers (token ids),
@@ -10429,6 +10658,10 @@ static const uc_function_list_t torch_fns[] = {
 	{ "copy_many",	torch_copy_many },
 	{ "copy_async",	torch_copy_async },
 	{ "copy_h2d_async",	torch_copy_h2d_async },
+	{ "fd_write",	torch_fd_write },
+	{ "fd_read",	torch_fd_read },
+	{ "fd_send_all",	torch_fd_send_all },
+	{ "fd_recv_all",	torch_fd_recv_all },
 	{ "moe_coop",	torch_moe_coop },
 	{ "skinny",	torch_skinny },
 	{ "fp8_gemv",	torch_fp8_gemv },

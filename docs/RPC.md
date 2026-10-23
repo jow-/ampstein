@@ -46,11 +46,20 @@ activations would halve this but are not bit-exact; at most an opt-in later.
 0. **Measure, go / no-go.** A ucode ping-pong between pinned buffers (100 KB,
    20 MB) over the real link: p50 and p99, `TCP_NODELAY`, with and without the
    switch. Proceed if p99 is under ~2 ms.
-1. **Native bindings** in `torch.so`: `send_tensor(fd, pinned, nbytes)` /
-   `recv_tensor(fd, pinned, nbytes)`, non-blocking, over plain POSIX sockets;
-   they raise on bad arguments or a closed peer (`tests/bindings_errors.uc`),
-   no exceptions cross the module boundary. Device copies use the existing
-   `copy_async` / `copy_h2d_async`.
+1. **Native bindings** (done): in `torch.so`, on the integer of
+   `socket.fileno()`, over plain POSIX sockets with `MSG_DONTWAIT |
+   MSG_NOSIGNAL`. `fd_write(fd, t, off, n)` / `fd_read(fd, t, off, n)` are one
+   non-blocking attempt (bytes moved; 0 for EAGAIN; `fd_read` -1 for an orderly
+   close), the building blocks for `uloop` handlers that keep their own
+   progress. `fd_send_all(fd, t, timeout_ms?)` / `fd_recv_all(...)` finish the
+   whole tensor, polling while the socket is full or empty, and raise on a
+   timeout, a reset or a close before the end. `t` is any contiguous CPU tensor
+   (pinned for the async device copies); `narrow()` views send slices. Errors
+   raise (`tests/bindings_errors.uc`); `tests/fd_tensor.uc` covers the transfers,
+   the EAGAIN path, timeouts, EOF and the device round trip. Device copies use
+   the existing `copy_async` / `copy_h2d_async`. `rpc_pingpong.uc --native`
+   times it (loopback: 100 KB RTT 55 us; the wire figures with the native path
+   are still to be measured on jai).
 2. **`rpc.uc` transport.** Frames `[type, seq, len]` + payload on one
    persistent connection: JSON for control, raw bytes for tensors. Coordinator
    side non-blocking on `uloop`; worker side a plain blocking loop. Keep-alive

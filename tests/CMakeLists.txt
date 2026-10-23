@@ -36,6 +36,8 @@ amp_test(st_reader)
 amp_test(st_save)
 # bindings_errors: every binding raises (instead of returning null) on wrong argument types / counts
 amp_test(bindings_errors)
+# fd_tensor: raw tensor bytes over a socket (fd_write / fd_read / fd_send_all / fd_recv_all), RPC phase 1
+amp_test(fd_tensor)
 
 # --- EXL3 kernels and the llama-family model
 # exl3: exl3_gemm vs a torch reference, synthetic tensors

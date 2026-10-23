@@ -240,6 +240,29 @@ expect_raise('exl3_reconstruct: one arg', function () {
 	torch.exl3_reconstruct(xc);
 });
 
+/* --- fds ---------------------------------------------------------------------- */
+
+expect_raise('fd_write: no args', function () { torch.fd_write(); });
+expect_raise('fd_write: fd not an integer', function () { torch.fd_write('3', torch.zeros([2]), 0, 1); });
+expect_raise('fd_write: negative fd', function () { torch.fd_write(-1, torch.zeros([2]), 0, 1); });
+expect_raise('fd_write: not a tensor', function () { torch.fd_write(1, 'x', 0, 1); });
+expect_raise('fd_write: cuda tensor', function () { torch.fd_write(1, xc, 0, 1); });
+expect_raise('fd_write: range outside', function () { torch.fd_write(1, torch.zeros([2]), 4, 8); });
+expect_raise('fd_write: negative length', function () { torch.fd_write(1, torch.zeros([2]), 0, -1); });
+expect_raise('fd_write: not a socket', function () {
+	torch.fd_write(require('fs').open('/dev/null', 'w').fileno(), torch.zeros([2]), 0, 4);
+});
+expect_raise('fd_write: closed fd', function () { torch.fd_write(987, torch.zeros([2]), 0, 4); });
+expect_raise('fd_read: three args', function () { torch.fd_read(1, torch.zeros([2]), 0); });
+expect_raise('fd_read: bad fd', function () { torch.fd_read(987, torch.zeros([2]), 0, 4); });
+expect_raise('fd_send_all: no args', function () { torch.fd_send_all(); });
+expect_raise('fd_send_all: bad timeout', function () { torch.fd_send_all(1, torch.zeros([2]), -5); });
+expect_raise('fd_send_all: non-contiguous', function () {
+	torch.fd_send_all(1, torch.zeros([4, 4]).transpose(0, 1));
+});
+expect_raise('fd_recv_all: bad fd', function () { torch.fd_recv_all(987, torch.zeros([2])); });
+expect_raise('fd_recv_all: too many args', function () { torch.fd_recv_all(1, torch.zeros([2]), 1, 2); });
+
 /* --- graphs ----------------------------------------------------------------- */
 
 expect_raise('graph.replay: zero count', function () {
