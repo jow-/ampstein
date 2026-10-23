@@ -466,6 +466,28 @@ export function create(model, opts) {
 	const MTP_ADAPT = !!(model.mtp_chain && !DF && mtp_planned >= 2 && getenv('AMP_MTP_ADAPT') != null &&
 		opts.mtp_adaptive != false);
 
+	// prompt-lookup drafts (opts.lookup = the most drafts a round verifies; models whose verify graphs keep
+	// per-position states for any window: model.spec_any): when the last tokens occurred before, the text that
+	// followed them is the draft - no draft chain, and a copy of 7 tokens verifies in one round. Rows are
+	// verified exactly as MTP drafts are (greedy and sampled); the sizes below get their own step graphs.
+	const LK_N = (model.spec_any && model.mtp && !DF && mtp_planned >= 2 && opts.graphs != false) ?
+		(opts.lookup || 0) : 0;
+	const LK_MIN = (getenv('AMP_LOOKUP_MIN') != null) ? int(getenv('AMP_LOOKUP_MIN')) : 4;     // fewest drafts worth a round
+	const LK_NGRAM = 3;                                      // tokens that must match before the draft
+	const LK_CTX = (getenv('AMP_LOOKUP_CTX') != null) ? int(getenv('AMP_LOOKUP_CTX')) : 6;   // ... and the match must reach back this far
+	let lk_sizes = [];                                       // verify sizes (rows) of a lookup round
+
+	if (LK_N >= LK_MIN) {
+		for (let sz = LK_MIN + 1; sz < LK_N + 1; sz = int(sz * 1.5 + 0.5))
+			push(lk_sizes, sz);
+
+		push(lk_sizes, LK_N + 1);
+	}
+
+	const LK_START = min(LK_N, 7);          // drafts of the first lookup round; a full acceptance doubles it, a miss shrinks it
+
+	const SPEC_N = max(mtp_planned, LK_N + 1);              // rows of the largest verify window
+
 	// per-position GDN states for MTP verify (W >= 2): the W-token verify
 	// forward keeps every GDN layer's recurrent + conv state after each
 	// of its first W-1 tokens (qwen35.gdn_forward, cl.spec_*), so a
@@ -489,19 +511,19 @@ export function create(model, opts) {
 	let rollback = [];
 
 	if (spec) {
-		for (let a = 0; a < mtp_planned - 1; a++)
+		for (let a = 0; a < SPEC_N - 1; a++)
 			push(rollback, {d: [], s: []});
 
 		for (let k in gdn_layers)
 			for (let cl in states(k)) {
 				let dev = 'cuda:' + cl.dev;
 
-				cl.spec_w = mtp_planned;
-				cl.spec_states = torch.zeros([ mtp_planned - 1, ...cl.rec_state.shape() ],
+				cl.spec_w = SPEC_N;
+				cl.spec_states = torch.zeros([ SPEC_N - 1, ...cl.rec_state.shape() ],
 					'float32', dev);
 				cl.spec_conv = [];
 
-				for (let a = 0; a < mtp_planned - 1; a++) {
+				for (let a = 0; a < SPEC_N - 1; a++) {
 					push(cl.spec_conv, torch.zeros(cl.conv_state.shape(), 'float16', dev));
 					push(rollback[a].d, cl.rec_state, cl.conv_state);
 					push(rollback[a].s, cl.spec_states.narrow(0, a, 1), cl.spec_conv[a]);
@@ -539,6 +561,10 @@ export function create(model, opts) {
 				push(sizes, k);
 		else if (spec)
 			push(sizes, mtp_planned);
+
+		for (let k in lk_sizes)
+			if (index(sizes, k) < 0)
+				push(sizes, k);
 		else
 			for (let k = 2; k <= mtp_planned; k++)
 				push(sizes, k);
@@ -1876,7 +1902,8 @@ export function create(model, opts) {
 			completion_tokens: j.generated,
 			preemptions: j.preempted || 0,
 			mtp: j.rounds ? {rounds: j.rounds, drafted: j.drafted,
-				accepted: j.accepted} : null,
+				accepted: j.accepted, lk_rounds: j.lk_r || 0, lk_drafted: j.lk_d || 0,
+				lk_accepted: j.lk_a || 0} : null,
 			timings: {
 				prefill_ms: j.t_prefill_done - j.t_start,
 				prefill_tokens: length(j.ids) - j.reuse_start,
@@ -2479,7 +2506,87 @@ export function create(model, opts) {
 		}
 	}
 
-	function mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows, V) {
+	/* --- prompt lookup (LK_N) ---------------------------------------
+	 * lk_pos maps the LK_NGRAM tokens ending at a position of `ids` to the latest such position; the index
+	 * follows `ids` incrementally (a longer array with the same indexed prefix extends it, anything else
+	 * rebuilds it - `ids` is replaced wholesale on a reuse, a restore, a reset). The draft of a round is
+	 * what followed the previous occurrence of the last LK_NGRAM tokens (the round's seed token included). */
+	let lk_pos = {}, lk_n = 0, lk_tail = null, lk_mid = null;
+	let lk_cap = LK_START;           // drafts the next lookup round may take
+	let lk_cool = 0;                 // rounds left without a lookup after a miss
+	let lk_gap = null;               // draft-cache rows not yet written: {pos, tok, hid} (rounds that skipped the chain)
+
+	function lk_key(a, b, c) {
+		return (a * 262147 + b) * 262147 + c;
+	}
+
+	function lk_sync() {
+		let n = length(ids);
+
+		if (lk_n > n || (lk_n > 0 && (ids[lk_n - 1] != lk_tail || ids[lk_n >> 1] != lk_mid))) {
+			lk_pos = {};
+			lk_n = 0;
+		}
+
+		for (let i = lk_n; i < n; i++)
+			if (i >= LK_NGRAM - 1)
+				lk_pos[lk_key(ids[i - 2], ids[i - 1], ids[i])] = i;
+
+		lk_n = n;
+		lk_tail = n ? ids[n - 1] : null;
+		lk_mid = n ? ids[n >> 1] : null;
+	}
+
+	/* the drafts for the seed token t (null: none worth a round) */
+	function lk_draft(t) {
+		let n = length(ids);
+
+		if (n < LK_NGRAM)
+			return null;
+
+		lk_sync();
+
+		// (the seed is not in `ids` yet: the key is the last two tokens and the seed)
+		let i = lk_pos[lk_key(ids[n - 2], ids[n - 1], t)];
+
+		if (i == null || i + 1 >= n)
+			return null;
+
+		let k = min(lk_cap, n - 1 - i);
+
+		if (k < LK_MIN)
+			return null;
+
+		// the match reaches back further than the key? (a phrase that merely recurs rarely continues the same way)
+		// (ids[i - d] pairs with the d-th token before the seed, ids[n - d])
+		let m = LK_NGRAM;
+
+		while (m < LK_CTX && i - m >= 0 && ids[i - m] == ids[n - m])
+			m++;
+
+		if (m < LK_CTX)
+			return null;
+
+		return slice(ids, i + 1, i + 1 + k);
+	}
+
+	/* write the draft-cache rows of the lookup rounds since the last chain (positions < p + 1) */
+	function lk_flush(p) {
+		let g = lk_gap;
+
+		lk_gap = null;
+
+		if (!g || !dc || g.pos + length(g.tok) != p + 1)
+			return;
+
+		for (let o = 0; o < length(g.tok); o += 128) {
+			let m = min(128, length(g.tok) - o);
+
+			mtp_run(slice(g.tok, o, o + m), g.hid.narrow(1, o, m), g.pos + o, null);
+		}
+	}
+
+	function mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows, V, lk) {
 		let W = (V != null) ? V : mtp_w;
 
 		// a stop id among the accepted drafts ends the round there: it
@@ -2497,6 +2604,23 @@ export function create(model, opts) {
 		j.rounds++;
 		j.drafted += W;
 		j.accepted += a;
+
+		if (lk) {
+			j.lk_r = (j.lk_r || 0) + 1;
+			j.lk_d = (j.lk_d || 0) + lk;
+			j.lk_a = (j.lk_a || 0) + min(a, lk);
+			lk_cool = (a == 0) ? 4 : 0;
+			lk_cap = (a >= lk) ? min(LK_N, lk * 2) : max(LK_MIN, min(LK_N, a + 2));
+
+			// the draft cache rows of the accepted tokens, from the target's own hiddens (written at the next chain)
+			let g = lk_gap || {pos: p + 1, tok: [], hid: null};
+			let h0 = last_hidden.view([1, 1, -1]).cuda(M.dev);
+			let hs = (a > 0) ? torch.cat([ h0, vhidden.narrow(1, 0, a).cuda(M.dev) ], 1) : h0.add(0.0);
+
+			push(g.tok, ...slice(c, 0, a + 1));
+			g.hid = g.hid ? torch.cat([ g.hid, hs ], 1) : hs;
+			lk_gap = g;
+		}
 
 		if (mark)
 			mark('accept');
@@ -2657,6 +2781,31 @@ export function create(model, opts) {
 			return;
 		}
 
+		// prompt lookup: drafts copied from earlier text replace the chain when there are enough of them
+		let lkd = null, lkV = 0, lkk = 0;
+
+		if (LK_N) {
+			if (lk_cool > 0)
+				lk_cool--;
+			else if (cache.length + LK_N + 2 < max_ctx)
+				lkd = lk_draft(j.t_next);
+
+			if (lkd) {
+				lkk = length(lkd);
+
+				for (let sz in lk_sizes)
+					if (sz >= length(lkd) + 1) {
+						lkV = sz;
+						break;
+					}
+
+				while (length(lkd) < lkV - 1)
+					push(lkd, lkd[length(lkd) - 1]);
+			}
+			else
+				lk_flush(p);        // (the chain below reads the draft cache up to p)
+		}
+
 		// draft chain
 		let c = [j.t_next];
 		let D = last_hidden;
@@ -2677,7 +2826,7 @@ export function create(model, opts) {
 		// verify graph (the eager fallback scores host ids) and the plain
 		// lm_head; the sampled walk and the TP sharded draft head stay
 		// synchronous below.
-		if (temp <= 0 && (DF || (!sharded && !draft_head)) && graph &&
+		if (!lkd && temp <= 0 && (DF || (!sharded && !draft_head)) && graph &&
 		    graph.has(W) && graph.run_dev) {
 			c_dev.narrow(0, 0, 1).fill_(j.t_next);
 
@@ -2728,7 +2877,10 @@ export function create(model, opts) {
 			return;
 		}
 
-		if (DF) {
+		if (lkd) {
+			push(c, ...lkd, -1);        // (the dummy never matches: the bonus comes from the last row)
+		}
+		else if (DF) {
 			// one block-diffusion pass proposes the W drafts (greedy walk of the
 			// candidate selector: a deterministic one-hot proposal, lossless under
 			// the acceptance rules below); its context rows are the last verify's
@@ -2778,7 +2930,7 @@ export function create(model, opts) {
 
 		mark('snapshot');
 
-		let V = (conf && MTP_ADAPT && ad) ? ad_pick(conf, temp) : W;
+		let V = lkd ? lkV : (conf && MTP_ADAPT && ad) ? ad_pick(conf, temp) : W;
 
 		if (conf && V < W) {
 			c = slice(c, 0, V);
@@ -2827,7 +2979,7 @@ export function create(model, opts) {
 		if (conf && MTP_ADAPT)
 			ad_learn(conf, temp, V, a, now_ms() - t_v0, now_ms() - t_round0);
 
-		mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows, V);
+		mtp_finish(j, p, c, a, bonus, vhidden, mark, tm, vrows, V, lkk);
 	}
 
 	/* a speculative round keeps the first L rows: the cache length, and the model's own state of the rows

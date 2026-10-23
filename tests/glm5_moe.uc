@@ -84,8 +84,8 @@ assert(e < 0.02, 'MoE output');
 try { torch.synchronize(); } catch (e2) {}
 print('glm5_moe: ok\n');
 
-// fused decode path (torch.moe_coop) vs the composite path, 1 and 5 tokens
-for (let rows in [1, 5]) {
+// fused decode path (torch.moe_coop) vs the composite path, 1 to 16 tokens
+for (let rows in [1, 5, 12, 16]) {
 	let yy = y.narrow(0, 0, rows).contiguous();
 	let a = glm5.moe_forward(cfg, M, yy).mul(1.0);
 	let b = glm5.moe_forward_ref(cfg, M, yy);

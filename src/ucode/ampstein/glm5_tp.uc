@@ -312,7 +312,7 @@ function load_mtp(model_dir, cfg, plan, devs, expert_dev) {
 }
 
 /* largest all-reduce payload in rows through the P2P kernel */
-const P2P_ROWS = 8;
+const P2P_ROWS = 16;
 
 export function load(model_dir, opts) {
 	opts = opts || {};
@@ -613,6 +613,7 @@ export function load(model_dir, opts) {
 		lm_heads: lm_heads,
 		lm_head: lm_heads[0],     // engine: "the model has a head" (logits come from the shards)
 		mtp: mtp, kv_bits: opts.kv_bits,
+		spec_any: true,           // the step graphs keep per-position KDA states for any window up to the engine's largest (glm5.kda_forward)
 
 		mm_build: glm5.mm_build,
 

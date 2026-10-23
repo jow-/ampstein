@@ -762,3 +762,24 @@ ucode loop over 24k scores cost 33 ms per plan against 0.3 ms; (3) ucode's `/` o
 rate computed as `misses / picks` printed 0.000 and looked like a perfect cache. `AMP_VRAM_LOG=1` (allocator around the
 warm-up) is how chunk 8192 was sized. Details: `docs/EXPERT_STREAMING.md`.
 
+
+## L173 — GLM-5.3 prompt-lookup drafts (`--lookup N`): a verify row costs 5 ms, so only long copies pay
+
+On the 3 x 2 stage layout a verify step is 17.4 ms at 1 row and 28.0 ms at 3 rows (distinct-expert reads grow
+with the rows, ~5 ms per row), the MTP head accepts ~50% of its drafts (2.3 tokens per ~37 ms round), and the
+rest of the round (3 stages of ~10 ms: MoE 4, dense GEMMs 2.7, all-reduce waits 1, ~2 of small kernels) is at the
+bandwidth/ALU floor. What the profile leaves is tokens per round. `--lookup N` drafts from the context itself:
+when the last 3 tokens (seed included) occurred before and the match reaches back `AMP_LOOKUP_CTX` (6) tokens,
+the up-to-`lk_cap` tokens that followed are verified in one step of 5 / 8 / 12 rows (`N` = 11), no draft chain.
+A full acceptance doubles the cap, a partial one sets it to accepted + 2, a round with no accepted draft pauses
+lookups for 4 rounds. The draft-cache rows of skipped chains are written lazily from the target's hiddens
+(`lk_flush`, only when a chain round needs them). Prose is unaffected (66.8 vs 62-67 tok/s); the 3-token key alone
+cost ~5% on prose (short recurrences continue differently), the 6-token match removed that. Copy of a 6 KB file:
+65 -> 145-156 tok/s (98% of the drafts accepted, output 0.998 similar to the source); at 68k / 183k context a
+quoted passage decodes at 75-77 tok/s; prefill is untouched (1430 / 1312 tok/s).
+Needed on the model side: `glm5.kda_forward` keeps per-position states for any verify size up to `cl.spec_w`
+(the largest window, the engine allocates it), `COOP_ROWS` and `P2P_ROWS` 8 -> 16 (the fused decode MoE and the
+all-reduce buffers; `tests/glm5_moe.uc` checks 1-16 rows against the composite path, 3.4-4.3e-3 rel-rms at
+every size). A graph size above `P2P_ROWS` is silently not captured (`graphs()` skips it) and the engine then
+verifies eagerly with last-row logits: `shape '[12, -1]' is invalid`. Cost: ~100 MiB per GPU (spec states, graphs);
+the cache-slot allocation was already 0 on this layout.

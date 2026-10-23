@@ -283,12 +283,12 @@ export function kda_forward(cfg, K, x, cl) {
 
 	let qkv = K.qkv.forward(x);                                  // (T, D) fp16
 
-	// speculative verify (the engine set cl.spec_w = W and this is the
-	// W-token verify step): keep the state after each of the first W-1
-	// tokens — the conv window per candidate here, before gdn_prep
-	// advances it, the recurrent state inside the scan — so a rejection
-	// after token a restores them with one batched copy per GPU
-	let spec = cl.spec_w && T == cl.spec_w;
+	// speculative verify (the engine set cl.spec_w = the largest window W
+	// and this is a verify step of 2 .. W tokens): keep the state after each
+	// of the first T-1 tokens — the conv window per candidate here, before
+	// gdn_prep advances it, the recurrent state inside the scan — so a
+	// rejection after token a restores them with one batched copy per GPU
+	let spec = cl.spec_w && T >= 2 && T <= cl.spec_w;
 
 	if (spec) {
 		let km1 = cl.conv_state.shape()[2];
@@ -304,7 +304,7 @@ export function kda_forward(cfg, K, x, cl) {
 
 	let core = spec ?
 		torch.kda_scan(p[0], p[1], p[2], gg.gb[1], gg.gb[0], cl.rec_state,
-			math.pow(hd * 1.0, -0.5), cl.spec_states) :
+			math.pow(hd * 1.0, -0.5), (T < cl.spec_w) ? cl.spec_states.narrow(0, 0, T - 1) : cl.spec_states) :
 		torch.kda_scan(p[0], p[1], p[2], gg.gb[1], gg.gb[0], cl.rec_state,
 			math.pow(hd * 1.0, -0.5));
 	let o = torch.kda_out_norm(core, gg.z, K.o_norm, cfg.rms_norm_eps);
@@ -847,7 +847,7 @@ function shared_out(cfg, M, y) {
  * experts' trellis / suh / svh data and the scratch for up to COOP_ROWS
  * tokens. Built lazily; null when the experts do not share one bitrate /
  * codebook (the composite path then serves every size). */
-const COOP_ROWS = 8;
+const COOP_ROWS = 16;
 
 function build_coop(cfg, M) {
 	let ex = M.experts;

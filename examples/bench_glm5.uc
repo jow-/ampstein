@@ -37,7 +37,12 @@ let tok = 5;
 function step() {
 	if (S > 1) {
 		let pos = cache.length;
-		let lg = G.run([tok, tok + 1, tok + 2], pos).logits;
+		let ids = [];
+
+		for (let i = 0; i < S; i++)
+			push(ids, tok + i);
+
+		let lg = G.run(ids, pos).logits;
 
 		tok = lg.argmax(-1).tolist()[0];
 		cache.length = pos + 1;

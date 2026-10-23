@@ -344,6 +344,7 @@ export function serve(args) {
 		max_ctx: args.ctx,
 		prefill_chunk: args.chunk,
 		mtp_window: (DS || D41) ? 0 : args.mtp,
+		lookup: args.lookup,
 		dspark_window: args.dspark_window,
 		draft_vocab: args.draft_vocab,
 		warmup: args.warmup,
@@ -855,6 +856,10 @@ export function serve(args) {
 		let mtp = info.mtp ? sprintf(', MTP %d rounds, %.0f%% of drafts accepted, %.2f tok/round',
 			info.mtp.rounds, 100.0 * info.mtp.accepted / info.mtp.drafted,
 			info.completion_tokens * 1.0 / info.mtp.rounds) : '';
+
+		if (info.mtp && info.mtp.lk_rounds)
+			mtp += sprintf(', lookup %d rounds, %.0f%% of %d drafts', info.mtp.lk_rounds,
+				100.0 * info.mtp.lk_accepted / info.mtp.lk_drafted, info.mtp.lk_drafted);
 
 		let why = '';
 		let d = info.reuse_detail;
