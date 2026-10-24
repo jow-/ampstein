@@ -3996,7 +3996,7 @@ export function create(model, opts) {
 			for (let i = 0; i < n; i++)
 				push(wids, 0);
 
-			let popts = {chunk: n, cuts: [], hidden: W > 0 && !DF};
+			let popts = {chunk: n, cuts: [], hidden: W > 0 && !DF, warmup: true};
 			let run = model.prefill_pipeline ?
 				model.prefill_pipeline(cache, wids, popts) :
 				qwen35.prefill_pipeline(model, cache, wids, popts);

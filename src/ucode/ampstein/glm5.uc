@@ -801,6 +801,9 @@ export function moe_route(cfg, M, y) {
 			let r = torch.v41_route(mm32(y.to('float32'), M.gate_t), M.bias, cfg.num_experts_per_tok,
 				cfg.routed_scaling_factor);
 
+			if (TRACE)
+				TRACE(cfg, M, y, r[0]);
+
 			return {idx: r[0], w: r[1]};
 		}
 
@@ -816,6 +819,9 @@ export function moe_route(cfg, M, y) {
 				sc.add(M.bias_vl).topk(cfg.num_experts_per_tok, -1).indices);
 
 		let sw = sc.gather(1, sel);
+
+		if (TRACE)
+			TRACE(cfg, M, y, sel);
 
 		return {idx: sel, w: sw.div(sw.sum(1, true).add(1e-20)).mul(cfg.routed_scaling_factor)};
 	}
@@ -847,7 +853,7 @@ function shared_out(cfg, M, y) {
  * experts' trellis / suh / svh data and the scratch for up to COOP_ROWS
  * tokens. Built lazily; null when the experts do not share one bitrate /
  * codebook (the composite path then serves every size). */
-const COOP_ROWS = 16;
+export const COOP_ROWS = 16;
 
 function build_coop(cfg, M) {
 	let ex = M.experts;
@@ -893,6 +899,61 @@ function build_coop(cfg, M) {
 	};
 }
 
+/* CPU experts (docs/EXPERT_STREAMING.md): the picks of experts that live in host memory run on the CPU (torch.moe_cpu_*,
+ * the exllamav3 kernels) instead of being read over the PCIe link by the fused GPU kernel — a miss then costs ~0.8 ms
+ * on the host cores instead of ~4 ms of x4 link. M.cpu = {handle, map (int32 [n_routed_experts]: the expert's index
+ * in the CPU layer, -1 for any other expert), drop, out (device fp32 [COOP_ROWS, hidden]), xh / selh / wh / outh
+ * (pinned buffers of the same shapes), threads}. The CPU branch runs on a side stream beside the GPU kernel
+ * (D2H of the activations and picks, a host function, H2D of the sum); it is captured with the rest of a decode graph. */
+const CPU_SLOT = 3;
+
+/* Prefill chunks (M.cpu_pf, set per layer by the model): the cold picks of a chunk run on the CPU too, in one buffer set
+ * per device shared by its layers (one layer's CPU branch has joined the compute stream before the next one starts).
+ * Grown, never freed: an outgrown set may still be read by a queued host function. */
+let CPU_PF = {}, CPU_PF_OLD = [];
+
+function cpu_pf_bufs(M, T, K, H) {
+	let b = CPU_PF[M.dev];
+
+	if (b && b.rows >= T)
+		return b;
+
+	if (b)
+		push(CPU_PF_OLD, b);
+
+	let n = max(T, 2048);
+
+	b = CPU_PF[M.dev] = {
+		rows: n, out: torch.zeros([n, H], 'float32', 'cuda:' + M.dev),
+		xh: torch.pinned_empty([n, H], 'float16'), selh: torch.pinned_empty([n, K], 'int32'),
+		wh: torch.pinned_empty([n, K], 'float16'), outh: torch.pinned_empty([n, H], 'float32')
+	};
+
+	return b;
+}
+
+function cpu_experts_begin(M, y, r) {
+	let c = M.cpu, T = y.shape()[0], K = r.idx.shape()[1];
+	let b = (T <= COOP_ROWS) ? c : cpu_pf_bufs(M, T, K, y.shape()[1]);
+	// (a staged prefill chunk with a split: only the CPU-only slots; the staged ones run on the GPU)
+	let map = (T > COOP_ROWS && M.cpu_pf == 'split') ? c.map_pf : c.map;
+	// (a pick the route tail skip dropped is -1: no expert, nothing for the CPU either)
+	let ix = r.idx.reshape([-1]);
+	let loc = M.skip ? torch.where(ix.le(-1), c.none, map.gather(0, ix.clamp(0, null))).view([T, K]).contiguous() :
+		map.gather(0, ix).view([T, K]).contiguous();
+	let w16 = r.w.to('float16').contiguous();
+	let out = b.out.narrow(0, 0, T);
+	let x = y.contiguous();
+
+	torch.stream_side(M.dev, CPU_SLOT);
+	torch.moe_cpu_enqueue(c.handle, x, loc, w16, out, b.xh.narrow(0, 0, T), b.selh.narrow(0, 0, T),
+		b.wh.narrow(0, 0, T), b.outh.narrow(0, 0, T), c.threads);
+	torch.stream_main(M.dev, CPU_SLOT);
+
+	// (the fused kernel gets the other picks: a dropped id is outside the rank's range and ignored)
+	return {idx: torch.where(loc.le(-1), r.idx, c.drop), out: out, keep: [ x, loc, w16 ]};
+}
+
 /* y: (T, hidden) fp16, T <= COOP_ROWS: routing on the device, two fused
  * launches for the routed experts. Returns (T, hidden) fp32. */
 function moe_forward_fused(cfg, M, y) {
@@ -914,6 +975,16 @@ function moe_forward_fused(cfg, M, y) {
 		let keep = sk.cold.gather(0, ix).view(r.idx.shape()).mul(sk.tail).le(0);
 
 		r = {idx: torch.where(keep, r.idx, sk.drop), w: r.w};
+	}
+
+	if (M.cpu) {
+		let cp = cpu_experts_begin(M, y, r);
+
+		torch.moe_coop(y.contiguous(), cp.idx.contiguous(), r.w.to('float16').contiguous(), M.coop, sh);
+		torch.stream_wait(M.dev, CPU_SLOT);
+		M.coop.out.narrow(0, 0, T).add_(cp.out);
+
+		return M.coop.out.narrow(0, 0, T);
 	}
 
 	torch.moe_coop(y.contiguous(), r.idx.contiguous(), r.w.to('float16').contiguous(),
@@ -1019,6 +1090,22 @@ function moe_sorted_begin(cfg, M, y) {
 	let dv = 'cuda:' + M.dev;
 	let A = T * K;
 	let r = moe_route(cfg, M, y);
+	let cp = null, all = null;
+
+	// a prefill chunk with CPU experts: the cold picks go to the CPU (joined in moe_sorted_finish), the kernels get the rest;
+	// the residency manager still counts every pick of the chunk
+	if (M.cpu && M.cpu_pf) {
+		if (M.pflog) {
+			let loc = r.idx.reshape([-1]).sub(torch.full([1], M.e0 ?? 0, 'int64', dv));
+			let bad = loc.neg().le(0).to('int64').mul(loc.le(E - 1).to('int64')).le(0);
+
+			all = torch.zeros([E + 1], 'int64', dv).index_add_(0, torch.where(bad, torch.full([1], E, 'int64', dv), loc),
+				torch.ones([A], 'int64', dv));
+		}
+
+		cp = cpu_experts_begin(M, y, r);
+		r = {idx: cp.idx, w: r.w};
+	}
 
 	if (M.fused_prep && !NO_FUSED_PREP) {
 		// the whole dispatch (remap to local ids, stable sort by expert, counts / starts / inverse / kinds) in one kernel
@@ -1028,7 +1115,7 @@ function moe_sorted_begin(cfg, M, y) {
 		let pr = torch.moe_prep(r.idx.contiguous(), r.w.contiguous(), E, (M.e0 != null) ? M.e0 : 0);
 
 		return {y: y, T: T, A: A, fe: pr[0], order: pr[1], tok: pr[2], wts: pr[3], count: pr[4], start: pr[5], inv: pr[6],
-			kind: pr[7], prep: true};
+			kind: pr[7], prep: true, cpu: cp, count_all: all};
 	}
 
 	let fe = r.idx.reshape([-1]);
@@ -1070,8 +1157,17 @@ function moe_sorted_begin(cfg, M, y) {
 		y: y, T: T, A: A, fe: fe, order: order,
 		tok: ft.tok.gather(0, order),
 		wts: r.w.reshape([-1]).to('float16').gather(0, order),
-		count: torch.zeros([E + 1], 'int64', dv).index_add_(0, fe, ft.ones)
+		count: torch.zeros([E + 1], 'int64', dv).index_add_(0, fe, ft.ones),
+		cpu: cp, count_all: all
 	};
+}
+
+/* the CPU experts' part of a prefill chunk (moe_sorted_begin), added to the kernels' sum */
+function cpu_join(M, p, out) {
+	if (p.cpu) {
+		torch.stream_wait(M.dev, CPU_SLOT);
+		out.add_(p.cpu.out);
+	}
 }
 
 /* The routed experts' weighted outputs land in per-assignment slots (a scratch of fp32 rows) and
@@ -1126,6 +1222,8 @@ function moe_sorted_finish(cfg, M, p) {
 				torch.moe_fused(yc, out, count, tok, wts, M.coop, -1, 1, FUSED_ROWS, 16);
 		}
 
+		cpu_join(M, p, out);
+
 		return M.shared ? out.add(shared_out(cfg, M, y)) : out;
 	}
 
@@ -1179,6 +1277,8 @@ function moe_sorted_finish(cfg, M, p) {
 		out.index_add_(0, rt, d.mul(wt));
 	}
 
+	cpu_join(M, p, out);
+
 	let res = M.shared ? out.add(shared_out(cfg, M, y)) : out;
 
 	if (HPG) {
@@ -1210,8 +1310,14 @@ export function moe_begin(cfg, M, y) {
 			M.coop = M.stage.pf;
 		}
 
-		if (M.coop && (M.coop.mul1 || M.coop.mcg) && !getenv('AMP_GLM5_NO_SORTED'))
-			return {sorted: moe_sorted_begin(cfg, M, y)};
+		if (M.coop && (M.coop.mul1 || M.coop.mcg) && !getenv('AMP_GLM5_NO_SORTED')) {
+			let sp = moe_sorted_begin(cfg, M, y);
+
+			if (M.pflog)
+				M.pflog(sp.count_all ?? sp.count);       // host-resident experts: the chunk's picks per expert, for the residency manager
+
+			return {sorted: sp};
+		}
 	}
 
 	return {done: moe_forward_ref(cfg, M, y)};

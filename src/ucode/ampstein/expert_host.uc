@@ -10,7 +10,8 @@
 // model without host experts.
 //
 // M.stage = {dev, arena: [gate, up, down] (nc, a, b, c) pinned trellis of the cold experts, nc, par (buffer
-//            parity), bufs (set by the loader), bytes (per expert and matrix), next (the next layer's M on the
+//            parity), nst (slots [0, nst) are staged, the rest computed on the CPU: CPU experts with a split; default nc),
+//            bufs (set by the loader), bytes (per expert and matrix), next (the next layer's M on the
 //            same device), copied (a copy into bufs is queued), on (this layer runs on the staged tables),
 //            pf / dec (the staged and the decode tables of M.coop), hv (staged MLPs of heavy experts, by index)}
 
@@ -20,22 +21,42 @@ const NO_PREFETCH = getenv('AMP_EXPERT_NO_PREFETCH') != null;     // debugging: 
 
 export const STAGE_MIN = +(getenv('AMP_EXPERT_STAGE_MIN') || 128);
 
+// AMP_EXPERT_STAGE_BUFS=1: one staging buffer per device instead of two (half the VRAM, for more resident experts): a
+// layer's copy then starts at the layer itself, behind the previous layer's MoE, and overlaps only its attention
+export const BUFS = (getenv('AMP_EXPERT_STAGE_BUFS') == '1') ? 1 : 2;
+
 // queue the copy of the cold experts of st's layer into its buffer, behind the work already queued on the
 // device (the layer that last read this buffer has been launched by then)
 function issue(st) {
+	if (!(st.nst ?? st.nc)) {
+		st.copied = true;
+
+		return;
+	}
+
 	torch.stream_side(st.dev, SLOT);
 
 	for (let m = 0; m < 3; m++)
-		torch.copy_h2d_async(st.bufs[m].narrow(0, 0, st.nc), st.arena[m]);
+		torch.copy_h2d_async(st.bufs[m].narrow(0, 0, st.nst ?? st.nc), st.arena[m].narrow(0, 0, st.nst ?? st.nc));
 
 	torch.stream_main(st.dev, SLOT);
 	st.copied = true;
 }
 
 // the start of a layer of a prefill-sized chunk: its cold experts are staged (queued now unless the previous
-// layer already did), the compute stream waits for them, and the next layer's copy is queued behind this one
-export function begin(M) {
+// layer already did), the compute stream waits for them, and the next layer's copy is queued behind this one.
+// A group of chunks that runs layer by layer (gid: its number) stages the layer once: a later chunk of the same
+// group only switches the layer's tables to the buffer again.
+export function begin(M, gid) {
 	let st = M.stage;
+
+	if (gid != null && st.gid === gid) {
+		st.on = true;
+
+		return;
+	}
+
+	st.gid = gid;
 
 	if (!st.copied)
 		issue(st);
@@ -44,8 +65,31 @@ export function begin(M) {
 	st.copied = false;
 	st.on = true;
 
-	if (st.next && !NO_PREFETCH)
+	if (st.next && !NO_PREFETCH && BUFS == 2 && !st.next.stage.copied)
 		issue(st.next.stage);
+}
+
+// the start of a staged prefill: a stage's GPUs idle until the first chunk reaches them, so the first layers of every
+// stage (both buffers) are copied ahead — M: the stage's first layer on a device
+export function prestage(M) {
+	let st = M.stage;
+
+	if (!st || st.copied)
+		return;
+
+	issue(st);
+
+	if (st.next && BUFS == 2 && !NO_PREFETCH && !st.next.stage.copied)
+		issue(st.next.stage);
+}
+
+// the end of a prefill: copies queued ahead that no chunk used are dropped (the arena may change before the next
+// prefill: expert_dyn exchanges)
+export function unstage(M) {
+	let st = M.stage;
+
+	if (st)
+		st.copied = false;
 }
 
 // the pointer tables of M.coop with the cold experts' trellis repointed into the staging buffer
@@ -57,7 +101,8 @@ export function tables(M) {
 		let base = st.bufs[m].data_ptr();
 
 		for (let ex in M.experts)
-			push(a, ex.slot == null ? ex[name].trellis.data_ptr() : base + ex.slot * st.bytes[m]);
+			// (a slot past nst is not staged: the CPU computes that expert's picks, expert_dyn / glm5.cpu_experts_begin)
+			push(a, (ex.slot == null || ex.slot >= (st.nst ?? st.nc)) ? ex[name].trellis.data_ptr() : base + ex.slot * st.bytes[m]);
 
 		return torch.from_array(a, 'int64', dv);
 	}
@@ -70,7 +115,8 @@ export function tables(M) {
 export function mlp(M, e) {
 	let st = M.stage, ex = M.experts[e];
 
-	if (ex.slot == null)
+	// (a slot that is not staged, past nst: the expert's own forward reads the arena)
+	if (ex.slot == null || ex.slot >= (st.nst ?? st.nc))
 		return ex;
 
 	if (!st.hv)
@@ -101,8 +147,8 @@ export function setup(layers, nl) {
 		for (let R in layers[i]) {
 			let st = R.moe.stage;
 
-			if (st && st.nc > (cap[st.dev] || 0))
-				cap[st.dev] = st.nc;
+			if (st && (st.nst ?? st.nc) > (cap[st.dev] || 0))
+				cap[st.dev] = st.nst ?? st.nc;
 		}
 
 	let pool = {}, total = 0;
@@ -117,7 +163,7 @@ export function setup(layers, nl) {
 			if (!pool[st.dev]) {
 				pool[st.dev] = [];
 
-				for (let par = 0; par < 2; par++) {
+				for (let par = 0; par < BUFS; par++) {
 					let b = [];
 
 					for (let m = 0; m < 3; m++) {
@@ -131,7 +177,7 @@ export function setup(layers, nl) {
 				}
 			}
 
-			st.bufs = pool[st.dev][st.par];
+			st.bufs = pool[st.dev][st.par % BUFS];
 			st.bytes = map(st.arena, (t) => t.numel() * 2 / st.nc);
 
 			if (i + 1 < nl)

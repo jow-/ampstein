@@ -42,10 +42,14 @@ function usage() {
 	printf("  --tp                  tensor parallel\n");
 	printf("  --tp-share F          tensor-parallel share (two GPUs, default 0.5)\n");
 	printf("  --expert-resident F   Qwen3.8-Flash-Next --tp: keep the fraction F (0..1) of the experts in VRAM, the rest\n");
-	printf("                        in pinned host memory (needs --expert-profile; default 1 = all in VRAM)\n");
+	printf("                        in pinned host memory (needs --expert-profile; default 1 = all in VRAM). DeepSeek-V4.1\n");
+	printf("                        --tp: also a list, one fraction per pipeline stage (0.8,0.7,0.6) or per GPU\n");
 	printf("  --expert-profile FILE routing profile (JSON, counts[layer][expert]) ranking the experts for --expert-resident\n");
 	printf("  --expert-swaps N      exchange up to N experts per decode step between VRAM and host memory, following the\n");
 	printf("                        routing of the requests (default 0 = the profile's set stays)\n");
+	printf("  --expert-cpu N        DeepSeek-V4.1 --tp (2.50bpw packs): run the picks of host-resident experts on N CPU threads\n");
+	printf("                        (AVX-512, int8 activations: ~1.4%% rms noise on those experts) instead of reading them over PCIe;\n");
+	printf("                        with --expert-swaps the CPU's set follows the exchanges\n");
 	printf("  --expert-skip N       decode: drop picks of host-resident experts at router rank >= N (0-9; approximate, trades\n");
 	printf("                        accuracy for speed; default 0 = off)\n");
 	printf("  --worker              run as an RPC worker for a GLM pipeline split over hosts (docs/RPC.md); needs --connect\n");
@@ -192,9 +196,10 @@ function parse_args() {
 		case '--image-cache': a.image_cache = int(v); i++; break;
 		case '--tp': a.tp = true; break;
 		case '--tp-share': a.tp_share = +v; i++; break;
-		case '--expert-resident': a.expert_resident = +v; i++; break;
+		case '--expert-resident': a.expert_resident = index(v, ',') >= 0 ? map(split(v, ','), (x) => +x) : +v; i++; break;
 		case '--expert-profile': a.expert_profile = v; i++; break;
 		case '--expert-swaps': a.expert_swaps = +v; i++; break;
+		case '--expert-cpu': a.expert_cpu = int(v); i++; break;
 		case '--expert-skip': a.expert_skip = +v; i++; break;
 		case '--stages': a.stages = int(v); i++; break;
 		case '--worker': a.worker = true; break;

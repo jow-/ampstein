@@ -22,11 +22,32 @@
 // let m = dsv41_tp.load(dir, {devices: 6, stages: 3, max_seq: 262144});
 
 import * as math from 'math';
+import { readfile } from 'fs';
 import * as weights from './weights.uc';
 import * as models from './models.uc';
 import * as glm5 from './glm5.uc';
 import * as dsv4_tp from './dsv4_tp.uc';
 import * as dsv41 from './dsv41.uc';
+import * as expert_host from './expert_host.uc';
+import * as expert_dyn from './expert_dyn.uc';
+import * as tune from './tune.uc';
+
+// AMP_NSYS=prefill|decode: with `nsys profile --capture-range=cudaProfilerApi`, capture the first whole prefill of at least
+// AMP_NSYS_MIN new tokens (default 1000), or decode steps 21-40
+const NSYS = getenv('AMP_NSYS');
+const NSYS_MIN = +(getenv('AMP_NSYS_MIN') || 1000);
+let nsys_pf = false;
+let nsys_step = 0;
+
+/* An anonymous-memory copy of a (small) checkpoint tensor: what the CPU kernels read must not depend on the page cache */
+// (pinned: an exchange of dynamic residency rewrites the copies of an arena slot's scales in stream order, expert_dyn.uc)
+function cpu_copy(t) {
+	let c = torch.pinned_empty(t.shape(), t.dtype());
+
+	c.copy_(t);
+
+	return c;
+}
 
 const P2P_ROWS = 8;
 const MAX_ROWS = 8;
@@ -615,6 +636,9 @@ function dsv41_tp_graphs(model, allreduce) {
 				for (let g = 1; g < Gs; g++)
 					it.bar[g].copy_(it.bar[0]);
 
+				if (model.dyn)
+					model.dyn.after_stage(it.s, S);       // host-resident experts: count the picks, exchange some
+
 				sp_lap('graph' + it.s, true);
 
 				for (let ctx in b.ctxs)
@@ -654,6 +678,18 @@ function dsv41_tp_graphs(model, allreduce) {
 
 			cache.length = pos + S;
 			model.last_rows = {pos: pos, S: S};
+
+			if (model.dyn)
+				model.dyn.tick();
+
+			if (NSYS == 'decode') {
+				if (++nsys_step == 21)
+					torch.profile(true);
+				else if (nsys_step == 41) {
+					torch.synchronize();
+					torch.profile(false);
+				}
+			}
 
 			let dt = length(taps) ? taps[0].dev : 0;
 
@@ -906,6 +942,24 @@ function dsv41_tp_methods(model) {
 			push(c.taps, {dev: S.devs[0], t: c.h[0].mean(1)});
 
 		hp('engram');
+
+		// host-resident experts: stage this layer's cold ones (and queue the next layer's) behind the attention; a (the one up to the snapshot cut) uses them too when its group already staged the layer
+		// short chunk (the one up to the snapshot cut) uses them too when its group already staged the layer. With CPU
+		// experts a prompt of up to CPU_PF_MAX new tokens runs its cold picks on the CPU instead (c.cpu_pf): no staging
+		let Tc = c.h[0].shape()[0];
+		let smin = tune.get('stage_min', expert_host.STAGE_MIN);      // tunable: rows from which a chunk stages
+
+		for (let g = 0; g < Gs; g++) {
+			let M = L[g].moe, st = M.stage;
+			let staged = (st && !(c.cpu_pf && M.cpu) &&
+				(Tc >= smin || (Tc > glm5.COOP_ROWS && c.gid != null && st.gid === c.gid))) ? true : false;
+
+			// (the CPU's part of the chunk: all cold picks, the CPU-only slots of a split, or none)
+			M.cpu_pf = !M.cpu ? null : (c.cpu_pf ? 'all' : ((staged && M.cpu.map_pf && !c.no_split) ? 'split' : null));
+
+			if (staged)
+				expert_host.begin(M, c.gid);
+		}
 
 		let at = [];
 
@@ -1302,6 +1356,10 @@ function dsv41_tp_methods(model) {
 		return null;
 	};
 
+	const SETTLE_MIN = +(getenv('AMP_EXPERT_SETTLE_MIN') || 512);       // prompts of at least this many tokens ...
+	const SETTLE_ROUNDS = +(getenv('AMP_EXPERT_SETTLE_ROUNDS') || 2);   // ... trigger this many exchange rounds (an expert per layer each)
+	const CPU_PF_MAX = +(getenv('AMP_EXPERT_CPU_PF_MAX') ?? 512);         // CPU experts: prompts up to this many new tokens prefill on the CPU
+
 	/* Engine interface: chunked prefill as a wavefront over the stages (one stage per chunk per round). */
 	model.prefill_pipeline = function (cache, ids, opts) {
 		let chunk = opts.chunk || 512;
@@ -1318,9 +1376,40 @@ function dsv41_tp_methods(model) {
 		bounds = sort(bounds, (a, b) => a - b);
 		push(bounds, start + total);
 
-		let active = [];
+		let active = [];                 // per stage: the group of chunks (consecutive, run layer by layer) or null
 		let next = 0, prev_end = start, done = 0, result = null;
+		// AMP_DSV41_TP_GROUP=N: N chunks per round and stage. With host-resident experts a layer's cold experts are staged
+		// once per group instead of once per chunk (the link, not the compute, bounds a chunk of 1024 rows on jai's x4 links)
+		let group = opts.group || tune.get('group', +(getenv('AMP_DSV41_TP_GROUP') || 1));     // tunable
+		let gid = 0, settled = false, hp_done = false, nsys_n = 0;
 		let snap_at = (opts.cuts && length(opts.cuts)) ? opts.cuts[0] : 0;
+		// CPU experts: up to CPU_PF_MAX new tokens the CPU computes the cold picks; past that, staging them over the link
+		// once per group is cheaper (its cost does not grow with the rows)
+		// (not the warm-up: its rows are one token repeated, which piles every row onto the same few experts — the CPU's worst
+		// case — and it sizes the GPUs' working set, which the CPU paths do not touch)
+		let cpu_pf = (model.cpu_experts && total <= tune.get('cpu_pf_max', CPU_PF_MAX) && !opts.warmup) ? true : false;     // tunable
+		// the CPU's part of a split (AMP_EXPERT_CPU_SPLIT) only for prompts that fit in one group: with more groups the stages
+		// overlap and their CPU shares would queue on the same cores (jai, 51k tokens: 375 tok/s against ~690 staged). Then
+		// the kernels read those experts zero-copy from the arena instead (few rows each: about one pass, as staging)
+		let no_split = (opts.warmup || total > tune.get('split_max', group * (opts.chunk || 512))) ? true : false;     // tunable
+
+		// a staged prompt: every stage copies its first two layers' host experts ahead (its GPUs are idle until then)
+		let pre = [];
+
+		if (model.host_staged && !cpu_pf && total >= tune.get('stage_min', expert_host.STAGE_MIN) &&
+		    tune.get('prestage', 1)) {     // tunable
+			for (let S in stages)
+				if (S.first >= 0)
+					for (let g = 0; g < Gs; g++) {
+						let M = layers[S.first][g].moe;
+
+						expert_host.prestage(M);
+						push(pre, M);
+
+						if (M.stage && M.stage.next)
+							push(pre, M.stage.next);
+					}
+		}
 
 		for (let s = 0; s < NS; s++)
 			push(active, null);
@@ -1365,68 +1454,92 @@ function dsv41_tp_methods(model) {
 						return;
 			}
 
-			let end = bounds[next++];
+			let grp = [];
 
-			let t0 = clock(true);
+			// (unique over the life of the model: a layer remembers the group that staged it, and a later prefill's group
+			// must never match it — the buffer holds other layers by then)
+			gid = model.gid_next = (model.gid_next || 0) + 1;
 
-			prefetch(min(total, end - start + ahead * chunk));
+			// (a group ends at the snapshot boundary: nothing of the chunks behind it may run before the snapshot)
+			while (next < length(bounds) && length(grp) < group && !(length(grp) && snap_at && prev_end == snap_at)) {
+				let end = bounds[next++];
 
-			let t1 = clock(true);
-			let last_c = (end == start + total);
+				let t0 = clock(true);
 
-			issue();
+				prefetch(min(total, end - start + ahead * chunk));
 
-			let c = model.chunk_begin(slice(ids, prev_end - start, end - start), cache, nr ? true : false);
+				let t1 = clock(true);
+				let last_c = (end == start + total);
 
-			issue();
-			let t2 = clock(true);
+				issue();
 
-			if (getenv('AMP_DSV41_TP_HOSTPROF'))
-				warn(sprintf('admit: prefetch %.1f ms, chunk_begin %.1f ms\n', (t1[0] - t0[0]) * 1e3 + (t1[1] - t0[1]) / 1e6,
-					(t2[0] - t1[0]) * 1e3 + (t2[1] - t1[1]) / 1e6));
+				let c = model.chunk_begin(slice(ids, prev_end - start, end - start), cache, nr ? true : false);
 
-			if (opts.on_taps)
-				c.taps = [];
+				issue();
+				let t2 = clock(true);
 
-			c.last = last_c;
-			prev_end = end;
-			active[0] = c;
+				if (getenv('AMP_DSV41_TP_HOSTPROF'))
+					warn(sprintf('admit: prefetch %.1f ms, chunk_begin %.1f ms\n', (t1[0] - t0[0]) * 1e3 + (t1[1] - t0[1]) / 1e6,
+						(t2[0] - t1[0]) * 1e3 + (t2[1] - t1[1]) / 1e6));
+
+				if (opts.on_taps)
+					c.taps = [];
+
+				c.last = last_c;
+				c.gid = gid;
+				c.cpu_pf = cpu_pf;
+				c.no_split = no_split;
+				prev_end = end;
+				push(grp, c);
+			}
+
+			active[0] = grp;
 		}
 
 		function round() {
 			let cs = [];
 
+			if (NSYS == 'prefill' && !nsys_pf && total >= NSYS_MIN && !opts.warmup && nsys_n++ == 0) {
+				torch.synchronize();
+				torch.profile(true);
+			}
+
 			for (let s = NS - 1; s >= 0; s--)
 				if (active[s])
-					push(cs, {c: active[s], s: s});
+					for (let c in active[s])
+						push(cs, {c: c, s: s});
 
 			if (!getenv('AMP_DSV41_TP_WHOLE'))
 				model.chunk_stages(cs, cache);
 
 			for (let s = NS - 1; s >= 0; s--) {
-				let c = active[s];
+				let grp = active[s];
 
-				if (!c)
+				if (!grp)
 					continue;
 
 				if (getenv('AMP_DSV41_TP_WHOLE'))
-					model.chunk_stage(c, cache, s);
+					for (let c in grp)
+						model.chunk_stage(c, cache, s);
 
 				if (s == NS - 1) {
-					if (opts.on_taps)
-						opts.on_taps(model.chunk_taps(c), c.pos0);
+					for (let c in grp) {
+						if (opts.on_taps)
+							opts.on_taps(model.chunk_taps(c), c.pos0);
 
-					if (c.last)
-						result = model.chunk_head(c, 1);
+						if (c.last)
+							result = model.chunk_head(c, 1);
 
-					done = c.end - start;
+						done = c.end - start;
+
+						if (opts.on_aux)
+							opts.on_aux(c.end);
+					}
+
 					active[s] = null;
-
-					if (opts.on_aux)
-						opts.on_aux(c.end);
 				}
 				else {
-					active[s + 1] = c;
+					active[s + 1] = grp;
 					active[s] = null;
 				}
 			}
@@ -1435,6 +1548,18 @@ function dsv41_tp_methods(model) {
 		}
 
 		admit();
+
+		// AMP_ALLOC_LOG=1: the caching allocator's retries / cudaMalloc / cudaFree calls of this prefill, per GPU (a retry frees
+		// the whole cache and synchronises the device: on full GPUs a new set of chunk shapes can cost seconds)
+		let al_devs = [], al0 = null;
+
+		if (getenv('AMP_ALLOC_LOG')) {
+			for (let S in stages)
+				for (let d in S.devs)
+					push(al_devs, d);
+
+			al0 = map(al_devs, (d) => torch.mem_info(d));
+		}
 
 		return {
 			step: function (rounds) {
@@ -1456,6 +1581,40 @@ function dsv41_tp_methods(model) {
 				for (let c in active)
 					if (c)
 						more = true;
+
+				if (!more)
+					for (let M in pre)
+						expert_host.unstage(M);
+
+				if (!more && nsys_n && !nsys_pf) {
+					nsys_pf = true;
+					torch.synchronize();
+					torch.profile(false);
+				}
+
+				if (!more && al0) {
+					warn('dsv41_tp: allocator during this prefill (retries/mallocs/frees): ' + join(' ', map(al_devs, (d, k) => {
+						let m = torch.mem_info(d);
+
+						return sprintf('%d:%d/%d/%d', d, m[4] - al0[k][4], m[5] - al0[k][5], m[6] - al0[k][6]);
+					})) + '\n');
+					al0 = null;
+				}
+
+				if (!more && HP && !hp_done) {
+					hp_done = true;
+					warn('dsv41_tp: host seconds per phase of this prefill: ' +
+						join(', ', map(sort(keys(HP)), (k) => sprintf('%s %.2f', k, HP[k]))) + '\n');
+
+					for (let k in keys(HP))
+						HP[k] = 0;
+				}
+
+				// host-resident experts: the prompt has told which experts the answer is likely to use
+				if (!more && !settled && model.dyn && total >= tune.get('settle_min', SETTLE_MIN)) {     // tunables
+					settled = true;
+					model.dyn.settle(tune.get('settle_rounds', SETTLE_ROUNDS));
+				}
 
 				return more;
 			},
@@ -1767,6 +1926,72 @@ export function load(model_dir, opts) {
 		S.end = i + 1;
 	}
 
+	// ---- host-resident experts (opts.host_experts = {frac, profile}; frac: a number or one per stage): per expert-parallel
+	// rank, the `frac` of its (layer, expert) pairs with the highest counts in the routing profile keep their trellis in
+	// VRAM; the rest stay in pinned host memory and the fused kernels read them over the link (a miss costs its
+	// transfer, a hit nothing), prefill stages them (expert_host.uc). Without it every expert is uploaded to its rank.
+	let cold = null, n_cold = 0;
+	let hx = opts.host_experts;
+	let dyn = (hx && hx.swaps > 0 && hx.frac != null && hx.profile) ? true : false;     // dynamic residency (expert_dyn.uc)
+	let cpux = (hx && hx.cpu > 0) ? hx.cpu : 0;       // cold experts computed on the CPU (threads), not read over the link
+	// AMP_EXPERT_CPU_SPLIT=q|q0,q1,...: with CPU experts, the least popular q of each layer's cold experts (one q, or one per
+	// stage) are not staged for prefill either: the CPU computes their picks while the link stages the others (0: prefill
+	// stages every cold expert). Best where the CPU's part takes about as long as the link's (the stages' CPU work
+	// serialises: one pool)
+	let cpu_split = map(split(getenv('AMP_EXPERT_CPU_SPLIT') ?? '0', ','), (v) => +v);
+	let prof_counts = null;
+
+	if (hx && hx.frac != null && hx.profile) {
+		let prof = json(readfile(hx.profile)).counts;
+		let fr = (type(hx.frac) == 'array') ? hx.frac : map(stages, () => hx.frac);
+
+		prof_counts = prof;
+
+		if (type(prof) != 'array' || length(prof) < nl)
+			die(`dsv41_tp: host_experts profile ${hx.profile} has no counts for ${nl} layers`);
+
+		// (one fraction per stage, or one per rank of every stage: GPUs with more free memory keep more experts)
+		if (length(fr) != NS && length(fr) != NS * Gs)
+			die(`dsv41_tp: host_experts: ${length(fr)} resident fractions for ${NS} stages of ${Gs} ranks`);
+
+		cold = [];
+
+		for (let i = 0; i < nl; i++) {
+			let row = [];
+
+			for (let e = 0; e < cfg.n_routed_experts; e++)
+				push(row, false);
+
+			push(cold, row);
+		}
+
+		for (let S in stages) {
+			for (let r = 0; r < Gs; r++) {
+				let f = (length(fr) == NS) ? fr[S.id] : fr[S.id * Gs + r];
+
+				if (f >= 1.0)
+					continue;
+
+				let e0 = plan.experts[r][0], en = plan.experts[r][1];
+				let items = [];
+
+				for (let i = max(S.first, nr); i < S.end && i < nl; i++)
+					for (let e = e0; e < e0 + en; e++)
+						push(items, [prof[i][e], i, e]);
+
+				sort(items, (a, b) => (b[0] - a[0]) || (a[1] - b[1]) || (a[2] - b[2]));
+
+				for (let k = int(length(items) * f + 0.5); k < length(items); k++) {
+					cold[items[k][1]][items[k][2]] = true;
+					n_cold++;
+				}
+			}
+		}
+
+		warn(sprintf('dsv41_tp: host experts: %d of %d routed experts stay in pinned host memory (resident fraction %s)\n',
+			n_cold, (nl - nr) * cfg.n_routed_experts, join(',', fr)));
+	}
+
 	glm5.set_fused_rows(max(256, opts.prefill_rows || 1024));
 
 	let meta = dsv41.build_engram_meta(model_dir, cfg);
@@ -1796,8 +2021,13 @@ export function load(model_dir, opts) {
 
 			if (at >= 0) {
 				let rest = substr(key, at + 9);
+				let ex = +substr(rest, 0, index(rest, '.'));
 
-				return S.expert_dev[+substr(rest, 0, index(rest, '.'))];
+				// a cold expert's trellis is read into the pinned arena below, not uploaded
+				if (cold && cold[i][ex] && substr(rest, -8) == '.trellis')
+					return null;
+
+				return S.expert_dev[ex];
 			}
 
 			return st;
@@ -1818,19 +2048,183 @@ export function load(model_dir, opts) {
 			let dev = S.devs[g];
 			let e0 = plan.experts[g][0], en = plan.experts[g][1];
 			let ex = [];
+			let arena = null, slot = 0, reads = [], slot_of = {}, nst = 0;
+			let cl = {w1: [[], [], []], w3: [[], [], []], w2: [[], [], []], ids: []};      // the CPU layer: trellis, suh, svh per matrix
 
-			for (let e = e0; e < e0 + en; e++)
+			if (cold) {
+				// this rank's cold experts: one pinned arena per matrix, an expert's trellis is a view of it
+				let nc = 0, first = -1;
+
+				for (let e = e0; e < e0 + en; e++)
+					if (cold[i][e]) {
+						nc++;
+
+						if (first < 0)
+							first = e;
+					}
+
+				if (nc) {
+					// arena slots by popularity in the profile: prefill stages slots [0, nst) over the link; with CPU experts the
+					// least popular `cpu_split` of them stay on the CPU in prefill too (few rows each: cheap there, and a smaller
+					// staging buffer)
+					let ce = [];
+
+					for (let e = e0; e < e0 + en; e++)
+						if (cold[i][e])
+							push(ce, e);
+
+					sort(ce, (a, b) => (prof_counts[i][b] - prof_counts[i][a]) || (a - b));
+
+					for (let k = 0; k < nc; k++)
+						slot_of[ce[k]] = k;
+
+					let q = cpu_split[min(S.id, length(cpu_split) - 1)];
+
+					nst = cpux ? nc - int(nc * q + 0.5) : nc;
+
+					for (let k = 0; k < nc; k++) {
+						cl.ids[k] = null;
+
+						for (let pn in ['w1', 'w3', 'w2'])
+							for (let m = 0; m < 3; m++)
+								cl[pn][m][k] = null;
+					}
+
+					arena = {};
+
+					for (let pn in ['w1', 'w3', 'w2']) {
+						let k0 = `${mkey}.experts.${first}.${pn}.trellis`;
+						let sh = ws.info(k0).shape;
+
+						arena[pn] = torch.pinned_empty([nc, sh[0], sh[1], sh[2]], ws.tensor(k0).dtype());
+					}
+				}
+			}
+
+			for (let e = e0; e < e0 + en; e++) {
+				if (!(cold && cold[i][e])) {
+					// (dynamic residency: a resident expert is the same kind of object as a cold one, see models.LinearEXL3Cold)
+					if (dyn)
+						push(ex, {
+							slot: null,
+							gate: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.w1`, dev, null),
+							up: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.w3`, dev, null),
+							down: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.w2`, dev, null)
+						});
+					else
+						push(ex, {
+							gate: models.linear(ws, `${mkey}.experts.${e}.w1`, false, dev),
+							up: models.linear(ws, `${mkey}.experts.${e}.w3`, false, dev),
+							down: models.linear(ws, `${mkey}.experts.${e}.w2`, false, dev)
+						});
+
+					continue;
+				}
+
+				let hs = {};
+				let my_slot = slot_of[e];
+
+				for (let pn in ['w1', 'w3', 'w2']) {
+					let key = `${mkey}.experts.${e}.${pn}.trellis`;
+					let dst = arena[pn].narrow(0, my_slot, 1).view(ws.info(key).shape);
+
+					push(reads, [ ws.file(key), key, dst ]);
+					hs[pn] = dst;
+
+					if (cpux) {
+						let k = `${mkey}.experts.${e}.${pn}`;
+
+						cl[pn][0][my_slot] = dst;
+						cl[pn][1][my_slot] = cpu_copy(ws.tensor(k + '.suh'));
+						cl[pn][2][my_slot] = cpu_copy(ws.tensor(k + '.svh'));
+					}
+				}
+
+				cl.ids[my_slot] = e;
+
+				slot++;
+
 				push(ex, {
-					gate: models.linear(ws, `${mkey}.experts.${e}.w1`, false, dev),
-					up: models.linear(ws, `${mkey}.experts.${e}.w3`, false, dev),
-					down: models.linear(ws, `${mkey}.experts.${e}.w2`, false, dev)
+					slot: my_slot,
+					gate: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.w1`, dev, hs.w1),
+					up: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.w3`, dev, hs.w3),
+					down: models.LinearEXL3Cold(ws, `${mkey}.experts.${e}.w2`, dev, hs.w2)
 				});
+			}
+
+			// (the cold experts' trellis: pread straight into the arena by several threads, not through the mmap)
+			if (length(reads))
+				torch.read_into(reads, 8);
 
 			let M = {
 				type: 'moe', dev: dev, experts: ex, e0: e0, e1: e0 + en, router: 'sqrtsp',
 				gate_t: gate_t.cuda(dev), bias: bias.cuda(dev), bias_vl: null, tid2eid: null, ids: null, vlon: false,
 				async_moe: true, fused_prep: true, shared: shard_mlp8(shared, plan.shared[g], dev)
 			};
+
+			if (cpux && length(cl.ids)) {
+				let map = [];
+
+				for (let e = 0; e < cfg.n_routed_experts; e++)
+					push(map, -1);
+
+				for (let j = 0; j < length(cl.ids); j++)
+					map[cl.ids[j]] = j;
+
+				// (prefill with a split: only the CPU-only slots [nst, nc))
+				let map_pf = null;
+
+				if (nst < length(cl.ids)) {
+					map_pf = [];
+
+					for (let e = 0; e < cfg.n_routed_experts; e++)
+						push(map_pf, -1);
+
+					for (let j = nst; j < length(cl.ids); j++)
+						map_pf[cl.ids[j]] = j;
+				}
+
+				let K = cfg.num_experts_per_tok, dvs = 'cuda:' + dev;
+
+				M.cpu = {
+					handle: torch.moe_cpu_make_layer(cl.w1[0], cl.w1[1], cl.w1[2], cl.w3[0], cl.w3[1], cl.w3[2],
+						cl.w2[0], cl.w2[1], cl.w2[2], cfg.swiglu_limit + 0.0),
+					map: torch.from_array(map, 'int32', dvs), drop: torch.full([1], -1, 'int64', dvs),
+					none: torch.full([1], -1, 'int32', dvs),
+					map_pf: map_pf ? torch.from_array(map_pf, 'int32', dvs) : null,
+					out: torch.zeros([16, H], 'float32', dvs),
+					xh: torch.pinned_empty([16, H], 'float16'), selh: torch.pinned_empty([16, K], 'int32'),
+					wh: torch.pinned_empty([16, K], 'float16'), outh: torch.pinned_empty([16, H], 'float32'),
+					threads: cpux,
+					// (per matrix gate / up / down, per arena slot: the scales the CPU layer reads, for expert_dyn's exchanges)
+					suh: [cl.w1[1], cl.w3[1], cl.w2[1]], svh: [cl.w1[2], cl.w3[2], cl.w2[2]]
+				};
+			}
+
+			// route tail skip (--expert-skip N, live: the tunable skip; AMP_EXPERT_SKIP_LIVE=1 builds the masks with N = 0):
+			// picks of host experts at router rank >= N are dropped in decode / verify steps (glm5.moe_forward_fused) —
+			// approximate, their weight is lost
+			if (arena && (hx.skip > 0 || getenv('AMP_EXPERT_SKIP_LIVE'))) {
+				let K = cfg.num_experts_per_tok, cm = [], tl = [];
+
+				for (let e = 0; e < cfg.n_routed_experts; e++)
+					push(cm, (e >= e0 && e < e0 + en && ex[e - e0].slot != null) ? 1.0 : 0.0);
+
+				for (let k = 0; k < K; k++)
+					push(tl, (hx.skip > 0 && k >= hx.skip) ? 1.0 : 0.0);
+
+				M.skip = {
+					cold: torch.from_array(cm, 'float32', 'cuda:' + dev),
+					tail: torch.from_array(tl, 'float32', 'cuda:' + dev).view([1, K]),
+					drop: torch.full([1], -1, 'int64', 'cuda:' + dev)
+				};
+			}
+
+			if (arena)
+				M.stage = {
+					dev: dev, arena: [arena.w1, arena.w3, arena.w2], nc: slot, nst: nst, par: i % 2,
+					bufs: null, bytes: null, next: null, copied: false, on: false, pf: null, dec: null
+				};
 
 			// (mixed integer widths: the per-expert tables; one half-integer width, the 2.50bpw packs: null, glm5.moe_begin
 			// builds the uniform-width tables on first use)
@@ -1870,11 +2264,20 @@ export function load(model_dir, opts) {
 
 		attn = shared = null;
 
+		if (getenv('AMP_LOAD_LOG'))
+			warn(sprintf('dsv41_tp: layer %d loaded at %.0f s\n', i, time() - t_load));
+
 		if (i % 4 == 3)
 			gc();
 	}
 
 	gc();
+
+	if (cold) {
+		let sb = expert_host.setup(layers, nl);
+
+		warn(sprintf('dsv41_tp: host experts: staging buffers %.2f GiB per device\n', sb / 1073741824.0 / G));
+	}
 
 	let last = stages[stage_of[nl - 1]];
 
@@ -1955,6 +2358,43 @@ export function load(model_dir, opts) {
 	};
 
 	dsv41_tp_methods(model);
+
+	model.cpu_experts = (cpux && cold) ? true : false;
+	model.host_staged = cold ? true : false;
+
+	// tunable cpu_threads: the CPU experts' thread count, live (torch.moe_cpu_threads)
+	if (model.cpu_experts) {
+		tune.on('cpu_threads', (v) => torch.moe_cpu_threads(+v));
+
+		// tunable skip: the route tail skip's router rank (0: off), where the masks exist
+		tune.on('skip', function (v) {
+			let K = cfg.num_experts_per_tok, tl = [];
+
+			for (let k = 0; k < K; k++)
+				push(tl, (v > 0 && k >= v) ? 1.0 : 0.0);
+
+			for (let i = nr; i < nl; i++)
+				for (let R in layers[i])
+					if (R.moe && R.moe.skip)
+						R.moe.skip.tail.copy_(torch.from_array(tl, 'float32').view([1, K]));
+		});
+		// tunable cpu_prof: CPU call statistics every N calls (0: off); cpu_phases: the kernels' phase times
+		tune.on('cpu_prof', (v) => torch.moe_cpu_prof(+v));
+		tune.on('cpu_phases', (v) => torch.moe_cpu_prof(+tune.get('cpu_prof', 0), v ? true : false));
+	}
+
+	if (dyn && cold) {
+		let sr = [];
+
+		for (let S in stages)
+			if (S.first >= 0)
+				push(sr, {first: S.first, end: S.end});
+
+		model.dyn = expert_dyn.create(model, layers, nl, cfg, hx, sr);
+
+		warn(sprintf('dsv41_tp: dynamic expert residency: up to %g swaps per decode step, plan every %d steps\n',
+			model.dyn.swaps_per_step, model.dyn.interval));
+	}
 
 	return model;
 }

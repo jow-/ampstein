@@ -390,6 +390,8 @@ export function serve(args) {
 	else if (D41 && args.tp) {
 		model = dsv41_tp.load(args.model, {devices: args.gpus, stages: args.stages, max_seq: args.ctx,
 			prefill_rows: args.chunk, spark: D41_SPARK && args.stages == cfg.num_mtp_layers,
+			host_experts: (args.expert_resident != null && args.expert_profile) ? {frac: args.expert_resident,
+				profile: args.expert_profile, swaps: args.expert_swaps, cpu: args.expert_cpu, skip: args.expert_skip} : null,
 			...rpc_load});
 
 		if (model.spark_stages) {

@@ -11,6 +11,7 @@ import * as glm5 from './glm5.uc';
 import * as dsv4 from './dsv4.uc';
 import * as dsv4_tp from './dsv4_tp.uc';
 import * as dsv41 from './dsv41.uc';
+import * as tune from './tune.uc';
 
 const RING = 1024;
 const SKIP_POS = 1099511627776;
@@ -515,7 +516,9 @@ export function load(model, opts) {
 		d.update_rows(taps, pos);
 	};
 
-	let PR = getenv('AMP_DSPARK_PROF') ? {n: 0, draft: 0, verify: 0, update: 0} : null;
+	// AMP_DSPARK_PROF=1 or the live tunable dspark_prof: ms per round of drafting / verify (synchronised) / update
+	let PR0 = {n: 0, draft: 0, verify: 0, update: 0}, PR = null;
+	let PR_ENV = getenv('AMP_DSPARK_PROF') ? 1 : 0;
 
 	function now() {
 		let c = clock(true);
@@ -523,9 +526,43 @@ export function load(model, opts) {
 		return c[0] * 1000.0 + c[1] / 1e6;
 	}
 
+	/* The cost of a round per draft length V (ms, drafting included): the static table is the prior, and the rounds
+	 * measure it (from the draft to the verify's argmax, a sync) — host-resident experts make the verify steps slower
+	 * and their cost grow differently with the rows. Per V a moving average once it has 4 rounds; a V not measured yet
+	 * scales its prior by the measured ones. Tunables: dspark_costs (an array that replaces the prior and the
+	 * measurements), dspark_adapt (1: the measured costs). Off by default: on jai with host experts it chose shorter
+	 * drafts at the same round time (2.5 instead of 2.7 tokens per round). AMP_DSPARK_ADAPT=1 turns it on. */
+	let ADAPT = getenv('AMP_DSPARK_ADAPT') == '1', meas = map(d.cost, () => ({n: 0, ms: 0.0}));
+
+	function round_costs() {
+		let fix = tune.get('dspark_costs', null);
+
+		if (type(fix) == 'array' && length(fix) >= length(d.cost))
+			return fix;
+
+		if (!tune.get('dspark_adapt', ADAPT))
+			return d.cost;
+
+		let rs = 0.0, rn = 0;
+
+		for (let v = 0; v < length(d.cost); v++)
+			if (meas[v].n >= 4) {
+				rs += meas[v].ms / d.cost[v];
+				rn++;
+			}
+
+		let ratio = rn ? rs / rn : 1.0;
+
+		return map(d.cost, (c, v) => (meas[v].n >= 4) ? meas[v].ms : c * ratio);
+	}
+
 	/* one round from the seed token (not yet in the target cache) at p0 */
 	d.run = function (seed, p0, Vmax) {
-		let t0 = PR ? now() : 0;
+		PR = tune.get('dspark_prof', PR_ENV) ? PR0 : null;
+
+		let tr = now();
+		let cost = round_costs();
+		let t0 = PR ? tr : 0;
 		let r = d.draft(seed, p0);
 
 		if (PR) {
@@ -534,13 +571,13 @@ export function load(model, opts) {
 		}
 
 		// the draft length that maximizes the expected tokens per millisecond (see dsv41_spark.uc)
-		let V = 0, best = 1.0 / d.cost[0], prod = 1.0, acc = 0.0;
+		let V = 0, best = 1.0 / cost[0], prod = 1.0, acc = 0.0;
 
 		for (let k = 0; k < min(Vmax, B); k++) {
 			prod *= r.conf[k];
 			acc += prod;
 
-			let rate = (1.0 + acc) / d.cost[k + 1];
+			let rate = (1.0 + acc) / cost[k + 1];
 
 			if (rate > best) {
 				best = rate;
@@ -563,6 +600,14 @@ export function load(model, opts) {
 		d.update_rows(ver.taps, p0);
 
 		let am = ver.logits.to('float32').argmax(-1).tolist();
+		let ms = now() - tr, mv = meas[V];
+
+		// (a round far off the average — a prefill or an exchange burst in between — counts less)
+		mv.ms = mv.n ? mv.ms * 0.9 + min(ms, mv.ms * 2.0) * 0.1 : ms;
+		mv.n++;
+
+		if (PR && PR.n % 50 == 49)
+			warn('dspark costs (ms per round by V): ' + join(' ', map(round_costs(), (c) => sprintf('%.1f', c))) + '\n');
 
 		if (PR) {
 			PR.update += now() - t0;
