@@ -39,6 +39,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
+#include <cuda_profiler_api.h>
 #include <sys/socket.h>
 #include <poll.h>
 #include <errno.h>
@@ -52,6 +53,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <list>
+#include <unordered_map>
 #include <memory>
 #include <functional>
 #include <optional>
@@ -3737,6 +3740,529 @@ torch_synchronize(uc_vm_t *vm, size_t nargs)
 	return NULL;
 }
 
+/* --- CPU experts (vendor/exl3/exllamav3_ext/cpu/moe_mul1.cpp) --------------------------------------------------- */
+
+#include "exl3/exllamav3_ext/cpu/moe_mul1.h"
+
+/* A list of tensors from an array argument. */
+static bool
+tensor_list_arg(uc_vm_t *vm, uc_value_t *v, std::vector<at::Tensor> &out, const char *what)
+{
+	if (ucv_type(v) != UC_ARRAY) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "%s: expected an array of tensors", what);
+		return false;
+	}
+
+	for (size_t i = 0; i < ucv_array_length(v); i++) {
+		at::Tensor *t = tensor_arg(vm, ucv_array_get(v, i));
+
+		if (!t)
+			return false;
+
+		out.push_back(*t);
+	}
+
+	return true;
+}
+
+/*
+ * moe_cpu_make_layer(gate_trellis, gate_suh, gate_svh, up_trellis, up_suh, up_svh, down_trellis, down_suh, down_svh,
+ *                    act_limit): int
+ *
+ * Registers the experts of one layer for the CPU kernels: nine arrays (one tensor per expert) of contiguous CPU
+ * tensors, the trellis as stored in the checkpoint (int16 [k/16, n/16, 16K]), suh / svh fp16. mul1 codebook only,
+ * SiLU gated experts with the clamp act_limit (DeepSeek-V4: swiglu_limit). The tensors are referenced, not copied.
+ * Returns the handle for moe_cpu_forward / moe_cpu_enqueue.
+ */
+static uc_value_t *
+torch_moe_cpu_make_layer(uc_vm_t *vm, size_t nargs)
+{
+	std::vector<at::Tensor> a[9];
+	double lim;
+
+	if (nargs != 10) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (nine arrays of tensors, act_limit)");
+		return NULL;
+	}
+
+	for (int i = 0; i < 9; i++)
+		if (!tensor_list_arg(vm, uc_fn_arg(i), a[i], "moe_cpu_make_layer"))
+			return NULL;
+
+	if (!arg_number(vm, uc_fn_arg(9), &lim))
+		return NULL;
+
+	if (a[3].empty()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "moe_cpu_make_layer: no experts");
+		return NULL;
+	}
+
+	try {
+		std::vector<at::Tensor> none;
+		int64_t h = exl3_moe_cpu_make_layer(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8],
+			none, none, none, 0, lim, 0);
+
+		return ucv_int64_new(h);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+static uc_value_t *
+torch_moe_cpu_free_layer(uc_vm_t *vm, size_t nargs)
+{
+	int64_t h;
+
+	if (nargs != 1 || !arg_int(vm, uc_fn_arg(0), &h)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (handle)");
+		return NULL;
+	}
+
+	exl3_moe_cpu_free_layer(h);
+
+	return NULL;
+}
+
+/* The tensors of one call, checked: x [m, H] fp16, sel [m, K] int32, w [m, K] fp16, out [m, H] fp32. */
+struct moe_cpu_args {
+	at::Tensor *x, *sel, *w, *out;
+	int rows, topk;
+};
+
+static bool
+moe_cpu_args_check(uc_vm_t *vm, uc_value_t **v, bool want_cuda, moe_cpu_args *a, const char *what)
+{
+	a->x = tensor_arg(vm, v[0]);
+	a->sel = tensor_arg(vm, v[1]);
+	a->w = tensor_arg(vm, v[2]);
+	a->out = tensor_arg(vm, v[3]);
+
+	if (!a->x || !a->sel || !a->w || !a->out)
+		return false;
+
+	if (a->x->is_cuda() != want_cuda || a->sel->is_cuda() != want_cuda || a->w->is_cuda() != want_cuda ||
+	    a->out->is_cuda() != want_cuda || !a->x->is_contiguous() || !a->sel->is_contiguous() ||
+	    !a->w->is_contiguous() || !a->out->is_contiguous() || a->x->dim() != 2 || a->sel->dim() != 2 ||
+	    a->x->scalar_type() != at::kHalf || a->w->scalar_type() != at::kHalf ||
+	    a->sel->scalar_type() != at::kInt || a->out->scalar_type() != at::kFloat ||
+	    a->sel->size(0) != a->x->size(0) || a->out->size(0) != a->x->size(0) || a->w->numel() != a->sel->numel() ||
+	    a->out->size(1) != a->x->size(1) || (want_cuda && a->x->get_device() != a->out->get_device())) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"%s: x [m, H] fp16, sel [m, K] int32, w [m, K] fp16, out [m, H] fp32, contiguous, all %s", what,
+			want_cuda ? "on one device" : "on the CPU");
+		return false;
+	}
+
+	a->rows = (int)a->x->size(0);
+	a->topk = (int)a->sel->size(1);
+
+	return true;
+}
+
+/* The optional thread count argument. */
+static bool
+moe_cpu_threads_arg(uc_vm_t *vm, size_t nargs, size_t at, int64_t *threads)
+{
+	*threads = 8;
+
+	if (nargs > at && (!arg_int(vm, uc_fn_arg(at), threads) || *threads < 1 || *threads > 64)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "threads: expected an integer 1..64");
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * moe_cpu_forward(handle, x, sel, w, out, threads?): null
+ *
+ * Runs the layer's experts for the picks `sel` (ids into the layer's expert list; ids outside it are skipped) now, on
+ * `threads` threads (default 8); CPU tensors. out is overwritten with the weighted sum of the experts' outputs.
+ */
+static uc_value_t *
+torch_moe_cpu_forward(uc_vm_t *vm, size_t nargs)
+{
+	int64_t h, threads;
+	moe_cpu_args a;
+	uc_value_t *v[4];
+
+	if (nargs < 5 || nargs > 6 || !arg_int(vm, uc_fn_arg(0), &h)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (handle, x, sel, w, out, threads?)");
+		return NULL;
+	}
+
+	for (int i = 0; i < 4; i++)
+		v[i] = uc_fn_arg(1 + i);
+
+	if (!moe_cpu_args_check(vm, v, false, &a, "moe_cpu_forward") || !moe_cpu_threads_arg(vm, nargs, 5, &threads))
+		return NULL;
+
+	try {
+		exl3_moe_cpu_forward_raw(h, (const at::Half *)a.x->data_ptr(), (const int32_t *)a.sel->data_ptr(),
+			(const at::Half *)a.w->data_ptr(), (float *)a.out->data_ptr(), a.rows, a.topk, (int)threads);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+/* One queued CPU expert call: kept for the life of the process when a graph captured it (the graph replays it), freed
+ * by its host function when it was queued eagerly (oneshot). */
+struct moe_cpu_job {
+	int64_t handle;
+	const at::Half *x;
+	const int32_t *sel;
+	const at::Half *w;
+	float *out;
+	int rows, topk, threads;
+	bool oneshot;
+};
+
+static std::mutex moe_cpu_jobs_mutex;
+static std::vector<std::unique_ptr<moe_cpu_job>> moe_cpu_jobs;
+
+/* AMP_EXPERT_CPU_PROF=N: every N host calls, their mean wall time, picks, overlap (calls already running when one
+ * starts: a serialised pool shows up as wall time spent waiting) and the number of distinct calling threads */
+static struct {
+	long every, calls, picks, empty, overlap;
+	double us;
+	std::atomic<int> running;
+	std::mutex lock;
+	std::vector<pthread_t> tids;
+} moe_cpu_prof = { -1 };
+
+/* With the statistics on: would a cache of decoded experts help? The distinct experts of every decode-sized call (at
+ * most 16 rows; prefill calls touch most of a layer) go through simulated LRU caches of 256 / 1024 / 4096 experts: the
+ * hit rates say how often the CPU decodes an expert it decoded recently. */
+struct moe_cpu_lru {
+	size_t cap;
+	long hits;
+	std::list<uint64_t> order;
+	std::unordered_map<uint64_t, std::list<uint64_t>::iterator> at;
+
+	bool
+	touch(uint64_t k)
+	{
+		auto it = at.find(k);
+
+		if (it != at.end()) {
+			order.splice(order.begin(), order, it->second);
+			hits++;
+
+			return true;
+		}
+
+		order.push_front(k);
+		at[k] = order.begin();
+
+		if (order.size() > cap) {
+			at.erase(order.back());
+			order.pop_back();
+		}
+
+		return false;
+	}
+};
+
+static moe_cpu_lru moe_cpu_lrus[3] = { { 256 }, { 1024 }, { 4096 } };
+static long moe_cpu_lru_n = 0;
+
+/* the thread count that overrides the enqueued one (0: none), set by moe_cpu_threads (live tuning) */
+static std::atomic<int> moe_cpu_threads_over{0};
+
+
+static int
+moe_cpu_threads(int dflt)
+{
+	int n = moe_cpu_threads_over.load(std::memory_order_relaxed);
+
+	return n ? n : dflt;
+}
+
+static void
+moe_cpu_run(moe_cpu_job *j)
+{
+	if (moe_cpu_prof.every < 0) {
+		const char *e = getenv("AMP_EXPERT_CPU_PROF");
+
+		moe_cpu_prof.every = e ? atol(e) : 0;
+		exl3_moe_cpu_set_prof(getenv("EXL3_MOE_CPU_PROF") != NULL);
+	}
+
+	int threads = moe_cpu_threads(j->threads);
+
+	if (!moe_cpu_prof.every) {
+		try {
+			exl3_moe_cpu_forward_raw(j->handle, j->x, j->sel, j->w, j->out, j->rows, j->topk, threads);
+		}
+		catch (const std::exception &e) {
+			fprintf(stderr, "ampstein: CPU experts: %s\n", e.what());
+		}
+
+		return;
+	}
+
+	int busy = moe_cpu_prof.running.fetch_add(1);
+	int picks = 0;
+	struct timespec t0, t1;
+
+	for (int i = 0; i < j->rows * j->topk; i++)
+		picks += (j->sel[i] >= 0);
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+
+	try {
+		exl3_moe_cpu_forward_raw(j->handle, j->x, j->sel, j->w, j->out, j->rows, j->topk, threads);
+	}
+	catch (const std::exception &e) {
+		fprintf(stderr, "ampstein: CPU experts: %s\n", e.what());
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	moe_cpu_prof.running.fetch_sub(1);
+
+	std::lock_guard<std::mutex> lock(moe_cpu_prof.lock);
+	pthread_t self = pthread_self();
+	bool known = false;
+
+	for (pthread_t t : moe_cpu_prof.tids)
+		known = known || pthread_equal(t, self);
+
+	if (!known)
+		moe_cpu_prof.tids.push_back(self);
+
+	if (j->rows <= 16) {
+		uint64_t seen[16 * 16];
+		int ns = 0;
+
+		for (int i = 0; i < j->rows * j->topk && ns < 16 * 16; i++) {
+			if (j->sel[i] < 0)
+				continue;
+
+			uint64_t k = ((uint64_t)j->handle << 20) | (uint32_t)j->sel[i];
+			bool dup = false;
+
+			for (int q = 0; q < ns && !dup; q++)
+				dup = (seen[q] == k);
+
+			if (dup)
+				continue;
+
+			seen[ns++] = k;
+			moe_cpu_lru_n++;
+
+			for (auto &c : moe_cpu_lrus)
+				c.touch(k);
+		}
+	}
+
+	moe_cpu_prof.calls++;
+	moe_cpu_prof.picks += picks;
+	moe_cpu_prof.empty += (picks == 0);
+	moe_cpu_prof.overlap += (busy > 0);
+	moe_cpu_prof.us += (t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3;
+
+	if (moe_cpu_prof.calls % moe_cpu_prof.every == 0) {
+		fprintf(stderr, "ampstein: CPU experts: %ld calls, %.1f us/call, %.2f picks/call, %.0f%% empty, "
+			"%.0f%% overlapped, %zu threads; decoded-expert LRU hits (since start, %ld experts) 256: %.0f%%, "
+			"1024: %.0f%%, 4096: %.0f%%\n", moe_cpu_prof.calls, moe_cpu_prof.us / moe_cpu_prof.calls,
+			(double)moe_cpu_prof.picks / moe_cpu_prof.calls, 100.0 * moe_cpu_prof.empty / moe_cpu_prof.calls,
+			100.0 * moe_cpu_prof.overlap / moe_cpu_prof.calls, moe_cpu_prof.tids.size(), moe_cpu_lru_n,
+			moe_cpu_lru_n ? 100.0 * moe_cpu_lrus[0].hits / moe_cpu_lru_n : 0.0,
+			moe_cpu_lru_n ? 100.0 * moe_cpu_lrus[1].hits / moe_cpu_lru_n : 0.0,
+			moe_cpu_lru_n ? 100.0 * moe_cpu_lrus[2].hits / moe_cpu_lru_n : 0.0);
+		moe_cpu_prof.calls = moe_cpu_prof.picks = moe_cpu_prof.empty = moe_cpu_prof.overlap = 0;
+		moe_cpu_prof.us = 0;
+	}
+}
+
+static void CUDART_CB
+moe_cpu_host_fn(void *p)
+{
+	moe_cpu_job *j = static_cast<moe_cpu_job *>(p);
+
+	moe_cpu_run(j);
+
+	if (j->oneshot)
+		delete j;
+}
+
+/*
+ * moe_cpu_threads(n): null
+ *
+ * From now on every CPU expert call (queued or captured) runs on n threads instead of the count it was enqueued with;
+ * 0 restores the enqueued counts.
+ */
+static uc_value_t *
+torch_moe_cpu_threads(uc_vm_t *vm, size_t nargs)
+{
+	int64_t n;
+
+	if (nargs != 1 || !arg_int(vm, uc_fn_arg(0), &n) || n < 0 || n > 64) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (threads 0..64)");
+		return NULL;
+	}
+
+	moe_cpu_threads_over.store((int)n);
+
+	return NULL;
+}
+
+/*
+ * moe_cpu_prof(every, phases?): null
+ *
+ * CPU expert call statistics on stderr every `every` calls (0: off; the AMP_EXPERT_CPU_PROF default), and with
+ * `phases` the exllamav3 kernels' per-phase times (stdout, every 512 calls; EXL3_MOE_CPU_PROF).
+ */
+static uc_value_t *
+torch_moe_cpu_prof(uc_vm_t *vm, size_t nargs)
+{
+	int64_t n;
+	uc_value_t *ph = uc_fn_arg(1);
+
+	if (nargs < 1 || nargs > 2 || !arg_int(vm, uc_fn_arg(0), &n) || n < 0 ||
+	    (nargs == 2 && ucv_type(ph) != UC_BOOLEAN)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (every >= 0, phases?)");
+		return NULL;
+	}
+
+	std::lock_guard<std::mutex> lock(moe_cpu_prof.lock);
+
+	moe_cpu_prof.every = n;
+	moe_cpu_prof.calls = moe_cpu_prof.picks = moe_cpu_prof.empty = moe_cpu_prof.overlap = 0;
+	moe_cpu_prof.us = 0;
+
+	if (nargs == 2)
+		exl3_moe_cpu_set_prof(ucv_boolean_get(ph));
+
+	return NULL;
+}
+
+/*
+ * moe_cpu_enqueue(handle, x, sel, w, out, x_h, sel_h, w_h, out_h, threads?): null
+ *
+ * The same call, queued on the current stream of the device tensors' device (x, sel, w, out: device tensors; *_h:
+ * pinned CPU tensors of the same shapes and dtypes): x / sel / w are copied down, a host function runs the experts,
+ * out is copied back up. Legal during graph capture (a host node and four copies); the pinned buffers and the layer
+ * must stay alive as long as the stream work (or the graph) does. The host function holds the stream until the CPU is
+ * done.
+ */
+static uc_value_t *
+torch_moe_cpu_enqueue(uc_vm_t *vm, size_t nargs)
+{
+	int64_t h, threads;
+	moe_cpu_args d, c;
+	uc_value_t *v[4];
+
+	if (nargs < 9 || nargs > 10 || !arg_int(vm, uc_fn_arg(0), &h)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (handle, x, sel, w, out, x_h, sel_h, w_h, out_h, threads?)");
+		return NULL;
+	}
+
+	for (int i = 0; i < 4; i++)
+		v[i] = uc_fn_arg(1 + i);
+
+	if (!moe_cpu_args_check(vm, v, true, &d, "moe_cpu_enqueue"))
+		return NULL;
+
+	for (int i = 0; i < 4; i++)
+		v[i] = uc_fn_arg(5 + i);
+
+	if (!moe_cpu_args_check(vm, v, false, &c, "moe_cpu_enqueue") || !moe_cpu_threads_arg(vm, nargs, 9, &threads))
+		return NULL;
+
+	if (!c.x->is_pinned() || !c.sel->is_pinned() || !c.w->is_pinned() || !c.out->is_pinned() ||
+	    c.x->sizes() != d.x->sizes() || c.sel->sizes() != d.sel->sizes() || c.out->sizes() != d.out->sizes()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"moe_cpu_enqueue: the host buffers must be pinned and shaped like the device tensors");
+		return NULL;
+	}
+
+	try {
+		c10::cuda::CUDAGuard g((c10::DeviceIndex)d.x->get_device());
+		cudaStream_t st = c10::cuda::getCurrentCUDAStream((c10::DeviceIndex)d.x->get_device()).stream();
+		cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+		auto job = std::make_unique<moe_cpu_job>();
+
+		if (cudaStreamIsCapturing(st, &cs) != cudaSuccess)
+			RAISE("moe_cpu_enqueue: cannot query the stream's capture status");
+
+		job->handle = h;
+		job->x = (const at::Half *)c.x->data_ptr();
+		job->sel = (const int32_t *)c.sel->data_ptr();
+		job->w = (const at::Half *)c.w->data_ptr();
+		job->out = (float *)c.out->data_ptr();
+		job->rows = d.rows;
+		job->topk = d.topk;
+		job->threads = (int)threads;
+		job->oneshot = (cs == cudaStreamCaptureStatusNone);
+
+		cudaError_t e = cudaMemcpyAsync(c.x->data_ptr(), d.x->data_ptr(), d.x->nbytes(), cudaMemcpyDeviceToHost, st);
+
+		if (e == cudaSuccess)
+			e = cudaMemcpyAsync(c.sel->data_ptr(), d.sel->data_ptr(), d.sel->nbytes(), cudaMemcpyDeviceToHost, st);
+
+		if (e == cudaSuccess)
+			e = cudaMemcpyAsync(c.w->data_ptr(), d.w->data_ptr(), d.w->nbytes(), cudaMemcpyDeviceToHost, st);
+
+		bool oneshot = job->oneshot;
+
+		if (e == cudaSuccess)
+			e = cudaLaunchHostFunc(st, moe_cpu_host_fn, job.get());
+
+		// (an eager job belongs to its host function once queued, which may already have run and freed it)
+		if (e == cudaSuccess && oneshot)
+			job.release();
+
+		if (e == cudaSuccess)
+			e = cudaMemcpyAsync(d.out->data_ptr(), c.out->data_ptr(), d.out->nbytes(), cudaMemcpyHostToDevice, st);
+
+		if (e != cudaSuccess)
+			RAISE(cudaGetErrorString(e));
+
+		if (oneshot)
+			return NULL;
+
+		std::lock_guard<std::mutex> lock(moe_cpu_jobs_mutex);
+
+		moe_cpu_jobs.push_back(std::move(job));
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
+/*
+ * profile(on: bool): null
+ *
+ * cudaProfilerStart() / cudaProfilerStop(): the capture range of `nsys profile --capture-range=cudaProfilerApi`
+ * (a server is profiled over one prefill or a few decode steps instead of its whole life). A no-op without a profiler.
+ */
+static uc_value_t *
+torch_profile(uc_vm_t *vm, size_t nargs)
+{
+	bool on = true;
+
+	if (nargs != 1 || !arg_bool(vm, uc_fn_arg(0), &on)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (on: bool)");
+		return NULL;
+	}
+
+	if (on)
+		cudaProfilerStart();
+	else
+		cudaProfilerStop();
+
+	return NULL;
+}
+
 /* --- fused kernels (src/amp_kernels.cu) ----------------------------------- */
 
 extern "C" int
@@ -4481,10 +5007,12 @@ torch_dsa_select(uc_vm_t *vm, size_t nargs)
 }
 
 /*
- * mem_info(dev): [allocated, reserved, free, total] bytes of CUDA device
+ * mem_info(dev): [allocated, reserved, free, total, retries, mallocs, frees] of CUDA device
  * `dev` — what the caching allocator hands to tensors, what it holds from
  * the driver, and the driver's view (cudaMemGetInfo, i.e. including the
- * CUDA context and non-PyTorch allocations).
+ * CUDA context and non-PyTorch allocations), then the allocator's counts of
+ * retries (an allocation that failed, freed the cache and tried again),
+ * cudaMalloc and cudaFree calls since the start.
  */
 static uc_value_t *
 torch_mem_info(uc_vm_t *vm, size_t nargs)
@@ -4498,7 +5026,7 @@ torch_mem_info(uc_vm_t *vm, size_t nargs)
 
 	try {
 		c10::cuda::CUDAGuard g((c10::DeviceIndex)dev);
-		int64_t alloc = 0, reserved = 0;
+		int64_t alloc = 0, reserved = 0, retries = 0, mallocs = 0, frees = 0;
 
 		// (the allocator knows a device only after its first tensor: until then there is nothing
 		// allocated, and asking raises "Invalid device argument")
@@ -4507,6 +5035,9 @@ torch_mem_info(uc_vm_t *vm, size_t nargs)
 
 			alloc = (int64_t)st.allocated_bytes[0].current;
 			reserved = (int64_t)st.reserved_bytes[0].current;
+			retries = (int64_t)st.num_alloc_retries;
+			mallocs = (int64_t)st.num_device_alloc;
+			frees = (int64_t)st.num_device_free;
 		}
 		catch (const std::exception &) {
 		}
@@ -4515,12 +5046,15 @@ torch_mem_info(uc_vm_t *vm, size_t nargs)
 
 		cudaMemGetInfo(&fr, &tot);
 
-		uc_value_t *a = ucv_array_new_length(vm, 4);
+		uc_value_t *a = ucv_array_new_length(vm, 7);
 
 		ucv_array_push(a, ucv_int64_new(alloc));
 		ucv_array_push(a, ucv_int64_new(reserved));
 		ucv_array_push(a, ucv_int64_new((int64_t)fr));
 		ucv_array_push(a, ucv_int64_new((int64_t)tot));
+		ucv_array_push(a, ucv_int64_new(retries));
+		ucv_array_push(a, ucv_int64_new(mallocs));
+		ucv_array_push(a, ucv_int64_new(frees));
 
 		return a;
 	}
@@ -7770,6 +8304,157 @@ torch_stream_wait(uc_vm_t *vm, size_t nargs)
 	return NULL;
 }
 
+/* --- expert exchange (expert_dyn.uc) --------------------------------------- */
+
+extern "C" int amp_poke(void *const *p, const long long *v, const int *sz, int n, cudaStream_t stream);
+
+/* the byte-for-byte copy pairs of one direction: equal sizes, contiguous, the host side pinned */
+static bool
+exchange_pairs(uc_vm_t *vm, uc_value_t *dv, uc_value_t *sv, bool h2d, int dev, std::vector<at::Tensor> &dst,
+               std::vector<at::Tensor> &src)
+{
+	if (!tensor_list_arg(vm, dv, dst, "expert_exchange") || !tensor_list_arg(vm, sv, src, "expert_exchange"))
+		return false;
+
+	if (dst.size() != src.size()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expert_exchange: %zu destinations for %zu sources", dst.size(),
+			src.size());
+		return false;
+	}
+
+	for (size_t i = 0; i < dst.size(); i++) {
+		at::Tensor &d = h2d ? dst[i] : src[i], &h = h2d ? src[i] : dst[i];
+
+		if (!d.is_cuda() || d.get_device() != dev || !h.is_pinned() || !d.is_contiguous() || !h.is_contiguous() ||
+		    d.nbytes() != h.nbytes()) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"expert_exchange: copy %zu: a contiguous tensor on device %d and a pinned one of the same byte size", i,
+				dev);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/*
+ * expert_exchange(dev, slot, up_dst, up_src, down_dst, down_src, d2h_dst, d2h_src, pokes): null
+ *
+ * One exchange of dynamic expert residency, queued on the current stream of `dev` as expert_dyn.uc did op by op:
+ * upload i (pinned up_src[i] -> up_dst[i] on the device) on the current stream, and behind each upload the download
+ * i (device down_src[i] -> pinned down_dst[i]) on side stream `slot` (the link is full duplex; download i may
+ * overwrite the bytes upload i has read); the current stream then waits for the side stream, copies d2h_src[i] ->
+ * pinned d2h_dst[i], and writes `pokes` ([[address, value, 4 or 8], ...], at most 32: pointer-table entries, map
+ * and mask words) in one kernel launch. Tensors must stay referenced until the stream has run the copies.
+ */
+static uc_value_t *
+torch_expert_exchange(uc_vm_t *vm, size_t nargs)
+{
+	int64_t dev, slot;
+	std::vector<at::Tensor> ud, us, dd, ds, xd, xs;
+	std::vector<void *> pp;
+	std::vector<long long> pv;
+	std::vector<int> ps;
+
+	if (nargs != 9 || !arg_int(vm, uc_fn_arg(0), &dev) || !arg_int(vm, uc_fn_arg(1), &slot) || dev < 0 ||
+	    dev >= AMP_FORK_MAXD || dev >= at::cuda::device_count() || slot < 0 || slot >= AMP_FORK_MAXK) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (device, slot 0..3, up_dst, up_src, down_dst, down_src, d2h_dst, d2h_src, pokes)");
+		return NULL;
+	}
+
+	if (!exchange_pairs(vm, uc_fn_arg(2), uc_fn_arg(3), true, (int)dev, ud, us) ||
+	    !exchange_pairs(vm, uc_fn_arg(4), uc_fn_arg(5), false, (int)dev, dd, ds) ||
+	    !exchange_pairs(vm, uc_fn_arg(6), uc_fn_arg(7), false, (int)dev, xd, xs))
+		return NULL;
+
+	if (dd.size() > ud.size()) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expert_exchange: more downloads than uploads");
+		return NULL;
+	}
+
+	uc_value_t *pk = uc_fn_arg(8);
+
+	if (ucv_type(pk) != UC_ARRAY || ucv_array_length(pk) > 32) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expert_exchange: pokes: expected an array of at most 32");
+		return NULL;
+	}
+
+	for (size_t i = 0; i < ucv_array_length(pk); i++) {
+		uc_value_t *e = ucv_array_get(pk, i);
+		int64_t a, v, s;
+
+		if (ucv_type(e) != UC_ARRAY || ucv_array_length(e) != 3 || !arg_int(vm, ucv_array_get(e, 0), &a) ||
+		    !arg_int(vm, ucv_array_get(e, 1), &v) || !arg_int(vm, ucv_array_get(e, 2), &s) || !a ||
+		    (s != 4 && s != 8) || a % s) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"expert_exchange: poke %zu: expected [aligned address, value, 4 or 8]", i);
+			return NULL;
+		}
+
+		pp.push_back((void *)(uintptr_t)a);
+		pv.push_back((long long)v);
+		ps.push_back((int)s);
+	}
+
+	try {
+		c10::cuda::CUDAGuard g((c10::DeviceIndex)dev);
+		fork_slot *f = &fork_slots[dev][slot];
+
+		// (the slot's side stream and events, created as stream_side would)
+		if (!f->init) {
+			f->side = c10::cuda::getStreamFromPool(slot >= 2, (c10::DeviceIndex)dev);
+			f->dev = (int)dev;
+			cudaEventCreateWithFlags(&f->ev_start, cudaEventDisableTiming);
+			cudaEventCreateWithFlags(&f->ev_done, cudaEventDisableTiming);
+			f->init = true;
+		}
+
+		cudaStream_t st = c10::cuda::getCurrentCUDAStream((c10::DeviceIndex)dev).stream();
+		cudaStream_t side = f->side->stream();
+		cudaError_t e = cudaSuccess;
+
+		for (size_t i = 0; i < ud.size() && e == cudaSuccess; i++) {
+			e = cudaMemcpyAsync(ud[i].data_ptr(), us[i].data_ptr(), ud[i].nbytes(), cudaMemcpyHostToDevice, st);
+
+			if (e == cudaSuccess && i < dd.size()) {
+				// (an event re-recorded after the wait was queued: the wait keeps the record it saw)
+				e = cudaEventRecord(f->ev_start, st);
+
+				if (e == cudaSuccess)
+					e = cudaStreamWaitEvent(side, f->ev_start, 0);
+
+				if (e == cudaSuccess)
+					e = cudaMemcpyAsync(dd[i].data_ptr(), ds[i].data_ptr(), dd[i].nbytes(), cudaMemcpyDeviceToHost,
+						side);
+			}
+		}
+
+		if (e == cudaSuccess && dd.size()) {
+			e = cudaEventRecord(f->ev_done, side);
+
+			if (e == cudaSuccess)
+				e = cudaStreamWaitEvent(st, f->ev_done, 0);
+		}
+
+		for (size_t i = 0; i < xd.size() && e == cudaSuccess; i++)
+			e = cudaMemcpyAsync(xd[i].data_ptr(), xs[i].data_ptr(), xd[i].nbytes(), cudaMemcpyDeviceToHost, st);
+
+		if (e != cudaSuccess)
+			RAISE(cudaGetErrorString(e));
+
+		int rc = amp_poke(pp.data(), pv.data(), ps.data(), (int)pp.size(), st);
+
+		if (rc)
+			RAISEF("expert_exchange: poke: %s", cudaGetErrorString((cudaError_t)rc));
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	return NULL;
+}
+
 /* --- completion notifier (eventfd + cudaLaunchHostFunc) ------------------- */
 
 /* The shared state behind a notifier: the eventfd and the completion
@@ -8886,6 +9571,60 @@ torch_h2d_file(uc_vm_t *vm, size_t nargs)
 	if (!out)
 		return NULL;
 
+	/*
+	 * Read-ahead: one pread() at a time keeps an NVMe drive at queue depth 1 (350 MB/s on the 2.50bpw DeepSeek pack
+	 * against 790 MB/s for eight parallel readers; the cold start of a 160 GB load was 10 minutes), and
+	 * posix_fadvise(WILLNEED) starts no I/O on that array. A few helper threads read the entries ahead of the consumer
+	 * into the page cache, at most WINDOW bytes past it, so the preads below hit memory.
+	 */
+	std::atomic<size_t> consumed(0), ra_next(0);
+	std::atomic<bool> stop_ra(false);
+	std::vector<size_t> prefix(ents.size() + 1, 0);
+
+	for (size_t j = 0; j < ents.size(); j++)
+		prefix[j + 1] = prefix[j] + ents[j].nbytes;
+
+	auto ra_work = [&]() {
+		const size_t WINDOW = (size_t)3 << 30;
+		std::vector<uint8_t> scratch((size_t)4 << 20);
+
+		for (;;) {
+			size_t k = ra_next.fetch_add(1);
+
+			if (k >= ents.size())
+				return;
+
+			// wait until the consumer is within WINDOW of this entry
+			while (!stop_ra.load() && prefix[k] > prefix[std::min(consumed.load(), ents.size())] + WINDOW)
+				usleep(2000);
+
+			if (stop_ra.load())
+				return;
+
+			size_t done = 0;
+
+			while (done < ents[k].nbytes && !stop_ra.load()) {
+				size_t len = std::min(scratch.size(), ents[k].nbytes - done);
+				ssize_t got = pread(ents[k].f->fd, scratch.data(), len, (off_t)(ents[k].file_off + done));
+
+				if (got <= 0)
+					break;
+
+				done += (size_t)got;
+			}
+		}
+	};
+	std::vector<std::thread> ra_th;
+
+	if (ents.size() > 1)
+		for (int t = 0; t < 4; t++)
+			ra_th.emplace_back(ra_work);
+
+	struct ra_join {
+		std::atomic<bool> &stop; std::vector<std::thread> &t;
+		~ra_join() { stop.store(true); for (auto &x : t) if (x.joinable()) x.join(); }
+	} ra_guard{stop_ra, ra_th};
+
 	try {
 		c10::cuda::CUDAGuard dev_guard(dev);
 		h2d_ring ring;
@@ -8896,6 +9635,8 @@ torch_h2d_file(uc_vm_t *vm, size_t nargs)
 
 		for (i = 0; i < n; i++) {
 			src_ent &ent = ents[i];
+
+			consumed.store(i);
 
 			at::Tensor dst = at::empty(ent.dims,
 				at::TensorOptions().dtype(ent.dt)
@@ -8926,6 +9667,140 @@ torch_h2d_file(uc_vm_t *vm, size_t nargs)
 	}
 
 	return out;
+}
+
+/*
+ * read_into(items: array, threads?): null
+ *
+ * Reads safetensors tensors straight into CPU memory the caller owns (the pinned arenas of host-resident experts).
+ * items is an array of [stfile, name, dst] with dst a contiguous CPU tensor of the stored byte size; the bytes are
+ * read with pread() by `threads` workers (default 8: one reader does not keep an NVMe array busy), not through the
+ * mmap page-fault path (L40). Raises when any read fails or a destination does not fit.
+ */
+static uc_value_t *
+torch_read_into(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *items = uc_fn_arg(0);
+	int nthreads = 8;
+
+	if (nargs < 1 || nargs > 2 || ucv_type(items) != UC_ARRAY) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"expected (array of [stfile, name, dst], threads?)");
+		return NULL;
+	}
+
+	if (nargs == 2) {
+		uc_value_t *tv = uc_fn_arg(1);
+
+		if (ucv_type(tv) != UC_INTEGER || ucv_int64_get(tv) < 1 || ucv_int64_get(tv) > 64) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE, "threads: expected an integer 1..64");
+			return NULL;
+		}
+
+		nthreads = (int)ucv_int64_get(tv);
+	}
+
+	struct job { int fd; size_t file_off; size_t nbytes; uint8_t *dst; };
+	std::vector<job> jobs;
+	size_t n = ucv_array_length(items), i;
+
+	jobs.reserve(n);
+
+	for (i = 0; i < n; i++) {
+		uc_value_t *it = ucv_array_get(items, i);
+
+		if (ucv_type(it) != UC_ARRAY || ucv_array_length(it) != 3) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE, "item %zu: expected [stfile, name, dst]",
+				(unsigned long)i);
+			return NULL;
+		}
+
+		uc_value_t *fv = ucv_array_get(it, 0), *nv = ucv_array_get(it, 1), *dv = ucv_array_get(it, 2);
+		st_file_t *f = NULL;
+
+		if (ucv_type(fv) == UC_RESOURCE && res_is_type(fv, STFILE_TYPE))
+			f = static_cast<st_file_t *>(ucv_resource_data(fv, STFILE_TYPE));
+
+		if (!f || ucv_type(nv) != UC_STRING) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE, "item %zu: expected [stfile, name, dst]",
+				(unsigned long)i);
+			return NULL;
+		}
+
+		at::Tensor *dst = tensor_arg(vm, dv);
+
+		if (!dst)
+			return NULL;
+
+		const char *dtype;
+		int64_t *shape;
+		size_t ndim, offset, nbytes;
+		int rc = st_lookup(f, ucv_string_get(nv), &dtype, &shape, &ndim, &offset, &nbytes);
+
+		if (rc < 0) {
+			uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, "item %zu: no such (or malformed) tensor '%s'",
+				(unsigned long)i, ucv_string_get(nv));
+			return NULL;
+		}
+
+		free(shape);
+
+		if (dst->is_cuda() || !dst->is_contiguous() ||
+		    (size_t)dst->numel() * dst->element_size() != nbytes) {
+			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+				"item %zu: dst must be a contiguous CPU tensor of %zu bytes", (unsigned long)i, nbytes);
+			return NULL;
+		}
+
+		jobs.push_back({f->fd, f->data_off + offset, nbytes, (uint8_t *)dst->data_ptr()});
+	}
+
+	std::atomic<size_t> next(0);
+	std::atomic<bool> failed(false);
+
+	try {
+		auto work = [&]() {
+			for (;;) {
+				size_t k = next.fetch_add(1);
+
+				if (k >= jobs.size() || failed.load())
+					return;
+
+				job &j = jobs[k];
+				size_t done = 0;
+
+				while (done < j.nbytes) {
+					ssize_t got = pread(j.fd, j.dst + done, j.nbytes - done, (off_t)(j.file_off + done));
+
+					if (got <= 0) {
+						failed.store(true);
+						return;
+					}
+
+					done += (size_t)got;
+				}
+			}
+		};
+		std::vector<std::thread> th;
+
+		for (int t = 1; t < nthreads && (size_t)t < jobs.size(); t++)
+			th.emplace_back(work);
+
+		work();
+
+		for (auto &t : th)
+			t.join();
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+
+	if (failed.load()) {
+		uc_vm_raise_exception(vm, EXCEPTION_RUNTIME, "read_into: short read from safetensors file");
+		return NULL;
+	}
+
+	return NULL;
 }
 
 /*
@@ -10760,6 +11635,9 @@ static const uc_function_list_t torch_fns[] = {
 	{ "stream_side",	torch_stream_side },
 	{ "stream_main",	torch_stream_main },
 	{ "stream_wait",	torch_stream_wait },
+	{ "expert_exchange",	torch_expert_exchange },
+	{ "moe_cpu_threads",	torch_moe_cpu_threads },
+	{ "moe_cpu_prof",	torch_moe_cpu_prof },
 	{ "moe_fused",	torch_moe_fused },
 	{ "moe_gather",	torch_moe_gather },
 	{ "moe_concurrency",	torch_moe_concurrency },
@@ -10791,6 +11669,12 @@ static const uc_function_list_t torch_fns[] = {
 	{ "ptr_array",	torch_ptr_array },
 	{ "h2d",		torch_h2d },
 	{ "h2d_file",	torch_h2d_file },
+	{ "read_into",	torch_read_into },
+	{ "profile",	torch_profile },
+	{ "moe_cpu_make_layer",	torch_moe_cpu_make_layer },
+	{ "moe_cpu_free_layer",	torch_moe_cpu_free_layer },
+	{ "moe_cpu_forward",	torch_moe_cpu_forward },
+	{ "moe_cpu_enqueue",	torch_moe_cpu_enqueue },
 	{ "graph",		torch_graph_new },
 	{ "cat",	torch_cat },
 	{ "stack",	torch_stack },

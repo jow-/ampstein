@@ -6962,3 +6962,57 @@ amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc
 
 	return (int)cudaGetLastError();
 }
+
+/* --- small scattered writes (expert_dyn exchanges: pointer tables, maps, masks) --------------------------------- */
+
+/* Up to AMP_POKE_MAX writes of 4 or 8 bytes to arbitrary device addresses in one launch: the addresses and values
+ * travel in the kernel's parameters, so nothing on the host has to outlive the call (and a captured graph would replay
+ * the same writes). */
+#define AMP_POKE_MAX 32
+
+struct amp_poke_args {
+	void *p[AMP_POKE_MAX];
+	long long v[AMP_POKE_MAX];
+	int sz[AMP_POKE_MAX];
+	int n;
+};
+
+__global__ void
+amp_poke_kernel(amp_poke_args a)
+{
+	int i = threadIdx.x;
+
+	if (i >= a.n)
+		return;
+
+	if (a.sz[i] == 8)
+		*(long long *)a.p[i] = a.v[i];
+	else
+		*(int *)a.p[i] = (int)a.v[i];
+}
+
+extern "C" int
+amp_poke(void *const *p, const long long *v, const int *sz, int n, cudaStream_t stream)
+{
+	amp_poke_args a;
+
+	if (n < 0 || n > AMP_POKE_MAX)
+		return (int)cudaErrorInvalidValue;
+
+	if (n == 0)
+		return 0;
+
+	for (int i = 0; i < n; i++) {
+		if ((sz[i] != 4 && sz[i] != 8) || !p[i] || ((uintptr_t)p[i] % sz[i]))
+			return (int)cudaErrorInvalidValue;
+
+		a.p[i] = p[i];
+		a.v[i] = v[i];
+		a.sz[i] = sz[i];
+	}
+
+	a.n = n;
+	amp_poke_kernel<<<1, AMP_POKE_MAX, 0, stream>>>(a);
+
+	return (int)cudaGetLastError();
+}

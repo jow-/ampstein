@@ -279,4 +279,37 @@ expect_raise('graph.replay: zero count', function () {
 	g.replay(0);
 });
 
+/* --- host-resident experts ------------------------------------------------------ */
+
+expect_raise('read_into: not an array', function () { torch.read_into(1); });
+expect_raise('read_into: bad item', function () { torch.read_into([ [ 1, 2 ] ]); });
+expect_raise('moe_cpu_make_layer: no args', function () { torch.moe_cpu_make_layer(); });
+expect_raise('moe_cpu_make_layer: not arrays', function () {
+	torch.moe_cpu_make_layer(1, 2, 3, 4, 5, 6, 7, 8, 9, 1.0);
+});
+expect_raise('moe_cpu_make_layer: no experts', function () {
+	torch.moe_cpu_make_layer([], [], [], [], [], [], [], [], [], 1.0);
+});
+expect_raise('moe_cpu_forward: no args', function () { torch.moe_cpu_forward(); });
+expect_raise('moe_cpu_forward: bad tensors', function () {
+	torch.moe_cpu_forward(0, torch.zeros([1, 8]), torch.zeros([1, 2]), torch.zeros([1, 2]), torch.zeros([1, 8]));
+});
+expect_raise('moe_cpu_enqueue: no args', function () { torch.moe_cpu_enqueue(); });
+expect_raise('moe_cpu_threads: no args', function () { torch.moe_cpu_threads(); });
+expect_raise('moe_cpu_threads: too many', function () { torch.moe_cpu_threads(65); });
+expect_raise('moe_cpu_prof: negative', function () { torch.moe_cpu_prof(-1); });
+expect_raise('moe_cpu_prof: phases not boolean', function () { torch.moe_cpu_prof(10, 1); });
+expect_raise('expert_exchange: no args', function () { torch.expert_exchange(); });
+expect_raise('expert_exchange: bad slot', function () { torch.expert_exchange(0, 9, [], [], [], [], [], [], []); });
+expect_raise('expert_exchange: unpaired copy', function () {
+	torch.expert_exchange(0, 2, [ torch.zeros([2], 'float32', 'cuda:0') ], [], [], [], [], [], []);
+});
+expect_raise('expert_exchange: unpinned source', function () {
+	torch.expert_exchange(0, 2, [ torch.zeros([2], 'float32', 'cuda:0') ], [ torch.zeros([2]) ], [], [], [], [], []);
+});
+expect_raise('expert_exchange: bad poke', function () { torch.expert_exchange(0, 2, [], [], [], [], [], [], [ [ 3, 0, 8 ] ]); });
+expect_raise('expert_exchange: bad poke size', function () {
+	torch.expert_exchange(0, 2, [], [], [], [], [], [], [ [ 4096, 0, 2 ] ]);
+});
+
 printf('bindings_errors: %d wrong-argument cases all raised\n', n);
