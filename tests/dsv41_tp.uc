@@ -1,5 +1,5 @@
 // tests/dsv41_tp.uc — DeepSeek-V4.1 as 2 stages x 2 tensor-parallel ranks (dsv41_tp) against the single-chain model:
-// chunked prefill logits, wavefront prefill, graph decode, a multi-row step and its rollback.
+// chunked prefill logits, wavefront prefill, graph decode, a multi-row step and its rollback, the host-RAM store.
 //   AMP_MODEL_DSV41  AMP_DSV41_LAYERS (default 8)  AMP_DSV41_PREFILL (default 300)
 
 import * as dsv41 from 'ampstein.dsv41';
@@ -51,6 +51,28 @@ function run(m, tp) {
 	while (pl.step(1)) {}
 
 	out.pipe = pl.logits().to('float32').cpu();
+
+	// the host-RAM store: the prefilled cache to host memory, another sequence over it, the cache back; a step
+	// then gives what it gave before (the same computation: identical up to the order of the all-reduces)
+	if (tp && m.cache_export) {
+		let put = function (t) {
+			let h = torch.pinned_empty(t.shape(), t.dtype());
+
+			h.copy_(t);
+
+			return h;
+		};
+
+		let n2 = cache2.length;
+		let em = m.cache_export(cache2, n2, put, null, null);
+
+		out.st0 = m.forward_chunk([ toks[1] ], cache2, 1).to('float32').cpu();
+		m.reset_cache(cache2);
+		m.prefill(map(ids, (t) => 1000 + (t * 7) % 60000), cache2, 128, 0);
+		m.cache_import(cache2, em, n2, true);
+		out.st1 = m.forward_chunk([ toks[1] ], cache2, 1).to('float32').cpu();
+	}
+
 	out.steps = [];
 
 	for (let t in toks)
@@ -96,4 +118,12 @@ cmp('graph 1', b.g1, a.g1);
 cmp('rows 5', b.g5, a.g5);
 
 assert(worst < 0.1, 'tensor-parallel logits differ from the single-chain model');
+
+if (b.st0) {
+	let e = rel_rms(b.st1, b.st0);
+
+	printf('%-10s rel rms %.2e  argmax %d %d\n', 'store', e, b.st1.argmax(-1).tolist()[0], b.st0.argmax(-1).tolist()[0]);
+	assert(e < 1e-3, 'a step after the cache store round trip differs from the step before it');
+}
+
 printf('dsv41_tp: all ok\n');

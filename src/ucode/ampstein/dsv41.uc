@@ -1180,6 +1180,44 @@ export function mirror_entry(cache, src, j) {
 	}
 }
 
+/* ---- the host-RAM prompt-cache store (dsv41_tp cache_export / cache_import) ---- */
+
+/* the first n rows of a pool (fp16: [rows], Q8: [codes, scales]) */
+export function pool_rows(P, n) {
+	return pool_is_q8(P) ? [ P.q.narrow(0, 0, n), P.s.narrow(0, 0, n) ] : [ P.narrow(0, 0, n) ];
+}
+
+/* the rows saved by pool_rows back into the first rows of P */
+export function pool_load(P, rows) {
+	let n = rows[0].shape()[0];
+
+	if (pool_is_q8(P)) {
+		P.q.narrow(0, 0, n).copy_(rows[0]);
+		P.s.narrow(0, 0, n).copy_(rows[1]);
+	}
+	else
+		P.narrow(0, 0, n).copy_(rows[0]);
+}
+
+/* bytes per pool row */
+export function pool_row_bytes(P) {
+	return pool_is_q8(P) ? P.q.shape()[1] + P.s.shape()[1] * 2 : P.shape()[1] * 2;
+}
+
+/* after the owner's rows were replaced: every mirror of source layer src copies the first n rows again */
+export function mirror_reload(cache, src, n) {
+	let P = cache.pools[src], cl = P.owner;
+
+	for (let m in P.mirrors) {
+		if (n > 0) {
+			pool_copy(m.pool, cl.pool, 0, n);
+			pool_copy(m.kidx, cl.kidx, 0, n);
+		}
+
+		m.n = n;
+	}
+}
+
 /* one token into the compressor of a kv source layer; writes the pool and index key of its slot */
 function comp_decode(cfg, A, cl, xn, st) {
 	let C = A.comp, ratio = A.ratio;

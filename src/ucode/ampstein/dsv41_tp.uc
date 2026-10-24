@@ -230,6 +230,93 @@ function dsv41_tp_state(model, allreduce) {
 			model.remote_client.reset(cache.rcache);
 	};
 
+	/* ---- the host-RAM prompt-cache store (engine.uc store_*, --cache-ram): per lane the pool and index-key rows of the
+	 * kv source layers, the aux state (pool counts, half-built pairs, window rows: the window ring needs nothing
+	 * beyond those), the Engram id history and the drafter's ring. The mirrors of the pools on the other stages'
+	 * GPUs are reloaded whole after an import (decode graphs read them as they are). Not with layers on a worker host
+	 * (nr) or a cut inside a pool group. ---- */
+	function aux_map(aux, fn) {
+		return map(aux, (row) => map(row, (e) => e ? {n: e.n, pk: e.pk ? fn(e.pk) : null, pg: e.pg ? fn(e.pg) : null,
+			kw: e.kw ? fn(e.kw) : null} : null));
+	}
+
+	if (!nr && !cut) {
+		model.cache_bytes = function (cache, n) {
+			let b = 8 * n;
+
+			for (let g = 0; g < Gs; g++)
+				for (let i = 0; i < nl; i++) {
+					let cl = cache.lanes[g].layers[i];
+
+					if (!cl)
+						continue;
+
+					b += min(n, W) * cfg.head_dim * 2 + 2 * cfg.head_dim * 4;
+
+					if (cl.pool)
+						b += (int(n / layers[i][g].attn.ratio) + 1) *
+							(dsv41.pool_row_bytes(cl.pool) + dsv41.pool_row_bytes(cl.kidx));
+				}
+
+			if (model.dspark && model.dspark.ring_bytes)
+				b += model.dspark.ring_bytes(n);
+
+			return b;
+		};
+
+		model.cache_export = function (cache, n, put, snap_aux, dst) {
+			if (dst)
+				die('dsv41_tp: cache_export: no device slots');
+
+			if (cache.length != n)
+				die(`dsv41_tp: cache_export: ${n} tokens asked, the cache holds ${cache.length}`);
+
+			let pools = map(cache.lanes, (lane) => map(lane.layers, (cl) => (cl && cl.pool) ?
+				{pool: map(dsv41.pool_rows(cl.pool, cl.n), put), kidx: map(dsv41.pool_rows(cl.kidx, cl.n), put)} : null));
+
+			return {
+				pools: pools, aux: aux_map(model.aux_get(cache), put), snap: snap_aux ? aux_map(snap_aux, put) : null,
+				cids: slice(cache.cids, 0, n),
+				drafter: (model.dspark && model.dspark.ring_export) ? model.dspark.ring_export(n, put) : null
+			};
+		};
+
+		// start == the entry's length (live) or its snapshot's (the snapshot's aux state; the pools hold its rows too)
+		model.cache_import = function (cache, em, start, live) {
+			for (let g = 0; g < Gs; g++)
+				for (let i = 0; i < nl; i++) {
+					let P = em.pools[g][i], cl = cache.lanes[g].layers[i];
+
+					if (P) {
+						dsv41.pool_load(cl.pool, P.pool);
+						dsv41.pool_load(cl.kidx, P.kidx);
+					}
+				}
+
+			cache.length = start;
+			model.aux_set(cache, aux_map(live ? em.aux : em.snap, (t) => t));
+
+			for (let g = 0; g < Gs; g++)
+				for (let i = 0; i < nl; i++) {
+					let cl = cache.lanes[g].layers[i];
+
+					if (cl && cl.pool)
+						dsv41.mirror_reload(cache.lanes[g], i, cl.n);
+				}
+
+			cache.cids = slice(em.cids, 0, start);
+			model.last_rows = null;
+
+			if (em.drafter && model.dspark && model.dspark.ring_import)
+				model.dspark.ring_import(em.drafter, start);
+
+			return {snap: em.snap ? map(em.snap, (row, g) => map(row, (e, i) => e ?
+				{n: e.n, pk: e.pk ? e.pk.cuda(cache.lanes[g].layers[i].dev) : null,
+					pg: e.pg ? e.pg.cuda(cache.lanes[g].layers[i].dev) : null,
+					kw: e.kw ? e.kw.cuda(cache.lanes[g].layers[i].dev) : null} : null)) : null};
+		};
+	}
+
 	/* take back the rows of the last multi-row step beyond the length L (p0 < L <= p0 + S) */
 	model.rollback = function (cache, L) {
 		let lr = model.last_rows;

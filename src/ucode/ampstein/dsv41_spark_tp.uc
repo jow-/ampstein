@@ -506,6 +506,30 @@ export function load(model, opts) {
 		return true;
 	};
 
+	/* host-RAM prompt-cache store (dsv41_tp cache_export / cache_import): every rank's ring of main kv rows and the
+	 * positions they hold; an import at `start` forgets the positions from start on */
+	d.ring_export = function (n, put) {
+		return {stamp: slice(stamp), rings: map(stages, (S) => map(S.ranks, (R) => put(R.ring)))};
+	};
+
+	d.ring_import = function (o, start) {
+		for (let b = 0; b < length(stages); b++)
+			for (let r = 0; r < length(stages[b].ranks); r++)
+				stages[b].ranks[r].ring.copy_(o.rings[b][r]);
+
+		for (let i = 0; i < RING; i++)
+			stamp[i] = (o.stamp[i] >= 0 && o.stamp[i] < start) ? o.stamp[i] : -1;
+	};
+
+	d.ring_bytes = function (n) {
+		let b = 0;
+
+		for (let S in stages)
+			b += length(S.ranks) * RING * D * 2;
+
+		return b;
+	};
+
 	d.build = function (graph, cache, windows) {
 		d.graph = graph;
 		d.cache = cache;

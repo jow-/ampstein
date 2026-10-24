@@ -193,7 +193,7 @@ Launch (from an installed tree; `cmake --install build --prefix ~/ampstein-hx` f
 ```sh
 AMP_DSV41_TP_GROUP=3 AMP_EXPERT_CPU_SPLIT=0.25,0.35,0.4 ucode ~/ampstein-hx/bin/ampstein \
 	--model /data/models/DSV4.1-Flash-1017-exl3-2.50bpw-H5-HQ5bpw-SH --tp \
-	--ctx 262144 --chunk 1536 --cache-ram 0 \
+	--ctx 262144 --chunk 1536 --cache-ram 16 \
 	--expert-profile ~/ampstein-rpc/profile_dsv41.json \
 	--expert-resident 0.58,0.65,0.655,0.655,0.62,0.625 --expert-cpu 12 --expert-swaps 0.5 \
 	--host 0.0.0.0 --port 8061
@@ -206,6 +206,9 @@ before a restart (an old process still releasing its memory makes the new one fa
 - `--expert-resident`: the fraction of the routed experts kept in VRAM, one per stage or (as above) one per GPU; the values
   above leave 0.6 - 0.9 GiB free per GPU after the warm-up (GPU 0 holds the embedding, GPU 1 has the most room). The rest
   (~60 GiB) is pinned host memory: the host needs ~75 GiB free.
+- `--cache-ram 16`: the host-RAM session store (`cache_export` / `cache_import`: per lane the pools and index keys,
+  the aux state, the Engram ids, the drafter's ring). A conversation that another one displaced comes back in ~0.1 s
+  instead of a fresh prefill (24k tokens: 1.5 s for the next turn against 49 s); a 24k-token entry takes 0.1 GiB.
 - `--expert-profile FILE`: per-layer expert pick counts (`examples/trace_routing_dsv41.uc` over real sessions, then
   `tests/oracle/routing_profile.py`); it chooses the resident set and orders the host experts by popularity.
 - `--expert-cpu N`: threads of the CPU expert pool (12 = jai's physical cores; 16 and 24 are slower: one pool, spinning
@@ -245,9 +248,9 @@ reference outputs equal the GPU-only ones.
 
 Tried and dropped: two CPU pools of 6 threads (one per rank; slower: the ranks' calls rarely overlap and a call halves
 its threads), 16 / 24 threads, drafter costs measured online (`dspark_adapt`: shorter drafts, same round time), chunk
-2048. Open: the host-RAM session store (`--cache-ram`) for this model (no `cache_export` / `cache_import` yet), a cache of
-decoded experts for the CPU (64% of decode-time CPU experts were decoded recently), an NLL / tool-call quality check of
-the CPU experts' int8 activations.
+2048. Open: a cache of decoded experts for the CPU (65% of decode-time CPU experts were decoded among the last 1024,
+84% among 4096; exact copies are 2 bytes per weight and read as slowly as the trellis decodes, so only an int8 copy
+would pay), an NLL / tool-call quality check of the CPU experts' int8 activations.
 
 ## KV cache quantization (Q8 pools, default)
 
