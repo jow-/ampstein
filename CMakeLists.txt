@@ -87,7 +87,11 @@ add_library(ucode_torch MODULE
     src/torch/tokenizer.c
     src/torch/image.c
     src/torch/amp_tokenizer.cpp
+    vendor/exl3/exllamav3_ext/cpu/moe_mul1.cpp
 )
+# The CPU expert kernels pick their instruction set at run time (per-function target attributes), so no -m flags
+# here, but they need an optimizer: the module itself is built without one by default
+set_source_files_properties(vendor/exl3/exllamav3_ext/cpu/moe_mul1.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 # Build tree mirrors the install layout (<build>/lib/ampstein/torch.so) so the
 # tests can use `-L <build>/lib -ltorch=ampstein.torch`.
 #

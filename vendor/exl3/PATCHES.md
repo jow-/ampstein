@@ -30,3 +30,19 @@ invariant 3). Re-apply after any vendor refresh.
    output is then clamped to the fp16 range) and `pre_out` (R, H) (this site's `pre`, written by the chunk-0
    block). The partials kernel, the sinkhorn and every existing launch are unchanged (`pre_in`/`pre_out` null).
    Replaces ~16 small composite kernels per site; checked against the composite form in `tests/dsv41_hc2.uc`.
+
+6. `exllamav3_ext/cpu/moe_mul1.cpp` — `#include <torch/torch.h>` instead of `<torch/extension.h>` (the latter drags in
+   pybind11 / Python.h). Compiled into torch.so with `-O3` (CMakeLists.txt); bound as `torch.moe_cpu_*`
+   (src/torch/amp_torch.cpp). Math untouched.
+
+7. `exllamav3_ext/cpu/moe_mul1.cpp` — the half-integer 2.5 bpw tiles of the 2.50bpw DeepSeek-V4.1 packs (`HALF25`):
+   positions alternate 2 and 3 bits, a tile is 640 bits (40 uint16), so `tile_words / tile_u16 / window_end` take the
+   width, `make_lane_shifts_each(_c)` builds the per-lane shifts of the `dword_codes` decode for it, `bw_band` reads the
+   tile by its width, the dispatch routes the width to `bw_tiles`, and `make_matrix` detects the trellis' last dimension
+   40 (AVX-512 BW tier only). The integer widths take their old paths unchanged; checked against the GPU kernels with
+   `examples/moe_cpu_bench.uc` (int8 activations: ~1.4% rms, as for the integer widths).
+
+8. `exllamav3_ext/cpu/moe_mul1.cpp` — a pool worker that a dispatch does not include (its index at or past the call's
+   worker count) parks at once instead of spinning (`Pool::worker_loop`): spinning surplus workers slowed the
+   participating ones on the same cores (jai: 24 threads on 12 cores ran slower than 12). Scheduling only; math
+   untouched.

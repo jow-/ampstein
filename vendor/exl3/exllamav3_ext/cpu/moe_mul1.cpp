@@ -1,7 +1,7 @@
 #if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include "moe_mul1.h"
 #include <c10/util/Half.h>
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 #include <algorithm>
 #include <array>
@@ -66,6 +66,22 @@ void exl3_moe_cpu_set_prof(bool enabled)
 namespace {
 
 constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
+
+// ampstein: the half-integer bitrate 2.5 (the 2.50bpw DeepSeek-V4.1 packs; mul1 only). `bits` takes the value HALF25 in
+// the kernel templates: the ring of a tile is 640 bits (20 words, 40 uint16), the window of position t ends at
+// S(t) = 5 * (t / 2) + (t odd ? 5 : 2) (positions alternate 2 and 3 new bits, see exl3_dq.cuh dq8_half) plus one ring.
+// Only the AVX-512 BW dword kernel is instantiated for it (any AVX-512 CPU runs that).
+constexpr int HALF25 = 25;
+
+template <int bits> constexpr int tile_words() { return bits == HALF25 ? 20 : bits * 8; }
+template <int bits> constexpr int tile_u16() { return tile_words<bits>() * 2; }
+
+// end bit of the 16-bit window of ring position t, one ring ahead (so that the window start never goes negative)
+template <int bits> constexpr int window_end(int t)
+{
+    if constexpr (bits == HALF25) return (t >> 1) * 5 + ((t & 1) ? 5 : 2) + 640;
+    else return t * bits + bits + 256 * bits;
+}
 constexpr float HAD_SCALE = 0.088388347648f;
 constexpr int MAX_M = 4;
 
@@ -135,11 +151,11 @@ constexpr std::array<int32_t, 16> make_row_indices()
 {
     std::array<int32_t, 16> idx{};
     const auto inv = make_tc_perm_inv();
-    constexpr int words32 = bits * 256 / 32;
+    constexpr int words32 = tile_words<bits>();
     for (int col = 0; col < 16; ++col) {
         const int t = inv[row * 16 + col];
-        const int b0 = t * bits + bits - 16 + 256 * bits;
-        const int b1 = b0 + 16;
+        const int b1 = window_end<bits>(t);
+        const int b0 = b1 - 16;
         idx[col] = (second_word ? (b1 - 1) / 32 : b0 / 32) % words32;
     }
     return idx;
@@ -160,7 +176,7 @@ constexpr int row_shift(int col)
 {
     const auto inv = make_tc_perm_inv();
     const int t = inv[row * 16 + col];
-    const int b1 = t * bits + bits + 256 * bits;
+    const int b1 = window_end<bits>(t);
     return ((b1 - 1) / 32 + 1) * 32 - b1;
 }
 
@@ -477,10 +493,39 @@ constexpr std::array<int32_t, 16> make_lane_shifts()
 // shifts: one per-lane variable funnel shift (vpsrlvd/vpsllvd against compile-time count
 // vectors) merges both in 4 uops (GCC fuses the or+and into vpternlogd), where two immediate
 // funnel shifts plus a lane blend took 8.
+// One shift count per lane, for the 2.5 bpw tiles: the bit offsets of the columns of a half-row step by 80 bits, not by a
+// multiple of 32, so the funnel shift alternates between two values along the row
+template <int bits, int row>
+constexpr std::array<int32_t, 16> make_lane_shifts_each()
+{
+    std::array<int32_t, 16> v{};
+    for (int i = 0; i < 16; ++i) v[i] = row_shift<bits, row>(i);
+    return v;
+}
+
+template <int bits, int row>
+constexpr std::array<int32_t, 16> make_lane_shifts_each_c()
+{
+    std::array<int32_t, 16> v{};
+    for (int i = 0; i < 16; ++i) v[i] = 32 - row_shift<bits, row>(i);
+    return v;
+}
+
 template <int bits, int row, int delta>
 M1_TARGET_BW
 inline __m512i dword_codes(__m512i a, __m512i b)
 {
+    if constexpr (bits == HALF25)
+    {
+        static_assert(delta == 0, "no row pairing for the 2.5 bpw tiles");
+        alignas(64) static constexpr auto sh = make_lane_shifts_each<bits, row>();
+        alignas(64) static constexpr auto shc = make_lane_shifts_each_c<bits, row>();
+        const __m512i c = _mm512_or_si512(_mm512_srlv_epi32(b, _mm512_load_si512(sh.data())),
+                                          _mm512_sllv_epi32(a, _mm512_load_si512(shc.data())));
+        return _mm512_and_si512(c, _mm512_set1_epi32(0xffff));
+    }
+    else
+    {
     constexpr int s0 = row_shift<bits, row>(0) - delta;
     constexpr int s1 = row_shift<bits, row>(8) - delta;
     static_assert(s0 >= 0 && s1 >= 0, "pairing delta exceeds shift headroom");
@@ -496,6 +541,7 @@ inline __m512i dword_codes(__m512i a, __m512i b)
         const __m512i c = _mm512_or_si512(_mm512_srlv_epi32(b, _mm512_load_si512(sh.data())),
                                           _mm512_sllv_epi32(a, _mm512_load_si512(shc.data())));
         return _mm512_and_si512(c, _mm512_set1_epi32(0xffff));
+    }
     }
 }
 
@@ -783,8 +829,8 @@ void bw_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
 {
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;
-    constexpr int packed_size = 16 * bits;
-    constexpr int words32 = bits * 256 / 32;
+    constexpr int packed_size = tile_u16<bits>();
+    constexpr int words32 = tile_words<bits>();
     constexpr auto ld_mask = [](int n) -> __mmask16
     {
         return n >= 16 ? 0xffffu : (n <= 0 ? 0x0000u : static_cast<__mmask16>((1u << n) - 1u));
@@ -1555,6 +1601,16 @@ const Isa g_isa = []{ return detect_isa(); }();
 void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
     if (tn0 >= tn1) return;
+    if (mat.bits == HALF25)
+    {
+        switch (m)
+        {
+            case 1: bw_tiles<HALF25, 1>(mat, in, tout, tn0, tn1); return;
+            case 2: bw_tiles<HALF25, 2>(mat, in, tout, tn0, tn1); return;
+            case 3: bw_tiles<HALF25, 3>(mat, in, tout, tn0, tn1); return;
+            default: bw_tiles<HALF25, 4>(mat, in, tout, tn0, tn1); return;
+        }
+    }
     switch (g_isa) {
         case Isa::Vbmi:
         {
@@ -1866,6 +1922,8 @@ struct Pool
                 fn.load(std::memory_order_relaxed)(ctx, idx, nw);
                 done.fetch_add(1, std::memory_order_release);
             }
+            else
+                idle = 65536;   // ampstein: not taking part: park at once instead of spinning beside the workers that do
         }
     }
 
@@ -2253,7 +2311,7 @@ struct StageCtx
 
 inline size_t trellis_bytes(const MoeCpuMatrix& m)
 {
-    return static_cast<size_t>(m.k / 16) * (m.n / 16) * 16 * m.bits * 2;
+    return static_cast<size_t>(m.k / 16) * (m.n / 16) * (m.bits == HALF25 ? 40 : 16 * m.bits) * 2;
 }
 
 // Staged bytes are copied verbatim, swizzled or not: the GPU restores the native tile order
@@ -2342,11 +2400,16 @@ static MoeCpuMatrix make_matrix
     m.k = static_cast<int>(trellis.size(0)) * 16;
     m.n = static_cast<int>(trellis.size(1)) * 16;
     m.bits = static_cast<int>(trellis.size(2)) / 16;
+    if (trellis.size(2) == 40)                  // 2.5 bpw (16 * 2.5 uint16 per tile)
+    {
+        TORCH_CHECK(g_isa == Isa::Bw, "CPU MoE: the 2.5 bpw tiles run on the AVX-512 BW tier only (EXL3_MOE_CPU_MAX_ISA=bw on newer CPUs)");
+        m.bits = HALF25;
+    }
     // K8 tensors are exempt from swizzling (routed to the dword kernel, which would gain
     // nothing) -- the child loader applies the same bits != 8 rule when repacking, so the two
     // sides agree per tensor
-    m.swz = swizzled && m.bits != 8 ? 1 : 0;
-    TORCH_CHECK(m.bits >= 1 && m.bits <= 8, "CPU MoE requires K in [1, 8]");
+    m.swz = swizzled && m.bits != 8 && m.bits != HALF25 ? 1 : 0;
+    TORCH_CHECK((m.bits >= 1 && m.bits <= 8) || m.bits == HALF25, "CPU MoE requires K in [1, 8] or 2.5");
     TORCH_CHECK(m.k % 128 == 0 && m.n % 128 == 0, "dims must be divisible by 128");
     TORCH_CHECK(m.k <= 8192, "k too large for i32 accumulation");
     return m;
@@ -2474,6 +2537,7 @@ void exl3_moe_cpu_forward_raw(
     int threads
 )
 {
+
     const MoeCpuLayer* layer = get_layer(handle);
     const int m_total = rows;
     const int top_k = topk;
@@ -2632,7 +2696,7 @@ void exl3_moe_cpu_forward
 
 #else  // !x86: EXL3_AARCH64_STUB — CPU MoE offload kernels are AVX-only; stubbed on this architecture
 #include "moe_mul1.h"
-#include <torch/extension.h>
+#include <torch/torch.h>
 #define NO_MOE_CPU() TORCH_CHECK(false, "CPU MoE offload (moe_mul1) is not available on this CPU architecture (x86 AVX2/AVX-512 only)")
 void exl3_moe_cpu_set_prof(bool) {}
 void exl3_moe_cpu_pool_prime(int) {}
