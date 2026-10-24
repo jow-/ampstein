@@ -3,7 +3,7 @@
 # project directories listed in `projs` are read: extend deliberately, sessions can hold
 # private material.   python3 pi_samples.py [OUT.json]
 import json, glob, os, random, sys
-random.seed(7)
+random.seed(int(os.environ.get('PI_SEED', 7)))   # PI_SEED=11: another draw of sessions (held-out samples for the speed benchmarks)
 root = os.path.expanduser('~/.pi/agent/sessions/')
 projs = ['ampstein.git','ucode.git','ucode-llm.git','exllamav3','llama.cpp.git','luci.git','rpcd.git','uhttpd.git',
          'openwrt-minibuild.git','cgi-io.git','iwinfo.git','vllm','tabbyAPI','ucode-lang-manual.git','uwsd.git']

@@ -1,9 +1,10 @@
-# Analysis of examples/trace_routing_qwen4.uc output (docs/EXPERT_STREAMING.md): decode hit rate of a per-layer
+# Analysis of examples/trace_routing_qwen4.uc / trace_routing_dsv41.uc output (docs/EXPERT_STREAMING.md): decode hit rate of a per-layer
 # LRU, a global decayed-count cache (what a residency manager would keep), static oracles and a leave-one-out
-# profile, as a function of the resident fraction.   python3 routing_analysis_qwen4.py route.txt
+# profile, as a function of the resident fraction.   python3 routing_analysis_qwen4.py route.txt [layers experts top-k [fractions]]
+# (default 48 512 10: Qwen3.8-Flash-Next; DeepSeek-V4.1: 40 384 6)
 import sys, numpy as np
 from collections import defaultdict, OrderedDict
-NL, NE, K = 48, 512, 10
+NL, NE, K = tuple(int(x) for x in sys.argv[2:5]) if len(sys.argv) > 4 else (48, 512, 10)
 pre = defaultdict(lambda: [[] for _ in range(NL)]); dec = defaultdict(lambda: [[] for _ in range(NL)])
 for line in open(sys.argv[1]):
     h = line.split(); (pre if h[0]=='P' else dec)[h[1]][int(h[2])].append(tuple(map(int,h[3:3+K])))
@@ -16,7 +17,7 @@ for n in names:
         a=dec[n][L]
         ov += [len(set(a[i])&set(a[i-1])) for i in range(1,len(a))]
         d3 += [len(set(a[i])|set(a[i+1])|set(a[i+2])) for i in range(0,len(a)-2,3)]
-print("consecutive-token expert overlap %.2f of %d; distinct experts in a 3-token window %.1f of 30" % (np.mean(ov),K,np.mean(d3)))
+print("consecutive-token expert overlap %.2f of %d; distinct experts in a 3-token window %.1f of %d" % (np.mean(ov),K,np.mean(d3),3*K))
 print("prefill touches %.0f of %d experts/layer (mean)" % (np.mean([len(set(e for a in pre[n][L] for e in a)) for n in names for L in range(NL)]), NE))
 
 def warm_lru(n, L, C):
@@ -83,7 +84,7 @@ def sim_profile(f):  # leave-one-out profile from other samples' decode+prefill 
         c=counts_of([x for x in names if x!=n],dec)+0.1*counts_of([x for x in names if x!=n],pre)/np.maximum(1,1)
         h,t=eval_mask(topmask(c,N),n); H+=h; T+=t
     return H/T
-fs=[0.10,0.25,0.40,0.55,0.60,0.78]
+fs=[float(x) for x in sys.argv[5].split(',')] if len(sys.argv) > 5 else [0.10,0.25,0.40,0.55,0.60,0.78]
 print("\nresident fraction -> decode hit rate")
 print("%-6s %-9s %-10s %-10s %-10s %-10s %-10s"%("frac","LRU/layer","LRU cold","glob d.99","glob d.97","oracle/lay","oracle gl"))
 rows={}
@@ -93,5 +94,5 @@ for f in fs:
 print("\nleave-one-out global profile (no adaptation) hit rate:")
 for f in fs: print("%.2f %.3f"%(f,sim_profile(f)))
 print("\nshare of LRU misses by router rank position (0=top):")
-for f in (0.25,0.55,0.78):
-    rm,rk=rows[f]; tm=sum(rm); print("frac %.2f miss rate %.3f; ranks>=7 hold %.2f of misses; per-rank miss rate:"%(f,tm/sum(rk),sum(rm[7:])/tm)," ".join("%.2f"%(a/b) for a,b in zip(rm,rk)))
+for f in fs[1:4]:
+    rm,rk=rows[f]; tm=sum(rm); print("frac %.2f miss rate %.3f; last 3 ranks hold %.2f of misses; per-rank miss rate:"%(f,tm/sum(rk),sum(rm[K-3:])/tm)," ".join("%.2f"%(a/b) for a,b in zip(rm,rk)))

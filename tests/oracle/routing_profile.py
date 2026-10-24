@@ -1,8 +1,8 @@
 # Turn the output of examples/trace_routing_qwen4.uc into the routing profile that ampstein --expert-profile ranks
 # the experts by: counts[layer][expert] = decode routings + 0.1 * prefill routings.
-#   python3 routing_profile.py route.txt profile.json
+#   python3 routing_profile.py route.txt profile.json [layers experts]   (default 48 512: Qwen3.8-Flash-Next; DSV4.1: 40 384)
 import json, sys
-NL, NE = 48, 512
+NL, NE = (int(sys.argv[3]), int(sys.argv[4])) if len(sys.argv) > 4 else (48, 512)
 c = [[0.0] * NE for _ in range(NL)]
 for line in open(sys.argv[1]):
     h = line.split()
