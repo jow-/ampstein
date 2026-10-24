@@ -180,6 +180,75 @@ drafter (47 / 45 with the full graph sets and chunk 1024), against 40 / 34 / 37 
 the host issues both ranks' launches): 667 tok/s at 75k tokens (single chain 899), and it grows with the chunk, which
 the memory (drafter + graphs + replicated pools) caps at 1536.
 
+## jai alone: the 2.50bpw pack with host-RAM experts
+
+The 2.50bpw pack (`DSV4.1-Flash-1017-exl3-2.50bpw-H5-HQ5bpw-SH`, 158.8 GiB of routed experts) does not fit jai's
+6 x 23.5 GiB. A fraction of every stage's experts stays in pinned host memory (`--expert-resident`, chosen by a routing
+profile), and the picks of those experts run on the CPU (`--expert-cpu`, the vendored exllamav3 CPU kernels,
+`docs/EXPERT_STREAMING.md`). jai's links are PCIe gen3 x4 (~2.9 GB/s measured), which bounds prefill: a prefill chunk
+group stages a layer's host experts over the link (`AMP_DSV41_TP_GROUP` chunks share one staging), except the CPU's part.
+
+Launch (from an installed tree; `cmake --install build --prefix ~/ampstein-hx` first), with the DSpark drafter:
+
+```sh
+AMP_DSV41_TP_GROUP=3 AMP_EXPERT_CPU_SPLIT=0.25,0.35,0.4 ucode ~/ampstein-hx/bin/ampstein \
+	--model /data/models/DSV4.1-Flash-1017-exl3-2.50bpw-H5-HQ5bpw-SH --tp \
+	--ctx 262144 --chunk 1536 --cache-ram 0 \
+	--expert-profile ~/ampstein-rpc/profile_dsv41.json \
+	--expert-resident 0.58,0.65,0.655,0.655,0.62,0.625 --expert-cpu 12 --expert-swaps 0.5 \
+	--host 0.0.0.0 --port 8061
+```
+
+From a build tree the same, as `ucode -L $PWD/build/lib -L $PWD/src/ucode ./ampstein ...` (absolute `-L` paths). Loading
+takes ~7 min (disk-bound: one NVMe, ~0.7 GB/s); SIGTERM is ignored until the model is loaded. The GPUs must be free
+before a restart (an old process still releasing its memory makes the new one fail with out of memory).
+
+- `--expert-resident`: the fraction of the routed experts kept in VRAM, one per stage or (as above) one per GPU; the values
+  above leave 0.6 - 0.9 GiB free per GPU after the warm-up (GPU 0 holds the embedding, GPU 1 has the most room). The rest
+  (~60 GiB) is pinned host memory: the host needs ~75 GiB free.
+- `--expert-profile FILE`: per-layer expert pick counts (`examples/trace_routing_dsv41.uc` over real sessions, then
+  `tests/oracle/routing_profile.py`); it chooses the resident set and orders the host experts by popularity.
+- `--expert-cpu N`: threads of the CPU expert pool (12 = jai's physical cores; 16 and 24 are slower: one pool, spinning
+  surplus workers). Decode picks of host experts always run there.
+- `--expert-swaps N`: exchanges between VRAM and host memory per decode step (fractional: 0.5), following the requests'
+  routing, plus a settle after each prefill of 512 tokens or more; the CPU's set follows (window miss rate ~2.3 - 3.5%
+  against ~5% static). One exchange is one native call (`torch.expert_exchange`, ~0.5 ms of host time); the residency it
+  learns persists, so a low rate is enough.
+- `AMP_EXPERT_CPU_SPLIT=q0,q1,q2`: per stage, the least popular fraction q of each layer's host experts is not staged for
+  prefill: the CPU computes their picks while the link stages the rest (balance: CPU time ~ link time per stage; stage 0's
+  early layers route less predictably, hence less). Also shrinks the staging buffers (1.96 -> 1.31 GiB per GPU). Only
+  for prompts that fit one group (tunable `split_max`, default group x chunk): with more groups the stages overlap and
+  their CPU shares queue on the same cores, so the kernels read those experts zero-copy from the arena instead (a few
+  rows each: about one pass over the link, like staging).
+- `AMP_DSV41_TP_GROUP=3`: chunks per prefill group (each group stages the host experts once); 3 x 1536 rows is what
+  the VRAM holds next to the resident experts (4 runs out of memory, as does chunk 2048 with 2).
+- `AMP_EXPERT_CPU_PF_MAX=N` (default 512): prompts of up to N new tokens prefill with every host expert on the CPU (no
+  staging; for the short increments of an agent turn). `AMP_EXPERT_STAGE_BUFS=1`: one staging buffer instead of two.
+- Prefill copies every stage's first two layers ahead (its GPUs are idle until the first chunk arrives): ~1 - 2 s less
+  per fresh prompt.
+- Live tunables (`src/ucode/ampstein/tune.uc`): `AMP_TUNE=FILE` names a JSON object re-read when it changes, e.g.
+  `{"swaps": 1, "cpu_threads": 10}`. Keys: `cpu_threads`, `cpu_prof` (CPU call statistics every N calls), `cpu_phases`,
+  `cpu_pf_max`, `stage_min`, `group`, `prestage`, `settle_min`, `settle_rounds`, `swaps`, `interval`, `margin`, `decay`,
+  `pf_steps`, `pf_weight`, `dspark_prof` (draft / verify / update ms per round), `dspark_adapt`, `dspark_costs`.
+- Diagnostics at start: `AMP_EXPERT_CPU_PROF=N`, `EXL3_MOE_CPU_PROF=1`, `AMP_EXPERT_DYN_LOG=N`, `AMP_ALLOC_LOG=1`,
+  `AMP_DSV41_TP_HOSTPROF=1`, `AMP_NSYS=prefill|decode` (with `nsys --capture-range=cudaProfilerApi`; add
+  `--cuda-graph-trace=node` for decode).
+
+Measured (fresh prompts, nothing cached; earlier "~4 s for 1.9k tokens" figures came from a bug — a prefill group id
+that matched a layer's stale staging — and are void): 700 tokens 8.6 s, 1650 tokens 10.7 s, 2350 tokens 12 s, 5400
+tokens ~21 s, 22.7k tokens 42.7 s (530 tok/s), 55k tokens 89.7 s (613 tok/s). A fresh prompt pays ~8 s of staging over
+the x4 links before its length matters (the three stages one after another); long prompts overlap the stages and
+approach the host-bound TP prefill of the all-resident model (~670 - 900 tok/s). A prompt increment of 50 - 250 tokens
+(an agent turn): 1 - 4 s. Decode with the drafter: ~75 - 80 ms per round (draft 7, verify 65, update 5) of 2.7 - 3.1
+tokens, 35 - 42 tok/s warm (26 - 33 right after a start), against ~41 - 45 tok/s with every expert resident. Greedy
+reference outputs equal the GPU-only ones.
+
+Tried and dropped: two CPU pools of 6 threads (one per rank; slower: the ranks' calls rarely overlap and a call halves
+its threads), 16 / 24 threads, drafter costs measured online (`dspark_adapt`: shorter drafts, same round time), chunk
+2048. Open: the host-RAM session store (`--cache-ram`) for this model (no `cache_export` / `cache_import` yet), a cache of
+decoded experts for the CPU (64% of decode-time CPU experts were decoded recently), an NLL / tool-call quality check of
+the CPU experts' int8 activations.
+
 ## KV cache quantization (Q8 pools, default)
 
 The compressed pools (the pooled rows and the indexer keys of the kv source layers, replicated per lane under TP) are
