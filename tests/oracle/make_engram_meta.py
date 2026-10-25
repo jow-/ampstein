@@ -9,16 +9,23 @@ write them to <model_dir>/engram_meta.safetensors:
   offsets     int64 (layers, (ngram-1)*heads) bucket range starts inside a layer's table
   pad         int64 (1,)              compressed id of engram_pad_token_id
 
-Needs: tokenizers, numpy, sympy, safetensors (not needed at serving time; run once per model).
+If the model directory ships engram_token_map.u32 (little-endian uint32 per token id, as the 1017 packs do) it is used
+instead of deriving the map from tokenizer.json, and `tokenizers` is not needed.
+
+Needs: numpy, sympy, safetensors (+ tokenizers without engram_token_map.u32); not needed at serving time; run once per model.
   python3 make_engram_meta.py /path/to/model-dir
 """
 import json
+import os
 import sys
 
 import numpy as np
 from safetensors.numpy import save_file
 from sympy import isprime
-from tokenizers import Regex, Tokenizer, normalizers
+try:
+    from tokenizers import Regex, Tokenizer, normalizers
+except ImportError:
+    Tokenizer = None
 
 
 def find_next_prime(start, seen):
@@ -59,9 +66,15 @@ def main(model_dir):
     layers = tc["engram_layer_ids"]
     nmax, heads, vs = tc["engram_max_ngram_size"], tc["engram_n_heads"], tc["engram_vocab_size"]
 
-    backend = Tokenizer.from_file(f"{model_dir}/tokenizer.json")
     n = tc["vocab_size"]
-    token_map, cvs = build_token_map(backend, n)
+    shipped = f"{model_dir}/engram_token_map.u32"
+    if os.path.exists(shipped):
+        token_map = np.fromfile(shipped, dtype="<u4").astype(np.int64).tolist()
+        assert len(token_map) == n, (len(token_map), n)
+        cvs = max(token_map) + 1
+    else:
+        backend = Tokenizer.from_file(f"{model_dir}/tokenizer.json")
+        token_map, cvs = build_token_map(backend, n)
     assert cvs == tc["engram_compressed_vocab_size"], (cvs, tc["engram_compressed_vocab_size"])
 
     primes, seen = [], set()

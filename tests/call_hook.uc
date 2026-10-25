@@ -175,6 +175,43 @@ for (let i = 0; i < 7; i++)
 
 check('long ago: let through', ask_h(wcall('/tmp/poll2.sh', BODY), far) === true);
 
+// a one-line wrapper that only runs the script written just before
+let SCRIPT = '#!/bin/bash\ncd /home/x || exit 1\ngrep -n foo bar | head\necho done\n';
+let wa = [sw('/tmp/a.sh', SCRIPT)];
+
+check('wrapper of the previous write: dropped', type(ask_h(wcall('/tmp/a1.sh', 'bash /tmp/a.sh\n'), wa)) == 'string');
+check('...the note points at bash and the script', index(ask_h(wcall('/tmp/a1.sh', 'bash /tmp/a.sh'), wa), '`bash`') >= 0 &&
+	index(ask_h(wcall('/tmp/a1.sh', 'bash /tmp/a.sh'), wa), '/tmp/a.sh') >= 0);
+check('wrapper with shebang, comment and blanks: dropped',
+	type(ask_h(wcall('/tmp/a1.sh', '#!/bin/bash\n# run it\n\nbash /tmp/a.sh\n'), wa)) == 'string');
+check('wrapper, other shapes: dropped', type(ask_h(wcall('/tmp/a1.sh', 'exec bash -x /tmp/a.sh 2>&1 | tail'), wa)) == 'string' &&
+	type(ask_h(wcall('/tmp/a1.sh', '/tmp/a.sh'), wa)) == 'string' && type(ask_h(wcall('/tmp/a1.sh', 'cd /tmp && bash a.sh'), wa)) == 'string');
+check('wrapper of an older write, other write between: let through', ask_h(wcall('/tmp/a2.sh', 'bash /tmp/a.sh'), [sw('/tmp/a.sh', SCRIPT), sw('/tmp/b.txt', 'unrelated text here')]) === true);
+check('wrapper of a wrapper chain: dropped', type(ask_h(wcall('/tmp/a2.sh', 'bash /tmp/a1.sh'), [sw('/tmp/a1.sh', 'echo hi && true')])) == 'string');
+check('wrapper in this response (calls): dropped', type(call(policy, null, {call: wcall('/tmp/a1.sh', 'bash /tmp/a.sh'),
+	calls: [sw('/tmp/a.sh', SCRIPT)], history: [], text: '', reasoning: '', tools: ['bash', 'write'],
+	tool_defs: [], tokens: 10, overrides: 0})) == 'string');
+check('cd dir && bash script: dropped', type(ask_h(wcall('/tmp/a1.sh', 'cd /tmp && bash a.sh'), wa)) == 'string');
+check('cd dir && bash ./script with redirect: dropped',
+	type(ask_h(wcall('/tmp/a1.sh', '#!/bin/bash\ncd /tmp/\nbash ./a.sh 2>&1 | tail -20\n'), wa)) == 'string');
+check('set -e, cd and exec around the call: dropped',
+	type(ask_h(wcall('/tmp/a1.sh', 'set -e\ncd "/tmp"; exec bash /tmp/a.sh\n'), wa)) == 'string');
+check('setup only: let through', ask_h(wcall('/tmp/a1.sh', 'cd /tmp && set -e'), wa) === true);
+check('setup and a different command: let through', ask_h(wcall('/tmp/a1.sh', 'cd /tmp && make'), wa) === true);
+check('setup and two commands: let through', ask_h(wcall('/tmp/a1.sh', 'cd /tmp && bash a.sh && make'), wa) === true);
+check('a script of several commands: let through', ask_h(wcall('/tmp/a1.sh', 'echo x\nbash /tmp/a.sh\n'), wa) === true);
+check('a one-liner that runs another file: let through', ask_h(wcall('/tmp/a1.sh', 'bash /tmp/other.sh'), wa) === true);
+check('a one-liner that is no call: let through', ask_h(wcall('/tmp/a1.sh', 'echo hello'), wa) === true);
+check('second file of a project: let through', ask_h(wcall('/p/main.c', '#include "a.h"'), [sw('/p/a.h', 'int x;\n')]) === true);
+let far2 = [sw('/tmp/a.sh', SCRIPT)];
+
+for (let i = 0; i < 8; i++)
+	push(far2, {name: 'bash', arguments: '{"command": "ls"}', result: 'ok'});
+
+check('wrapper after an intervening call: let through', ask_h(wcall('/tmp/a1.sh', 'bash /tmp/a.sh'), far2) === true);
+check('wrapper of a failed write: let through', ask_h(wcall('/tmp/a1.sh', 'bash /tmp/a.sh'),
+	[{name: 'write', arguments: sprintf('%J', {path: '/tmp/a.sh', content: SCRIPT}), result: 'Validation failed for tool "write"'}]) === true);
+
 check('the sleep note says to poll', index(ask(bash('sleep 600'), [], 0), 'Poll') >= 0);
 check('another tool with a sleep is not touched', ask({name: 'write', arguments: '{"content": "sleep 600"}'}, [], 0) === true);
 

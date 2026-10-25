@@ -28,6 +28,7 @@ import * as models from './models.uc';
 import * as glm5 from './glm5.uc';
 import * as dsv4_tp from './dsv4_tp.uc';
 import * as dsv41 from './dsv41.uc';
+import * as ggufq from './ggufq.uc';
 import * as expert_host from './expert_host.uc';
 import * as expert_dyn from './expert_dyn.uc';
 import * as tune from './tune.uc';
@@ -97,6 +98,10 @@ function hc_copy(hc, dev) {
 
 /* the shared expert on rank g: w1 / w3 rows, w2 columns of the intermediate range ri */
 function shard_mlp8(M, ri, dev) {
+	if (M.gate.qtype)                // GGUF: the gate / up launch stays fused
+		return ggufq.mlp_from(dsv41.lin8_rows(M.gate, ri[0], ri[1], dev), dsv41.lin8_rows(M.up, ri[0], ri[1], dev),
+			dsv41.lin8_cols(M.down, ri[0], ri[1], dev));
+
 	return {
 		gate: dsv41.lin8_rows(M.gate, ri[0], ri[1], dev),
 		up: dsv41.lin8_rows(M.up, ri[0], ri[1], dev),
@@ -1018,6 +1023,10 @@ function dsv41_tp_methods(model) {
 
 		hp(null);
 
+		// the prompt skip (prefill_pipeline): past the last kv source a chunk before the prompt's tail is not needed
+		if (c.skip_after != null && i > c.skip_after)
+			return;
+
 		if (engrams[i]) {
 			let emb = engram_chunk(i, c);
 
@@ -1030,7 +1039,22 @@ function dsv41_tp_methods(model) {
 
 		hp('engram');
 
-		// host-resident experts: stage this layer's cold ones (and queue the next layer's) behind the attention; a (the one up to the snapshot cut) uses them too when its group already staged the layer
+		// the last kv source of a skipped chunk: its compressor alone (the pool rows and index keys later layers read)
+		if (c.skip_after != null && i == c.skip_after) {
+			for (let g = 0; g < Gs; g++) {
+				let lane = cache.lanes[g];
+				let a = dsv41.hc_site(cg, L[g].hc_attn, c.h[g], c.pre[g]);
+				let xn = torch.rms_norm(a.col, L[g].attn_norm, eps);
+
+				dsv41.attn_forward_steps(cg, L[g].attn, c.ctx[g], lane, lane.layers[i], xn, c.pos0).compress();
+			}
+
+			hp('skip');
+
+			return;
+		}
+
+		// host-resident experts: stage this layer's cold ones (and queue the next layer's) behind the attention; a
 		// short chunk (the one up to the snapshot cut) uses them too when its group already staged the layer. With CPU
 		// experts a prompt of up to CPU_PF_MAX new tokens runs its cold picks on the CPU instead (c.cpu_pf): no staging
 		let Tc = c.h[0].shape()[0];
@@ -1446,6 +1470,7 @@ function dsv41_tp_methods(model) {
 	const SETTLE_MIN = +(getenv('AMP_EXPERT_SETTLE_MIN') || 512);       // prompts of at least this many tokens ...
 	const SETTLE_ROUNDS = +(getenv('AMP_EXPERT_SETTLE_ROUNDS') || 2);   // ... trigger this many exchange rounds (an expert per layer each)
 	const CPU_PF_MAX = +(getenv('AMP_EXPERT_CPU_PF_MAX') ?? 512);         // CPU experts: prompts up to this many new tokens prefill on the CPU
+	const PROMPT_SKIP = getenv('AMP_DSV41_PROMPT_SKIP') != '0';           // the prompt skip (prefill_pipeline)
 
 	/* Engine interface: chunked prefill as a wavefront over the stages (one stage per chunk per round). */
 	model.prefill_pipeline = function (cache, ids, opts) {
@@ -1479,6 +1504,17 @@ function dsv41_tp_methods(model) {
 		// overlap and their CPU shares would queue on the same cores (jai, 51k tokens: 375 tok/s against ~690 staged). Then
 		// the kernels read those experts zero-copy from the arena instead (few rows each: about one pass, as staging)
 		let no_split = (opts.warmup || total > tune.get('split_max', group * (opts.chunk || 512))) ? true : false;     // tunable
+
+		/* The prompt skip: past the last kv source (layer 20) a layer keeps nothing of a position but its window rows
+		 * (cfg.window back), and it sees the earlier positions only through the sources' pools and index keys. So the
+		 * layers after it need a position only within (layers after it + 1) windows of the prompt's end (the window's
+		 * dependency cone): a chunk that ends before that runs up to the source's compressor and stops. Same results
+		 * (up to the order of sums), most of the second half's work and expert staging saved on long prompts.
+		 * AMP_DSV41_PROMPT_SKIP=0 / the tunable prompt_skip: every layer for every position. */
+		let S_last = max(...filter(cfg.kv_sources, (k) => k < nl));
+		let cone_from = start + total - (nl - S_last + 1) * cfg.window;
+		let skip_on = (!opts.warmup && !nr && cone_from > start &&
+			(opts.prompt_skip ?? tune.get('prompt_skip', PROMPT_SKIP))) ? true : false;     // tunable
 
 		// a staged prompt: every stage copies its first two layers' host experts ahead (its GPUs are idle until then)
 		let pre = [];
@@ -1576,6 +1612,7 @@ function dsv41_tp_methods(model) {
 				c.gid = gid;
 				c.cpu_pf = cpu_pf;
 				c.no_split = no_split;
+				c.skip_after = (skip_on && end <= cone_from) ? S_last : null;
 				prev_end = end;
 				push(grp, c);
 			}
@@ -1611,7 +1648,8 @@ function dsv41_tp_methods(model) {
 
 				if (s == NS - 1) {
 					for (let c in grp) {
-						if (opts.on_taps)
+						// (a skipped chunk has no taps: the drafter's ring keeps only the prompt's last positions)
+						if (opts.on_taps && c.skip_after == null)
 							opts.on_taps(model.chunk_taps(c), c.pos0);
 
 						if (c.last)
@@ -1948,7 +1986,7 @@ export function load(model_dir, opts) {
 	// AMP_DSV41_TP_SPLIT=13,13,14: layers per stage (and AMP_DSV41_TP_SPARK=0,2,1: the stage of each drafter stage),
 	// for hand-tuning the memory balance; 'auto' keeps the planner's. 13,13,14 is the default for 40 layers on 3
 	// stages: the last stage's ratio-1 layers cost the most prefill time, and it fits at 256k context, chunk 1536
-	let spl = getenv('AMP_DSV41_TP_SPLIT') || ((NS == 3 && nl == 40 && !nr) ? '13,13,14' : 'auto');
+	let spl = getenv('AMP_DSV41_TP_SPLIT') || ((NS == 3 && nl == 40 && !nr && !ws.gguf) ? '13,13,14' : 'auto');     // (GGUF layers differ in size: the planner's split)
 
 	if (spl != 'auto') {
 		let sz = map(split(spl, ','), (x) => +x), at = 0;
@@ -2081,7 +2119,8 @@ export function load(model_dir, opts) {
 
 	glm5.set_fused_rows(max(256, opts.prefill_rows || 1024));
 
-	let meta = dsv41.build_engram_meta(model_dir, cfg);
+	let GG = ws.gguf ? true : false;                // GGUF checkpoint (docs/GGUF.md): quantized rows, experts in stacked tensors
+	let meta = dsv41.build_engram_meta(model_dir, cfg, ws);
 	let layers = [];
 	let engrams = {};
 	let t_load = time();
@@ -2103,6 +2142,9 @@ export function load(model_dir, opts) {
 
 			if (index(key, '.engram.embed') > 0)
 				return null;                         // streamed from disk
+
+			if (GG && index(key, '.exps.') > 0)
+				return null;                         // a GGUF expert stack: each rank uploads its own slice below
 
 			let at = index(key, '.experts.');
 
@@ -2135,6 +2177,27 @@ export function load(model_dir, opts) {
 			let dev = S.devs[g];
 			let e0 = plan.experts[g][0], en = plan.experts[g][1];
 			let ex = [];
+
+			if (GG) {
+				// GGUF: this rank's experts [e0, e0 + en) of the three stacked matrices, uploaded alone
+				let M = {
+					type: 'moe', dev: dev, experts: ex, e0: e0, e1: e0 + en, router: 'sqrtsp',
+					gate_t: gate_t.cuda(dev), bias: bias.cuda(dev), bias_vl: null, tid2eid: null, ids: null, vlon: false,
+					shared: shard_mlp8(shared, plan.shared[g], dev), gq: ggufq.experts(ws, mkey, dev, e0, en),
+					gq_forward: (c, Mx, y) => ggufq.moe_forward(c, Mx, y, {route: glm5.moe_route, act: glm5.act_mul, mlp: glm5.mlp_forward, side: glm5.par_side, join: glm5.par_join})
+				};
+
+				push(row, {
+					dev: dev, idx: i,
+					hc_attn: hc_copy(hc_a, dev), hc_ffn: hc_copy(hc_f, dev),
+					attn_norm: an.cuda(dev), ffn_norm: fnw.cuda(dev),
+					attn: shard_attn(cfg, attn, g, Gs, dev),
+					moe: M
+				});
+
+				continue;
+			}
+
 			let arena = null, slot = 0, reads = [], slot_of = {}, nst = 0;
 			let cl = {w1: [[], [], []], w3: [[], [], []], w2: [[], [], []], ids: []};      // the CPU layer: trellis, suh, svh per matrix
 
@@ -2336,7 +2399,7 @@ export function load(model_dir, opts) {
 			for (let g = 0; g < Gs; g++) {
 				let dev = S.devs[g];
 				let Eg = {layer: i, dev: dev, key: E.key, wkv: dsv41.lin8_to(E.wkv, dev), weight: E.weight.cuda(dev),
-					file: E.file, wname: E.wname, sname: E.sname, emb_bufs: {},
+					file: E.file, wname: E.wname, sname: E.sname, qt: E.qt, row_bytes: E.row_bytes, emb_bufs: {},
 					emb_buf: torch.zeros([1, E.emb_buf.shape()[1]], 'float16', 'cuda:' + dev)};
 
 				push(per, Eg);
@@ -2391,14 +2454,22 @@ export function load(model_dir, opts) {
 
 		embed_t = {host: table, index: function (idt) {return this.host.index(idt.cpu()).cuda(ed);}};
 	}
+	else if (!remote && GG && ws.qtype('embed.weight') && !getenv('AMP_GGUF_EMBED_FP16')) {
+		// (stays quantized, 0.42 GiB: the rows of the tokens are dequantized by id, also inside the graphs)
+		embed_t = {raw: ws.gpu('embed.weight', ed), qt: ws.qtype('embed.weight'),
+			dev: ed, index: function (idt) {return torch.gguf_embed(this.raw, this.qt, idt.cuda(this.dev, true));}};
+	}
 	else if (!remote) {
 		embed_t = ws.gpu16('embed.weight', ed);
 		ws.release('embed.weight', ed);
 	}
 
-	let head_full = no_head ? null : models.linear(ws, 'head', false, last.devs[0]);
+	let head_full = no_head ? null : (GG ? ggufq.linear(ws, 'head', last.devs[0]) : models.linear(ws, 'head', false, last.devs[0]));
 	// rank g multiplies its vocabulary slice: the head is a dense fp16 matrix (1.59bpw pack) or EXL3 (1017 packs)
 	let lm_heads = no_head ? [] : map(last.devs, function (d, g) {
+		if (GG)
+			return ggufq.linear_rows(head_full, plan.vocab[g][0], plan.vocab[g][1], d);
+
 		if (head_full.trellis)
 			return models.cols(head_full, [ [ plan.vocab[g][0], plan.vocab[g][1] ] ], d);
 

@@ -1,5 +1,6 @@
 // tests/dsv41_tp.uc — DeepSeek-V4.1 as 2 stages x 2 tensor-parallel ranks (dsv41_tp) against the single-chain model:
-// chunked prefill logits, wavefront prefill, graph decode, a multi-row step and its rollback, the host-RAM store.
+// chunked prefill logits, wavefront prefill, graph decode, a multi-row step and its rollback, the host-RAM store, the
+// prompt skip (a real check only with AMP_DSV41_PREFILL past the cone: 8 layers -> more than 896 tokens).
 //   AMP_MODEL_DSV41  AMP_DSV41_LAYERS (default 8)  AMP_DSV41_PREFILL (default 300)
 
 import * as dsv41 from 'ampstein.dsv41';
@@ -9,7 +10,7 @@ import { stat } from 'fs';
 
 const MODEL = getenv('AMP_MODEL_DSV41') || '/data/models/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw';
 
-if (!stat(MODEL + '/model.safetensors.index.json')) {
+if (!stat(MODEL + '/config.json')) {
 	warn('skip: DSV4.1 model dir missing\n');
 	exit(125);
 }
@@ -51,6 +52,20 @@ function run(m, tp) {
 	while (pl.step(1)) {}
 
 	out.pipe = pl.logits().to('float32').cpu();
+
+	// the prompt skip: a prompt longer than the cone (AMP_DSV41_PREFILL > (layers - last kv source + 1) x window)
+	// gives the same logits with and without it, and so does the next step from either cache
+	if (tp) {
+		for (let sk = 0; sk < 2; sk++) {
+			let cs = m.new_cache(MAXSEQ);
+			let ps = m.prefill_pipeline(cs, ids, {chunk: 128, prompt_skip: sk ? true : false});
+
+			while (ps.step(1)) {}
+
+			out['skip' + sk] = ps.logits().to('float32').cpu();
+			out['skip' + sk + 'n'] = m.forward_chunk([ toks[2] ], cs, 1).to('float32').cpu();
+		}
+	}
 
 	// the host-RAM store: the prefilled cache to host memory, another sequence over it, the cache back; a step
 	// then gives what it gave before (the same computation: identical up to the order of the all-reduces)
@@ -118,6 +133,13 @@ cmp('graph 1', b.g1, a.g1);
 cmp('rows 5', b.g5, a.g5);
 
 assert(worst < 0.1, 'tensor-parallel logits differ from the single-chain model');
+
+if (b.skip0) {
+	let e = max(rel_rms(b.skip1, b.skip0), rel_rms(b.skip1n, b.skip0n));
+
+	printf('%-10s rel rms %.2e  argmax %d %d\n', 'skip', e, b.skip1.argmax(-1).tolist()[0], b.skip0.argmax(-1).tolist()[0]);
+	assert(e < 1e-3, 'the prompt skip changes the logits');
+}
 
 if (b.st0) {
 	let e = rel_rms(b.st1, b.st0);

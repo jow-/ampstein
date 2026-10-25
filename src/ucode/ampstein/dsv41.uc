@@ -26,6 +26,7 @@ import * as weights from './weights.uc';
 import * as models from './models.uc';
 import * as glm5 from './glm5.uc';
 import * as dsv4 from './dsv4.uc';
+import * as ggufq from './ggufq.uc';
 import {readfile, stat} from 'fs';
 
 const NEGH = -60000.0;
@@ -214,6 +215,9 @@ export function lin8_from(w, s, dev) {
  * SAGE packs), EXL3 (key + '.trellis': the 2.50bpw packs) or a plain fp16 / bf16 matrix. The three behave alike:
  * forward(x) with x (M, K) fp16 -> (M, N) fp16, in_features, out_features, and the tensor-parallel shards below. */
 export function lin8(ws, key, dev) {
+	if (ws.gguf && ws.qtype(key + '.weight'))            // a GGUF checkpoint: ggml block-quantized rows (ggufq.uc)
+		return ggufq.linear(ws, key, dev);
+
 	if (ws.has(key + '.trellis'))
 		return models.LinearEXL3(ws, key, dev);
 
@@ -277,6 +281,9 @@ function lin3g_from(slices, dev) {
 }
 
 export function lin8g(ws, key, G, dev) {
+	if (ws.gguf && ws.qtype(key + '.weight'))
+		return ggufq.linear_grouped(ws, key, G, dev);
+
 	if (ws.has(key + '.slice.0.trellis')) {
 		let sl = [];
 
@@ -291,6 +298,9 @@ export function lin8g(ws, key, G, dev) {
 
 /* tensor-parallel shards of FP8 linears (copies on dev) */
 export function lin8_to(l, dev) {
+	if (l.qtype)
+		return ggufq.linear_to(l, dev);
+
 	if (l.trellis)
 		return models.cols(l, [ [ 0, l.out_features ] ], dev);
 
@@ -302,6 +312,9 @@ export function lin8_to(l, dev) {
 
 /* output rows [r0, r0 + n) */
 export function lin8_rows(l, r0, n, dev) {
+	if (l.qtype)
+		return ggufq.linear_rows(l, r0, n, dev);
+
 	if (l.trellis)
 		return models.cols(l, [ [ r0, n ] ], dev);
 
@@ -313,6 +326,9 @@ export function lin8_rows(l, r0, n, dev) {
 
 /* input columns [c0, c0 + n): the partial sum of a row-parallel layer */
 export function lin8_cols(l, c0, n, dev) {
+	if (l.qtype)
+		return ggufq.linear_cols(l, c0, n, dev);
+
 	if (l.trellis)
 		return models.rows(l, c0, n, dev);
 
@@ -328,6 +344,9 @@ export function lin8_cols(l, c0, n, dev) {
 
 /* groups [g0, g0 + n) of a grouped linear */
 export function lin8g_groups(l, g0, n, dev) {
+	if (l.qtype)
+		return ggufq.grouped_groups(l, g0, n, dev);
+
 	if (l.slices)
 		return lin3g_from(map(slice(l.slices, g0, g0 + n), (s) => models.cols(s, [ [ 0, s.out_features ] ], dev)), dev);
 
@@ -437,21 +456,30 @@ export function hc_collapse(streams, pre) {
 /* ------------------------------------------------------------------ */
 /* Engram                                                              */
 
-export function build_engram_meta(ws_dir, cfg) {
+export function build_engram_meta(ws_dir, cfg, ws) {
 	let path = ws_dir + '/engram_meta.safetensors';
+	let st = null, T;
 
-	if (!stat(path))
-		die(`dsv41: ${path} is missing; generate it once with: python3 tests/oracle/make_engram_meta.py ${ws_dir}`);
+	if (ws && ws.gguf) {
+		T = ws.engram_meta(cfg.engram_pad_id);          // the hash tables are tensors of the GGUF itself
+	}
+	else {
+		if (!stat(path))
+			die(`dsv41: ${path} is missing; generate it once with: python3 tests/oracle/make_engram_meta.py ${ws_dir}`);
 
-	let st = torch.st(path);
+		st = torch.st(path);
+		T = {token_map: st.tensor('token_map'), pad: st.tensor('pad'), multipliers: st.tensor('multipliers'),
+			offsets: st.tensor('offsets'), primes: st.tensor('primes')};
+	}
+
 	let M = {
-		token_map: st.tensor('token_map').to('int64').view([-1, 1]),
-		pad: st.tensor('pad').to('int64').tolist()[0],
-		keep: st,                           // the tensors below may view its mapping
+		token_map: T.token_map.to('int64').view([-1, 1]),
+		pad: T.pad.to('int64').tolist()[0],
+		keep: st ?? T,                      // the tensors below may view its mapping
 		mult: [], offs: [], sizes: []
 	};
-	let mult = st.tensor('multipliers').to('int64'), offs = st.tensor('offsets').to('int64');
-	let primes = st.tensor('primes').to('int64');
+	let mult = T.multipliers.to('int64'), offs = T.offsets.to('int64');
+	let primes = T.primes.to('int64');
 
 	for (let l = 0; l < length(cfg.engram_layers); l++) {
 		push(M.mult, mult.narrow(0, l, 1).view([-1]).contiguous());
@@ -470,6 +498,9 @@ export function build_engram(ws, cfg, i, dev) {
 		wkv: lin8(ws, key + '.wkv', dev),
 		weight: ws.gpu(key + '.q_weight', dev).to('float32').mul(ws.gpu(key + '.k_weight', dev).to('float32')).contiguous(),
 		file: ws.has(key + '.embed.weight') ? ws.file(key + '.embed.weight') : null,
+		// (a GGUF checkpoint: IQ4_NL rows, no scale tensor)
+		qt: (ws.gguf && ws.has(key + '.embed.weight')) ? ws.qtype(key + '.embed.weight') : null,
+		row_bytes: (ws.gguf && ws.has(key + '.embed.weight')) ? int(ws.info(key + '.embed.weight').nbytes / ws.info(key + '.embed.weight').shape[0]) : 0,
 		emb_buf: torch.zeros([1, (cfg.engram_ngram - 1) * cfg.engram_heads * cfg.engram_dim], 'float16', 'cuda:' + dev),
 		emb_bufs: {},
 		wname: key + '.embed.weight',
@@ -492,6 +523,12 @@ export function engram_start(cfg, meta, E, li, hist_t, T) {
 	let U = torch.ngram_hash(hist_t, T, meta.mult[li], meta.offs[li], meta.sizes[li], cfg.engram_heads,
 		meta.pad, uids, inverse, heads);
 	let u = uids.narrow(0, 0, U).contiguous();
+	if (E.qt) {
+		let rq = torch.empty([U, E.row_bytes], 'uint8');
+
+		return {T: T, U: U, inverse: inverse, rq: rq, u: u, t1: E.file.gather_async(E.wname, u, rq)};
+	}
+
 	let rw = torch.empty([U, cfg.engram_dim], 'float8_e4m3fn');
 	let rsc = torch.empty([U, cfg.engram_dim / 32], 'float8_e8m0fnu');
 
@@ -509,6 +546,13 @@ export function engram_finish(cfg, E, st) {
 	let U = st.U;
 
 	torch.gather_wait(st.t1);
+
+	if (st.rq) {
+		let rows = torch.gguf_dequant(st.rq.cuda(E.dev, true), E.qt, 'float16');
+
+		return rows.index(st.inverse.cuda(E.dev, true)).view([st.T, H * cfg.engram_dim]);
+	}
+
 	torch.gather_wait(st.t2);
 
 	// non-blocking copies (staged through the caching pinned allocator): the host never waits for the device,
@@ -566,7 +610,9 @@ export function engram_prefetch(cfg, meta, engrams, cache, ids, pos0, lo, hi) {
 			let u = uids.narrow(0, 0, U).contiguous();
 
 			E.file.prefetch(E.wname, u);
-			E.file.prefetch(E.sname, u);
+
+			if (!E.qt)
+				E.file.prefetch(E.sname, u);
 		}
 	}
 }
@@ -648,6 +694,12 @@ export function build_attn(ws, cfg, i, dev) {
 /* cache                                                               */
 
 /* ---- pools of compressed rows: fp16, or Q8 (AMP_DSV41_KV=q8): int8 codes + one fp16 scale per 32 elements ---- */
+
+const PROMPT_SKIP = getenv('AMP_DSV41_PROMPT_SKIP') != '0';     // the prompt skip (prefill_pipeline), docs/DSV41.md
+
+// score elements of one tile of the prefill indexer (rows x pool entries; the topk behind it needs a few times that in workspace):
+// AMP_DSV41_IDX_SLAB; a GGUF model, which has little VRAM left over, takes a smaller tile (set in load)
+let IDX_SLAB = +(getenv('AMP_DSV41_IDX_SLAB') || 32 * 1024 * 1024);
 
 const KV_MODE = getenv('AMP_DSV41_KV') || 'q8';                   // q8 (pool + index keys) | q8pool (pool only) | fp16
 const KV_Q8 = (KV_MODE == 'q8' || KV_MODE == 'q8pool');
@@ -978,7 +1030,7 @@ function index_picks(cfg, A, ctx, cache, xn, qr, pos0, src) {
 	let kk = pool_view(pc.kidx, S);
 	let scale = math.pow(Di * 1.0, -0.5) * math.pow(Hi * 1.0, -0.5);
 	let K = min(cfg.index_topk, S);
-	let SLAB = max(1, int(32 * 1024 * 1024 / S));
+	let SLAB = max(1, int(IDX_SLAB / S));
 	let outs = [], cand_new = [];
 
 	for (let r0 = 0; r0 < T; r0 += SLAB) {
@@ -1108,7 +1160,8 @@ export function attn_forward_steps(cfg, A, ctx, cache, cl, xn, pos0) {
 		prof('h.wo_b');
 	}
 
-	return {steps: [ qkv, kvrows, compress, select, attend, project ], out: function () {return st.y;}};
+	// (compress alone: what a later layer reads of a position the prompt skip does not run further, dsv41_tp)
+	return {steps: [ qkv, kvrows, compress, select, attend, project ], out: function () {return st.y;}, compress: compress};
 }
 
 export function attn_forward(cfg, A, ctx, cache, cl, xn, pos0) {
@@ -1135,9 +1188,24 @@ export function new_dec_dev(cfg, dev) {
 }
 
 /* meta: [pos, pos % ring, pos / 2, 2 * (pos / 2), pos / candidate block, 0, 0, 0] */
+/* The metadata rows go through a page-locked host tensor with non-blocking copies: the host does not wait for each device, and the six
+ * segments of a step share one tensor (built once per position). The tensor is rewritten only when the position changes, after
+ * the step that read it has been waited for (the host reads the results of every step before it starts the next). */
+let POS_PIN = {pos: -1, i: 0, t: []};
+
 export function dec_set_pos(cfg, st, pos) {
-	st.meta.copy_(torch.from_array([pos, pos % RING, int(pos / 2), 2 * int(pos / 2),
-		int(pos / cfg.candidate_block_size), 0, 0, 0], 'int64').cuda(st.dev, true));
+	if (POS_PIN.pos != pos || !length(POS_PIN.t)) {
+		// (a ring of 8: a step whose copies have not run yet keeps its tensor while the next positions are prepared)
+		if (!length(POS_PIN.t))
+			for (let k = 0; k < 8; k++)
+				push(POS_PIN.t, torch.pinned_empty([8], 'int64'));
+
+		POS_PIN.i = (POS_PIN.i + 1) % 8;
+		POS_PIN.t[POS_PIN.i].copy_(torch.from_array([pos, pos % RING, int(pos / 2), 2 * int(pos / 2), int(pos / cfg.candidate_block_size), 0, 0, 0], 'int64'));
+		POS_PIN.pos = pos;
+	}
+
+	st.meta.copy_(POS_PIN.t[POS_PIN.i], true);
 }
 
 function meta_i(st, k) {
@@ -1392,16 +1460,29 @@ export function new_dec_rows(cfg, dev, S) {
 	return {dev: dev, S: S, meta: meta, rows: rows};
 }
 
+let ROWS_PIN = {};
+
 export function dec_set_rows(cfg, st, pos) {
-	let a = [];
+	let pn = ROWS_PIN[st.S];
 
-	for (let s = 0; s < st.S; s++) {
-		let p = pos + s;
+	if (!pn)
+		pn = ROWS_PIN[st.S] = {pos: -1, i: 0, t: map(slice([0,1,2,3,4,5,6,7]), () => torch.pinned_empty([st.S, 8], 'int64'))};
 
-		push(a, p, p % RING, int(p / 2), 2 * int(p / 2), int(p / cfg.candidate_block_size), (p % 2 == 1) ? int(p / 2) : -1, 0, 0);
+	if (pn.pos != pos) {
+		let a = [];
+
+		for (let s = 0; s < st.S; s++) {
+			let p = pos + s;
+
+			push(a, p, p % RING, int(p / 2), 2 * int(p / 2), int(p / cfg.candidate_block_size), (p % 2 == 1) ? int(p / 2) : -1, 0, 0);
+		}
+
+		pn.i = (pn.i + 1) % 8;
+		pn.t[pn.i].copy_(torch.from_array(a, 'int64').view([st.S, 8]));
+		pn.pos = pos;
 	}
 
-	st.meta.copy_(torch.from_array(a, 'int64').view([st.S, 8]).cuda(st.dev, true));
+	st.meta.copy_(pn.t[pn.i], true);
 }
 
 /* attention of the S rows of xn (S, D) fp16; sts: the rows' states, ctxs: one indexer context per row */
@@ -1631,6 +1712,10 @@ export function block_decode_rows(cfg, L, ctxs, cache, cl, streams, pre, st, cap
 /* MoE                                                                 */
 
 export function build_mlp8(ws, key, dev) {
+	// GGUF: gate and up of the same type run as one launch with the SwiGLU (ggufq.mlp); mlp_forward calls M.fused when it is set
+	if (ws.gguf && ws.qtype(key + '.w1.weight') && ws.qtype(key + '.w1.weight') == ws.qtype(key + '.w3.weight') && ws.qtype(key + '.w1.weight') != 'IQ4_NL')
+		return ggufq.mlp(ws, key, dev);
+
 	return {
 		gate: lin8(ws, key + '.w1', dev),
 		up: lin8(ws, key + '.w3', dev),
@@ -1704,6 +1789,20 @@ export function build_coop(cfg, M) {
 export function build_moe(ws, cfg, i, dev) {
 	let key = `layers.${i}.ffn`;
 	let experts = [];
+
+	if (ws.gguf) {
+		// GGUF checkpoint: the routed experts are three stacked quantized matrices, run by ggufq.moe_forward
+		// (glm5.moe_begin calls M.gq_forward)
+		return {
+			type: 'moe', dev: dev, experts: experts, router: 'sqrtsp',
+			gate_t: mat32(ws, key + '.gate', dev),
+			bias: ws.gpu(key + '.gate.bias', dev).to('float32').reshape([1, -1]).contiguous(),
+			bias_vl: null, tid2eid: null, ids: null, vlon: false,
+			shared: build_mlp8(ws, key + '.shared_experts', dev),
+			gq: ggufq.experts(ws, key, dev),
+			gq_forward: (cfg, M, y) => ggufq.moe_forward(cfg, M, y, {route: glm5.moe_route, act: glm5.act_mul, mlp: glm5.mlp_forward, side: glm5.par_side, join: glm5.par_join})
+		};
+	}
 
 	for (let e = 0; e < cfg.n_routed_experts; e++)
 		push(experts, build_expert(ws, `${key}.experts.${e}`, dev));
@@ -1853,8 +1952,9 @@ export function seg_cost(cfg, bytes, a, b, max_seq) {
 export function spark_stage_bytes(ws, cfg) {
 	let out = [];
 
+	// (+ a working set per stage: 400 MB for the EXL3 packs, measured at ~100 MB with a GGUF trunk: stage tensors 1.1 - 1.4 GiB in all)
 	for (let b = 0; b < cfg.num_mtp_layers; b++)
-		push(out, 400000000);
+		push(out, ws.gguf ? 100000000 : 400000000);
 
 	for (let key in ws.list()) {
 		if (index(key, 'mtp.') == 0) {
@@ -1987,6 +2087,267 @@ export function plan_devices(ws, cfg, ngpu, max_seq, extra_first, extra_last, sp
 	return bestd;
 }
 
+/* GGUF checkpoints fill the GPUs to the brim (IQ2_XXS: 128 GiB of weights on 6 x 23.5 GiB) and a layer is 3 - 3.8 GiB, so the contiguous plan
+ * of plan_devices leaves one device with a few hundred MiB for graphs, caches and the working set of a prefill chunk. This moves layers (and swaps
+ * pairs of layers) off the devices that would keep less than `reserve` bytes free, choosing the change that adds the fewest hops of the
+ * activations between devices (80 KB per token and hop). Counted per device: the layers, the pools of the kv sources it owns and a mirror of
+ * every pool its layers read from another device (max_seq positions), the head (with the last layer), the drafter's stages (sb bytes, on the
+ * devices sd, moved too) and the embedding (on the least loaded device). Returns {devs, embed, load, cap}. */
+export function rebalance(cfg, devs, bytes, ngpu, embed_bytes, head_bytes, reserve, max_seq, sb, sd) {
+	let nl = length(devs);
+	let cap = [];
+
+	for (let d = 0; d < ngpu; d++)
+		push(cap, torch.mem_info(d)[3] - reserve);
+
+	devs = slice(devs);
+	sd = sd ? slice(sd) : [];
+	sb = sb ?? [];
+
+	function loads(dv, ed) {
+		let L = [];
+
+		for (let d = 0; d < ngpu; d++)
+			push(L, 0);
+
+		L[dv[nl - 1]] += head_bytes;                    // the head lives with the last layer, wherever it is
+
+		if (ed != null)
+			L[ed] += embed_bytes;
+
+		for (let b = 0; b < length(sb); b++)           // the drafter's stages (they may share a device)
+			L[sd[b]] += sb[b];
+
+		for (let i = 0; i < nl; i++)
+			L[dv[i]] += bytes[i];
+
+		let seen = {};
+
+		for (let i = 0; i < nl; i++) {
+			let src = cfg.src[i];
+
+			if (index(cfg.kv_sources, i) >= 0 && !seen[`${i}.${dv[i]}`]) {
+				seen[`${i}.${dv[i]}`] = true;
+				L[dv[i]] += pool_bytes(cfg, i, max_seq);
+			}
+
+			if (src >= 0 && src < nl && dv[src] != dv[i] && !seen[`${src}.${dv[i]}`]) {
+				seen[`${src}.${dv[i]}`] = true;
+				L[dv[i]] += pool_bytes(cfg, src, max_seq);
+			}
+		}
+
+		return L;
+	}
+
+	function over(L) {
+		let o = 0;
+
+		for (let d = 0; d < ngpu; d++)
+			o = max(o, L[d] - cap[d]);
+
+		return o;
+	}
+
+	function hops(dv) {
+		let h = 0;
+
+		for (let i = 1; i < nl; i++)
+			if (dv[i] != dv[i - 1])
+				h++;
+
+		return h;
+	}
+
+	// the embedding goes where there is the most room
+	let ed = 0, base = loads(devs, null);
+
+	for (let d = 1; d < ngpu; d++)
+		if (base[d] - cap[d] < base[ed] - cap[ed])
+			ed = d;
+
+	for (let iter = 0; iter < 300; iter++) {
+		let L = loads(devs, ed), o0 = over(L);
+
+		if (o0 <= 0)
+			break;
+
+		let h0 = hops(devs), best = null, bscore = 1e30;
+
+		// a move or a swap that lowers the worst overload; fewest added hops first, then the lowest overload
+		for (let i = 0; i < nl; i++) {
+			let di = devs[i];
+
+			if (L[di] - cap[di] < o0 * 0.999)       // only layers of the device(s) at the worst overload
+				continue;
+
+			for (let r = 0; r < ngpu; r++) {
+				if (r == di)
+					continue;
+
+				devs[i] = r;
+
+				let o1 = over(loads(devs, ed)), sc = (hops(devs) - h0) * 1e12 + o1;
+
+				if (o1 < o0 && sc < bscore) {
+					bscore = sc;
+					best = [ i, -1 ];
+				}
+
+				for (let j = 0; j < nl; j++) {
+					if (devs[j] != r || j == i)
+						continue;
+
+					devs[j] = di;
+
+					let o2 = over(loads(devs, ed)), sc2 = (hops(devs) - h0) * 1e12 + o2;
+
+					if (o2 < o0 && sc2 < bscore) {
+						bscore = sc2;
+						best = [ i, j ];
+					}
+
+					devs[j] = r;
+				}
+
+				devs[i] = di;
+			}
+		}
+
+		// the drafter's stages move freely (no hops): a stage on an overloaded device to the device that leaves the lowest overload
+		let sbest = null, sscore = bscore;
+
+		for (let b = 0; b < length(sb); b++) {
+			let db = sd[b];
+
+			if (L[db] - cap[db] < o0 * 0.999)
+				continue;
+
+			for (let r = 0; r < ngpu; r++) {
+				if (r == db)
+					continue;
+
+				sd[b] = r;
+
+				let o1 = over(loads(devs, ed));
+
+				sd[b] = db;
+
+				if (o1 < o0 && o1 < sscore) {
+					sscore = o1;
+					sbest = [ b, r ];
+				}
+			}
+		}
+
+		if (sbest) {
+			sd[sbest[0]] = sbest[1];
+			continue;
+		}
+
+		if (!best)
+			break;
+
+		// re-derive the target device of the winning change
+		let i = best[0], j = best[1], di = devs[i];
+
+		if (j < 0) {
+			let tb = null, tbs = 1e30;
+
+			for (let r = 0; r < ngpu; r++) {
+				if (r == di)
+					continue;
+
+				devs[i] = r;
+
+				let sc = (hops(devs) - h0) * 1e12 + over(loads(devs, ed));
+
+				if (sc < tbs) {
+					tbs = sc;
+					tb = r;
+				}
+
+				devs[i] = di;
+			}
+
+			devs[i] = tb;
+		}
+		else {
+			let r = null, tbs = 1e30;
+
+			// (the swap partner j sits on the device r)
+			r = devs[j];
+			devs[i] = r;
+			devs[j] = di;
+		}
+	}
+
+	// feasible: now as few device changes as the budgets allow (each is a copy and a graph launch per decode step, ~1 ms): move a layer
+	// into the device of a neighbour layer, swap two layers, while it stays within every budget
+	if (over(loads(devs, ed)) <= 0) {
+		for (let iter = 0; iter < 200; iter++) {
+			let h0 = hops(devs), hbest = h0, change = null;
+
+			for (let i = 0; i < nl; i++) {
+				let di = devs[i];
+
+				for (let r in [ devs[i > 0 ? i - 1 : 0], devs[i < nl - 1 ? i + 1 : nl - 1] ]) {
+					if (r == di)
+						continue;
+
+					devs[i] = r;
+
+					let hh = hops(devs);
+
+					if (hh < hbest && over(loads(devs, ed)) <= 0) {
+						hbest = hh;
+						change = [ i, r, -1 ];
+					}
+
+					devs[i] = di;
+				}
+
+				for (let j = i + 1; j < nl; j++) {
+					let dj = devs[j];
+
+					if (dj == di)
+						continue;
+
+					devs[i] = dj;
+					devs[j] = di;
+
+					let hh = hops(devs);
+
+					if (hh < hbest && over(loads(devs, ed)) <= 0) {
+						hbest = hh;
+						change = [ i, dj, j ];
+					}
+
+					devs[i] = di;
+					devs[j] = dj;
+				}
+			}
+
+			if (!change)
+				break;
+
+			if (change[2] >= 0)
+				devs[change[2]] = devs[change[0]];
+
+			devs[change[0]] = change[1];
+		}
+	}
+
+	let L = loads(devs, ed);
+
+	for (let d = 0; d < ngpu; d++)
+		if (L[d] > cap[d])
+			warn(sprintf('dsv41: cuda:%d is planned %.2f GiB over its budget (%.2f GiB wanted free after the weights, the pools and the drafter)\n', d,
+				(L[d] - cap[d]) / 1073741824.0, reserve / 1073741824.0));
+
+	return {devs: devs, embed: ed, load: L, cap: cap, spark: sd};
+}
+
 /* the device with the fewest bytes planned (weights + pools; the head's device counts its head): where the
  * embedding table lives. The lookup is one row per token, wherever it is. */
 export function embed_device(ws, cfg, devs, max_seq, head_bytes, extra) {
@@ -2046,6 +2407,9 @@ export function load(model_dir, opts) {
 	let nl = cfg.num_hidden_layers;
 	let devs = opts.devices;
 
+	if (ws.gguf && !getenv('AMP_DSV41_IDX_SLAB'))
+		IDX_SLAB = 4 * 1024 * 1024;
+
 	if (devs == null)
 		devs = 1;
 
@@ -2054,24 +2418,49 @@ export function load(model_dir, opts) {
 		cfg.num_hidden_layers = nl;
 	}
 
-	let spark_devs = null, spark_load = {};
+	let spark_devs = null, spark_load = {}, spark_bytes = null;
 
 	if (type(devs) != 'array') {
 		let sb = (opts.spark && cfg.dspark_block && (ws.has('mtp.0.main_proj.weight') || ws.has('mtp.0.main_proj.trellis'))) ? spark_stage_bytes(ws, cfg) : null;
 
 		devs = plan_devices(ws, cfg, devs, opts.max_seq || 262144, 1000000000, 2000000000, sb);   // first device: Engram + chunk working set
 		spark_devs = SPARK_DEVS;
+		spark_bytes = sb;
 
 		for (let b = 0; spark_devs && b < length(spark_devs); b++)
 			spark_load[spark_devs[b]] = (spark_load[spark_devs[b]] || 0) + sb[b];
 	}
 
+	// GGUF checkpoints: balance the devices by moving layers where a contiguous run would leave too little free memory
+	let ed_planned = null;
+
+	if (ws.gguf && opts.devices != null && type(opts.devices) != 'array' && !getenv('AMP_DSV41_NO_REBALANCE')) {
+		let ngpu = opts.devices;
+
+		// the layers, the drafter's stages (placed freely, spark_devs is replaced by the result) and the embedding together
+		let eb = (ws.qtype('embed.weight') && !getenv('AMP_GGUF_EMBED_FP16')) ? ws.info('embed.weight').nbytes : cfg.vocab_size * cfg.hidden_size * 2;
+		let rb = rebalance(cfg, devs, layer_bytes(ws, cfg), ngpu, eb, ws.info('head.weight').nbytes, +(getenv('AMP_GGUF_RESERVE_MIB') || 1200) * 1048576.0,
+			opts.max_seq || 262144, spark_bytes, spark_devs);
+
+		devs = rb.devs;
+		ed_planned = rb.embed;
+
+		if (spark_bytes) {
+			spark_devs = rb.spark;
+			spark_load = {};
+
+			for (let b = 0; b < length(spark_devs); b++)
+				spark_load[spark_devs[b]] = (spark_load[spark_devs[b]] || 0) + spark_bytes[b];
+		}
+	}
+
 	let first = devs[0], last = devs[nl - 1];
-	let ed = (opts.embed_dev != null) ? opts.embed_dev : embed_device(ws, cfg, devs, opts.max_seq || 262144, 1300000000, spark_load);
+	let ed = (opts.embed_dev != null) ? opts.embed_dev : (ed_planned != null) ? ed_planned :
+		embed_device(ws, cfg, devs, opts.max_seq || 262144, 1300000000, spark_load);
 
 	glm5.set_fused_rows(max(256, opts.prefill_rows || 1024));
 
-	let meta = build_engram_meta(model_dir, cfg);
+	let meta = build_engram_meta(model_dir, cfg, ws);
 
 	ws.upload(function (key) {
 		if (index(key, 'layers.') == 0) {
@@ -2109,13 +2498,33 @@ export function load(model_dir, opts) {
 		cnt[d] = (cnt[d] || 0) + 1;
 
 	warn(`dsv41: layers per device: ${join(' ', map(keys(cnt), (k) => k + ':' + cnt[k]))}\n`);
+
+	{
+		let hops = 0;
+
+		for (let i = 1; i < nl; i++)
+			if (devs[i] != devs[i - 1])
+				hops++;
+
+		warn(`dsv41: layer plan ${join('', devs)} (${hops} device changes; each is a copy and a graph launch per decode step)\n`);
+	}
 	mem_report(devs, `layers loaded (embedding on cuda:${ed}, head on cuda:${last}, drafter on ${spark_devs ? 'cuda:' + join(',cuda:', spark_devs) : '-'})`);
 
-	let embed_t = ws.gpu16('embed.weight', ed);
+	let embed_t;
 
-	ws.release('embed.weight', ed);
+	if (ws.gguf && ws.qtype('embed.weight') && !getenv('AMP_GGUF_EMBED_FP16')) {
+		// a GGUF checkpoint: the table stays quantized on the GPU (0.42 GiB instead of 1.3), the rows of the tokens are dequantized by id
+		// (stateless: also inside the decode graphs)
+		embed_t = {raw: ws.gpu('embed.weight', ed), qt: ws.qtype('embed.weight'),
+			index: function (idt) {return torch.gguf_embed(this.raw, this.qt, idt);}};
+	}
+	else {
+		embed_t = ws.gpu16('embed.weight', ed);
 
-	let lm_head = models.linear(ws, 'head', false, last);
+		ws.release('embed.weight', ed);
+	}
+
+	let lm_head = ws.gguf ? ggufq.linear(ws, 'head', last) : models.linear(ws, 'head', false, last);
 
 	for (let sfx in [ 'weight', 'trellis', 'suh', 'svh', 'mul1' ])      // lm_head holds its own copy
 		ws.release('head.' + sfx, last);
@@ -2203,6 +2612,10 @@ export function load(model_dir, opts) {
 			for (let i = l0; i < l1; i++) {
 				let L = this.layers[i];
 
+				// the prompt skip: past the last kv source this chunk is not needed (prefill_pipeline)
+				if (c.skip_after != null && i > c.skip_after)
+					break;
+
 				if (c.dev != L.dev) {
 					c.h = c.h.cuda(L.dev);
 					c.pre = c.pre.cuda(L.dev);
@@ -2227,6 +2640,15 @@ export function load(model_dir, opts) {
 
 				if (c.taps && index(cfg.dspark_taps, i) >= 0)
 					push(c.taps, {dev: c.dev, t: c.h.mean(1)});     // the stream mean at the input of a tapped layer (T, D) fp32
+
+				// the last kv source of a skipped chunk: its compressor alone (the pool rows and index keys later layers read)
+				if (c.skip_after != null && i == c.skip_after) {
+					let a = hc_site(cfg, L.hc_attn, c.h, c.pre);
+
+					attn_forward_steps(cfg, L.attn, c.ctx, cache, cache.layers[i], torch.rms_norm(a.col, L.attn_norm, cfg.rms_norm_eps),
+						c.pos0).compress();
+					break;
+				}
 
 				let th0 = HOSTPROF ? prof_now() : 0;
 
@@ -2307,6 +2729,14 @@ export function load(model_dir, opts) {
 
 			push(caps_list, max_seq);
 
+			// AMP_DSV41_GRAPH_BUCKETS=n keeps only the n largest buckets (a context above a bucket's capacity uses the next one)
+			// (each bucket keeps ~0.5 GiB of graph memory in total, 0.9 GiB with the 5-row set; a single bucket of max_seq decodes as fast
+			// at short and at long contexts on a GGUF model, so that is the default there)
+			let nbk = getenv('AMP_DSV41_GRAPH_BUCKETS') ?? (model.ws.gguf ? 1 : null);
+
+			if (nbk != null)
+				caps_list = slice(caps_list, -(+nbk));
+
 			let gpool = {};
 			let buckets = [];
 
@@ -2386,6 +2816,19 @@ export function load(model_dir, opts) {
 			// multi-row steps (speculative verify): S rows per replay, per S its own set of graphs
 			let rowsets = {};
 			let tap_layers = cfg.dspark_taps;
+
+			// Which verify sizes get a graph (each set costs ~0.3 GiB over six GPUs): all that the engine asks for, or with
+			// AMP_DSV41_ROW_SIZES=a,b,.. only those (a GGUF model: 3 and the largest); a size without a graph runs the next larger one and
+			// takes the extra rows back with rollback() - they are rejected rows
+			let want = getenv('AMP_DSV41_ROW_SIZES') ? map(split(getenv('AMP_DSV41_ROW_SIZES'), ','), (x) => +x) :
+				model.ws.gguf ? [ 3, 5 ] : null;
+			let sizes_all = sizes;
+
+			if (want) {
+				let mx = max(...sizes);
+
+				sizes = filter(sizes, (S) => S < 2 || index(want, S) >= 0 || S == mx);
+			}
 
 			for (let S in sizes) {
 				if (S < 2)
@@ -2519,14 +2962,15 @@ export function load(model_dir, opts) {
 
 				let hist_t = torch.from_array(hist, 'int64').view([1, -1]);
 
+				// every layer's gathers are started now; a layer's rows are waited for just before the segment that holds it is
+				// replayed, so the later layers' reads overlap the earlier segments' compute
+				let ests = [];
+
 				for (let li = 0; li < length(cfg.engram_layers); li++) {
 					let l = cfg.engram_layers[li];
 
-					if (l < nl) {
-						let E = model.engrams[l];
-
-						E.emb_buf.copy_(engram_rows(cfg, model.meta, E, li, hist_t, 1));
-					}
+					if (l < nl)
+						push(ests, [ l, model.engrams[l], engram_start(cfg, model.meta, model.engrams[l], li, hist_t, 1) ]);
 				}
 
 				push(cache.cids, cn);
@@ -2551,6 +2995,13 @@ export function load(model_dir, opts) {
 
 				for (let it in b.items) {
 					let ts0 = PROF ? prof_now() : 0;
+
+					for (let es in ests) {
+						if (es[2] && es[0] >= it.first && es[0] < it.end) {
+							es[1].emb_buf.copy_(engram_finish(cfg, es[1], es[2]));
+							es[2] = null;
+						}
+					}
 
 					it.h_in.copy_(h);
 
@@ -2602,6 +3053,15 @@ export function load(model_dir, opts) {
 			/* S = length(ids) rows at pos .. pos + S - 1 through one replay chain: {logits (S, vocab), am (the
 			 * argmax of every row), taps (S, 3 * hidden) fp32}. cache.length becomes pos + S; rollback()
 			 * takes back the rows a speculation did not keep. */
+			const ROWPROF = getenv('AMP_DSV41_ROWPROF') ? {n: 0, t: {}} : null;
+
+			function rowprof(name, t0) {
+				ROWPROF.t[name] = (ROWPROF.t[name] || 0) + prof_now() - t0;
+
+				if (name == 'embed' && ++ROWPROF.n % 100 == 0)
+					warn('run_rows prelude (cumulative ms from entry, per call): ' + join(', ', map(keys(ROWPROF.t), (k) => sprintf('%s %.2f', k, ROWPROF.t[k] / ROWPROF.n))) + '\n');
+			}
+
 			function run_rows(ids, pos) {
 				let S = length(ids);
 				let rs = rowsets[S];
@@ -2624,8 +3084,13 @@ export function load(model_dir, opts) {
 				while (length(cache.cids) < pos)
 					push(cache.cids, model.meta.pad);
 
+				let rp0 = ROWPROF ? prof_now() : 0;
+
 				for (let sg in segs)
 					dec_set_rows(cfg, rs.sts[sg.dev], pos);
+
+				if (ROWPROF)
+					rowprof('set', rp0);
 
 				let idt = torch.from_array(ids, 'int64');
 				let cn = model.meta.token_map.index(idt).view([-1]).tolist();
@@ -2641,15 +3106,21 @@ export function load(model_dir, opts) {
 
 				let hist_t = torch.from_array(hist, 'int64').view([1, -1]);
 
+				if (ROWPROF)
+					rowprof('tok', rp0);
+
+				// every Engram layer's gathers start now; a layer's rows are waited for just before the segment that holds it is replayed
+				let ests = [];
+
 				for (let li = 0; li < length(cfg.engram_layers); li++) {
 					let l = cfg.engram_layers[li];
 
-					if (l < nl) {
-						let E = model.engrams[l];
-
-						E.emb_bufs[S].copy_(engram_rows(cfg, model.meta, E, li, hist_t, S));
-					}
+					if (l < nl)
+						push(ests, [ l, model.engrams[l], engram_start(cfg, model.meta, model.engrams[l], li, hist_t, S) ]);
 				}
+
+				if (ROWPROF)
+					rowprof('engram start', rp0);
 
 				let h = model.embed_tokens.index(idt.cuda(ed, true));
 
@@ -2658,9 +3129,22 @@ export function load(model_dir, opts) {
 
 				h = h.to('float32').reshape([S, 1, H]).expand([S, 4, H]).contiguous();
 
+				if (ROWPROF)
+					rowprof('embed', rp0);
+
 				let pre = null, logits = null, am = null, taps = [];
 
 				for (let it in b.items) {
+					for (let es in ests) {
+						if (es[2] && es[0] >= it.first && es[0] < it.end) {
+							es[1].emb_bufs[S].copy_(engram_finish(cfg, es[1], es[2]));
+							es[2] = null;
+						}
+					}
+
+					if (ROWPROF && !it.first)
+						rowprof('engram wait (seg 0)', rp0);
+
 					it.h_in.copy_(h);
 
 					if (pre)
@@ -2706,10 +3190,40 @@ export function load(model_dir, opts) {
 					taps: length(taps) ? torch.cat(map(taps, (t) => (t.dev == dt) ? t.t : t.t.cuda(dt)), 1) : null};
 			}
 
-			return {
-				has: function (S) {return S == 1 || rowsets[S] != null;},
+			let captured = sort(filter(map(keys(rowsets), (k) => +k), (k) => k > 1));
 
-				rows: run_rows,
+			/* S rows through the graph of S rows, or of the next larger captured size with the surplus rows taken back */
+			function run_rows_padded(ids, pos) {
+				let S = length(ids);
+
+				if (rowsets[S])
+					return run_rows(ids, pos);
+
+				let S2 = null;
+
+				for (let k in captured)
+					if (k > S && S2 == null)
+						S2 = k;
+
+				if (S2 == null)
+					die(`dsv41: no graph for ${S} rows`);
+
+				let ids2 = slice(ids);
+
+				while (length(ids2) < S2)
+					push(ids2, ids[S - 1]);
+
+				let r = run_rows(ids2, pos);
+
+				model.rollback(cache, pos + S);
+
+				return {logits: r.logits.narrow(0, 0, S), am: r.am.narrow(0, 0, S), taps: r.taps ? r.taps.narrow(0, 0, S) : null};
+			}
+
+			return {
+				has: function (S) {return S == 1 || (length(captured) > 0 && S >= 2 && S <= captured[length(captured) - 1]);},
+
+				rows: run_rows_padded,
 
 				run: function (ids, pos) {
 					return run_ids(ids[0], pos);
@@ -2794,6 +3308,78 @@ export function load(model_dir, opts) {
 			cache.cids = [];
 		},
 
+		/* ---- the host-RAM prompt-cache store (engine.uc store_*, --cache-ram): the pool and index-key rows of the kv source
+		 * layers, the aux state (pool counts, half-built pairs, window rows: the window ring needs nothing beyond those), the
+		 * Engram id history and the drafter's ring. The mirrors of the pools on the other GPUs are reloaded whole after an
+		 * import (the decode graphs read them as they are). ---- */
+		cache_bytes: function (cache, n) {
+			let cfg = this.cfg, W = cfg.window - 1;
+			let b = 8 * n;
+
+			for (let i = 0; i < nl; i++) {
+				let cl = cache.layers[i];
+
+				b += min(n, W) * cfg.head_dim * 2 + 2 * cfg.head_dim * 4;
+
+				if (cl.pool)
+					b += (int(n / this.layers[i].attn.ratio) + 1) * (pool_row_bytes(cl.pool) + pool_row_bytes(cl.kidx));
+			}
+
+			if (this.dspark && this.dspark.ring_bytes)
+				b += this.dspark.ring_bytes(n);
+
+			return b;
+		},
+
+		cache_export: function (cache, n, put, snap_aux, dst) {
+			if (dst)
+				die('dsv41: cache_export: no device slots');
+
+			if (cache.length != n)
+				die(`dsv41: cache_export: ${n} tokens asked, the cache holds ${cache.length}`);
+
+			let aux_map = (aux) => map(aux, (e) => e ? {n: e.n, pk: e.pk ? put(e.pk) : null, pg: e.pg ? put(e.pg) : null,
+				kw: e.kw ? put(e.kw) : null} : null);
+
+			return {
+				pools: map(cache.layers, (cl) => cl.pool ? {pool: map(pool_rows(cl.pool, cl.n), put), kidx: map(pool_rows(cl.kidx, cl.n), put)} : null),
+				aux: aux_map(this.aux_get(cache)), snap: snap_aux ? aux_map(snap_aux) : null,
+				cids: slice(cache.cids, 0, n),
+				drafter: (this.dspark && this.dspark.ring_export) ? this.dspark.ring_export(n, put) : null
+			};
+		},
+
+		// start == the entry's length (live) or its snapshot's (the snapshot's aux state; the pools hold its rows too)
+		cache_import: function (cache, em, start, live) {
+			for (let i = 0; i < nl; i++) {
+				let P = em.pools[i], cl = cache.layers[i];
+
+				if (P) {
+					pool_load(cl.pool, P.pool);
+					pool_load(cl.kidx, P.kidx);
+				}
+			}
+
+			cache.length = start;
+
+			let dev_aux = (aux) => map(aux, (e, i) => e ? {n: e.n, pk: e.pk ? e.pk.cuda(cache.layers[i].dev) : null,
+				pg: e.pg ? e.pg.cuda(cache.layers[i].dev) : null, kw: e.kw ? e.kw.cuda(cache.layers[i].dev) : null} : null);
+
+			this.aux_set(cache, dev_aux(live ? em.aux : em.snap));
+
+			for (let i = 0; i < nl; i++)
+				if (cache.layers[i].pool)
+					mirror_reload(cache, i, cache.layers[i].n);
+
+			cache.cids = slice(em.cids, 0, start);
+			this.last_rows = null;
+
+			if (em.drafter && this.dspark && this.dspark.ring_import)
+				this.dspark.ring_import(em.drafter, start);
+
+			return {snap: em.snap ? dev_aux(em.snap) : null};
+		},
+
 		/* Engine interface (as dsv4.prefill_pipeline): chunked prefill of ids at cache.length as a wavefront over
 		 * the device stages: one stage per chunk per round, so every GPU works on a different chunk (a layer
 		 * sees its chunks in order, which is all the window ring, the pools and the pairs need). The host issues
@@ -2831,6 +3417,12 @@ export function load(model_dir, opts) {
 			let next = 0, prev_end = start, done = 0, result = null;
 			let snap_at = (opts.cuts && length(opts.cuts)) ? opts.cuts[0] : 0;
 
+			// The prompt skip (docs/DSV41.md): the layers after the last kv source need a position only within
+			// (layers after it + 1) windows of the prompt's end, a chunk that ends before runs up to the source's compressor.
+			let S_last = max(...filter(model.cfg.kv_sources, (k) => k < nl));
+			let cone_from = start + total - (nl - S_last + 1) * model.cfg.window;
+			let skip_on = (!opts.warmup && cone_from > start && (opts.prompt_skip ?? PROMPT_SKIP)) ? true : false;
+
 			for (let s = 0; s < ns; s++)
 				push(active, null);
 
@@ -2856,6 +3448,7 @@ export function load(model_dir, opts) {
 
 				c.stage = 0;
 				c.last = last;
+				c.skip_after = (skip_on && end <= cone_from) ? S_last : null;
 				prev_end = end;
 				active[0] = c;
 			}
@@ -2869,8 +3462,9 @@ export function load(model_dir, opts) {
 
 					model.chunk_layers(c, cache, stages[s].first, stages[s].end);
 
-					if (s == ns - 1) {
-						if (opts.on_taps)
+					if (s == ns - 1 || (c.skip_after != null && stages[s].end > c.skip_after)) {
+						// (a skipped chunk ends in the stage of the last kv source and has no taps)
+						if (opts.on_taps && c.skip_after == null)
 							opts.on_taps(model.chunk_taps(c), c.pos0);
 
 						if (c.last)

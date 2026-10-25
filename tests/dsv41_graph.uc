@@ -9,7 +9,7 @@ import { stat } from 'fs';
 
 const MODEL = getenv('AMP_MODEL_DSV41') || '/data/models/DSV4.1-Flash-SAGE-EXL3-1.59bpw';
 
-if (!stat(MODEL + '/model.safetensors.index.json')) {
+if (!stat(MODEL + '/config.json')) {
 	warn('skip: DSV4.1 model dir missing\n');
 	exit(125);
 }

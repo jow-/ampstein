@@ -45,6 +45,10 @@ function join(dev, k) {
 		torch.stream_wait(dev, k);
 }
 
+/* (for modules that cannot import this one: a chain of ops on the forked side stream k of a device during graph capture, and the join) */
+export const par_side = side;
+export const par_join = join;
+
 /* fp32 (T, K) @ (K, N): the skinny kernel for decode / verify rows (cuBLAS
  * turns 2..8 rows into a slow generic GEMM), cuBLAS above */
 function mm32(x, w) {
@@ -200,6 +204,10 @@ export function build_mlp(ws, key, dev) {
 /* x: (R, hidden) fp16. Returns (R, hidden) fp16. */
 export function mlp_forward(cfg, M, x) {
 	let g, u;
+
+	// GGUF checkpoints (ggufq.mlp): gate, up and the SwiGLU in one launch for a few rows
+	if (M.fused && x.shape()[0] <= 8)
+		return M.down.forward(M.fused(x, cfg.swiglu_limit + 0.0));
 
 	if (M.gu && x.shape()[0] == 1) {
 		// gate and up as ONE batched launch (DeepSeek-V4 decode, models.multi)
@@ -1293,6 +1301,10 @@ function moe_sorted_finish(cfg, M, p) {
  * decode-sized and composite paths complete immediately. */
 export function moe_begin(cfg, M, y) {
 	let T = y.shape()[0];
+
+	// GGUF experts (ggufq.moe_forward): their own kernels
+	if (M.gq_forward)
+		return {done: M.gq_forward(cfg, M, y)};
 
 	if (!getenv('AMP_GLM5_NO_COOP')) {
 		if (M.coop == null)

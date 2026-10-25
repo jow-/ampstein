@@ -32,6 +32,10 @@ amp_test(tensor_basics)
 amp_test(tensor_ops)
 # st_reader: mmap safetensors reader against a python-written fixture
 amp_test(st_reader)
+# gguf_reader: the GGUF file reader (torch.gguf), CPU only
+amp_test(gguf_reader)
+# gguf_dequant: ggml block dequantization kernels against the gguf package (needs a GPU)
+amp_test(gguf_dequant)
 # st_save: safetensors writer round-tripped through torch.st
 amp_test(st_save)
 # bindings_errors: every binding raises (instead of returning null) on wrong argument types / counts
@@ -201,6 +205,12 @@ amp_test(dsv41_verify)
 amp_test(dsv41_tp)
 # dsv41_split: the first layers on a worker (rpc_stage over loopback) against the whole model (needs the model, 4 GPUs)
 amp_test(dsv41_split)
+# dsv41_gguf: DeepSeek-V4.1 from GGUF files, prefill against single-token steps (needs the GGUF model dir)
+amp_test(dsv41_gguf)
+# dsv41_gguf_rows: speculative-verify row steps through padded graphs (needs the GGUF model dir)
+amp_test(dsv41_gguf_rows)
+# dsv41_gguf_store: the host-RAM prompt-cache store of the single-chain model (needs the GGUF model dir)
+amp_test(dsv41_gguf_store)
 # dsv41_pipeline: wavefront prefill vs sequential (needs the model)
 amp_test(dsv41_pipeline)
 # glm5_chat: GLM chat template renderer + output parser (pure ucode)

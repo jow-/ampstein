@@ -31,11 +31,16 @@
 // per-tensor sync copies only run when upload() was not called.
 
 import {readfile, stat, lsdir} from 'fs';
+import * as ggufw from './ggufw.uc';
 
 const INDEX_NAME = 'model.safetensors.index.json';
 const SINGLE_NAME = 'model.safetensors';
 
 export function open(model_dir, only_file) {
+	// a GGUF checkpoint (llama.cpp quantizations): the same interface over the GGUF tensors, ggufw.uc
+	if (!only_file && ggufw.is_gguf_dir(model_dir))
+		return ggufw.open(model_dir);
+
 	let shards = {};      // shard filename -> stfile resource (lazy)
 	let map = null;       // sharded: key -> shard filename
 	let single = null;    // single-file: stfile resource

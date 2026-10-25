@@ -6,6 +6,16 @@ Checkpoint used: `vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw` (17 shards, 330 GB). 
 implementation of V4.1 (the pack's README asks for "a recent ExLlamaV3 with V4.1 / CED support" that is not
 public), so the oracles are DeepSeek's own code run on the CPU (`tests/oracle/make_dsv41_*.py`).
 
+## The 1017 pack (`vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw`)
+
+Same config and tensor layout as the 1.59bpw pack, three differences: the LM head is EXL3 (`head.trellis` / `suh` /
+`svh` / `mul1`, dense `head.weight` before; TP ranks take vocabulary column slices with `models.cols`), the DSpark
+drafter's 128 experts per stage are EXL3 instead of FP4 (the drafter runs them through the trunk's `moe_coop` /
+`moe_fused` path, `glm5.moe_forward` with the drafter's own `dcfg`), and the Engram tables differ (same size, other
+bytes: do not reuse the old shards). The pack ships `engram_token_map.u32` (identical to the map derived from
+`tokenizer.json`); `engram_meta.safetensors` is still needed and, with an unchanged config, can be copied from the
+older pack. Greedy output with the drafter equals the plain output; DSpark 45-52 tok/s on 3 stages x 2 ranks.
+
 ## What is in the pack
 
 | Part | Format | Size |
@@ -88,6 +98,30 @@ experts; the text model without tables, drafter and tower is 110.6 GiB.
 | `dsv41_graph` | eager decode, same prompt (full model, 6 GPUs, crossing the 4096 bucket) | identical logits |
 | `dsv41_pipeline` | sequential chunked prefill | identical logits (the wavefront changes the issue order only) |
 | `chat_dsv41` | `encoding.py` on 13 conversations (tools, parallel results out of order, reasoning drop, effort, reminders) | identical strings |
+
+## The prompt skip (prefill of `--tp` and of the single-chain model)
+
+Past the last kv source (layer 20) a layer keeps nothing of a position except its `window` (128) rows, and it sees earlier
+positions only through the sources' compressed pools and index keys. Layer *L*'s window row at position *t* depends on layer
+*L*-1 at *t*-127..*t*, so the reach grows by one window per layer, and the layers after the last source need a position only
+within (layers - S_last + 1) x window = 21 x 128 = **2688 tokens** of the end of the prompt (the dependency cone). A prefill chunk
+that ends before `cone_from = start + total - 2688` therefore runs layers 0..S_last-1 in full and, in layer S_last, only the
+compressor (`attn_forward_steps(...).compress()`: the pool rows and index keys later layers read), then stops: no attention,
+no MoE (and no expert staging) for layers S_last..39, no drafter taps (its ring keeps the prompt's last positions only).
+Exact, not an approximation: with `--tp` the logits and the next decode step are identical with and without the skip
+(`tests/dsv41_tp.uc` with `AMP_DSV41_PREFILL` past the cone, 8 layers: more than 896 tokens). The single-chain model
+(`prefill_pipeline`) too: on the full 40-layer 1.62bpw pack, a 6000-token prompt in 512-token chunks gives identical
+logits and identical decode steps (rel rms 0), while two chunkings of the same prompt without the skip differ by 3.6e-2;
+the 8-layer variant of `tests/dsv41_pipeline.uc` (2000 tokens, 512-token chunks) differs by 2e-3 against a chunking noise
+floor of 5e-3 (the fused MoE kernels' summation order follows the composition of an expert's batch, and the rows the skip
+leaves out change it), 128 and 256-token chunks are identical. Time of that 6000-token prefill on jai (6 GPUs, single
+chain): 3.8 s with the skip, 4.7 s without (chunks of 256).
+DeepSeek's own serving goes further (layers 20..39
+on the last 128 tokens only); that changes the answers and is not done here.
+
+It applies to prompts longer than the cone (the new tokens of a turn, not the cached prefix), never to warm-ups or the
+single-chain path. Turns of up to ~2.7k new tokens are unchanged; a long first prompt or a big tool result saves about
+half of the layers' work on everything before the last 2688 tokens. `AMP_DSV41_PROMPT_SKIP=0` / tunable `prompt_skip` turn it off.
 
 ## Placement and memory (jai: 6 x RTX A5000 / A5500, 23.5 GiB each)
 

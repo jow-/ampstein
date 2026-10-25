@@ -26,6 +26,7 @@ import * as chat_dsv41 from './chat_dsv41.uc';
 import * as chat_gemma4 from './chat_gemma4.uc';
 import * as gemma4 from './gemma4.uc';
 import * as dsv41 from './dsv41.uc';
+import * as ggufw from './ggufw.uc';
 import * as dsv41_spark from './dsv41_spark.uc';
 import * as dsv41_tp from './dsv41_tp.uc';
 import * as dsv41_spark_tp from './dsv41_spark_tp.uc';
@@ -299,8 +300,11 @@ export function serve(args) {
 		D41 ? dsv41.load_config(args.model) : GEM ? gemma4.load_config(args.model) :
 		Q4 ? qwen4.load_config(args.model) : qwen35.load_config(args.model);
 
+	// DeepSeek-V4.1 from GGUF files (docs/GGUF.md): single-chain model only, no drafter in the files
+	const D41_GGUF = D41 && ggufw.is_gguf_dir(args.model);
+
 	// DeepSeek-V4.1: the DSpark block drafter (mtp.* weights) unless --mtp 0
-	const D41_SPARK = D41 && !D41_MTP0 && cfg.dspark_block > 0 && cfg.num_mtp_layers > 0;
+	const D41_SPARK = D41 && !D41_MTP0 && (!D41_GGUF || ggufw.has_drafter(args.model)) && cfg.dspark_block > 0 && cfg.num_mtp_layers > 0;
 
 	if (D41_SPARK && !args.dspark_window)
 		args.dspark_window = 4;
@@ -1866,6 +1870,11 @@ export function serve(args) {
 	}
 
 	httpd.listen(args.host, args.port, route);
+	// The collector runs every 1000 allocations by default; the engine keeps several arrays of one integer per token of the context alive
+	// (the ids, the Engram history, the snapshots, parked states), so a pass costs ~1 ms at 50k tokens and several ran in every decode
+	// round (4.5 ms of 65 on the DSpark loop). Tensors are freed by reference counting, the collector only reclaims cycles.
+	gc('start', +(getenv('AMP_GC_INTERVAL') ?? 50000));
+
 	warn(`ampstein: serving '${served_name}' on http://${args.host}:${args.port}/v1\n`);
 
 	/* --- shutdown: save the cache state on SIGINT/SIGTERM ---------------------- */

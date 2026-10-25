@@ -266,6 +266,27 @@ None of these affect the server (which takes `--model`); they select inputs for
 | `AMP_DSPARK_NO_PREFILL_TAPS` | do not feed the drafter during prefill (it then needs a plain step per window) |
 | `AMP_DSPARK_COSTS` | ms of a 1..6-row verify step for the choice of the draft length (default `36.8,45.2,54.2,61.3,67.1,73.0`) |
 | `AMP_DSPARK_DRAFT_MS` | drafter time added to every round's cost estimate, default 8 |
+| `AMP_GGUF_RPW1` | unset | GGUF kernels: one output row per warp instead of two (the experts and single-row dense products default to two). |
+| `AMP_GGUF_NO_SHARED_PAR` | unset | GGUF checkpoints: the shared expert runs on the compute stream instead of a forked side stream during graph capture. |
+| `AMP_GGUF_GROUP` | unset | GGUF checkpoints: verify steps (2 - 8 rows) group the picks by expert (`torch.gguf_moe_group`) so an expert is read once for all its rows; slower on random picks, so off. |
+| `AMP_DSPARK_COSTS` | per model | the drafter's verify cost table, ms for 1 .. 6 rows (GGUF default `23.1,36.6,36.6,51.4,51.4,66.0`). |
+| `AMP_MOE_ATOMIC` (GGUF prefill too) | unset | the grouped MoE prefill kernels add the experts' outputs atomically (arbitrary order, not reproducible) instead of the fixed-order gather. |
+| `AMP_GC_INTERVAL` | `50000` | allocations between ucode garbage collections in the server (ucode's default is 1000). |
+| `AMP_DSV41_ROWPROF` | unset | prints the host time of the verify-step prelude (position metadata, token hashing, Engram start, embedding). |
+| `AMP_ENGINE_PROF` | unset | `step_fwd` prints the host enqueue time against the step period. |
+| `AMP_GGUF_RESERVE_MIB` | `1200` | GGUF checkpoints, single-chain DeepSeek-V4.1: the memory the layer plan keeps free on every GPU after weights, kv pools, mirrors and drafter (graphs ~0.35 GiB, a prefill ~0.35 GiB, margin). Above what the six GPUs can give, the start warns `planned ... over its budget`. |
+| `AMP_DSV41_NO_REBALANCE` | unset | GGUF: keep the contiguous layer plan of `plan_devices` (no layers moved between GPUs, the drafter stages where it put them). |
+| `AMP_DSV41_GRAPH_BUCKETS` | all (GGUF: `1`) | Decode graphs: capture only the n largest context buckets (4k, 16k, 64k, ... `max_seq`); each costs ~0.5 GiB of graph memory over the GPUs and the pool is not shared. |
+| `AMP_DSV41_ROW_SIZES` | all (GGUF: `3,5`) | Verify (multi-row) graph sizes to capture, plus the largest requested; a size without a graph runs the next larger one and takes the extra rows back. |
+| `AMP_DSV41_IDX_SLAB` | `33554432` (GGUF: `4194304`) | Score elements of one tile of the prefill indexer (rows x pool entries); its `topk` needs a few times that as workspace. |
+| `AMP_GGUF_SLICE` | `8388608` | GGUF: elements of one dequantized fp16 slice of a dense prefill matmul (16 MiB). |
+| `AMP_GGUF_EMBED_FP16` | unset | GGUF: dequantize the embedding table to fp16 on the GPU (1.3 GiB) instead of keeping Q5_K and dequantizing rows by id (0.42 GiB). |
+| `AMP_GGUF_FP16` | unset | GGUF checkpoints: the matrix-vector kernels with fp16 activations and exactly dequantized weights instead of the int8 `dp4a` kernels (about 3 - 8x slower; also switches the grouped / fused launches off). |
+| `AMP_GGUF_NO_GROUPED` **(opt-out)** | unset | GGUF: `wo_a` as one launch per group instead of one launch. |
+| `AMP_GGUF_NO_FUSED` **(opt-out)** | unset | GGUF: gate, up and SwiGLU of the experts / the shared expert as separate launches. |
+| `AMP_GGUF_NO_PF` **(opt-out)** | unset | GGUF: prefill of the routed experts through per-expert dequantization + cuBLAS instead of the grouped tensor-core kernel. |
+| `AMP_GGUF_PF_WMMA` | unset | GGUF: the grouped prefill kernel on fp16 WMMA (weights dequantized into shared memory) instead of int8 `mma.sync`. |
+| `AMP_DSV41_PROMPT_SKIP` **(opt-out)** | unset | DeepSeek-V4.1 `--tp` prefill: `0` runs every layer for every prompt position (default: the prompt skip, `docs/DSV41.md`). Also the tunable `prompt_skip`. |
 | `AMP_DSV41_KV` | compressed pools (rows + indexer keys): `q8` (default: int8 codes + a fp16 scale per 32), `q8pool` (rows only), `fp16` |
 | `AMP_V41_NO_TC` | use the CUDA-core attention kernel instead of the tensor-core one for prefill chunks |
 | `AMP_DEBUG_PROMPT` | log the rendered prompt text of every chat request (all architectures) |

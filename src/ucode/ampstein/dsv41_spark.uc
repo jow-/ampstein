@@ -194,8 +194,10 @@ export function load(model, opts) {
 	let confw = ws.gpu(last + '.confidence_head.proj.weight', dl).to('float32').reshape([-1, 1]).contiguous();
 
 	// ms of a verify step of 1 .. 6 rows (measured: examples/dsv41_verify_bench.uc) plus the drafter's own time
+	// (a GGUF checkpoint with the padded verify sizes 3 and 5: a 2-row step runs the 3-row graph and a 4-row step the 5-row one;
+	// examples/bench_dsv41_rows.uc on jai, 6 x A5000)
 	let costs = getenv('AMP_DSPARK_COSTS') ? map(split(getenv('AMP_DSPARK_COSTS'), ','), (x) => +x) :
-		[ 36.8, 45.2, 54.2, 61.3, 67.1, 73.0 ];
+		ws.gguf ? [ 23.1, 36.6, 36.6, 51.4, 51.4, 66.0 ] : [ 36.8, 45.2, 54.2, 61.3, 67.1, 73.0 ];
 
 	let d = {stages: stages, B: B, devs: devs, dcfg: dcfg, 
 		cost: map(costs, (c) => c + (+(getenv('AMP_DSPARK_DRAFT_MS') || 8))),
@@ -419,7 +421,20 @@ export function load(model, opts) {
 	};
 
 	/* one drafting round through the graphs (p0 >= window) */
+	// The small per-round inputs go through page-locked tensors with non-blocking copies (a ring of 8: the host rewrites a tensor only
+	// after the round that read it was waited for)
+	let PIN = null, pin_i = 0;
+
 	d.draft_graph = function (seed, p0) {
+		if (!PIN) {
+			PIN = [];
+
+			for (let k = 0; k < 8; k++)
+				push(PIN, {pf: torch.pinned_empty([B, 1], 'float32'), st: torch.pinned_empty([Wn], 'int64'), pt: torch.pinned_empty([1, 1], 'int64'),
+					ids: torch.pinned_empty([B], 'int64')});
+		}
+
+		let pn = PIN[pin_i = (pin_i + 1) % 8];
 		let posv = [], sl = [];
 
 		for (let j = 0; j < B; j++)
@@ -428,21 +443,27 @@ export function load(model, opts) {
 		for (let k = 0; k < Wn; k++)
 			push(sl, (p0 - Wn + k) % RING);
 
-		let pf = torch.from_array(posv, 'float32').view([B, 1]), st = torch.from_array(sl, 'int64');
-		let pt = torch.from_array([ p0 ], 'int64').view([1, 1]);
-
-		for (let b = 0; b < nb; b++) {
-			gb[b].posf.copy_(pf.cuda(stages[b].dev, true));
-			gb[b].slots.copy_(st.cuda(stages[b].dev, true));
-			gb[b].pos_t.copy_(pt.cuda(stages[b].dev, true));
-		}
-
 		let ids = [ seed ];
 
 		for (let i = 1; i < B; i++)
 			push(ids, cfg.dspark_noise_id);
 
-		let e = model.embed_tokens.index(torch.from_array(ids, 'int64').cuda(model.embed_dev, true)).to('float32');
+		pn.pf.copy_(torch.from_array(posv, 'float32').view([B, 1]));
+		pn.st.copy_(torch.from_array(sl, 'int64'));
+		pn.pt.copy_(torch.from_array([ p0 ], 'int64').view([1, 1]));
+		pn.ids.copy_(torch.from_array(ids, 'int64'));
+
+		for (let b = 0; b < nb; b++) {
+			gb[b].posf.copy_(pn.pf, true);
+			gb[b].slots.copy_(pn.st, true);
+			gb[b].pos_t.copy_(pn.pt, true);
+		}
+
+		let idd = torch.empty([B], 'int64', 'cuda:' + model.embed_dev);
+
+		idd.copy_(pn.ids, true);
+
+		let e = model.embed_tokens.index(idd).to('float32');
 
 		G.stage[0].h.copy_(e.reshape([B, 1, H]).expand([B, 4, H]).contiguous().cuda(d0));
 		G.seed.fill_(seed);
@@ -524,6 +545,24 @@ export function load(model, opts) {
 				return false;
 
 		return true;
+	};
+
+	/* host-RAM prompt-cache store (dsv41 cache_export / cache_import): every stage's ring of main kv rows and the positions they
+	 * hold; an import at `start` forgets the positions from start on */
+	d.ring_export = function (n, put) {
+		return {stamp: slice(stamp), rings: map(stages, (S) => put(S.ring))};
+	};
+
+	d.ring_import = function (o, start) {
+		for (let b = 0; b < length(stages); b++)
+			stages[b].ring.copy_(o.rings[b]);
+
+		for (let i = 0; i < RING; i++)
+			stamp[i] = (o.stamp[i] >= 0 && o.stamp[i] < start) ? o.stamp[i] : -1;
+	};
+
+	d.ring_bytes = function (n) {
+		return length(stages) * RING * cfg.head_dim * 2;
 	};
 
 	/* engine interface (see engine.dspark_round): the verify graphs come from model.graphs(cache, sizes) */

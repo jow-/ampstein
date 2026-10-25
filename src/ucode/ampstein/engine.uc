@@ -765,11 +765,34 @@ export function create(model, opts) {
 	 * through the captured graphs when one fits; else eager. Returns
 	 * logits (1, S, V) and leaves the post-norm hidden in cache.hidden
 	 * (graph buffers: copy what must outlive the next step). */
-	function step_fwd(token_ids) {
-		if (graph && graph.has(length(token_ids)))
-			return graph.run(token_ids, cache.length).logits;
+	let SFP = getenv('AMP_ENGINE_PROF') ? {n: 0, enq: 0, per: 0, last: null} : null;
 
-		return model.forward_chunk(token_ids, cache);
+	function step_fwd(token_ids) {
+		let t0 = SFP ? clock(true) : null;
+		let r;
+
+		if (graph && graph.has(length(token_ids)))
+			r = graph.run(token_ids, cache.length).logits;
+		else
+			r = model.forward_chunk(token_ids, cache);
+
+		if (SFP) {
+			let t1 = clock(true);
+
+			SFP.enq += (t1[0] - t0[0]) * 1000.0 + (t1[1] - t0[1]) / 1e6;
+
+			if (SFP.last)
+				SFP.per += (t0[0] - SFP.last[0]) * 1000.0 + (t0[1] - SFP.last[1]) / 1e6;
+
+			SFP.last = t0;
+
+			if (++SFP.n % 64 == 0) {
+				warn(sprintf('engine prof: %d steps, host enqueue %.2f ms, period between steps %.2f ms\n', SFP.n, SFP.enq / SFP.n, SFP.per / (SFP.n - 1)));
+				SFP.n = 0; SFP.enq = 0; SFP.per = 0; SFP.last = null;
+			}
+		}
+
+		return r;
 	}
 
 	/* --- host-RAM prompt-cache store ----------------------------------
@@ -3084,6 +3107,9 @@ export function create(model, opts) {
 	/* One DSpark round: draft + verify through three CUDA graphs (dspark_tp), accept
 	 * by the one-hot-draft rule (exact match at temperature 0, p(x) under the
 	 * sampling distribution otherwise), roll back by resetting the cache length. */
+	let tk_entry = 0, t_set = 0;
+	const DSP_PROF = getenv('AMP_DSPARK_PROF') ? {n: 0, round: 0, run: 0, gap: 0, last: 0, pre: 0, post: 0, loop: 0} : null;
+
 	function dspark_round(j) {
 		let V = dsv;
 		let p0 = cache.length;
@@ -3116,7 +3142,11 @@ export function create(model, opts) {
 			return;
 		}
 
+		let tr0 = DSP_PROF ? now_ms() : 0;
 		let r = SP.run(seed, p0, dsv);                  // r.V <= dsv: the confident prefix of the drafts
+
+		if (DSP_PROF)
+			DSP_PROF.run += now_ms() - tr0;
 		let dr = r.dr;
 		let a = 0, bonus = null;
 
@@ -3368,8 +3398,35 @@ export function create(model, opts) {
 		if (j.phase == 'mtp')
 			return mtp_round(j);
 
-		if (j.phase == 'dspark')
-			return dspark_round(j);
+		if (j.phase == 'dspark') {
+			if (!DSP_PROF)
+				return dspark_round(j);
+
+			// AMP_DSPARK_PROF=1: the host's share of a round: inside the round (outside SP.run it is the acceptance, streaming, bookkeeping)
+			// and between two rounds (the event loop, the next step's dispatch)
+			let t0 = now_ms();
+
+			if (DSP_PROF.last)
+				DSP_PROF.gap += t0 - DSP_PROF.last;
+
+			if (DSP_PROF.n >= 400 && DSP_PROF.n < 412)
+				warn(sprintf('round %d: gap %.2f  (tick start %.2f after the last round end, step entry %.2f)\n', DSP_PROF.n, t0 - DSP_PROF.last,
+					tk_entry - DSP_PROF.last, t0 - DSP_PROF.last));
+
+			DSP_PROF.pre += t0 - tk_entry;
+
+			let rv = dspark_round(j);
+
+			DSP_PROF.last = now_ms();
+			DSP_PROF.round += DSP_PROF.last - t0;
+
+			if (++DSP_PROF.n % 50 == 0)
+				warn(sprintf('engine prof (ms/round, %d rounds): round %.1f (SP.run %.1f) between rounds %.1f (tick tail after round %.1f, uloop latency %.1f)\n', DSP_PROF.n,
+					DSP_PROF.round / DSP_PROF.n, DSP_PROF.run / DSP_PROF.n, DSP_PROF.gap / DSP_PROF.n, DSP_PROF.post / DSP_PROF.n,
+					DSP_PROF.loop / DSP_PROF.n));
+
+			return rv;
+		}
 
 		// decode: sample from the pending logits, emit, feed back.
 		// The sampling runs on the GPU; the host only walks the kept
@@ -3602,6 +3659,15 @@ export function create(model, opts) {
 	}
 
 	function tick() {
+		if (DSP_PROF) {
+			tk_entry = now_ms();
+
+			if (t_set && DSP_PROF.last > 0)
+				DSP_PROF.loop += tk_entry - t_set;
+
+			t_set = 0;
+		}
+
 		/* a submit() during a pending GPU continuation re-arms the
 		 * timer; the continuation's tail re-arms after it runs — do
 		 * not step on top of the in-flight round */
@@ -3651,6 +3717,11 @@ export function create(model, opts) {
 		catch (e) {
 			warn(`engine: step failed: ${e.message}\n${e.stacktrace ? e.stacktrace[0].context : ''}\n`);
 			fail('internal error: ' + e.message);
+		}
+
+		if (DSP_PROF && DSP_PROF.last) {
+			t_set = now_ms();
+			DSP_PROF.post += t_set - DSP_PROF.last;
 		}
 
 		if (!waiting && (job || length(queue) || length(parked)))
