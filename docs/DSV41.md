@@ -248,9 +248,15 @@ reference outputs equal the GPU-only ones.
 
 Tried and dropped: two CPU pools of 6 threads (one per rank; slower: the ranks' calls rarely overlap and a call halves
 its threads), 16 / 24 threads, drafter costs measured online (`dspark_adapt`: shorter drafts, same round time), chunk
-2048. Open: a cache of decoded experts for the CPU (65% of decode-time CPU experts were decoded among the last 1024,
-84% among 4096; exact copies are 2 bytes per weight and read as slowly as the trellis decodes, so only an int8 copy
-would pay), an NLL / tool-call quality check of the CPU experts' int8 activations.
+2048, a cache of decoded experts for the CPU (65% of decode-time CPU experts were decoded among the last 1024, 84%
+among 4096; exact copies are 2 bytes per weight and read as slowly as the trellis decodes: only a lossy int8 copy would
+pay, ~7% of decode for ~25 GB).
+
+Quality of the CPU experts (`examples/dsv41_tp_nll.uc`, the same resident set computed by the GPU kernels reading the
+host experts zero-copy against the CPU kernels; 14k tokens of context, 2048 scored positions in 16-row steps): NLL
+1.8784 / 1.8788, top-1 1134 / 1135 of 2048, 71 argmax flips (near-ties). Greedy continuations of agent sessions fork
+at such a tie within a few hundred tokens and go on as equally coherent text (tool calls well-formed on both sides):
+greedy equality is not the measure here, the likelihood is.
 
 ## KV cache quantization (Q8 pools, default)
 
