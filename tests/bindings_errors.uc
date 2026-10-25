@@ -102,6 +102,16 @@ expect_raise('st: bad path', function () {
 	torch.st('/nonexistent/path.safetensors');
 });
 
+expect_raise('gguf: no args', function () { torch.gguf(); });
+expect_raise('gguf: non-string path', function () { torch.gguf(3); });
+expect_raise('gguf: bad path', function () { torch.gguf('/nonexistent/path.gguf'); });
+expect_raise('gguf: a safetensors file', function () { torch.gguf(`${sourcepath(0, true)}/bindings_errors.uc`); });
+expect_raise('gguf_dequant: no args', function () { torch.gguf_dequant(); });
+expect_raise('gguf_dequant: not a tensor', function () { torch.gguf_dequant(3, 'Q8_0'); });
+expect_raise('gguf_dequant: not uint8', function () { torch.gguf_dequant(torch.zeros([2, 34], 'float16', 'cuda'), 'Q8_0'); });
+expect_raise('gguf_dequant: unknown type', function () { torch.gguf_dequant(torch.zeros([2, 34], 'uint8', 'cuda'), 'Q9_9'); });
+expect_raise('gguf_dequant: ragged row', function () { torch.gguf_dequant(torch.zeros([2, 35], 'uint8', 'cuda'), 'Q8_0'); });
+
 /* --- fused kernels (CUDA) --------------------------------------------------- */
 
 let xc = torch.zeros([2, 8], 'float16', 'cuda');

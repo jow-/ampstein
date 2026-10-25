@@ -18,25 +18,42 @@
 #include <unistd.h>
 
 /* Known dtype strings and their element sizes (the safetensors spec
- * table). Anything else is rejected. */
+ * table), then the ggml block types a GGUF file carries (blck elements
+ * stored in bytes bytes; see gguf.c). Anything else is rejected. */
 static const struct {
 	const char *name;
-	size_t size;
+	size_t size;       /* bytes per element (plain) or per block */
+	size_t blck;       /* elements per block; 1 for the plain types */
 } st_dtypes[] = {
-	{ "F64",  8 }, { "F32", 4 }, { "F16", 2 }, { "BF16", 2 },
-	{ "I64",  8 }, { "I32", 4 }, { "I16", 2 }, { "I8",   1 },
-	{ "U8",   1 }, { "U16", 2 }, { "U32", 4 }, { "U64",  8 },
-	{ "BOOL", 1 }, { "F8_E4M3", 1 }, { "F8_E5M2", 1 }, { "F8_E8M0", 1 },
+	{ "F64",  8, 1 }, { "F32", 4, 1 }, { "F16", 2, 1 }, { "BF16", 2, 1 },
+	{ "I64",  8, 1 }, { "I32", 4, 1 }, { "I16", 2, 1 }, { "I8",   1, 1 },
+	{ "U8",   1, 1 }, { "U16", 2, 1 }, { "U32", 4, 1 }, { "U64",  8, 1 },
+	{ "BOOL", 1, 1 }, { "F8_E4M3", 1, 1 }, { "F8_E5M2", 1, 1 }, { "F8_E8M0", 1, 1 },
+	{ "Q4_0",  18, 32 }, { "Q4_1",  20, 32 }, { "Q5_0",  22, 32 }, { "Q5_1",  24, 32 },
+	{ "Q8_0",  34, 32 }, { "IQ4_NL", 18, 32 },
+	{ "Q2_K",  84, 256 }, { "Q3_K", 110, 256 }, { "Q4_K", 144, 256 }, { "Q5_K", 176, 256 },
+	{ "Q6_K", 210, 256 }, { "IQ2_XXS", 66, 256 }, { "IQ2_XS", 74, 256 }, { "IQ2_S", 82, 256 },
+	{ "IQ3_XXS", 98, 256 }, { "IQ3_S", 110, 256 }, { "IQ1_S", 50, 256 }, { "IQ1_M", 56, 256 },
+	{ "IQ4_XS", 136, 256 },
 };
 
-static size_t
-st_elem_size(const char *dt)
+int
+st_dtype_info(const char *dt, size_t *blck, size_t *bytes)
 {
-	for (size_t i = 0; i < sizeof(st_dtypes) / sizeof(st_dtypes[0]); i++)
-		if (!strcmp(dt, st_dtypes[i].name))
-			return st_dtypes[i].size;
+	for (size_t i = 0; i < sizeof(st_dtypes) / sizeof(st_dtypes[0]); i++) {
+		if (strcmp(dt, st_dtypes[i].name))
+			continue;
 
-	return 0;
+		if (blck)
+			*blck = st_dtypes[i].blck;
+
+		if (bytes)
+			*bytes = st_dtypes[i].size;
+
+		return 0;
+	}
+
+	return -1;
 }
 
 int
@@ -137,9 +154,9 @@ st_lookup(st_file_t *f, const char *name, const char **dtype,
 		return ST_MALFORMED;
 
 	const char *dt = json_object_get_string(jd);
-	size_t esize = st_elem_size(dt);
+	size_t blck, esize;
 
-	if (!esize)
+	if (st_dtype_info(dt, &blck, &esize))
 		return ST_MALFORMED;
 
 	size_t nd = (size_t)json_object_array_length(js);
@@ -192,8 +209,13 @@ st_lookup(st_file_t *f, const char *name, const char **dtype,
 	 * must match shape x dtype (an oversized nbytes would otherwise
 	 * read past the mmap — or write past a device buffer sized from
 	 * the shape, through h2d_file) */
+	if (blck > 1 && (!nd || dims[nd - 1] % (int64_t)blck)) {
+		free(dims);
+		return ST_MALFORMED;
+	}
+
 	if (begin < 0 || end < begin || (uint64_t)end > data_size ||
-	    product * esize != (uint64_t)(end - begin)) {
+	    product / blck * esize != (uint64_t)(end - begin)) {
 		free(dims);
 		return ST_MALFORMED;
 	}
@@ -243,4 +265,16 @@ st_name(st_file_t *f, size_t i)
 	}
 
 	return NULL;
+}
+char *
+st_meta_json(st_file_t *f)
+{
+	json_object *root = (json_object *)f->json, *meta;
+
+	if (!root || !json_object_object_get_ex(root, "__metadata__", &meta))
+		return NULL;
+
+	const char *s = json_object_to_json_string_ext(meta, JSON_C_TO_STRING_PLAIN);
+
+	return s ? strdup(s) : NULL;
 }

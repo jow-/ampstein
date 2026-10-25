@@ -37,6 +37,20 @@ void st_close(st_file_t *out);
 int st_lookup(st_file_t *f, const char *name, const char **dtype,
               int64_t **shape, size_t *ndim, size_t *offset, size_t *nbytes);
 
+/* Element size / block layout of a dtype string: *blck elements are stored in *bytes bytes (blck is 1 for the plain
+ * safetensors types, 32 / 256 for the ggml block types a GGUF file carries: Q8_0, Q5_K, IQ2_XXS, ...). Returns -1 for an
+ * unknown dtype. A block type's last dimension is a multiple of blck, and its row is last_dim / blck * bytes bytes. */
+int st_dtype_info(const char *dt, size_t *blck, size_t *bytes);
+
+/* Open a GGUF file (v2 / v3), mmap it and present it as a safetensors-style header: every tensor becomes an entry with
+ * the ggml type's name as its dtype, the shape in row-major order (ggml's ne[] reversed) and its byte range in the data
+ * region; the key/value metadata sits under "__metadata__" (see st_meta_json). Returns 0 or -1 (errno for I/O errors,
+ * EINVAL for a malformed file). */
+int gguf_open(const char *path, st_file_t *out);
+
+/* The "__metadata__" object of the header as a JSON string (malloc'ed, caller frees), or NULL when there is none. */
+char *st_meta_json(st_file_t *f);
+
 /* Number of tensors in the file (excluding __metadata__). */
 size_t st_count(st_file_t *f);
 

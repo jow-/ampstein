@@ -1,0 +1,1631 @@
+// amp_gguf.cu — dequantization of ggml block types (GGUF weights) on the GPU.
+//
+// Written from the reference dequantize_row_* functions of ggml (ggml/src/ggml-quants.c, MIT, see vendor/ggml/VERSION): the
+// values are bit-identical to them (tests/gguf_dequant.uc against tests/oracle/make_gguf_dequant.py). A quantized weight
+// is a uint8 tensor of rows of blocks (the layout of the file); a thread turns one group of 8 consecutive weights of a
+// block into 8 outputs (fp32 math, then the output dtype), so a block's reads are shared by neighbouring threads and
+// the stores are 16 bytes wide in fp16 / bf16.
+//
+// Block layouts (bytes), all little endian, a block is 256 weights (QK_K) unless noted:
+//   Q8_0     (32 w)   34: d f16, qs[32] i8
+//   IQ4_NL   (32 w)   18: d f16, qs[16] (two 4-bit indices into kvalues_iq4nl)
+//   Q5_K             176: d f16, dmin f16, scales[12] (6-bit scale + min per 32 w, packed), qh[32], qs[128]
+//   IQ2_XXS           66: d f16, qs[32] u16 (per 32 w: 4 grid indices of 8 bits, then 4 x 7 sign bits + 4 scale bits)
+//   IQ2_XS            74: d f16, qs[32] u16 (9-bit grid index + 7-bit signs), scales[8] (two 4-bit scales per 32 w)
+//   IQ1_M             56: qs[32], qh[16], scales[8] (four u16: 3-bit scales, the top nibbles carry the f16 super scale)
+//   IQ1_S             50: d f16, qs[32], qh[8] u16 (per 32 w: a 3-bit scale, a sign of the +-1/8 offset and 4 x 3 high bits of the grid indices)
+
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+#define NGRID_IQ1S 2048
+#define IQ1S_DELTA 0.125f
+
+#define GGML_TABLE_BEGIN(type, name, size) static __device__ const type name[size] = {
+#define GGML_TABLE_END() };
+#include "../../vendor/ggml/ggml_tables.inc"
+
+enum {
+	AMP_Q_Q8_0, AMP_Q_IQ4_NL, AMP_Q_Q5_K, AMP_Q_IQ2_XXS, AMP_Q_IQ2_XS, AMP_Q_IQ1_M, AMP_Q_IQ1_S,
+};
+
+struct amp_qinfo {
+	int block;       /* weights per block */
+	int bytes;       /* bytes per block */
+};
+
+static __host__ __device__ inline amp_qinfo amp_qtype_info(int t)
+{
+	switch (t) {
+	case AMP_Q_Q8_0:    return { 32, 34 };
+	case AMP_Q_IQ4_NL:  return { 32, 18 };
+	case AMP_Q_Q5_K:    return { 256, 176 };
+	case AMP_Q_IQ2_XXS: return { 256, 66 };
+	case AMP_Q_IQ2_XS:  return { 256, 74 };
+	case AMP_Q_IQ1_S:   return { 256, 50 };
+	default:            return { 256, 56 };
+	}
+}
+
+static __device__ inline float amp_h2f(const uint8_t *p)
+{
+	return __half2float(__ushort_as_half((unsigned short)(p[0] | (p[1] << 8))));
+}
+
+static __device__ inline unsigned amp_u16(const uint8_t *p)
+{
+	return (unsigned)p[0] | ((unsigned)p[1] << 8);
+}
+
+static __device__ inline void amp_scale_min_k4(int j, const uint8_t *q, int *d, int *m)
+{
+	if (j < 4) {
+		*d = q[j] & 63;
+		*m = q[j + 4] & 63;
+	} else {
+		*d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+		*m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+	}
+}
+
+/* group g (8 weights) of a block -> v[8] */
+/* gr / sg: the lookup tables (iq2xxs_grid or iq2xs_grid, ksigns_iq2xs): the global ones, or copies in shared memory */
+template <int T> __device__ void amp_dq_group(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg);
+
+template <> __device__ void amp_dq_group<AMP_Q_Q8_0>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		v[j] = (float)(int8_t)b[2 + g * 8 + j] * d;
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_IQ4_NL>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+	const uint8_t *qs = b + 2 + (g & 1) * 8;
+	const int hi = g >> 1;
+
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		v[j] = d * (float)kvalues_iq4nl[hi ? qs[j] >> 4 : qs[j] & 0xf];
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_Q5_K>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b), dmin = amp_h2f(b + 2);
+	const uint8_t *scales = b + 4, *qh = b + 16, *qs = b + 48;
+	const int jj = g >> 3, half = (g >> 2) & 1, l0 = (g & 3) * 8;     /* 64-weight chunk, its half, offset in the half */
+	int sc, m;
+
+	amp_scale_min_k4(2 * jj + half, scales, &sc, &m);
+
+	const float d1 = d * sc, m1 = dmin * m;
+
+#pragma unroll
+	for (int l = 0; l < 8; l++) {
+		const int q = half ? qs[32 * jj + l0 + l] >> 4 : qs[32 * jj + l0 + l] & 0xF;
+
+		v[l] = d1 * (float)(q + ((qh[l0 + l] >> (2 * jj + half)) & 1 ? 16 : 0)) - m1;
+	}
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_IQ2_XXS>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+	const int ib32 = g >> 2, l = g & 3;
+	const uint8_t *q = b + 2 + 8 * ib32;
+	const unsigned aux1 = (unsigned)q[4] | ((unsigned)q[5] << 8) | ((unsigned)q[6] << 16) | ((unsigned)q[7] << 24);
+	const float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+	const uint64_t grid = gr[q[l]];
+	const uint8_t signs = sg[(aux1 >> (7 * l)) & 127];
+
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		v[j] = db * (float)((grid >> (8 * j)) & 0xff) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_IQ2_XS>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+	const int ib32 = g >> 2, l = g & 3;
+	const unsigned q = amp_u16(b + 2 + 2 * (4 * ib32 + l));
+	const uint8_t sc = b[2 + 64 + ib32];
+	const float db = d * (0.5f + (float)(l < 2 ? sc & 0xf : sc >> 4)) * 0.25f;
+	const uint64_t grid = gr[q & 511];
+	const uint8_t signs = sg[q >> 9];
+
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		v[j] = db * (float)((grid >> (8 * j)) & 0xff) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_IQ1_M>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+{
+	const uint8_t *qs = b, *qh = b + 32, *sb = b + 48;
+	const unsigned s0 = amp_u16(sb), s1 = amp_u16(sb + 2), s2 = amp_u16(sb + 4), s3 = amp_u16(sb + 6);
+	const unsigned su = (s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000);
+	const float d = __half2float(__ushort_as_half((unsigned short)su));
+	const int ib = g >> 2, l = g & 3;
+	const unsigned sc = amp_u16(sb + 2 * (ib >> 1));
+	const float dl = d * (float)(2 * ((sc >> (6 * (ib & 1) + (l >> 1) * 3)) & 0x7) + 1);
+	const unsigned h = qh[2 * ib + (l >> 1)];
+	const unsigned idx = qs[4 * ib + l] | (((l & 1) ? h << 4 : h << 8) & 0x700);
+	const float delta = h & ((l & 1) ? 0x80 : 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+	const uint64_t grid = iq1s_grid[idx];
+
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		v[j] = dl * ((float)(int8_t)((grid >> (8 * j)) & 0xff) + delta);
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_IQ1_S>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+	const int ib = g >> 2, l = g & 3;
+	const unsigned qh = amp_u16(b + 34 + 2 * ib);
+	const unsigned idx = b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+	const float dl = d * (float)(2 * ((qh >> 12) & 7) + 1);
+	const float delta = (qh & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+	const uint64_t grid = iq1s_grid[idx];
+
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		v[j] = dl * ((float)(int8_t)((grid >> (8 * j)) & 0xff) + delta);
+}
+
+template <typename O> __device__ inline void amp_store8(O *out, const float *v);
+
+template <> __device__ inline void amp_store8<float>(float *out, const float *v)
+{
+	((float4 *)out)[0] = make_float4(v[0], v[1], v[2], v[3]);
+	((float4 *)out)[1] = make_float4(v[4], v[5], v[6], v[7]);
+}
+
+template <> __device__ inline void amp_store8<__half>(__half *out, const float *v)
+{
+	__half h[8];
+
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		h[j] = __float2half(v[j]);
+
+	*(uint4 *)out = *(uint4 *)h;
+}
+
+template <> __device__ inline void amp_store8<__nv_bfloat16>(__nv_bfloat16 *out, const float *v)
+{
+	__nv_bfloat16 h[8];
+
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		h[j] = __float2bfloat16(v[j]);
+
+	*(uint4 *)out = *(uint4 *)h;
+}
+
+template <int T, typename O>
+__global__ void amp_gguf_dequant_kernel(const uint8_t *__restrict__ x, O *__restrict__ y, long ngroups)
+{
+	const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i >= ngroups)
+		return;
+
+	constexpr int gpb = (T == AMP_Q_Q8_0 || T == AMP_Q_IQ4_NL) ? 4 : 32;       /* groups of 8 per block */
+	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_IQ4_NL ? 18 : T == AMP_Q_Q5_K ? 176 :
+	                      T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
+	float v[8];
+
+	amp_dq_group<T>(x + (i / gpb) * bytes, (int)(i % gpb), v, T == AMP_Q_IQ2_XS ? iq2xs_grid : iq2xxs_grid, ksigns_iq2xs);
+	amp_store8<O>(y + i * 8, v);
+}
+
+template <int T, typename O>
+static int amp_gguf_dequant_launch(const void *x, void *y, long nblocks, cudaStream_t stream)
+{
+	const long ngroups = nblocks * (amp_qtype_info(T).block / 8);
+
+	amp_gguf_dequant_kernel<T, O><<<(unsigned)((ngroups + 255) / 256), 256, 0, stream>>>((const uint8_t *)x, (O *)y,
+		ngroups);
+
+	return (int)cudaGetLastError();
+}
+
+/* qtype: AMP_Q_*; odt: 0 fp32, 1 fp16, 2 bf16. x holds nblocks blocks, y nblocks * block weights. */
+extern "C" int
+amp_gguf_dequant(int qtype, int odt, const void *x, void *y, long nblocks, cudaStream_t stream)
+{
+	if (nblocks < 0 || ((uintptr_t)y & 15))
+		return (int)cudaErrorInvalidValue;
+
+#define AMP_DQ_CASE(T) \
+	case T: \
+		return odt == 0 ? amp_gguf_dequant_launch<T, float>(x, y, nblocks, stream) : \
+		       odt == 1 ? amp_gguf_dequant_launch<T, __half>(x, y, nblocks, stream) : \
+		                  amp_gguf_dequant_launch<T, __nv_bfloat16>(x, y, nblocks, stream)
+
+	switch (qtype) {
+	AMP_DQ_CASE(AMP_Q_Q8_0);
+	AMP_DQ_CASE(AMP_Q_IQ4_NL);
+	AMP_DQ_CASE(AMP_Q_Q5_K);
+	AMP_DQ_CASE(AMP_Q_IQ2_XXS);
+	AMP_DQ_CASE(AMP_Q_IQ2_XS);
+	AMP_DQ_CASE(AMP_Q_IQ1_M);
+	AMP_DQ_CASE(AMP_Q_IQ1_S);
+	}
+#undef AMP_DQ_CASE
+
+	return (int)cudaErrorInvalidValue;
+}
+
+/* ---- matrix-vector products on the quantized rows --------------------------------------------------------------------
+ *
+ * y[m][n] = sum_k x[m][k] * W[n][k] for up to 8 rows m (decode, speculative verify), fp32 accumulation; and the routed-
+ * experts form: out[slot][n] = sum_k x[slot / xdiv][k] * W[ids[slot]][n][k] over a stack of experts (E, N, row bytes).
+ * One warp per output row; a lane takes groups of 8 weights (dequantized by the functions above, so the values are the
+ * ones the dequantization kernel gives) and multiplies them with the 8 x values of every row. The x rows are read
+ * through the caches (they are a few KB). */
+
+template <int T, bool MOE>
+__global__ void amp_gguf_gemv_kernel(const __half *__restrict__ x, const uint8_t *__restrict__ w,
+                                     const long long *__restrict__ ids, void *__restrict__ out, int M, int N, int K,
+                                     int xdiv)
+{
+	constexpr int gpb = (T == AMP_Q_Q8_0 || T == AMP_Q_IQ4_NL) ? 4 : 32;
+	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_IQ4_NL ? 18 : T == AMP_Q_Q5_K ? 176 :
+	                      T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
+	constexpr int blk = gpb * 8;
+
+	/* the i-quants' lookup tables in shared memory: a lane's index is random, the global copies miss */
+	constexpr int NGRID = T == AMP_Q_IQ2_XXS ? 256 : T == AMP_Q_IQ2_XS ? 512 : 0;
+	__shared__ uint64_t s_grid[NGRID ? NGRID : 1];
+	__shared__ uint8_t s_signs[NGRID ? 128 : 1];
+
+	if (NGRID) {
+		for (int i = threadIdx.x; i < NGRID; i += blockDim.x)
+			s_grid[i] = (T == AMP_Q_IQ2_XS) ? iq2xs_grid[i] : iq2xxs_grid[i];
+
+		for (int i = threadIdx.x; i < 128; i += blockDim.x)
+			s_signs[i] = ksigns_iq2xs[i];
+
+		__syncthreads();
+	}
+
+	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+	const int n = blockIdx.x * (blockDim.x >> 5) + warp;
+	const int slot = blockIdx.y;
+
+	if (n >= N)
+		return;
+
+	const size_t rb = (size_t)(K / blk) * bytes;
+	const uint8_t *row;
+	const __half *xr = x;
+	int rows = M;
+
+	if (MOE) {
+		const long long e = ids[slot];
+
+		if (e < 0) {                       /* an expert of another rank: no contribution */
+			if (lane == 0)
+				((float *)out)[(size_t)slot * N + n] = 0.f;
+
+			return;
+		}
+
+		row = w + ((size_t)e * N + n) * rb;
+		xr = x + (size_t)(slot / xdiv) * K;
+		rows = 1;
+	} else {
+		row = w + (size_t)n * rb;
+	}
+
+	float acc[8];
+
+#pragma unroll
+	for (int m = 0; m < 8; m++)
+		acc[m] = 0.f;
+
+	const int ngroups = K / 8;
+
+	for (int g = lane; g < ngroups; g += 32) {
+		float v[8];
+
+		amp_dq_group<T>(row + (size_t)(g / gpb) * bytes, g % gpb, v, s_grid, s_signs);
+
+#pragma unroll
+		for (int m = 0; m < 8; m++) {
+			if (m < rows) {
+				const uint4 xv = *(const uint4 *)(xr + (size_t)m * K + (size_t)g * 8);
+				const __half2 *h = (const __half2 *)&xv;
+				float s = 0.f;
+
+#pragma unroll
+				for (int j = 0; j < 4; j++) {
+					const float2 f = __half22float2(h[j]);
+
+					s += v[2 * j] * f.x + v[2 * j + 1] * f.y;
+				}
+
+				acc[m] += s;
+			}
+		}
+	}
+
+#pragma unroll
+	for (int m = 0; m < 8; m++) {
+		float s = acc[m];
+
+#pragma unroll
+		for (int o = 16; o > 0; o >>= 1)
+			s += __shfl_xor_sync(0xffffffffu, s, o);
+
+		if (lane == 0 && m < rows) {
+			if (MOE)
+				((float *)out)[(size_t)slot * N + n] = s;
+			else
+				((__half *)out)[(size_t)m * N + n] = __float2half(s);
+		}
+	}
+}
+
+template <int T>
+static int amp_gguf_gemv_launch(bool moe, const void *x, const void *w, const void *ids, void *out, int M, int N, int K,
+                                int xdiv, int slots, cudaStream_t stream)
+{
+	const dim3 blk(256);
+
+	if (moe) {
+		const dim3 grid((N + 7) / 8, slots);
+
+		amp_gguf_gemv_kernel<T, true><<<grid, blk, 0, stream>>>((const __half *)x, (const uint8_t *)w,
+			(const long long *)ids, out, M, N, K, xdiv);
+	} else {
+		const dim3 grid((N + 7) / 8, 1);
+
+		amp_gguf_gemv_kernel<T, false><<<grid, blk, 0, stream>>>((const __half *)x, (const uint8_t *)w, NULL, out, M,
+			N, K, xdiv);
+	}
+
+	return (int)cudaGetLastError();
+}
+
+/* Dense (ids == NULL): x (M, K) fp16, w (N, row bytes), y (M, N) fp16, M <= 8. Experts: x (R, K) fp16, ids (slots) int64,
+ * w (E, N, row bytes), out (slots, N) fp32, slot s using x row s / xdiv. K is a multiple of the block size. */
+extern "C" int
+amp_gguf_gemv(int qtype, const void *x, const void *w, const void *ids, void *out, int M, int N, int K, int xdiv,
+              int slots, cudaStream_t stream)
+{
+	const amp_qinfo qi = amp_qtype_info(qtype);
+	const bool moe = ids != NULL;
+
+	if (N < 1 || K < qi.block || (K % qi.block) || (!moe && (M < 1 || M > 8)) || (moe && (slots < 1 || xdiv < 1)) ||
+	    ((uintptr_t)x & 15))
+		return (int)cudaErrorInvalidValue;
+
+#define AMP_GV_CASE(T) \
+	case T: return amp_gguf_gemv_launch<T>(moe, x, w, ids, out, M, N, K, xdiv, slots, stream)
+
+	switch (qtype) {
+	AMP_GV_CASE(AMP_Q_Q8_0);
+	AMP_GV_CASE(AMP_Q_IQ4_NL);
+	AMP_GV_CASE(AMP_Q_Q5_K);
+	AMP_GV_CASE(AMP_Q_IQ2_XXS);
+	AMP_GV_CASE(AMP_Q_IQ2_XS);
+	AMP_GV_CASE(AMP_Q_IQ1_M);
+	AMP_GV_CASE(AMP_Q_IQ1_S);
+	}
+#undef AMP_GV_CASE
+
+	return (int)cudaErrorInvalidValue;
+}
+
+/* ---- integer dot products (dp4a) for the i-quants ---------------------------------------------------------------------
+ *
+ * The i-quants' weights are small integers (a grid byte, a sign, an integer sub-scale) times one f16 scale, so a row dot
+ * product is cheap in int8 arithmetic: the activation row is quantized once per call to int8 with an fp32 scale per 32
+ * values (ggml's q8_1: scale = amax / 127, q = round(x / scale)), the weights are decoded to signed bytes
+ * ((grid ^ mask) - mask, four at a time) and multiplied with __dp4a. About 2 instructions per weight instead of 12;
+ * the activation rounding (~0.3 % of a dot product) is what llama.cpp's kernels have as well. */
+
+__global__ void amp_gguf_quant_x_kernel(const __half *__restrict__ x, int8_t *__restrict__ xq, float *__restrict__ xs,
+                                        long nchunks)
+{
+	const long c = (long)blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (c >= nchunks)
+		return;
+
+	const uint4 *p = (const uint4 *)(x + c * 32);
+	uint4 v[4] = { p[0], p[1], p[2], p[3] };
+	const __half *h = (const __half *)v;
+	float f[32], amax = 0.f;
+
+#pragma unroll
+	for (int i = 0; i < 32; i++) {
+		f[i] = __half2float(h[i]);
+		amax = fmaxf(amax, fabsf(f[i]));
+	}
+
+	const float d = amax / 127.f, id = d != 0.f ? 1.f / d : 0.f;
+	int8_t q[32];
+
+#pragma unroll
+	for (int i = 0; i < 32; i++)
+		q[i] = (int8_t)__float2int_rn(f[i] * id);
+
+	uint4 *o = (uint4 *)(xq + c * 32);
+
+	o[0] = *(uint4 *)q;
+	o[1] = *(uint4 *)(q + 16);
+	xs[c] = d;
+}
+
+/* One item = 32 weights (an ib32 of a 256-weight block): w[8] the signed bytes of the four groups of 8 (two ints each),
+ * mult[4] the integer multiplier of every group, returns the f16 scale folded with the constant of the format. */
+template <int T> __device__ float amp_dec32_i8(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr, const uint64_t *sg);
+
+template <> __device__ float amp_dec32_i8<AMP_Q_IQ2_XXS>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                         const uint64_t *sg)
+{
+	const uint8_t *q = b + 2 + 8 * j;
+	const unsigned aux1 = amp_u16(q + 4) | (amp_u16(q + 6) << 16);
+	const unsigned g4 = amp_u16(q) | (amp_u16(q + 2) << 16);
+	const int ls = 2 * (int)(aux1 >> 28) + 1;
+
+#pragma unroll
+	for (int l = 0; l < 4; l++) {
+		const uint64_t grid = gr[(g4 >> (8 * l)) & 0xff], m = sg[(aux1 >> (7 * l)) & 127];
+		const unsigned g0 = (unsigned)grid, g1 = (unsigned)(grid >> 32), m0 = (unsigned)m, m1 = (unsigned)(m >> 32);
+
+		w[2 * l] = (int)__vsub4(g0 ^ m0, m0);
+		w[2 * l + 1] = (int)__vsub4(g1 ^ m1, m1);
+		mult[l] = ls;
+	}
+
+	return amp_h2f(b) * 0.125f;
+}
+
+template <> __device__ float amp_dec32_i8<AMP_Q_IQ2_XS>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                        const uint64_t *sg)
+{
+	const uint8_t *q = b + 2 + 8 * j;
+	const unsigned sc = b[2 + 64 + j];
+
+#pragma unroll
+	for (int l = 0; l < 4; l++) {
+		const unsigned v = amp_u16(q + 2 * l);
+		const uint64_t grid = gr[v & 511], m = sg[v >> 9];
+		const unsigned g0 = (unsigned)grid, g1 = (unsigned)(grid >> 32), m0 = (unsigned)m, m1 = (unsigned)(m >> 32);
+
+		w[2 * l] = (int)__vsub4(g0 ^ m0, m0);
+		w[2 * l + 1] = (int)__vsub4(g1 ^ m1, m1);
+		mult[l] = 2 * (int)(l < 2 ? sc & 0xf : sc >> 4) + 1;
+	}
+
+	return amp_h2f(b) * 0.125f;
+}
+
+/* IQ1_M: weights are dl * (grid + delta) with grid in {-1, 0, 1} (signed bytes, no sign mask) and delta = +-0.125 per group
+ * of 8: the dot product is dl * (dp4a(grid, x) + delta * sum(x)); mult[l] = the integer part of dl, dlt[l] = delta. */
+template <> __device__ float amp_dec32_i8<AMP_Q_IQ1_M>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                       const uint64_t *sg)
+{
+	/* (blocks are 56 bytes: always 8-byte aligned, so three wide loads replace a dozen byte loads) */
+	const unsigned qs4 = *(const unsigned *)(b + 4 * j);                       /* qs[4j .. 4j + 3] */
+	const unsigned qh2 = *(const unsigned short *)(b + 32 + 2 * j);            /* qh[2j], qh[2j + 1] */
+	const unsigned long long sb = *(const unsigned long long *)(b + 48);       /* the four u16 scale words */
+	const unsigned su = (((unsigned)sb >> 12) & 0xf) | (((unsigned)(sb >> 16) >> 8) & 0x00f0) | (((unsigned)(sb >> 32) >> 4) & 0x0f00) |
+	                    ((unsigned)(sb >> 48) & 0xf000);
+	const unsigned sc = (unsigned)(sb >> (16 * (j >> 1))) & 0xffff;
+
+#pragma unroll
+	for (int l = 0; l < 4; l++) {
+		const unsigned h = (qh2 >> (8 * (l >> 1))) & 0xff;
+		const unsigned idx = ((qs4 >> (8 * l)) & 0xff) | (((l & 1) ? h << 4 : h << 8) & 0x700);
+		const uint64_t grid = gr[idx];
+
+		w[2 * l] = (int)(unsigned)grid;
+		w[2 * l + 1] = (int)(unsigned)(grid >> 32);
+		mult[l] = 2 * (int)((sc >> (6 * (j & 1) + (l >> 1) * 3)) & 0x7) + 1;
+		dlt[l] = (h & ((l & 1) ? 0x80 : 0x08)) ? -IQ1S_DELTA : IQ1S_DELTA;
+	}
+
+	return __half2float(__ushort_as_half((unsigned short)su));
+}
+
+/* Q8_0 (an item is a whole 34-byte block) and Q5_K (an item is 32 weights: a quantized value 0..31 per byte, scale and min
+ * per item): the dot product of an item is xs * (a * sum(w * x) - b * sum(x)) with a = d * scale, b = dmin * min.
+ * Returns a, *dlt = b. */
+template <> __device__ float amp_dec32_i8<AMP_Q_Q8_0>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                      const uint64_t *sg)
+{
+#pragma unroll
+	for (int k = 0; k < 8; k++)
+		w[k] = (int)(amp_u16(b + 2 + 4 * k) | (amp_u16(b + 4 + 4 * k) << 16));
+
+	dlt[0] = 0.f;
+
+	return amp_h2f(b);
+}
+
+template <> __device__ float amp_dec32_i8<AMP_Q_Q5_K>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                      const uint64_t *sg)
+{
+	const int jj = j >> 1, half = j & 1;
+	const uint4 q0 = ((const uint4 *)(b + 48 + 32 * jj))[0], q1 = ((const uint4 *)(b + 48 + 32 * jj))[1];
+	const uint4 h0 = ((const uint4 *)(b + 16))[0], h1 = ((const uint4 *)(b + 16))[1];
+	const unsigned qs[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+	const unsigned qh[8] = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w };
+	int sc, m;
+
+	amp_scale_min_k4(j, b + 4, &sc, &m);
+
+#pragma unroll
+	for (int k = 0; k < 8; k++)
+		w[k] = (int)((((half ? qs[k] >> 4 : qs[k]) & 0x0f0f0f0fu)) | (((qh[k] >> j) & 0x01010101u) << 4));
+
+	dlt[0] = amp_h2f(b + 2) * (float)m;
+
+	return amp_h2f(b) * (float)sc;
+}
+
+/* IQ1_S: one scale (3 bits) and one offset sign per 32 weights; the groups of 8 take 3 high bits of their grid index from qh. */
+template <> __device__ float amp_dec32_i8<AMP_Q_IQ1_S>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                       const uint64_t *sg)
+{
+	const unsigned qh = amp_u16(b + 34 + 2 * j);
+	const int m = 2 * (int)((qh >> 12) & 7) + 1;
+	const float delta = (qh & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+#pragma unroll
+	for (int l = 0; l < 4; l++) {
+		const uint64_t grid = gr[b[2 + 4 * j + l] | (((qh >> (3 * l)) & 7) << 8)];
+
+		w[2 * l] = (int)(unsigned)grid;
+		w[2 * l + 1] = (int)(unsigned)(grid >> 32);
+		mult[l] = m;
+		dlt[l] = delta;
+	}
+
+	return amp_h2f(b);
+}
+
+/* The picks of a verify step grouped by expert: ids (S) int64 -> grp (S, 9) int32, row g = {expert, up to 8 slots that picked it (-1 pads)}, the groups first
+ * in order of their first slot, the unused rows {-1, -1 ...}. A pick < 0 is a group of its own (so the kernels still write its zero row). */
+__global__ void amp_moe_group_kernel(const long long *__restrict__ ids, int *__restrict__ grp, int S)
+{
+	__shared__ int lead[64];
+	const int i = threadIdx.x;
+	const long long e = (i < S) ? ids[i] : -1;
+	bool leader = i < S;
+
+	for (int j = 0; j < i && leader; j++)
+		if (e >= 0 && ids[j] == e)
+			leader = false;
+
+	lead[i] = leader ? 1 : 0;
+	__syncthreads();
+
+	int g = 0;
+
+	for (int j = 0; j < i; j++)
+		g += lead[j];
+
+	/* every group row starts empty */
+	for (int k = i; k < S * 9; k += blockDim.x)
+		grp[k] = -1;
+
+	__syncthreads();
+
+	if (leader) {
+		int *row = grp + (size_t)g * 9;
+		int n = 0;
+
+		row[0] = (e >= 0) ? (int)e : -1;
+
+		for (int j = i; j < S && n < 8; j++)
+			if (j == i || (e >= 0 && ids[j] == e))
+				row[1 + n++] = j;
+	}
+}
+
+extern "C" int
+amp_moe_group(const void *ids, void *grp, int S, cudaStream_t stream)
+{
+	if (S < 1 || S > 64)
+		return (int)cudaErrorInvalidValue;
+
+	amp_moe_group_kernel<<<1, 64, 0, stream>>>((const long long *)ids, (int *)grp, S);
+
+	return (int)cudaGetLastError();
+}
+
+/* rows per warp a block works through (the types with big lookup tables fill them once per block: see the kernel) */
+__host__ __device__ constexpr int amp_gemv_iter(int T)
+{
+	return (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S) ? 4 : (T == AMP_Q_IQ2_XS) ? 2 : 1;
+}
+
+/* QX (one activation row per block: the experts, or a dense product of one row): `xq` is the fp16 activation row(s) (M, G * K) instead of the
+ * quantized ones; the block quantizes the row (and column slice) it reads into shared memory first, with the arithmetic of amp_gguf_quant_x_kernel
+ * (bit-identical), which saves the launch of that kernel and its gap.
+ * GRP (experts, MR >= 2 rows, RPW 1): `ids` is the (S, 9) int32 table of amp_moe_group instead: row y = {expert, slot x 8} -- the picks of a verify step grouped by
+ * expert, so an expert's rows are read once for all the slots that chose it (each slot's activation row is slot / xdiv, its output row the slot).
+ * MR: the number of activation rows the instance handles (1 .. 5, or 8; the experts always 1): a one-token step carries no loops, predicates or
+ * registers for the other rows. RPW: output rows per warp (1 or 2): with 2 the activation loads are shared and the weight loads of both rows are in
+ * flight together (the expert kernels are latency-bound: a warp does only a few items per row). */
+template <int T, bool MOE, bool GLU, int MR, int RPW, bool GRP = false, bool QX = false>
+__global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const float *__restrict__ xs,
+                                        const uint8_t *__restrict__ w, const uint8_t *__restrict__ w_up,
+                                        const long long *__restrict__ ids, const float *__restrict__ scale,
+                                        void *__restrict__ out, int M, int N, int K, int xdiv, int G, float lim, int e0, int ne)
+{
+	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_Q5_K ? 176 : T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
+	constexpr int IPB = T == AMP_Q_Q8_0 ? 1 : 8;                    /* items of 32 weights per block */
+	constexpr bool AFFINE = T == AMP_Q_Q8_0 || T == AMP_Q_Q5_K;
+	constexpr int ITER = amp_gemv_iter(T);
+	constexpr int NGRID = AFFINE ? 0 : T == AMP_Q_IQ2_XXS ? 256 : T == AMP_Q_IQ2_XS ? 512 : 2048;
+	__shared__ uint64_t s_grid[NGRID ? NGRID : 1];
+	__shared__ uint64_t s_signs[AFFINE ? 1 : 128];
+
+	for (int i = threadIdx.x; i < NGRID; i += blockDim.x)
+		s_grid[i] = (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S) ? iq1s_grid[i] : (T == AMP_Q_IQ2_XS) ? iq2xs_grid[i] : iq2xxs_grid[i];
+
+	for (int i = threadIdx.x; !AFFINE && i < 128; i += blockDim.x) {
+		uint64_t m = 0;
+
+		for (int b = 0; b < 8; b++)
+			if (ksigns_iq2xs[i] & kmask_iq2xs[b])
+				m |= (uint64_t)0xff << (8 * b);
+
+		s_signs[i] = m;
+	}
+
+	const int8_t *xqe = xq;               /* where the main loop reads the quantized activation (and its scales) */
+	const float *xse = xs;
+	size_t xbase = 0;                       /* QX: the element offset of this block's row slice in the fp16 activation */
+
+	if (QX) {
+		extern __shared__ __align__(16) unsigned char qx_smem[];
+		int8_t *sq = (int8_t *)qx_smem;
+		float *ss = (float *)(qx_smem + K);
+		bool live = true;
+
+		if (MOE) {
+			const long long e = ids[blockIdx.y] - e0;
+
+			live = !(e < 0 || e >= ne);
+			xbase = (size_t)(blockIdx.y / xdiv) * K;
+		} else {
+			xbase = (size_t)blockIdx.y * K;                                  /* (dense: row 0, the columns of group blockIdx.y) */
+		}
+
+		if (live) {
+			const __half *xh = (const __half *)xq + xbase;
+
+			for (int c = threadIdx.x; c < K / 32; c += blockDim.x) {
+				const uint4 *p = (const uint4 *)(xh + c * 32);
+				uint4 v[4] = { p[0], p[1], p[2], p[3] };
+				const __half *h = (const __half *)v;
+				float f[32], amax = 0.f;
+
+#pragma unroll
+				for (int j = 0; j < 32; j++) {
+					f[j] = __half2float(h[j]);
+					amax = fmaxf(amax, fabsf(f[j]));
+				}
+
+				const float d = amax / 127.f, id = d != 0.f ? 1.f / d : 0.f;
+				int8_t q[32];
+
+#pragma unroll
+				for (int j = 0; j < 32; j++)
+					q[j] = (int8_t)__float2int_rn(f[j] * id);
+
+				uint4 *o = (uint4 *)(sq + c * 32);
+
+				o[0] = *(uint4 *)q;
+				o[1] = *(uint4 *)(q + 16);
+				ss[c] = d;
+			}
+		}
+
+		xqe = sq;
+		xse = ss;
+	}
+
+	__syncthreads();
+
+	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+	/* a block of the types with big lookup tables (IQ1_*: 16 KiB, IQ2_XS: 4 KiB, filled from global memory above) works through ITER rows per warp,
+	 * so the fill is paid once per ITER * 8 * RPW output rows */
+	for (int it = 0; it < ITER; it++) {
+		const int n0 = ((blockIdx.x * ITER + it) * (blockDim.x >> 5) + warp) * RPW;     /* this warp's output rows n0 .. n0 + RPW - 1 */
+		const int slot = blockIdx.y;
+		const int grp = MOE ? 0 : blockIdx.y;        /* G groups: rows [grp * N, (grp + 1) * N) see x columns [grp * K, (grp + 1) * K) */
+
+		if (n0 >= N)
+			break;
+
+		const size_t rb = (size_t)(K / (32 * IPB)) * bytes;
+		const uint8_t *row[RPW], *row_up[RPW];
+		size_t xrow = 0;
+		size_t xr[GRP ? MR : 1];
+		int os[GRP ? MR : 1];
+		int rows = M;
+
+		if (MOE) {
+			long long e;
+
+			if (GRP) {
+				const int *g = (const int *)ids + (size_t)slot * 9;
+
+				e = (long long)g[0] - e0;
+				rows = 0;
+
+	#pragma unroll
+				for (int m = 0; m < MR; m++) {
+					const int sl = g[1 + m];
+
+					if (sl >= 0) {
+						xr[m] = (size_t)(sl / xdiv);
+						os[m] = sl;
+						rows = m + 1;
+					}
+				}
+
+				if (rows == 0)
+					continue;
+			} else {
+				e = ids[slot] - e0;               /* (e0: the first expert of a shard; a pick outside [e0, e0 + ne) is none) */
+			}
+
+			if (e < 0 || e >= ne) {
+				if (lane == 0) {
+					for (int m = 0; m < (GRP ? rows : 1); m++) {
+						const size_t o = GRP ? (size_t)os[m] : (size_t)slot;
+
+	#pragma unroll
+						for (int r = 0; r < RPW; r++) {
+							if (GLU)
+								((__half *)out)[o * N + n0 + r] = __float2half(0.f);
+							else
+								((float *)out)[o * N + n0 + r] = 0.f;
+						}
+					}
+				}
+
+				continue;
+			}
+
+	#pragma unroll
+			for (int r = 0; r < RPW; r++) {
+				row[r] = w + ((size_t)e * N + n0 + r) * rb;
+				row_up[r] = GLU ? w_up + ((size_t)e * N + n0 + r) * rb : NULL;
+			}
+
+			if (!GRP) {
+				xrow = (size_t)(slot / xdiv);
+				rows = 1;
+			}
+		} else {
+	#pragma unroll
+			for (int r = 0; r < RPW; r++) {
+				row[r] = w + ((size_t)grp * N + n0 + r) * rb;
+				row_up[r] = GLU ? w_up + ((size_t)grp * N + n0 + r) * rb : NULL;
+			}
+		}
+
+		const int nchunks = K / 32;
+		float acc[RPW][MR], acc2[RPW][GLU ? MR : 1];
+
+	#pragma unroll
+		for (int r = 0; r < RPW; r++) {
+	#pragma unroll
+			for (int m = 0; m < MR; m++) {
+				acc[r][m] = 0.f;
+
+				if (GLU)
+					acc2[r][m] = 0.f;
+			}
+		}
+
+		/* the dot product of one item (32 weights) of a row with the item's activations (xv, xsc: of every activation row m) */
+		auto item_dot = [&](const uint8_t *rp, int i, float *accv, const int (*xv)[8], const float *xsc) {
+			int wv[8], mult[4];
+			float dlt[4];
+			const float ds = amp_dec32_i8<T>(rp + (size_t)(i / IPB) * bytes, i % IPB, wv, mult, dlt, s_grid, s_signs);
+
+	#pragma unroll
+			for (int m = 0; m < MR; m++) {
+				if (MR == 1 || m < rows) {
+					if (AFFINE) {
+						int ig = 0, sx = 0;
+
+	#pragma unroll
+						for (int k = 0; k < 8; k++)
+							ig = __dp4a(wv[k], xv[m][k], ig);
+
+						if (T == AMP_Q_Q5_K) {
+	#pragma unroll
+							for (int k = 0; k < 8; k++)
+								sx = __dp4a(0x01010101, xv[m][k], sx);
+						}
+
+						accv[m] += xsc[m] * (ds * (float)ig - dlt[0] * (float)sx);
+					} else {
+						int s = 0;
+						float sf = 0.f;
+
+	#pragma unroll
+						for (int l = 0; l < 4; l++) {
+							const int ig = __dp4a(wv[2 * l], xv[m][2 * l], 0) + __dp4a(wv[2 * l + 1], xv[m][2 * l + 1], 0);
+
+							if (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S) {
+								const int sx = __dp4a(0x01010101, xv[m][2 * l], 0) + __dp4a(0x01010101, xv[m][2 * l + 1], 0);
+
+								sf += (float)mult[l] * ((float)ig + dlt[l] * (float)sx);
+							} else {
+								s += mult[l] * ig;
+							}
+						}
+
+						accv[m] += (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S ? sf : (float)s) * ds * xsc[m];
+					}
+				}
+			}
+		};
+
+		for (int i = lane; i < nchunks; i += 32) {
+			int xv[MR][8];
+			float xsc[MR];
+
+	#pragma unroll
+			for (int m = 0; m < MR; m++) {
+				if (MR == 1 || m < rows) {
+					const size_t r = GRP ? xr[m] : MOE ? xrow : (size_t)m;
+					const uint4 *xp = QX ? (const uint4 *)(xqe + (size_t)i * 32) : (const uint4 *)(xq + r * K * G + (size_t)grp * K + (size_t)i * 32);
+					const uint4 x0 = xp[0], x1 = xp[1];
+
+					xv[m][0] = (int)x0.x; xv[m][1] = (int)x0.y; xv[m][2] = (int)x0.z; xv[m][3] = (int)x0.w;
+					xv[m][4] = (int)x1.x; xv[m][5] = (int)x1.y; xv[m][6] = (int)x1.z; xv[m][7] = (int)x1.w;
+					xsc[m] = QX ? xse[i] : xs[r * nchunks * G + grp * nchunks + i];
+				}
+			}
+
+	#pragma unroll
+			for (int r = 0; r < RPW; r++) {
+				item_dot(row[r], i, acc[r], xv, xsc);
+
+				if (GLU)
+					item_dot(row_up[r], i, acc2[r], xv, xsc);
+			}
+		}
+
+	#pragma unroll
+		for (int r = 0; r < RPW; r++) {
+	#pragma unroll
+			for (int m = 0; m < MR; m++) {
+				float s = acc[r][m], u = GLU ? acc2[r][m] : 0.f;
+
+	#pragma unroll
+				for (int o = 16; o > 0; o >>= 1) {
+					s += __shfl_xor_sync(0xffffffffu, s, o);
+
+					if (GLU)
+						u += __shfl_xor_sync(0xffffffffu, u, o);
+				}
+
+				if (lane == 0 && (MR == 1 || m < rows)) {
+					const int n = n0 + r;
+
+					if (GLU) {
+						/* clamped SwiGLU: silu(min(gate, lim)) * clamp(up, -lim, lim) (lim == 0: no clamp) */
+						if (lim > 0.f) {
+							s = fminf(s, lim);
+							u = fminf(fmaxf(u, -lim), lim);
+						}
+
+						const float h = s / (1.f + __expf(-s)) * u;
+
+						((__half *)out)[MOE ? (size_t)(GRP ? os[m] : slot) * N + n : (size_t)m * N * G + (size_t)grp * N + n] = __float2half(h);
+					} else if (MOE) {
+						((float *)out)[(size_t)(GRP ? os[m] : slot) * N + n] = scale ? s * scale[GRP ? os[m] : slot] : s;
+					} else {
+						((__half *)out)[(size_t)m * N * G + (size_t)grp * N + n] = __float2half(s);
+					}
+				}
+			}
+		}
+
+	}
+}
+
+/* Quantize x (R, K) fp16 for the integer kernels: xq (R, K) int8, xs (R, K / 32) fp32. */
+extern "C" int
+amp_gguf_quant_x(const void *x, void *xq, void *xs, int R, int K, cudaStream_t stream)
+{
+	if (R < 1 || K < 32 || (K % 32) || ((uintptr_t)x & 15))
+		return (int)cudaErrorInvalidValue;
+
+	const long nchunks = (long)R * (K / 32);
+
+	amp_gguf_quant_x_kernel<<<(unsigned)((nchunks + 127) / 128), 128, 0, stream>>>((const __half *)x, (int8_t *)xq,
+		(float *)xs, nchunks);
+
+	return (int)cudaGetLastError();
+}
+
+/* G > 1 (dense only): G groups of N rows, group g seeing the columns [g * K, (g + 1) * K) of the (M, G * K) activation rows,
+ * y (M, G * N). w_up != NULL: the fused gate / up product, w the gate rows and w_up the up rows (same type and shape), the
+ * output the clamped SwiGLU of the two in fp16 ((M, N) dense, (slots, N) experts; lim: swiglu_limit, 0 = none). scale != NULL
+ * (experts): out[slot] is multiplied by scale[slot]. The integer-dot variant of amp_gguf_gemv for the types that have one
+ * (IQ2_XXS, IQ2_XS, IQ1_M, Q5_K, Q8_0): xq / xs from amp_gguf_quant_x.
+ * Returns cudaErrorNotSupported for the others (the caller then uses the fp16 kernel). */
+extern "C" int
+amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const void *w_up, const void *ids, const void *scale,
+                 void *out, int M, int N, int K, int xdiv, int slots, int G, float lim, int e0, int ne, int mr, int qx, cudaStream_t stream)
+{
+	const bool moe = ids != NULL;
+
+	if (qtype != AMP_Q_IQ2_XXS && qtype != AMP_Q_IQ2_XS && qtype != AMP_Q_IQ1_M && qtype != AMP_Q_IQ1_S && qtype != AMP_Q_Q5_K && qtype != AMP_Q_Q8_0)
+		return (int)cudaErrorNotSupported;
+
+	if (N < 1 || K < amp_qtype_info(qtype).block || (K % amp_qtype_info(qtype).block) || (!moe && (M < 1 || M > 8)) ||
+	    (moe && (slots < 1 || xdiv < 1)) || (w_up && G != 1))
+		return (int)cudaErrorInvalidValue;
+
+	const dim3 blk(256);
+	static const bool rpw1 = getenv("AMP_GGUF_RPW1") != NULL;
+	const bool rpw2 = moe && !rpw1 && (N % 16) == 0;                 /* two output rows per warp for the experts (AMP_GGUF_RPW1=1: one) */
+	const bool rpw2d = !moe && !rpw1 && (N % 16) == 0;               /* ... and for a single-row dense product */
+
+#define AMP_I8_K(T, MOE_, GLU_, MR_, RPW_) \
+	amp_gguf_gemv_i8_kernel<T, MOE_, GLU_, MR_, RPW_><<<dim3((N + 8 * RPW_ * amp_gemv_iter(T) - 1) / (8 * RPW_ * amp_gemv_iter(T)), moe ? slots : G), blk, 0, stream>>>( \
+		(const int8_t *)xq, (const float *)xs, (const uint8_t *)w, (const uint8_t *)w_up, (const long long *)ids, (const float *)scale, out, M, N, K, \
+		xdiv, G, lim, e0, ne)
+#define AMP_I8_KQ(T, MOE_, GLU_, RPW_) \
+	amp_gguf_gemv_i8_kernel<T, MOE_, GLU_, 1, RPW_, false, true><<<dim3((N + 8 * RPW_ * amp_gemv_iter(T) - 1) / (8 * RPW_ * amp_gemv_iter(T)), moe ? slots : G), \
+		blk, (size_t)K + (size_t)(K / 32) * 4, stream>>>((const int8_t *)xq, (const float *)xs, (const uint8_t *)w, (const uint8_t *)w_up, \
+		(const long long *)ids, (const float *)scale, out, M, N, K, xdiv, G, lim, e0, ne)
+#define AMP_I8_KG(T, GLU_, MR_) \
+	amp_gguf_gemv_i8_kernel<T, true, GLU_, MR_, 1, true><<<dim3((N + 8 * amp_gemv_iter(T) - 1) / (8 * amp_gemv_iter(T)), slots), blk, 0, stream>>>( \
+		(const int8_t *)xq, (const float *)xs, (const uint8_t *)w, (const uint8_t *)w_up, (const long long *)ids, (const float *)scale, out, M, N, K, \
+		xdiv, G, lim, e0, ne)
+#define AMP_I8_GRP(T, GLU_) \
+	switch (mr) { \
+	case 2: AMP_I8_KG(T, GLU_, 2); break; \
+	case 3: AMP_I8_KG(T, GLU_, 3); break; \
+	case 4: AMP_I8_KG(T, GLU_, 4); break; \
+	case 5: AMP_I8_KG(T, GLU_, 5); break; \
+	default: AMP_I8_KG(T, GLU_, 8); break; \
+	}
+#define AMP_I8_ROWS(T, GLU_) \
+	switch (M) { \
+	case 1: if (rpw2d) AMP_I8_K(T, false, GLU_, 1, 2); else AMP_I8_K(T, false, GLU_, 1, 1); break; \
+	case 2: AMP_I8_K(T, false, GLU_, 2, 1); break; \
+	case 3: AMP_I8_K(T, false, GLU_, 3, 1); break; \
+	case 4: AMP_I8_K(T, false, GLU_, 4, 1); break; \
+	case 5: AMP_I8_K(T, false, GLU_, 5, 1); break; \
+	default: AMP_I8_K(T, false, GLU_, 8, 1); break; \
+	}
+#define AMP_I8_LAUNCH(T) \
+	do { \
+		if (qx && moe && w_up) { \
+			if (rpw2) AMP_I8_KQ(T, true, true, 2); else AMP_I8_KQ(T, true, true, 1); \
+		} else if (qx && moe) { \
+			if (rpw2) AMP_I8_KQ(T, true, false, 2); else AMP_I8_KQ(T, true, false, 1); \
+		} else if (qx && w_up) { \
+			if (rpw2d) AMP_I8_KQ(T, false, true, 2); else AMP_I8_KQ(T, false, true, 1); \
+		} else if (qx) { \
+			if (rpw2d) AMP_I8_KQ(T, false, false, 2); else AMP_I8_KQ(T, false, false, 1); \
+		} else if (moe && mr > 1 && w_up) { \
+			AMP_I8_GRP(T, true) \
+		} else if (moe && mr > 1) { \
+			AMP_I8_GRP(T, false) \
+		} else if (moe && w_up) { \
+			if (rpw2) AMP_I8_K(T, true, true, 1, 2); else AMP_I8_K(T, true, true, 1, 1); \
+		} else if (moe) { \
+			if (rpw2) AMP_I8_K(T, true, false, 1, 2); else AMP_I8_K(T, true, false, 1, 1); \
+		} else if (w_up) { \
+			AMP_I8_ROWS(T, true) \
+		} else { \
+			AMP_I8_ROWS(T, false) \
+		} \
+	} while (0)
+
+	if (qtype == AMP_Q_IQ2_XXS)
+		AMP_I8_LAUNCH(AMP_Q_IQ2_XXS);
+	else if (qtype == AMP_Q_IQ2_XS)
+		AMP_I8_LAUNCH(AMP_Q_IQ2_XS);
+	else if (qtype == AMP_Q_IQ1_M)
+		AMP_I8_LAUNCH(AMP_Q_IQ1_M);
+	else if (qtype == AMP_Q_IQ1_S)
+		AMP_I8_LAUNCH(AMP_Q_IQ1_S);
+	else if (qtype == AMP_Q_Q5_K)
+		AMP_I8_LAUNCH(AMP_Q_Q5_K);
+	else
+		AMP_I8_LAUNCH(AMP_Q_Q8_0);
+#undef AMP_I8_K
+#undef AMP_I8_LAUNCH
+
+	return (int)cudaGetLastError();
+}
+
+/* ---- grouped GEMM for the routed experts of a prefill chunk (tensor cores) ----------------------------------------------
+ *
+ * The tokens of a chunk are sorted by expert (torch.moe_prep: tok[], wts[] per sorted slot, start[e], count[e]). One thread block
+ * computes a tile of BM tokens x BN outputs of one expert: the activation rows are gathered into shared memory, the quantized weight
+ * rows are dequantized straight into shared memory (the group functions above: fp16, as the dequantization kernel gives), and
+ * WMMA (fp16 in, fp32 accumulate) multiplies them. Stage A (K = hidden): gate and up of the tile -> the clamped SwiGLU -> h[slot]
+ * (fp16); stage B (K = the expert's inner size): down of h -> out[tok] += routing weight * result (atomic fp32 adds). The weights are
+ * read from their quantized form once per token tile instead of being dequantized to a global fp16 copy first. */
+
+#include <mma.h>
+
+#define PF_BM 32
+#define PF_BN 64
+#define PF_BK 64
+#define PF_LD (PF_BK + 8)             /* smem row pitch (halves): 16-byte multiples, staggered banks */
+
+template <int T, bool STAGE_A>
+__global__ void __launch_bounds__(128)
+amp_gguf_moe_pf_kernel(const __half *__restrict__ xin, const long long *__restrict__ tok, const __half *__restrict__ wts,
+                       const long long *__restrict__ count, const long long *__restrict__ start,
+                       const uint8_t *__restrict__ w0, const uint8_t *__restrict__ w1, __half *__restrict__ hbuf,
+                       float *__restrict__ out, int N, int K, float lim, bool det)
+{
+	using namespace nvcuda;
+
+	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_Q5_K ? 176 : T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
+	constexpr int blk = T == AMP_Q_Q8_0 ? 32 : 256;
+	constexpr bool IQ = T == AMP_Q_IQ2_XXS || T == AMP_Q_IQ2_XS || T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S;
+	constexpr int NGRID = !IQ ? 0 : T == AMP_Q_IQ2_XXS ? 256 : T == AMP_Q_IQ2_XS ? 512 : 2048;
+
+	__shared__ __align__(16) __half s_x[PF_BM * PF_LD];
+	__shared__ __align__(16) __half s_w0[PF_BN * PF_LD];
+	__shared__ __align__(16) __half s_w1[STAGE_A ? PF_BN * PF_LD : 8];
+	__shared__ uint64_t s_grid[NGRID ? NGRID : 1];
+	__shared__ uint8_t s_signs[IQ ? 128 : 1];
+
+	const int e = blockIdx.y;
+	const int cnt = (int)count[e];
+	const int m0 = blockIdx.z * PF_BM;
+
+	if (m0 >= cnt)
+		return;
+
+	const int n0 = blockIdx.x * PF_BN;
+	const long long st = start[e];
+	const int tid = threadIdx.x, warp = tid >> 5;
+	const int wm = warp >> 1, wn = warp & 1;              /* 2 x 2 warps: each 16 rows x 32 columns */
+	const size_t rb = (size_t)(K / blk) * bytes;
+	const uint8_t *e0 = w0 + (size_t)e * N * rb, *e1 = STAGE_A ? w1 + (size_t)e * N * rb : NULL;
+
+	if (IQ) {
+		for (int i = tid; i < NGRID; i += 128)
+			s_grid[i] = (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S) ? iq1s_grid[i] : (T == AMP_Q_IQ2_XS) ? iq2xs_grid[i] : iq2xxs_grid[i];
+
+		for (int i = tid; i < 128; i += 128)
+			s_signs[i] = ksigns_iq2xs[i];
+
+		__syncthreads();
+	}
+
+	wmma::fragment<wmma::accumulator, 16, 16, 16, float> c0[2], c1[2];
+
+#pragma unroll
+	for (int j = 0; j < 2; j++) {
+		wmma::fill_fragment(c0[j], 0.f);
+		wmma::fill_fragment(c1[j], 0.f);
+	}
+
+	for (int k0 = 0; k0 < K; k0 += PF_BK) {
+		/* activation tile: 32 rows x 64 halves, 16 bytes per thread-load */
+		for (int i = tid; i < PF_BM * 8; i += 128) {
+			const int r = i >> 3, c8 = i & 7;
+			uint4 v = make_uint4(0, 0, 0, 0);
+
+			if (m0 + r < cnt) {
+				const size_t row = STAGE_A ? (size_t)tok[st + m0 + r] : (size_t)(st + m0 + r);
+
+				v = *(const uint4 *)(xin + row * K + k0 + c8 * 8);
+			}
+
+			*(uint4 *)(s_x + r * PF_LD + c8 * 8) = v;
+		}
+
+		/* weight tiles: 64 rows x 8 groups of 8 weights, dequantized to fp16 */
+		for (int i = tid; i < PF_BN * 8; i += 128) {
+			const int r = i >> 3, g8 = i & 7;
+			const size_t off = (size_t)(k0 / blk) * bytes;
+			const int grp = (k0 % blk) / 8 + g8;
+			float v[8];
+			__half h[8];
+
+			amp_dq_group<T>(e0 + (size_t)(n0 + r) * rb + off, grp, v, s_grid, (const uint8_t *)s_signs);
+#pragma unroll
+			for (int j = 0; j < 8; j++)
+				h[j] = __float2half(v[j]);
+			*(uint4 *)(s_w0 + r * PF_LD + g8 * 8) = *(uint4 *)h;
+
+			if (STAGE_A) {
+				amp_dq_group<T>(e1 + (size_t)(n0 + r) * rb + off, grp, v, s_grid, (const uint8_t *)s_signs);
+#pragma unroll
+				for (int j = 0; j < 8; j++)
+					h[j] = __float2half(v[j]);
+				*(uint4 *)(s_w1 + r * PF_LD + g8 * 8) = *(uint4 *)h;
+			}
+		}
+
+		__syncthreads();
+
+#pragma unroll
+		for (int kk = 0; kk < PF_BK; kk += 16) {
+			wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+
+			wmma::load_matrix_sync(a, s_x + wm * 16 * PF_LD + kk, PF_LD);
+
+#pragma unroll
+			for (int j = 0; j < 2; j++) {
+				wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+
+				wmma::load_matrix_sync(b, s_w0 + (wn * 32 + j * 16) * PF_LD + kk, PF_LD);
+				wmma::mma_sync(c0[j], a, b, c0[j]);
+
+				if (STAGE_A) {
+					wmma::load_matrix_sync(b, s_w1 + (wn * 32 + j * 16) * PF_LD + kk, PF_LD);
+					wmma::mma_sync(c1[j], a, b, c1[j]);
+				}
+			}
+		}
+
+		__syncthreads();
+	}
+
+	/* epilogue through shared memory (the staging tiles are reused: 32 x 64 floats each) */
+	float *sc0 = (float *)s_w0;                            /* 64 * 72 halves = 9216 bytes >= 32 * 64 * 4 = 8192 */
+	float *sc1 = (float *)s_w1;
+
+#pragma unroll
+	for (int j = 0; j < 2; j++) {
+		wmma::store_matrix_sync(sc0 + wm * 16 * PF_BN + wn * 32 + j * 16, c0[j], PF_BN, wmma::mem_row_major);
+
+		if (STAGE_A)
+			wmma::store_matrix_sync(sc1 + wm * 16 * PF_BN + wn * 32 + j * 16, c1[j], PF_BN, wmma::mem_row_major);
+	}
+
+	__syncthreads();
+
+	for (int i = tid; i < PF_BM * PF_BN; i += 128) {
+		const int r = i / PF_BN, c = i % PF_BN;
+
+		if (m0 + r >= cnt)
+			continue;
+
+		if (STAGE_A) {
+			float g = sc0[i], u = sc1[i];
+
+			if (lim > 0.f) {
+				g = fminf(g, lim);
+				u = fminf(fmaxf(u, -lim), lim);
+			}
+
+			hbuf[(size_t)(st + m0 + r) * N + n0 + c] = __float2half(g / (1.f + __expf(-g)) * u);
+		} else {
+			/* det: every assignment owns the row of its sorted position (a fixed-order gather sums them: bit-reproducible); else an atomic add into the token row */
+			if (det)
+				out[(size_t)(st + m0 + r) * N + n0 + c] = __half2float(wts[st + m0 + r]) * sc0[i];
+			else
+				atomicAdd(out + (size_t)tok[st + m0 + r] * N + n0 + c, __half2float(wts[st + m0 + r]) * sc0[i]);
+		}
+	}
+}
+
+/* y (T, H) fp16 tokens; tok / wts / count / start from torch.moe_prep; w1 / w3 (E, I, row bytes) gate / up of type t13, w2 (E, H, row
+ * bytes) down of type t2; out (T, H) fp32 (zeroed by the caller) receives sum_slots routing weight * down(swiglu(gate, up));
+ * hbuf (A, I) fp16 scratch; max_rows: an upper bound of the tokens one expert gets. */
+extern "C" int
+amp_gguf_moe_prefill(int t13, int t2, const void *y, const void *tok, const void *wts, const void *count, const void *start, const void *w1,
+                     const void *w3, const void *w2, void *hbuf, void *out, int E, int H, int I, int max_rows, float lim, int det,
+                     cudaStream_t stream)
+{
+	if (E < 1 || H < 256 || I < 256 || (H % PF_BN) || (I % PF_BN) || (H % 256) || (I % 256) || max_rows < 1 || ((uintptr_t)y & 15) ||
+	    ((uintptr_t)hbuf & 15))
+		return (int)cudaErrorInvalidValue;
+
+	const dim3 blk(128);
+	const unsigned mt = (unsigned)((max_rows + PF_BM - 1) / PF_BM);
+
+#define AMP_PF_CASE(T, STAGE) \
+	case T: \
+		amp_gguf_moe_pf_kernel<T, STAGE><<<STAGE ? dim3(I / PF_BN, E, mt) : dim3(H / PF_BN, E, mt), blk, 0, stream>>>( \
+			(const __half *)(STAGE ? y : hbuf), (const long long *)tok, (const __half *)wts, (const long long *)count, \
+			(const long long *)start, (const uint8_t *)(STAGE ? w1 : w2), (const uint8_t *)w3, (__half *)hbuf, (float *)out, \
+			STAGE ? I : H, STAGE ? H : I, lim, det != 0); \
+		break
+
+	switch (t13) {
+	AMP_PF_CASE(AMP_Q_IQ2_XXS, true);
+	AMP_PF_CASE(AMP_Q_IQ2_XS, true);
+	AMP_PF_CASE(AMP_Q_IQ1_M, true);
+	AMP_PF_CASE(AMP_Q_IQ1_S, true);
+	default: return (int)cudaErrorNotSupported;
+	}
+
+	switch (t2) {
+	AMP_PF_CASE(AMP_Q_IQ2_XXS, false);
+	AMP_PF_CASE(AMP_Q_IQ2_XS, false);
+	AMP_PF_CASE(AMP_Q_IQ1_M, false);
+	AMP_PF_CASE(AMP_Q_IQ1_S, false);
+	default: return (int)cudaErrorNotSupported;
+	}
+#undef AMP_PF_CASE
+
+	return (int)cudaGetLastError();
+}
+
+/* ---- the same on int8 tensor cores (mma.sync m16n8k16 s8) -------------------------------------------------------------------
+ *
+ * The weight rows are the M operand, the tokens the N operand. A thread decodes straight from the quantized bytes the 4 weights of
+ * each of its two rows that the fragment layout gives it (a grid half + its sign mask, a few instructions) - no dequantization to
+ * fp16 and no staging of weights in shared memory; the activation tile (int8 rows + an fp32 scale per 32 values, quantized once per
+ * layer) is gathered into shared memory. Each mma covers 16 weights of the k axis, which is inside one scale group of the format
+ * (IQ2_XS and IQ1_M change their sub-scale every 16), so the int32 result is converted and multiplied with the row's scale and the
+ * token's scale right away. IQ1_M's +-1/8 offsets are folded into the weights as 8 * grid +- 1 (the scale carries the 1/8). */
+
+#define MM_BN 64                       /* weight rows per block: 4 warps x 16 */
+#define MM_BM 32                       /* tokens per block: 4 n8 tiles */
+#define MM_XLD 272                     /* smem pitch of an activation row (256 bytes + 16, 16-byte aligned, staggered banks) */
+
+__device__ inline void amp_mma_s8_16816(int c[4], unsigned a0, unsigned a1, unsigned b0)
+{
+	asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};"
+	             : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+	             : "r"(a0), "r"(a1), "r"(b0), "r"(0));
+}
+
+/* the A word (4 weights as signed bytes) and the scale of one row for the k16 half `h` of item j of a block: tig selects the 4 weights */
+template <int T> __device__ void amp_mma_dec(const uint8_t *b, int j, int h, int tig, const uint64_t *gr, const uint64_t *sg, unsigned *a, float *sc);
+
+template <> __device__ void amp_mma_dec<AMP_Q_IQ2_XXS>(const uint8_t *b, int j, int h, int tig, const uint64_t *gr, const uint64_t *sg,
+                                                      unsigned *a, float *sc)
+{
+	const uint8_t *q = b + 2 + 8 * j;
+	const unsigned aux1 = amp_u16(q + 4) | (amp_u16(q + 6) << 16);
+	const int l = 2 * h + (tig >> 1);
+	const uint64_t grid = gr[q[l]], m = sg[(aux1 >> (7 * l)) & 127];
+	const unsigned g = (tig & 1) ? (unsigned)(grid >> 32) : (unsigned)grid, mk = (tig & 1) ? (unsigned)(m >> 32) : (unsigned)m;
+
+	*a = __vsub4(g ^ mk, mk);
+	*sc = amp_h2f(b) * 0.125f * (float)(2 * (int)(aux1 >> 28) + 1);
+}
+
+template <> __device__ void amp_mma_dec<AMP_Q_IQ2_XS>(const uint8_t *b, int j, int h, int tig, const uint64_t *gr, const uint64_t *sg,
+                                                     unsigned *a, float *sc)
+{
+	const uint8_t *q = b + 2 + 8 * j;
+	const int l = 2 * h + (tig >> 1);
+	const unsigned v = amp_u16(q + 2 * l);
+	const uint64_t grid = gr[v & 511], m = sg[v >> 9];
+	const unsigned g = (tig & 1) ? (unsigned)(grid >> 32) : (unsigned)grid, mk = (tig & 1) ? (unsigned)(m >> 32) : (unsigned)m;
+	const unsigned s8 = b[2 + 64 + j];
+
+	*a = __vsub4(g ^ mk, mk);
+	*sc = amp_h2f(b) * 0.125f * (float)(2 * (int)(h ? s8 >> 4 : s8 & 0xf) + 1);
+}
+
+template <> __device__ void amp_mma_dec<AMP_Q_IQ1_M>(const uint8_t *b, int j, int h, int tig, const uint64_t *gr, const uint64_t *sg,
+                                                    unsigned *a, float *sc)
+{
+	const int l = 2 * h + (tig >> 1);
+	const unsigned hh = b[32 + 2 * j + (l >> 1)];
+	const unsigned idx = b[4 * j + l] | (((l & 1) ? hh << 4 : hh << 8) & 0x700);
+	const unsigned long long sb = *(const unsigned long long *)(b + 48);
+	const unsigned su = (((unsigned)sb >> 12) & 0xf) | (((unsigned)(sb >> 16) >> 8) & 0x00f0) | (((unsigned)(sb >> 32) >> 4) & 0x0f00) |
+	                    ((unsigned)(sb >> 48) & 0xf000);
+	const unsigned scw = (unsigned)(sb >> (16 * (j >> 1))) & 0xffff;
+	const uint64_t grid = gr[idx];
+	const unsigned g = (tig & 1) ? (unsigned)(grid >> 32) : (unsigned)grid;
+	const unsigned g8 = (g << 3) & 0xF8F8F8F8u;                                   /* 8 * grid, bytewise (grid in -1..1) */
+	const bool neg = hh & ((l & 1) ? 0x80 : 0x08);
+
+	*a = neg ? __vsub4(g8, 0x01010101u) : __vadd4(g8, 0x01010101u);               /* 8 * (grid +- 1/8) */
+	*sc = __half2float(__ushort_as_half((unsigned short)su)) * (float)(2 * (int)((scw >> (6 * (j & 1) + h * 3)) & 0x7) + 1) * 0.125f;
+}
+
+template <> __device__ void amp_mma_dec<AMP_Q_IQ1_S>(const uint8_t *b, int j, int h, int tig, const uint64_t *gr, const uint64_t *sg,
+                                                    unsigned *a, float *sc)
+{
+	const unsigned qh = amp_u16(b + 34 + 2 * j);
+	const int l = 2 * h + (tig >> 1);
+	const uint64_t grid = gr[b[2 + 4 * j + l] | (((qh >> (3 * l)) & 7) << 8)];
+	const unsigned g = (tig & 1) ? (unsigned)(grid >> 32) : (unsigned)grid;
+	const unsigned g8 = (g << 3) & 0xF8F8F8F8u;                                   /* 8 * grid, bytewise (grid in -1..1) */
+
+	*a = (qh & 0x8000) ? __vsub4(g8, 0x01010101u) : __vadd4(g8, 0x01010101u);     /* 8 * (grid +- 1/8) */
+	*sc = amp_h2f(b) * (float)(2 * (int)((qh >> 12) & 7) + 1) * 0.125f;
+}
+
+/* Stage A (gate and up of K = hidden -> h fp16 (slot, N)) or stage B (down of K = inner size, h quantized -> out[tok] += weight * result). */
+template <int T, bool STAGE_A>
+__global__ void __launch_bounds__(128)
+amp_gguf_moe_mma_kernel(const int8_t *__restrict__ xq, const float *__restrict__ xs, const long long *__restrict__ tok,
+                        const __half *__restrict__ wts, const long long *__restrict__ count, const long long *__restrict__ start,
+                        const uint8_t *__restrict__ w0, const uint8_t *__restrict__ w1, __half *__restrict__ hbuf,
+                        float *__restrict__ out, int N, int K, float lim, bool det)
+{
+	constexpr int bytes = T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
+	constexpr int NGRID = T == AMP_Q_IQ2_XXS ? 256 : T == AMP_Q_IQ2_XS ? 512 : 2048;
+
+	/* the lookup tables are dead once the k loop is over: the epilogue tiles (gate, up / result: 2 x 32 x 65 floats) reuse their space */
+	constexpr int TAB_BYTES = NGRID * 8 + 128 * 8;
+	constexpr int CTILE_BYTES = 2 * MM_BM * (MM_BN + 1) * 4;
+	__shared__ __align__(16) int8_t s_x[MM_BM * MM_XLD];
+	__shared__ float s_xs[MM_BM * 8];
+	__shared__ __align__(16) unsigned char s_union[TAB_BYTES > CTILE_BYTES ? TAB_BYTES : CTILE_BYTES];
+	uint64_t *s_grid = (uint64_t *)s_union;
+	uint64_t *s_signs = s_grid + NGRID;
+	float (*s_c)[MM_BM * (MM_BN + 1)] = (float (*)[MM_BM * (MM_BN + 1)])s_union;
+
+	const int e = blockIdx.y;
+	const int cnt = (int)count[e];
+	const int m0 = blockIdx.z * MM_BM;
+
+	if (m0 >= cnt)
+		return;
+
+	const int n0 = blockIdx.x * MM_BN;
+	const long long st = start[e];
+	const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+
+	for (int i = tid; i < NGRID; i += 128)
+		s_grid[i] = (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S) ? iq1s_grid[i] : (T == AMP_Q_IQ2_XS) ? iq2xs_grid[i] : iq2xxs_grid[i];
+
+	for (int i = tid; i < 128; i += 128) {
+		uint64_t m = 0;
+
+		for (int b = 0; b < 8; b++)
+			if (ksigns_iq2xs[i] & kmask_iq2xs[b])
+				m |= (uint64_t)0xff << (8 * b);
+
+		s_signs[i] = m;
+	}
+
+	const size_t rb = (size_t)(K / 256) * bytes;
+	const int r0 = n0 + warp * 16 + gid;                           /* this thread's weight rows: r0 and r0 + 8 */
+	const uint8_t *ra0 = w0 + ((size_t)e * N + r0) * rb, *ra1 = w0 + ((size_t)e * N + r0 + 8) * rb;
+	const uint8_t *rb0 = STAGE_A ? w1 + ((size_t)e * N + r0) * rb : NULL, *rb1 = STAGE_A ? w1 + ((size_t)e * N + r0 + 8) * rb : NULL;
+	float acc0[4][4], acc1[4][4];                                  /* [n8 tile][c0..c3]: gate (or the only matrix) / up */
+
+#pragma unroll
+	for (int t = 0; t < 4; t++)
+#pragma unroll
+		for (int i = 0; i < 4; i++)
+			acc0[t][i] = acc1[t][i] = 0.f;
+
+	for (int kc = 0; kc < K; kc += 256) {
+		__syncthreads();
+
+		/* activation tile: 32 tokens x 256 int8 and their 8 scales */
+		for (int i = tid; i < MM_BM * 16; i += 128) {
+			const int r = i >> 4, c16 = i & 15;
+			uint4 v = make_uint4(0, 0, 0, 0);
+
+			if (m0 + r < cnt) {
+				const size_t row = STAGE_A ? (size_t)tok[st + m0 + r] : (size_t)(st + m0 + r);
+
+				v = *(const uint4 *)(xq + row * K + kc + c16 * 16);
+			}
+
+			*(uint4 *)(s_x + r * MM_XLD + c16 * 16) = v;
+		}
+
+		for (int i = tid; i < MM_BM * 8; i += 128) {
+			const int r = i >> 3, c = i & 7;
+
+			s_xs[i] = (m0 + r < cnt) ? xs[(STAGE_A ? (size_t)tok[st + m0 + r] : (size_t)(st + m0 + r)) * (K / 32) + kc / 32 + c] : 0.f;
+		}
+
+		__syncthreads();
+
+		const size_t boff = (size_t)(kc / 256) * bytes;
+
+#pragma unroll 2
+		for (int j = 0; j < 8; j++) {
+#pragma unroll
+			for (int h = 0; h < 2; h++) {
+				unsigned a0, a1, g0, g1;
+				float sa0, sa1, sg0, sg1;
+
+				amp_mma_dec<T>(ra0 + boff, j, h, tig, s_grid, s_signs, &a0, &sa0);
+				amp_mma_dec<T>(ra1 + boff, j, h, tig, s_grid, s_signs, &a1, &sa1);
+
+				if (STAGE_A) {
+					amp_mma_dec<T>(rb0 + boff, j, h, tig, s_grid, s_signs, &g0, &sg0);
+					amp_mma_dec<T>(rb1 + boff, j, h, tig, s_grid, s_signs, &g1, &sg1);
+				}
+
+#pragma unroll
+				for (int t = 0; t < 4; t++) {
+					const unsigned b = *(const unsigned *)(s_x + (t * 8 + gid) * MM_XLD + j * 32 + h * 16 + tig * 4);
+					const float x0 = s_xs[(t * 8 + 2 * tig) * 8 + j], x1 = s_xs[(t * 8 + 2 * tig + 1) * 8 + j];
+					int c[4];
+
+					amp_mma_s8_16816(c, a0, a1, b);
+					acc0[t][0] += (float)c[0] * sa0 * x0;
+					acc0[t][1] += (float)c[1] * sa0 * x1;
+					acc0[t][2] += (float)c[2] * sa1 * x0;
+					acc0[t][3] += (float)c[3] * sa1 * x1;
+
+					if (STAGE_A) {
+						amp_mma_s8_16816(c, g0, g1, b);
+						acc1[t][0] += (float)c[0] * sg0 * x0;
+						acc1[t][1] += (float)c[1] * sg0 * x1;
+						acc1[t][2] += (float)c[2] * sg1 * x0;
+						acc1[t][3] += (float)c[3] * sg1 * x1;
+					}
+				}
+			}
+		}
+	}
+
+	/* epilogue: the accumulators (weight row, token) -> smem [token][row] -> coalesced global writes */
+	__syncthreads();
+
+#pragma unroll
+	for (int t = 0; t < 4; t++) {
+#pragma unroll
+		for (int i = 0; i < 4; i++) {
+			const int row = warp * 16 + gid + (i >> 1) * 8, col = t * 8 + 2 * tig + (i & 1);
+
+			s_c[0][col * (MM_BN + 1) + row] = acc0[t][i];
+
+			if (STAGE_A)
+				s_c[1][col * (MM_BN + 1) + row] = acc1[t][i];
+		}
+	}
+
+	__syncthreads();
+
+	for (int i = tid; i < MM_BM * MM_BN; i += 128) {
+		const int col = i / MM_BN, row = i % MM_BN;
+
+		if (m0 + col >= cnt)
+			continue;
+
+		float g = s_c[0][col * (MM_BN + 1) + row];
+
+		if (STAGE_A) {
+			float u = s_c[1][col * (MM_BN + 1) + row];
+
+			if (lim > 0.f) {
+				g = fminf(g, lim);
+				u = fminf(fmaxf(u, -lim), lim);
+			}
+
+			hbuf[(size_t)(st + m0 + col) * N + n0 + row] = __float2half(g / (1.f + __expf(-g)) * u);
+		} else {
+			if (det)
+				out[(size_t)(st + m0 + col) * N + n0 + row] = __half2float(wts[st + m0 + col]) * g;
+			else
+				atomicAdd(out + (size_t)tok[st + m0 + col] * N + n0 + row, __half2float(wts[st + m0 + col]) * g);
+		}
+	}
+}
+
+/* amp_gguf_moe_prefill on the int8 tensor-core kernel: yq / ys the quantized token rows (amp_gguf_quant_x), hq / hs scratch for the
+ * quantized inner activations (A, I) / (A, I / 32); hbuf (A, I) fp16 scratch. */
+extern "C" int
+amp_gguf_moe_prefill_mma(int t13, int t2, const void *yq, const void *ys, const void *tok, const void *wts, const void *count,
+                         const void *start, const void *w1, const void *w3, const void *w2, void *hbuf, void *hq, void *hs, void *out,
+                         int E, int H, int I, int A, int max_rows, float lim, int det, cudaStream_t stream)
+{
+	if (E < 1 || (H % 256) || (I % 256) || (H % MM_BN) || (I % MM_BN) || max_rows < 1 || A < 1)
+		return (int)cudaErrorInvalidValue;
+
+	const dim3 blk(128);
+	const unsigned mt = (unsigned)((max_rows + MM_BM - 1) / MM_BM);
+
+#define AMP_MM_CASE(T, STAGE, GRID, XQ, XS, WA, WB, NN, KK) \
+	case T: \
+		amp_gguf_moe_mma_kernel<T, STAGE><<<GRID, blk, 0, stream>>>((const int8_t *)XQ, (const float *)XS, (const long long *)tok, \
+			(const __half *)wts, (const long long *)count, (const long long *)start, (const uint8_t *)WA, (const uint8_t *)WB, \
+			(__half *)hbuf, (float *)out, NN, KK, lim, det != 0); \
+		break
+
+	const dim3 ga(I / MM_BN, E, mt), gb(H / MM_BN, E, mt);
+
+	switch (t13) {
+	AMP_MM_CASE(AMP_Q_IQ2_XXS, true, ga, yq, ys, w1, w3, I, H);
+	AMP_MM_CASE(AMP_Q_IQ2_XS, true, ga, yq, ys, w1, w3, I, H);
+	AMP_MM_CASE(AMP_Q_IQ1_M, true, ga, yq, ys, w1, w3, I, H);
+	AMP_MM_CASE(AMP_Q_IQ1_S, true, ga, yq, ys, w1, w3, I, H);
+	default: return (int)cudaErrorNotSupported;
+	}
+
+	int rc = amp_gguf_quant_x(hbuf, hq, hs, A, I, stream);
+
+	if (rc)
+		return rc;
+
+	switch (t2) {
+	AMP_MM_CASE(AMP_Q_IQ2_XXS, false, gb, hq, hs, w2, w2, H, I);
+	AMP_MM_CASE(AMP_Q_IQ2_XS, false, gb, hq, hs, w2, w2, H, I);
+	AMP_MM_CASE(AMP_Q_IQ1_M, false, gb, hq, hs, w2, w2, H, I);
+	AMP_MM_CASE(AMP_Q_IQ1_S, false, gb, hq, hs, w2, w2, H, I);
+	default: return (int)cudaErrorNotSupported;
+	}
+#undef AMP_MM_CASE
+
+	return (int)cudaGetLastError();
+}
+
+/* ---- embedding rows: gather + dequantize from a quantized table, by device-side ids (usable inside CUDA graphs) ----------- */
+
+template <int T>
+__global__ void amp_gguf_embed_kernel(const uint8_t *__restrict__ w, const long long *__restrict__ ids, __half *__restrict__ out, long nrows,
+                                      long vocab, int K)
+{
+	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_IQ4_NL ? 18 : T == AMP_Q_Q5_K ? 176 : T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
+	constexpr int gpb = (T == AMP_Q_Q8_0 || T == AMP_Q_IQ4_NL) ? 4 : 32;       /* groups of 8 per block */
+	const int gper = K / 8;
+	const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i >= nrows * gper)
+		return;
+
+	const long r = i / gper;
+	const int g = (int)(i % gper);
+	long long id = ids[r];
+	float v[8];
+	__half h[8];
+
+	if (id < 0 || id >= vocab)
+		id = 0;
+
+	const size_t rb = (size_t)(K / (gpb * 8)) * bytes;
+
+	amp_dq_group<T>(w + (size_t)id * rb + (size_t)(g / gpb) * bytes, g % gpb, v, T == AMP_Q_IQ2_XS ? iq2xs_grid : iq2xxs_grid, ksigns_iq2xs);
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		h[j] = __float2half(v[j]);
+	*(uint4 *)(out + r * K + g * 8) = *(uint4 *)h;
+}
+
+extern "C" int
+amp_gguf_embed(int qtype, const void *w, const void *ids, void *out, long nrows, long vocab, int K, cudaStream_t stream)
+{
+	const amp_qinfo qi = amp_qtype_info(qtype);
+
+	if (nrows < 0 || vocab < 1 || K < qi.block || (K % qi.block) || ((uintptr_t)out & 15))
+		return (int)cudaErrorInvalidValue;
+
+	if (nrows == 0)
+		return 0;
+
+	const long n = nrows * (K / 8);
+	const unsigned grid = (unsigned)((n + 255) / 256);
+
+#define AMP_EMB_CASE(T) \
+	case T: amp_gguf_embed_kernel<T><<<grid, 256, 0, stream>>>((const uint8_t *)w, (const long long *)ids, (__half *)out, nrows, vocab, K); break
+
+	switch (qtype) {
+	AMP_EMB_CASE(AMP_Q_Q8_0);
+	AMP_EMB_CASE(AMP_Q_IQ4_NL);
+	AMP_EMB_CASE(AMP_Q_Q5_K);
+	AMP_EMB_CASE(AMP_Q_IQ2_XXS);
+	AMP_EMB_CASE(AMP_Q_IQ2_XS);
+	AMP_EMB_CASE(AMP_Q_IQ1_M);
+	AMP_EMB_CASE(AMP_Q_IQ1_S);
+	default: return (int)cudaErrorInvalidValue;
+	}
+#undef AMP_EMB_CASE
+
+	return (int)cudaGetLastError();
+}
