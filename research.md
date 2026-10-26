@@ -139,6 +139,18 @@ Qwen4Exp PLE PRs are especially close to Ampstein.
     #63711, #61346, #61168). AVX2/VNNI, grouped W8A16, MXFP4 W4A8, 4-bit KV.
     These are mainly for CPU fallback or CPU pools, not the CUDA expert path.
 
+## Already implemented in Ampstein
+
+- `MADV_HUGEPAGE` hints on the GGUF/safetensors mmap and the PLE gather mapping.
+- `AMP_QWEN4_DROP_FILE_CACHE=1` drops the model files' clean page cache after
+  load (`madvise(MADV_DONTNEED)` + `posix_fadvise(POSIX_FADV_DONTNEED)`), keeping
+  the PLE table file because it is still streamed.
+- PLE rows are copied into the fixed device buffer `it.emb` before graph replay,
+  so the captured graph reads only persistent buffers.
+- `prefill_pipeline` already does wavefront layer-split prefill across stages.
+- Cold experts use mapped pinned host memory plus device pointer tables; this is
+  already a zero-copy host-read path.
+
 ## Caveats
 
 - Several PRs are drafts or hardware-specific. Treat the measured gains as

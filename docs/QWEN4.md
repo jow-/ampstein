@@ -183,6 +183,9 @@ The GGUF loader uses the same `qwen4` layer split (no TP). `qwen4_tp` is not ada
   its row in either the resident stack or the mapped cold stack. `torch.gguf_moe_gemv_pt` then runs one grouped
   gemv per matrix for all decode slots, mixing resident and cold experts without a host-side split. The old i8
   types (the Qwen4 GGUF experts are `IQ2_XS`) use the pointer-table i8 kernel; newer types use the fp16 kernel.
+- Page cache: mmap'd weight/table files get an `MADV_HUGEPAGE` hint. `AMP_QWEN4_DROP_FILE_CACHE=1` drops the
+  model files' clean page cache after load (`madvise(MADV_DONTNEED)` + `posix_fadvise(POSIX_FADV_DONTNEED)`),
+  keeping the PLE table's file because it is still streamed row by row.
 - Routing bias is real: replaying three Pi coding sessions gave per-layer top-358 coverage 94.1-99.9%, versus
   62.6-80.1% for a uniform prefix. Across all 512 experts, the per-layer max/min count ratio was ~5.4x; all
   experts were used, but not equally.
@@ -230,7 +233,7 @@ high nibbles next 16). With `--mtp 3` on IQ3_XXS, 8k context, F = 0.75, Q8 KV:
 | 120 tokens | — | 23.9 tok/s (55 rounds, 50% accepted, 2.18 tok/round) |
 
 The draft head is opt-in (`--mtp`). Its own expert stack can use a different resident fraction:
-`AMP_QWEN4_MTP_EXPERT_RESIDENT` (default: 1.0, fully resident; independent of the backbone). At 256k the MTP KV/cache and draft block
+`AMP_QWEN4_MTP_EXPERT_RESIDENT` (default: the backbone's `AMP_QWEN4_EXPERT_RESIDENT`). At 256k the MTP KV/cache and draft block
 still cost ~0.4–0.5 GB of VRAM. With `AMP_QWEN4_EXPERT_RESIDENT=0.66`, `AMP_QWEN4_MTP_EXPERT_RESIDENT=0.0`,
 Q8 KV, chunk 4096, a 220k-token prompt gave PP 1196 tok/s and 20-token decode 19.9 tok/s (9 rounds, 56%
 accepted, 2.22 tok/round). Plain decode at the same context is faster (~24 tok/s at F = 0.70), so MTP is a

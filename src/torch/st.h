@@ -26,6 +26,11 @@ int st_open(const char *path, st_file_t *out);
 /* Release mappings and the parsed header. */
 void st_close(st_file_t *out);
 
+/* Ask the kernel to drop the file's clean page cache and mapped pages.
+ * Safe for files no longer read after load; do not use for a table that is
+ * still streamed row by row. */
+void st_drop_cache(st_file_t *f);
+
 /* Look up tensor `name`. Returns 0 and fills *dtype (string literal),
  * *shape (array of ndim int64s, caller frees), *offset and *nbytes
  * (relative to the data region) on success; ST_NOT_FOUND (-1) if the

@@ -80,6 +80,10 @@ st_open(const char *path, st_file_t *out)
 		return -1;
 	}
 
+#ifdef MADV_HUGEPAGE
+	madvise(base, (size_t)st.st_size, MADV_HUGEPAGE);
+#endif
+
 	memcpy(&header_len, base, sizeof(header_len));
 
 	/* overflow-safe bounds: the header must fit between the 8-byte
@@ -112,6 +116,19 @@ st_open(const char *path, st_file_t *out)
 	out->json = js;
 
 	return 0;
+}
+
+void
+st_drop_cache(st_file_t *f)
+{
+#ifdef MADV_DONTNEED
+	if (f->base)
+		madvise(f->base, f->size, MADV_DONTNEED);
+#endif
+#ifdef POSIX_FADV_DONTNEED
+	if (f->fd >= 0)
+		posix_fadvise(f->fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
 }
 
 void

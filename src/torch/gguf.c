@@ -164,6 +164,11 @@ gguf_open(const char *path, st_file_t *out)
 		return -1;
 	}
 
+#ifdef MADV_HUGEPAGE
+	/* THP hint: fewer page-table entries on the sequential load and on later reads */
+	madvise(base, (size_t)sb.st_size, MADV_HUGEPAGE);
+#endif
+
 	rd_t r = { base, (const uint8_t *)base + sb.st_size, 0 };
 	json_object *root = json_object_new_object(), *meta = json_object_new_object();
 	uint64_t alignment = 32, ntens = 0, nkv = 0;

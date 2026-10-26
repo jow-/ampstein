@@ -10906,6 +10906,10 @@ gather_map(int fd, size_t *len)
 		return NULL;
 
 	madvise(p, (size_t)sb.st_size, MADV_RANDOM);
+#ifdef MADV_HUGEPAGE
+	/* random row gathers still benefit from fewer TLB entries */
+	madvise(p, (size_t)sb.st_size, MADV_HUGEPAGE);
+#endif
 	maps[fd] = std::make_pair(p, (size_t)sb.st_size);
 	*len = (size_t)sb.st_size;
 
@@ -11057,6 +11061,7 @@ stfile_free_method(uc_vm_t *vm, size_t nargs)
 static uc_value_t *torch_st_gather(uc_vm_t *vm, size_t nargs);
 static uc_value_t *torch_st_gather_async(uc_vm_t *vm, size_t nargs);
 static uc_value_t *torch_st_prefetch(uc_vm_t *vm, size_t nargs);
+static uc_value_t *torch_st_drop_cache(uc_vm_t *vm, size_t nargs);
 
 static const uc_function_list_t stfile_methods[] = {
 	{ "list",	torch_st_list },
@@ -11065,6 +11070,7 @@ static const uc_function_list_t stfile_methods[] = {
 	{ "gather",	torch_st_gather },
 	{ "gather_async",	torch_st_gather_async },
 	{ "prefetch",	torch_st_prefetch },
+	{ "drop_cache",	torch_st_drop_cache },
 	{ "tensor",	torch_st_tensor },
 	{ "free",	stfile_free_method },
 };
@@ -11796,6 +11802,32 @@ torch_st_prefetch(uc_vm_t *vm, size_t nargs)
 				posix_fadvise(fd, base + (off_t)((size_t)row * (size_t)row_bytes), (off_t)row_bytes,
 					POSIX_FADV_WILLNEED);
 	}).detach();
+
+	return NULL;
+}
+
+/*
+ * stfile.drop_cache(): null
+ *
+ * Drop the file's clean page cache and mapped pages after loading. The pair
+ * matters: fadvise alone does not release mapped pages, madvise alone leaves
+ * unmapped clean pages on the LRU. Do not call this on a table that is still
+ * streamed row by row.
+ */
+static uc_value_t *
+torch_st_drop_cache(uc_vm_t *vm, size_t nargs)
+{
+	st_file_t *f = stfile_this(vm);
+
+	if (!f)
+		return NULL;
+
+	if (nargs != 0) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "drop_cache: no arguments");
+		return NULL;
+	}
+
+	st_drop_cache(f);
 
 	return NULL;
 }

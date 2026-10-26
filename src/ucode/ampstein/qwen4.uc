@@ -35,6 +35,10 @@ const MTP_TAP = (getenv('AMP_QWEN4_MTP_TAP') != '0');     // MTP input: per-stre
 function expert_resident_fraction(layer) {
 	let v = (layer == null) ? getenv('AMP_QWEN4_MTP_EXPERT_RESIDENT') : getenv('AMP_QWEN4_EXPERT_RESIDENT');
 
+	// the draft head defaults to the backbone's fraction
+	if (v == null && layer == null)
+		v = getenv('AMP_QWEN4_EXPERT_RESIDENT');
+
 	return (v == null) ? 1.0 : +v;
 }
 
@@ -1816,6 +1820,20 @@ export function load(model_dir, opts) {
 				cache.ple.ids[i] = this.cfg.eos_token_id;
 		}
 	};
+
+	// Optional: after loading, drop the model files' page cache (a third copy
+	// of bytes already in VRAM/host RAM). Keep the PLE table's file: it is still
+	// streamed row by row.
+	if (getenv('AMP_QWEN4_DROP_FILE_CACHE') == '1' && ws.gguf) {
+		let ple_file = ws.file('ple_table.weight');
+
+		for (let key in ws.list()) {
+			let f = ws.file(key);
+
+			if (f !== ple_file)
+				f.drop_cache();
+		}
+	}
 
 	return model;
 }
