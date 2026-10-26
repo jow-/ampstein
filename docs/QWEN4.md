@@ -190,13 +190,22 @@ The GGUF loader uses the same `qwen4` layer split (no TP). `qwen4_tp` is not ada
   62.6-80.1% for a uniform prefix. Across all 512 experts, the per-layer max/min count ratio was ~5.4x; all
   experts were used, but not equally.
 
-Measured on j7 (2x RTX 3090, both PCIe x8), IQ3_XXS, Q8 KV, F = 0.70, chunk 4096, 256k context:
+Measured on j7 (2x RTX 3090, both PCIe x8), IQ3_XXS, Q8 KV, 256k context. The chunk/resident split is a
+PP-vs-TG tradeoff:
 
-| Workload | Time | Rate |
+| Setting | PP 220k tokens | TG 20 tokens |
 |---|---:|---:|
-| PP 262k tokens | ~241-246 s | ~1.06-1.09k tok/s |
-| TG 20 tokens at ~262k, generic profile + pointer tables | ~0.835 s | ~24 tok/s |
-| TG 20 tokens at ~262k, Pi-session profile + pointer tables | ~0.616 s | ~32.5 tok/s |
+| F = 0.70, chunk 4096 | ~1196 tok/s | ~24 tok/s |
+| F = 0.66, chunk 8192 | ~1365 tok/s | ~22.1 tok/s |
+| F = 0.65, chunk 8192 | ~1371 tok/s | ~21.7 tok/s |
+| F = 0.70, chunk 4096, generic profile + pointer tables | ~1.06-1.09k tok/s (262k) | ~24 tok/s |
+| F = 0.70, chunk 4096, Pi-session profile + pointer tables | ~1.06-1.09k tok/s (262k) | ~32.5 tok/s |
+
+F = 0.67 with chunk 8192 OOMs during warm-up: the per-chunk stream buffer is `(S, 4, 2560)` fp32, i.e. 320 MiB
+at S = 8192, and the GPU margin is smaller. Splitting the attention into query slabs does not fix this (the
+streams dominate) and changes the GEMM reduction order, so it is not used.
+
+For PP-heavy agent prompts, use `F = 0.66 --chunk 8192`; for TG-heavy workloads, use `F = 0.70 --chunk 4096`.
 
 With a routing-frequency profile the cold-hit fraction is ~0.4% on the generic profile and ~0.1-5.8% per
 layer on the Pi-session profile, versus ~30% for a uniform prefix. The pointer-table decode path removes the
