@@ -23,7 +23,7 @@ assert(join(',', m['test.arr_i']) == '1,2,3' && join('|', m['test.arr_s']) == 'a
 
 let names = sort(f.list());
 
-assert(join(',', names) == 'iq1_m,iq1_s,iq2_xs,iq2_xxs,iq4_nl,plain_bf16,plain_f32,plain_i32,q5_k,q8_0,stack', `inventory ${names}`);
+assert(join(',', names) == 'iq1_m,iq1_s,iq2_s,iq2_xs,iq2_xxs,iq3_s,iq3_xxs,iq4_nl,iq4_xs,plain_bf16,plain_f32,plain_i32,q2_0,q3_k,q4_0,q4_k,q5_k,q6_k,q8_0,stack', `inventory ${names}`);
 
 // shape (row-major), logical dtype, byte count
 function check_info(n, dtype, shape, nbytes) {
@@ -41,6 +41,15 @@ check_info('iq2_xxs', 'IQ2_XXS', '24x768', 24 * 3 * 66);
 check_info('iq2_xs', 'IQ2_XS', '24x768', 24 * 3 * 74);
 check_info('iq1_m', 'IQ1_M', '24x768', 24 * 3 * 56);
 check_info('iq1_s', 'IQ1_S', '24x768', 24 * 3 * 50);
+check_info('q2_0', 'Q2_0', '24x768', 24 * 12 * 18);
+check_info('q4_0', 'Q4_0', '24x768', 24 * 24 * 18);
+check_info('q4_k', 'Q4_K', '24x768', 24 * 3 * 144);
+check_info('q3_k', 'Q3_K', '24x768', 24 * 3 * 110);
+check_info('q6_k', 'Q6_K', '24x768', 24 * 3 * 210);
+check_info('iq2_s', 'IQ2_S', '24x768', 24 * 3 * 82);
+check_info('iq3_xxs', 'IQ3_XXS', '24x768', 24 * 3 * 98);
+check_info('iq3_s', 'IQ3_S', '24x768', 24 * 3 * 110);
+check_info('iq4_xs', 'IQ4_XS', '24x768', 24 * 3 * 136);
 check_info('stack', 'IQ2_XXS', '5x6x512', 5 * 6 * 2 * 66);
 check_info('plain_f32', 'F32', '3x8', 96);
 check_info('plain_bf16', 'BF16', '4x6', 48);

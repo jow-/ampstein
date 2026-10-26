@@ -22,6 +22,7 @@ import * as models from './models.uc';
 import * as weights from './weights.uc';
 import * as qwen35 from './qwen35.uc';
 import * as glm5 from './glm5.uc';
+import * as ggufq from './ggufq.uc';
 import * as math from 'math';
 import {readfile} from 'fs';
 
@@ -29,6 +30,13 @@ export const LP = 'model.language_model.layers.';
 const NO_FUSED_MIX = (getenv('AMP_QWEN4_NO_FUSED_MIX') == '1');
 const QSA_REF = (getenv('AMP_QWEN4_QSA_REF') == '1');       // composite sparse attention instead of the kernel
 const MTP_TAP = (getenv('AMP_QWEN4_MTP_TAP') != '0');     // MTP input: per-stream (reference default) or averaged
+
+/* fraction of the routed experts kept in VRAM; the rest stay pinned on the host (GGUF only) */
+function expert_resident_fraction(layer) {
+	let v = (layer == null) ? getenv('AMP_QWEN4_MTP_EXPERT_RESIDENT') : getenv('AMP_QWEN4_EXPERT_RESIDENT');
+
+	return (v == null) ? 1.0 : +v;
+}
 
 /* ------------------------------------------------------------------ */
 /* config                                                              */
@@ -71,8 +79,13 @@ export function load_config(model_dir) {
  * projection (post gates); the final mixer has none. */
 export function build_gr(ws, cfg, key, dev, inject) {
 	let H = cfg.hc_mult, D = cfg.hidden_size;
-	let w = ws.gpu(key + '.hc_norm.weight', dev).to('float32').add(1.0)
-		.view([H, D]).contiguous();
+	let w = ws.gpu(key + '.hc_norm.weight', dev).to('float32');
+
+	// the GGUF conversion stores the hc norm already with the +1 constant
+	if (!ws.gguf)
+		w = w.add(1.0);
+
+	w = w.view([H, D]).contiguous();
 	let down = ws.gpu16(key + '.input_mix_weight_down.weight', dev);   // (rank, H*D)
 	let up = ws.gpu16(key + '.input_mix_weight_up.weight', dev);       // (H*D, rank)
 	let proj = inject ?
@@ -126,9 +139,39 @@ export function gr_mix(cfg, G, streams) {
  * the SSD): a forward gathers only the unique rows its tokens hash to. */
 export function build_ple(ws, cfg, idx, dev) {
 	let key = `${LP}${idx}.ple`;
+	let H = cfg.hc_mult, D = cfg.hidden_size;
+
+	if (ws.gguf) {
+		let tk = 'ple_table.weight';
+		let raw = ws.tensor(tk);
+		let meta = ws.meta;
+
+		return {
+			dev: dev, idx: idx,
+			key_w: ws.gpu16(key + '.key_proj.weight', dev).t().contiguous(),     // (E, H*D)
+			value_w: ws.gpu16(key + '.value_proj.weight', dev).t().contiguous(), // (E, D)
+			norm_key: ws.gpu(key + '.norm_key.weight', dev).to('float32').sub(1.0).to('bfloat16'),
+			norm_query: ws.gpu(key + '.norm_query.weight', dev).to('float32').sub(1.0).to('bfloat16'),
+			norm_conv: ws.gpu(key + '.norm_conv.weight', dev).to('float32').sub(1.0).to('bfloat16'),
+			conv_w: ws.gpu(key + '.conv1d.weight', dev).contiguous().view([H * D, 1, cfg.ple_kernel]),
+			state_len: (cfg.ple_kernel - 1) * cfg.ngram_size,
+			trellis: raw,
+			file: ws.file(tk),
+			wname: ws.gguf_name(tk),
+			total_rows: null,
+			K: 0,
+			words: raw.shape()[1],
+			offsets: torch.from_array(meta['qwen4exp.ple.head_offsets'], 'int64'),
+			sizes: torch.from_array(meta['qwen4exp.ple.head_vocab_sizes'], 'int64'),
+			mult: torch.from_array(meta['qwen4exp.ple.layer_multipliers'], 'int64'),
+			bias: null,
+			heads: (cfg.ngram_size - 1) * cfg.heads_per_ngram,
+			gguf: true
+		};
+	}
+
 	let tab = weights.open(cfg.model_dir, 'ngram_embedding.safetensors');
 	let tk = `${key}.ple_embedding.ngram_embedding`;
-	let H = cfg.hc_mult, D = cfg.hidden_size;
 	// the n-gram table is one tensor (4 / 6 bpw checkpoints) or consecutive equal shards (ng4: 128 x (2.5 M, 41)),
 	// which lie back to back in the file: gathers address them as one table
 	let sharded = !tab.has(tk + '.trellis');
@@ -199,7 +242,7 @@ export function ple_start(cfg, P, ctx_ids, token_ids) {
 	let U = torch.ngram_hash(hist_t, S, P.mult, P.offsets, P.sizes,
 		cfg.heads_per_ngram, cfg.eos_token_id, uids, inverse, heads);
 	let u = uids.narrow(0, 0, U).contiguous();
-	let packed = torch.empty([U, P.words], 'int16');
+	let packed = torch.empty([U, P.words], P.gguf ? 'uint8' : 'int16');
 
 	return {S: S, U: U, inverse: inverse, heads: heads, packed: packed,
 		ticket: P.total_rows ? P.file.gather_async(P.wname, u, packed, P.total_rows) : P.file.gather_async(P.wname, u, packed),
@@ -213,6 +256,13 @@ export function ple_finish(cfg, P, job) {
 
 	// non-blocking copies: the host never waits for the device, so the stages keep flowing
 	let packed = job.packed.cuda(P.dev, true);
+
+	if (P.gguf) {
+		let rows = torch.gguf_dequant(packed, 'IQ4_NL', 'float16');
+
+		return rows.index(job.inverse.cuda(P.dev, true)).view([1, job.S, P.heads * 160]);
+	}
+
 	let rows = torch.empty([job.U, 160], 'float16', dv);
 
 	torch.ngram_dequant(packed, P.K, job.heads.narrow(0, 0, job.U).cuda(P.dev, true), P.bias, rows);
@@ -335,7 +385,15 @@ export function gdn_forward(cfg, L, x, cl) {
 	let o = torch.kda_out_norm(core, z.view([S, cfg.ln_v_dim]).to('float32').contiguous(), L.norm_w32,
 		cfg.rms_norm_eps);
 
-	return L.out_proj.forward(o.view([1, S, cfg.ln_v_dim]));
+	let ov = o.view([1, S, cfg.ln_v_dim]);
+
+	if (L.out_group) {
+		let hd = cfg.ln_v_dim / cfg.ln_num_v_heads;
+
+		ov = ov.view([1, S, 16, 3, hd]).transpose(2, 3).contiguous().view([1, S, cfg.ln_v_dim]);
+	}
+
+	return L.out_proj.forward(ov);
 }
 
 /* ------------------------------------------------------------------ */
@@ -763,7 +821,101 @@ export function attn_forward_dev(cfg, L, x, cl, st) {
 /* ------------------------------------------------------------------ */
 /* layers                                                              */
 
-function build_moe(ws, cfg, key, dev) {
+function build_moe(ws, cfg, key, dev, layer) {
+	if (ws.gguf) {
+		let E = cfg.n_routed_experts;
+		let f = expert_resident_fraction(layer);
+		let R = (f >= 1.0) ? E : max(1, min(E, int(E * f)));
+		let ids = [], cold_ids = [], prof = null;
+		let prof_path = getenv('AMP_QWEN4_EXPERT_PROFILE');
+
+		if (prof_path && R < E && layer != null) {
+			prof = json(readfile(prof_path));
+			let p = prof[layer];
+
+			if (p && length(p)) {
+				ids = slice(p, 0, min(R, length(p)));
+
+				let in_res = {};
+				for (let e in ids)
+					in_res[e] = true;
+
+				// pad to R if the profile covers fewer experts than the resident budget
+				for (let e = 0; e < E && length(ids) < R; e++)
+					if (!in_res[e]) {
+						push(ids, e);
+						in_res[e] = true;
+					}
+
+				for (let e = 0; e < E; e++)
+					if (!in_res[e])
+						push(cold_ids, e);
+			}
+		}
+
+		if (!length(ids)) {
+			for (let e = 0; e < R; e++)
+				push(ids, e);
+
+			for (let e = R; e < E; e++)
+				push(cold_ids, e);
+		}
+
+		let res_of = [], cold_of = [];
+
+		for (let e = 0; e < E; e++) {
+			res_of[e] = -1;
+			cold_of[e] = -1;
+		}
+
+		for (let s = 0; s < length(ids); s++)
+			res_of[ids[s]] = s;
+
+		for (let s = 0; s < length(cold_ids); s++)
+			cold_of[cold_ids[s]] = s;
+
+		let gq = ggufq.experts_pick(ws, key, dev, ids);
+		let gq_cold = length(cold_ids) ? ggufq.experts_host_mapped(ws, key, cold_ids, dev) : null;
+
+		let pt1 = [], pt3 = [], pt2 = [];
+		let rb1 = gq.w1.shape()[2], rb3 = gq.w3.shape()[2], rb2 = gq.w2.shape()[2];
+		let n1 = gq.w1.shape()[1], n3 = gq.w3.shape()[1], n2 = gq.w2.shape()[1];
+
+		for (let e = 0; e < E; e++) {
+			let rs = res_of[e], cs = cold_of[e];
+			let src = (rs >= 0) ? gq : gq_cold;
+			let slot = (rs >= 0) ? rs : cs;
+
+			push(pt1, src.w1.data_ptr() + slot * n1 * rb1);
+			push(pt3, src.w3.data_ptr() + slot * n3 * rb3);
+			push(pt2, src.w2.data_ptr() + slot * n2 * rb2);
+		}
+
+		// device-side row mapping for the pointer-table decode path (T <= 8): slot s reads x row s / Kt.
+		// Precomputed so a CUDA graph capture does not stage a host array through pinned memory.
+		let slots = [];
+
+		for (let s = 0; s < 8 * cfg.num_experts_per_tok; s++)
+			push(slots, int(s / cfg.num_experts_per_tok));
+
+		return {
+			type: 'moe', dev: dev, router: 'softmax', layer: layer,
+			gq: gq, gq_cold: gq_cold,
+			pt1: torch.from_array(pt1, 'int64', 'cuda:' + dev),
+			pt3: torch.from_array(pt3, 'int64', 'cuda:' + dev),
+			pt2: torch.from_array(pt2, 'int64', 'cuda:' + dev),
+			slot_rows: torch.from_array(slots, 'int64', 'cuda:' + dev),
+			res_of: res_of, cold_of: cold_of, n_experts_total: E,
+			gate_t: ws.gpu(key + '.gate.weight', dev).to('float32').t().contiguous(),
+			shared: ggufq.mlp(ws, key + '.shared_expert', dev),
+			shared_gate: ws.gpu(key + '.shared_expert_gate.weight', dev).to('float32')
+				.t().contiguous(),
+			gq_forward: function (cfg, M, y) {
+				return ggufq.moe_forward(cfg, M, y, {route: glm5.moe_route, act: glm5.act_mul, mlp: glm5.mlp_forward, side: glm5.par_side, join: glm5.par_join});
+			}
+		};
+	}
+
 	let experts = [];
 
 	for (let e = 0; e < cfg.n_routed_experts; e++)
@@ -780,50 +932,161 @@ function build_moe(ws, cfg, key, dev) {
 
 /* The GDN / full-attention weights of a layer (no hyper-connection sites, no MoE),
  * all on `dev`. Shared by the layer-split loader and the tensor-parallel one. */
+/* GGUF qwen4exp stores the linear-attention value heads group-major: (3 groups, 16 heads), while the HF / EXL3
+ * layout is head-major (16 heads, 3 groups). The q/k part is unchanged. These helpers put the GGUF tensors into
+ * the HF order the kernels expect. */
+function perm_all_value_rows(t) {
+	let rb = t.shape()[1];
+
+	return t.view([3, 16, 128, rb]).transpose(0, 1).contiguous().view([6144, rb]);
+}
+
+function perm_value_rows(t) {
+	let rb = t.shape()[1];
+	let qk = t.narrow(0, 0, 4096);
+	let v = perm_all_value_rows(t.narrow(0, 4096, 6144));
+
+	return torch.cat([ qk, v ], 0);
+}
+
+function perm_heads_rows(t) {
+	return t.view([3, 16, t.shape()[1]]).transpose(0, 1).contiguous().view([48, t.shape()[1]]);
+}
+
+function perm_heads_vec(t) {
+	return t.view([3, 16]).t().contiguous().view([48]);
+}
+
+/* a plain linear over an fp16 tensor (same forward as models.LinearFP16) */
+function tensor_linear(w) {
+	return {
+		weight: w, bias: null, in_features: w.shape()[1], out_features: w.shape()[0],
+
+		forward: function (x) {
+			let s = x.shape();
+			let flat = (length(s) == 2) ? x : x.view([-1, this.in_features]);
+			let y = torch.matmul(flat, this.weight.t());
+
+			return (length(s) == 2) ? y : y.view([s[0], s[1], this.out_features]);
+		}
+	};
+}
+
 export function build_sublayer_at(ws, cfg, key, type, dev) {
 	let L = {type: type, dev: dev};
 
+	let lin = function (ws, key, seq, dev, perm) {
+		if (!ws.gguf)
+			return models.linear(ws, key, seq, dev);
+
+		let qt = ws.qtype(key + '.weight');
+
+		if (qt) {
+			let raw = ws.gpu(key + '.weight', dev);
+
+			if (perm) {
+				let p = perm(raw);
+
+				ws.drop(key + '.weight', dev);
+				raw = p;
+			}
+
+			return ggufq.linear_from(raw, qt, dev);
+		}
+
+		let w = ws.gpu16(key + '.weight', dev);
+
+		if (perm) {
+			let p = perm(w);
+
+			ws.drop(key + '.weight', dev);
+			w = p;
+		}
+
+		return tensor_linear(w);
+	};
+
 	if (L.type == 'linear_attention') {
 		let k = key + '.linear_attn';
+		let g = ws.gguf;
 
-		L.in_proj_qkv = models.linear(ws, k + '.in_proj_qkv', true, dev);
-		L.in_proj_z = models.linear(ws, k + '.in_proj_z', true, dev);
-		L.in_proj_b = models.linear(ws, k + '.in_proj_b', true, dev);
-		L.in_proj_a = models.linear(ws, k + '.in_proj_a', true, dev);
-		L.out_proj = models.linear(ws, k + '.out_proj', true, dev);
+		L.in_proj_qkv = lin(ws, k + '.in_proj_qkv', true, dev, g ? perm_value_rows : null);
+		L.in_proj_z = lin(ws, k + '.in_proj_z', true, dev, g ? perm_all_value_rows : null);
+		L.in_proj_b = lin(ws, k + '.in_proj_b', true, dev, g ? perm_heads_rows : null);
+		L.in_proj_a = lin(ws, k + '.in_proj_a', true, dev, g ? perm_heads_rows : null);
+		L.out_proj = lin(ws, k + '.out_proj', true, dev);
+		L.out_group = g;        // out_proj's input columns are group-major in the GGUF
 		L.dt_bias = ws.gpu(k + '.dt_bias', dev).to('float32');
-		L.neg_exp_a_log = ws.gpu(k + '.A_log', dev).to('float32').exp().neg();
+		L.neg_exp_a_log = ws.gpu(k + '.A_log', dev).to('float32');
+
+		if (g) {
+			L.dt_bias = perm_heads_vec(L.dt_bias);
+			L.neg_exp_a_log = perm_heads_vec(L.neg_exp_a_log);   // ssm_a is already -exp(A_log)
+		} else {
+			L.neg_exp_a_log = L.neg_exp_a_log.exp().neg();
+		}
+
 		L.conv_w = ws.gpu(k + '.conv1d.weight', dev).squeeze(1).to('float16');
+
+		if (g)
+			L.conv_w = perm_value_rows(L.conv_w);
+
 		L.norm_w32 = ws.gpu(k + '.norm.weight', dev).to('float32').contiguous();
 	} else {
 		let k = key + '.self_attn';
 
-		L.q_proj = models.linear(ws, k + '.q_proj', true, dev);
-		L.k_proj = models.linear(ws, k + '.k_proj', true, dev);
-		L.v_proj = models.linear(ws, k + '.v_proj', true, dev);
-		L.o_proj = models.linear(ws, k + '.o_proj', true, dev);
-		L.q_norm_w = ws.gpu(k + '.q_norm.weight', dev).to('float16').add(1.0);
-		L.k_norm_w = ws.gpu(k + '.k_norm.weight', dev).to('float16').add(1.0);
-		L.idx_qk = models.linear(ws, k + '.indexer.index_qk_proj', true, dev);
-		L.idx_qn = ws.gpu(k + '.indexer.q_layernorm.weight', dev).to('float16').add(1.0);
-		L.idx_kn = ws.gpu(k + '.indexer.k_layernorm.weight', dev).to('float16').add(1.0);
+		L.q_proj = lin(ws, k + '.q_proj', true, dev);
+		L.k_proj = lin(ws, k + '.k_proj', true, dev);
+		L.v_proj = lin(ws, k + '.v_proj', true, dev);
+		L.o_proj = lin(ws, k + '.o_proj', true, dev);
+		L.q_norm_w = ws.gpu(k + '.q_norm.weight', dev).to('float16');
+		L.k_norm_w = ws.gpu(k + '.k_norm.weight', dev).to('float16');
+
+		if (!ws.gguf) {
+			L.q_norm_w = L.q_norm_w.add(1.0);
+			L.k_norm_w = L.k_norm_w.add(1.0);
+		}
+
+		if (ws.gguf) {
+			L.idx_q = lin(ws, k + '.indexer.q_proj', true, dev);
+			L.idx_k = lin(ws, k + '.indexer.k_proj', true, dev);
+			L.idx_qn = ws.gpu(k + '.indexer.q_norm.weight', dev).to('float16');
+			L.idx_kn = ws.gpu(k + '.indexer.k_norm.weight', dev).to('float16');
+
+			if (!ws.gguf) {
+				L.idx_qn = L.idx_qn.add(1.0);
+				L.idx_kn = L.idx_kn.add(1.0);
+			}
+			L.idx_qk = {
+				forward: function (x) {
+					return torch.cat([ L.idx_q.forward(x), L.idx_k.forward(x) ], -1);
+				}
+			};
+		} else {
+			L.idx_qk = models.linear(ws, k + '.indexer.index_qk_proj', true, dev);
+			L.idx_qn = ws.gpu(k + '.indexer.q_layernorm.weight', dev).to('float16').add(1.0);
+			L.idx_kn = ws.gpu(k + '.indexer.k_layernorm.weight', dev).to('float16').add(1.0);
+		}
 	}
 
 	return L;
 }
 
-export function build_layer_at(ws, cfg, key, type, dev) {
+export function build_layer_at(ws, cfg, key, type, dev, layer) {
 	let L = build_sublayer_at(ws, cfg, key, type, dev);
 
 	L.attn_hc = build_gr(ws, cfg, key + '.attn_hyper_connection', dev, true);
 	L.mlp_hc = build_gr(ws, cfg, key + '.mlp_hyper_connection', dev, true);
-	L.moe = build_moe(ws, cfg, key + '.mlp', dev);
+	L.moe = build_moe(ws, cfg, key + '.mlp', dev, layer);
 
 	return L;
 }
 
 export function build_layer(ws, cfg, i, dev) {
-	return build_layer_at(ws, cfg, LP + i, cfg.layer_types[i], dev);
+	let L = build_layer_at(ws, cfg, LP + i, cfg.layer_types[i], dev, i);
+	L.moe.layer = i;
+
+	return L;
 }
 
 /* Phase A of a layer on streams (S, 4, D) fp32 (updated in place): the
@@ -1078,13 +1341,24 @@ function build_graphs(model, cache, sizes) {
 export function build_mtp(ws, ws_patch, cfg, dev) {
 	let H = cfg.hc_mult, D = cfg.hidden_size;
 
+	if (ws.gguf) {
+		return {
+			dev: dev,
+			norm_h: ws.gpu('mtp.pre_fc_norm_hidden.weight', dev).to('float32').view([H, D]).contiguous(),
+			norm_e: ws.gpu('mtp.pre_fc_norm_embedding.weight', dev).to('float16'),
+			eh_proj: ggufq.linear(ws, 'mtp.eh_proj', dev),
+			layer: build_layer_at(ws, cfg, 'mtp.layers.0', 'full_attention', dev, null),
+			mixer: build_gr(ws, cfg, 'mtp.hyper_connection_mixer', dev, false)
+		};
+	}
+
 	return {
 		dev: dev,
 		norm_h: ws.gpu('mtp.pre_fc_norm_hidden.weight', dev).to('float32').add(1.0).view([H, D]).contiguous(),
 		norm_e: ws.gpu('mtp.pre_fc_norm_embedding.weight', dev).to('float16').add(1.0),
 		fc_hidden: models.linear(ws, 'mtp.fc_hidden', true, dev),
 		fc_embedding: models.linear(ws, 'mtp.fc_embedding', true, dev),
-		layer: build_layer_at(ws, cfg, 'mtp.layers.0', 'full_attention', dev),
+		layer: build_layer_at(ws, cfg, 'mtp.layers.0', 'full_attention', dev, null),
 		mixer: build_gr(ws_patch, cfg, 'mtp.hyper_connection_mixer', dev, false)
 	};
 }
@@ -1114,12 +1388,23 @@ export function new_mtp_cache(cfg, max_seq, dev) {
 export function mtp_input(cfg, M, emb, S, stack) {
 	let H = cfg.hc_mult, D = cfg.hidden_size;
 	let eps = cfg.rms_norm_eps;
-	let e = M.fc_embedding.forward(qwen35.rmsnorm_bias1(emb, M.norm_e, eps));          // (1, S, D)
 
 	stack = stack.cuda(M.dev);
 
 	let ms = stack.mul(stack).mean(-1, true).add(eps).rsqrt();
 	let normed = stack.mul(ms).mul(M.norm_h).to('float16');                       // (S, H, D)
+
+	if (M.eh_proj) {
+		// GGUF MTP fuses the embedding and hidden projections into one 2D -> D linear per stream
+		let e = qwen35.rmsnorm_bias1(emb, M.norm_e, eps);                       // (1, S, D)
+		let ee = e.view([S, 1, D]).expand([S, H, D]);                          // (S, H, D)
+		let inp = torch.cat([ ee, normed ], -1);                               // (S, H, 2D)
+		let h = M.eh_proj.forward(inp.view([1, S * H, 2 * D])).view([S, H, D]);
+
+		return h.to('float32').contiguous();
+	}
+
+	let e = M.fc_embedding.forward(qwen35.rmsnorm_bias1(emb, M.norm_e, eps));          // (1, S, D)
 	let h = M.fc_hidden.forward(normed.view([1, S * H, D])).view([S, H, D]);
 
 	if (MTP_TAP)
@@ -1171,6 +1456,9 @@ export function load(model_dir, opts) {
 			let rest = substr(key, length(LP));
 			let idx = +substr(rest, 0, index(rest, '.'));
 
+			if (expert_resident_fraction() < 1.0 && index(rest, '.mlp.exps.') >= 0)
+				return null;
+
 			return (idx >= 0 && idx < nl) ? devs[idx] : null;
 		}
 
@@ -1185,16 +1473,27 @@ export function load(model_dir, opts) {
 	});
 
 	let embed_tokens = ws.gpu16('model.language_model.embed_tokens.weight', first_dev);
+	ws.release('model.language_model.embed_tokens.weight', first_dev);
 	let layers = [], ples = {};
 	let mtp = null;
 
-	// the MTP head is opt-in (opts.mtp = true): the engine's draft machinery is not
-	// wired to it (docs/QWEN4.md), so a loaded head would only enable a broken path
-	if (!partial && opts.mtp == true && ws.has('mtp.fc_hidden.trellis')) {
+	// the MTP head is opt-in (opts.mtp = true). EXL3 packs carry it in the main
+	// checkpoint or a mixer patch; GGUF packs carry it in a separate mtp-*.gguf
+	// shard (blk.48.nextn.*), mapped to the mtp.* keys by ggufw.
+	if (!partial && opts.mtp == true && (ws.has('mtp.fc_hidden.trellis') || ws.has('mtp.eh_proj.weight'))) {
 		let in_main = ws.has('mtp.hyper_connection_mixer.hc_norm.weight');
 		let pw = in_main ? ws : weights.open(model_dir, 'mtp_hyper_connection_mixer_patch.safetensors');
 
-		ws.upload((key) => index(key, 'mtp.') == 0 ? last_dev : null);
+		ws.upload(function (key) {
+			if (index(key, 'mtp.') != 0)
+				return null;
+
+			// the MTP experts are placed by build_moe (resident subset + mapped host cold)
+			if (expert_resident_fraction(null) < 1.0 && index(key, '.mlp.exps.') >= 0)
+				return null;
+
+			return last_dev;
+		});
 
 		if (!in_main)
 			pw.upload((key) => last_dev);
@@ -1215,7 +1514,7 @@ export function load(model_dir, opts) {
 		embed_tokens: embed_tokens,
 		mixer: partial ? null :
 			build_gr(ws, cfg, 'model.language_model.hyper_connection_mixer', last_dev, false),
-		lm_head: partial ? null : models.LinearEXL3Seq(ws, 'lm_head', last_dev),
+		lm_head: partial ? null : ((ws.gguf && ws.qtype('lm_head.weight')) ? ggufq.linear(ws, 'lm_head', last_dev) : models.linear(ws, 'lm_head', true, last_dev)),
 
 		new_cache: function (max_seq) {
 			let cfg = this.cfg;

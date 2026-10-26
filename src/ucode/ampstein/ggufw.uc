@@ -40,7 +40,89 @@ const BLK = {
 
 const TOP = {'token_embd.weight': 'embed.weight', 'output.weight': 'head.weight', 'output_norm.weight': 'norm.weight'};
 
-function hf_name(g) {
+/* Qwen3.8-Flash-Next (qwen4exp): blk.N.<gguf name> -> layers.N.<hf name> */
+const Q4BLK = {
+	'attn_qkv.weight': 'linear_attn.in_proj_qkv.weight',
+	'attn_gate.weight': 'linear_attn.in_proj_z.weight',
+	'ssm_out.weight': 'linear_attn.out_proj.weight',
+	'ssm_beta.weight': 'linear_attn.in_proj_b.weight',
+	'ssm_alpha.weight': 'linear_attn.in_proj_a.weight',
+	'ssm_dt.bias': 'linear_attn.dt_bias',
+	'ssm_a': 'linear_attn.A_log',
+	'ssm_conv1d.weight': 'linear_attn.conv1d.weight',
+	'ssm_norm.weight': 'linear_attn.norm.weight',
+	'attn_q.weight': 'self_attn.q_proj.weight', 'attn_k.weight': 'self_attn.k_proj.weight',
+	'attn_v.weight': 'self_attn.v_proj.weight', 'attn_output.weight': 'self_attn.o_proj.weight',
+	'attn_q_norm.weight': 'self_attn.q_norm.weight', 'attn_k_norm.weight': 'self_attn.k_norm.weight',
+	'indexer.q_proj.weight': 'self_attn.indexer.q_proj.weight',
+	'indexer.k_proj.weight': 'self_attn.indexer.k_proj.weight',
+	'indexer.q_norm.weight': 'self_attn.indexer.q_norm.weight',
+	'indexer.k_norm.weight': 'self_attn.indexer.k_norm.weight',
+	'ffn_gate_inp.weight': 'mlp.gate.weight',
+	'ffn_gate_inp_shexp.weight': 'mlp.shared_expert_gate.weight',
+	'ffn_gate_exps.weight': 'mlp.exps.w1', 'ffn_up_exps.weight': 'mlp.exps.w3',
+	'ffn_down_exps.weight': 'mlp.exps.w2',
+	'ffn_gate_shexp.weight': 'mlp.shared_expert.w1.weight',
+	'ffn_up_shexp.weight': 'mlp.shared_expert.w3.weight',
+	'ffn_down_shexp.weight': 'mlp.shared_expert.w2.weight',
+	'hc_attn_down.weight': 'attn_hyper_connection.input_mix_weight_down.weight',
+	'hc_attn_up.weight': 'attn_hyper_connection.input_mix_weight_up.weight',
+	'hc_attn_inject.weight': 'attn_hyper_connection.block_inject_weight.weight',
+	'hc_attn_norm.weight': 'attn_hyper_connection.hc_norm.weight',
+	'hc_ffn_down.weight': 'mlp_hyper_connection.input_mix_weight_down.weight',
+	'hc_ffn_up.weight': 'mlp_hyper_connection.input_mix_weight_up.weight',
+	'hc_ffn_inject.weight': 'mlp_hyper_connection.block_inject_weight.weight',
+	'hc_ffn_norm.weight': 'mlp_hyper_connection.hc_norm.weight',
+	'ple_key.weight': 'ple.key_proj.weight', 'ple_value.weight': 'ple.value_proj.weight',
+	'ple_conv1d.weight': 'ple.conv1d.weight',
+	'ple_norm_conv.weight': 'ple.norm_conv.weight', 'ple_norm_key.weight': 'ple.norm_key.weight',
+	'ple_norm_query.weight': 'ple.norm_query.weight'
+};
+
+/* qwen4exp MTP block (blk.48.nextn.*) -> the engine's mtp.* keys */
+const Q4NEXT = {
+	'nextn.eh_proj.weight': 'mtp.eh_proj.weight',
+	'nextn.enorm.weight': 'mtp.pre_fc_norm_embedding.weight',
+	'nextn.hnorm.weight': 'mtp.pre_fc_norm_hidden.weight',
+	'nextn.hc_head_down.weight': 'mtp.hyper_connection_mixer.input_mix_weight_down.weight',
+	'nextn.hc_head_up.weight': 'mtp.hyper_connection_mixer.input_mix_weight_up.weight',
+	'nextn.hc_head_norm.weight': 'mtp.hyper_connection_mixer.hc_norm.weight'
+};
+
+const Q4TOP = {
+	'token_embd.weight': 'model.language_model.embed_tokens.weight',
+	'output.weight': 'lm_head.weight',
+	'per_layer_token_embd.weight': 'ple_table.weight',
+	'output_hc_down.weight': 'model.language_model.hyper_connection_mixer.input_mix_weight_down.weight',
+	'output_hc_up.weight': 'model.language_model.hyper_connection_mixer.input_mix_weight_up.weight',
+	'output_hc_norm.weight': 'model.language_model.hyper_connection_mixer.hc_norm.weight'
+};
+
+function hf_name(g, arch) {
+	if (arch == 'qwen4exp') {
+		if (Q4TOP[g])
+			return Q4TOP[g];
+
+		let m = match(g, /^blk\.([0-9]+)\.(.*)$/);
+
+		if (m) {
+			if (+m[1] == 48) {
+				if (Q4NEXT[m[2]])
+					return Q4NEXT[m[2]];
+
+				if (Q4BLK[m[2]])
+					return `mtp.layers.0.${Q4BLK[m[2]]}`;
+
+				return null;
+			}
+
+			if (Q4BLK[m[2]])
+				return `model.language_model.layers.${m[1]}.${Q4BLK[m[2]]}`;
+		}
+
+		return null;
+	}
+
 	if (TOP[g])
 		return TOP[g];
 
@@ -96,18 +178,18 @@ export function open(model_dir) {
 	let gmap = {};             // gguf name -> [stfile, gguf name] (the tensors that have no hf key: engram_* hash tables)
 	let keylist = [];
 	let gpu_raw = {}, gpu_cast = {};
-	let meta = null;
+	let meta = null, arch = null;
 
 	if (!length(fl[0]))
 		die(`ggufw: no .gguf files in ${model_dir}`);
 
 	function add(path, stf) {
 		for (let g in stf.list()) {
-			let k = hf_name(g);
+			let k = hf_name(g, arch);
 
 			gmap[g] = [ stf, g ];
 
-			if (k != null) {
+			if (k != null && !kmap[k]) {
 				kmap[k] = [ stf, g ];
 				push(keylist, k);
 			}
@@ -117,8 +199,10 @@ export function open(model_dir) {
 	for (let f in fl[0]) {
 		let stf = torch.gguf(model_dir + '/' + f);
 
-		if (meta == null)
+		if (meta == null) {
 			meta = json(stf.meta());
+			arch = meta['general.architecture'];
+		}
 
 		add(f, stf);
 	}

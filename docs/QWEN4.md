@@ -161,3 +161,77 @@ the kernels. Without the flag nothing changes. See `docs/EXPERT_STREAMING.md` (Q
 `--expert-swaps N` (with `--expert-resident`) lets the resident set follow the requests: up to N experts per decode step
 are exchanged with host memory (N = 4: +13-21% decode on 6.05 bpw). 6.05 bpw: `--expert-resident 0.24 --chunk 8192`.
 
+
+## GGUF (Qwen4exp, IQ3_XXS / IQ2_XS) on 2x RTX 3090
+
+The GGUF loader uses the same `qwen4` layer split (no TP). `qwen4_tp` is not adapted to GGUF. Key details:
+
+- GGUF linear-attention value heads are stored **group-major** (`i = g*16 + h`); the HF/EXL3 layout is
+  **head-major** (`j = h*3 + g`). `build_sublayer_at` reorders the value part of `in_proj_qkv`, all rows of
+  `in_proj_z`, the rows of `in_proj_b` / `in_proj_a`, the value channels of `conv1d`, and the input activation
+  of `out_proj` (the raw `out_proj` columns stay group-major). `A_log` / `ssm_dt.bias` are reordered as
+  `[3,16] -> [16,3]`; GGUF `ssm_a` is already `-exp(A_log)`, so it is reordered only.
+- The n-gram table (`per_layer_token_embd.weight`, IQ4_NL, ~28.8 GB) stays on disk; `ple_start` gathers the
+  unique rows and dequantizes them per chunk.
+- KV cache: `AMP_QWEN4_KV=q8` stores int8 codes plus fp16 scales, cutting the 256k full-attention KV from
+  ~3.1 GB to ~1.7 GB.
+- Expert placement: `AMP_QWEN4_EXPERT_RESIDENT=F` keeps `int(512*F)` routed experts in VRAM and the rest in
+  mapped pinned host memory (`torch.host_mapped`); decode reads cold rows over PCIe without staging copies.
+  `AMP_QWEN4_EXPERT_PROFILE=FILE` is a JSON object `{layer: [expert ids sorted by routing frequency]}`; the
+  resident set is the top `int(512*F)` ids, padded with unused ids if the profile is shorter.
+- Pointer tables: `build_moe` builds `pt1/pt2/pt3`, one int64 device pointer per global expert to the start of
+  its row in either the resident stack or the mapped cold stack. `torch.gguf_moe_gemv_pt` then runs one grouped
+  gemv per matrix for all decode slots, mixing resident and cold experts without a host-side split. The old i8
+  types (the Qwen4 GGUF experts are `IQ2_XS`) use the pointer-table i8 kernel; newer types use the fp16 kernel.
+- Routing bias is real: replaying three Pi coding sessions gave per-layer top-358 coverage 94.1-99.9%, versus
+  62.6-80.1% for a uniform prefix. Across all 512 experts, the per-layer max/min count ratio was ~5.4x; all
+  experts were used, but not equally.
+
+Measured on j7 (2x RTX 3090, both PCIe x8), IQ3_XXS, Q8 KV, F = 0.70, chunk 4096, 256k context:
+
+| Workload | Time | Rate |
+|---|---:|---:|
+| PP 262k tokens | ~241-246 s | ~1.06-1.09k tok/s |
+| TG 20 tokens at ~262k, generic profile + pointer tables | ~0.835 s | ~24 tok/s |
+| TG 20 tokens at ~262k, Pi-session profile + pointer tables | ~0.616 s | ~32.5 tok/s |
+
+With a routing-frequency profile the cold-hit fraction is ~0.4% on the generic profile and ~0.1-5.8% per
+layer on the Pi-session profile, versus ~30% for a uniform prefix. The pointer-table decode path removes the
+host `.tolist()` split and the per-token staging copies; it is now one grouped gemv per matrix for all slots.
+The remaining decode cost is launch overhead and the layer-split duty cycle: CUDA graphs / fused decode are
+the next step.
+
+### MTP from a separate GGUF
+
+The `ISTA-DASLab` GGUF shards have no MTP tensors; `ggml-org/Qwen3.8-Flash-Next-GGUF` publishes it as a separate
+file (`mtp-Qwen3.8-Flash-Next-Q4_0.gguf`, 2.2 GB; BF16 / Q8_0 variants exist). Symlink that file into the model
+directory next to the backbone shards. `ggufw` maps the file's `blk.48.*` tensors to the engine's
+`mtp.layers.0.*` keys and its `blk.48.nextn.*` tensors to `mtp.*`:
+
+| GGUF tensor | engine key |
+|---|---|
+| `blk.48.nextn.eh_proj.weight` | `mtp.eh_proj.weight` |
+| `blk.48.nextn.enorm.weight` / `hnorm.weight` | `mtp.pre_fc_norm_embedding.weight` / `mtp.pre_fc_norm_hidden.weight` |
+| `blk.48.nextn.hc_head_{down,up,norm}.weight` | `mtp.hyper_connection_mixer.*` |
+| `blk.48.{attn,ffn,hc_*}.weight` | `mtp.layers.0.*` |
+
+GGUF fuses the two EXL3 draft projections (`fc_hidden`, `fc_embedding`) into one `eh_proj` that takes
+`[rms(embed); rms(stream)]` per hyper-connection stream and returns one hidden vector per stream. `build_mtp`
+uses `ggufq.linear` for `eh_proj`, and `mtp_input` concatenates the broadcast embedding with the normalized
+stream stack before the projection. The GGUF `enorm` / `hnorm` already carry the `+1` RMS bias, unlike the
+EXL3 patch. The MTP layer's own MoE experts use the same resident/host split as the backbone.
+
+Q4_0 was added to the CUDA dequant/gemv kernels for this file (block 32, 18 bytes, low nibbles first 16 values,
+high nibbles next 16). With `--mtp 3` on IQ3_XXS, 8k context, F = 0.75, Q8 KV:
+
+| Request | Plain decode | MTP decode |
+|---|---:|---:|
+| 29 tokens | 25.0 tok/s | 29.1 tok/s (11 rounds, 73% accepted, 2.64 tok/round) |
+| 120 tokens | — | 23.9 tok/s (55 rounds, 50% accepted, 2.18 tok/round) |
+
+The draft head is opt-in (`--mtp`). Its own expert stack can use a different resident fraction:
+`AMP_QWEN4_MTP_EXPERT_RESIDENT` (default: 1.0, fully resident; independent of the backbone). At 256k the MTP KV/cache and draft block
+still cost ~0.4–0.5 GB of VRAM. With `AMP_QWEN4_EXPERT_RESIDENT=0.66`, `AMP_QWEN4_MTP_EXPERT_RESIDENT=0.0`,
+Q8 KV, chunk 4096, a 220k-token prompt gave PP 1196 tok/s and 20-token decode 19.9 tok/s (9 rounds, 56%
+accepted, 2.22 tok/round). Plain decode at the same context is faster (~24 tok/s at F = 0.70), so MTP is a
+win for short/medium contexts, not for 256k decode. At F = 0.70 with MTP the warm-up OOMs.

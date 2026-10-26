@@ -30,11 +30,15 @@ def make_blocks(t, nblocks):
     blk, size = GGML_QUANT_SIZES[t]
     raw = rng.integers(0, 256, (nblocks, size), dtype=np.uint8)
 
-    if t in (T.Q8_0, T.IQ4_NL, T.IQ2_XXS, T.IQ2_XS, T.IQ1_S):
+    if t in (T.Q4_0, T.Q8_0, T.IQ4_NL, T.IQ2_XXS, T.IQ2_XS, T.IQ1_S, T.Q2_0, T.IQ2_S, T.IQ3_XXS, T.IQ3_S, T.IQ4_XS):
         raw[:, 0:2] = f16_bytes(nblocks)
-    elif t == T.Q5_K:
+    elif t in (T.Q5_K, T.Q4_K):
         raw[:, 0:2] = f16_bytes(nblocks)
         raw[:, 2:4] = f16_bytes(nblocks)
+    elif t == T.Q3_K:
+        raw[:, 108:110] = f16_bytes(nblocks)
+    elif t == T.Q6_K:
+        raw[:, 208:210] = f16_bytes(nblocks)
     elif t == T.IQ1_M:
         # the f16 super scale is spread over the top nibbles of the four u16 scales (bytes 49, 51, 53, 55 of the block)
         su = rng.uniform(0.01, 0.5, nblocks).astype(np.float16).view(np.uint16).astype(np.uint32)
@@ -60,9 +64,10 @@ w.add_array('test.arr_s', ['a', 'bc', ''])
 w.add_array('test.arr_f', [0.5, 0.25])
 
 refs = {}
-for t in (T.Q8_0, T.IQ4_NL, T.Q5_K, T.IQ2_XXS, T.IQ2_XS, T.IQ1_M, T.IQ1_S):
+for t in (T.Q4_0, T.Q8_0, T.IQ4_NL, T.Q5_K, T.IQ2_XXS, T.IQ2_XS, T.IQ1_M, T.IQ1_S,
+          T.Q2_0, T.Q4_K, T.Q3_K, T.Q6_K, T.IQ2_S, T.IQ3_XXS, T.IQ3_S, T.IQ4_XS):
     blk, size = GGML_QUANT_SIZES[t]
-    cols = blk * (3 if blk == 256 else 24)
+    cols = 768
     rows = 24
     raw = make_blocks(t, rows * cols // blk).reshape(rows, cols // blk * size)
     ref = quants.dequantize(raw, t).astype(np.float32)

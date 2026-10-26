@@ -2452,6 +2452,63 @@ tensor_pin(uc_vm_t *vm, size_t nargs)
 }
 
 /*
+ * host_mapped(src, device?): torch.tensor
+ *
+ * Copies a contiguous CPU tensor into CUDA-mapped pinned host memory and returns
+ * a CUDA tensor whose data pointer is that host allocation (zero-copy reads over
+ * PCIe). The returned tensor owns the host allocation and frees it on destruction.
+ * Used for cold GGUF expert stacks.
+ */
+static uc_value_t *
+torch_host_mapped(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *src = NULL;
+	int64_t dev = 0;
+
+	if (nargs < 1 || !(src = tensor_arg(vm, uc_fn_arg(0))) || src->is_cuda())
+		RAISE("host_mapped: a CPU tensor is required");
+
+	if (nargs >= 2) {
+		uc_value_t *d = uc_fn_arg(1);
+
+		if (ucv_type(d) != UC_INTEGER)
+			RAISE("host_mapped: device must be an integer");
+
+		dev = ucv_int64_get(d);
+	}
+
+	try {
+		at::Tensor c = src->cpu().contiguous();
+		size_t n = c.nbytes();
+
+		if (n == 0)
+			return tensor_wrap(vm, c.to(at::kCUDA), 0);
+
+		void *host = NULL, *dptr = NULL;
+
+		if (cudaSetDevice((int)dev) != cudaSuccess ||
+		    cudaHostAlloc(&host, n, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
+			RAISE("host_mapped: out of mapped page-locked memory");
+
+		if (cudaHostGetDevicePointer(&dptr, host, 0) != cudaSuccess) {
+			cudaFreeHost(host);
+			RAISE("host_mapped: cannot get the mapped device pointer");
+		}
+
+		memcpy(host, c.data_ptr(), n);
+
+		at::Tensor out = at::from_blob(dptr, c.sizes(),
+			[host](void *) { cudaFreeHost(host); },
+			c.options().device(at::kCUDA, (int)dev));
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/*
  * pinned_empty(dims, dtype?): torch.tensor
  *
  * Uninitialized page-locked CPU tensor (cudaHostAllocPortable, like pin()):
@@ -7881,6 +7938,8 @@ torch_gguf_dequant(uc_vm_t *vm, size_t nargs)
 {
 	static const struct { const char *name; int id; } types[] = {
 		{ "Q8_0", 0 }, { "IQ4_NL", 1 }, { "Q5_K", 2 }, { "IQ2_XXS", 3 }, { "IQ2_XS", 4 }, { "IQ1_M", 5 }, { "IQ1_S", 6 },
+		{ "Q2_0", 7 }, { "Q4_K", 8 }, { "Q3_K", 9 }, { "Q6_K", 10 }, { "IQ2_S", 11 }, { "IQ3_XXS", 12 },
+		{ "IQ3_S", 13 }, { "IQ4_XS", 14 }, { "Q4_0", 15 },
 	};
 	at::Tensor *w;
 	uc_value_t *tv = uc_fn_arg(1), *dv = uc_fn_arg(2);
@@ -7902,7 +7961,7 @@ torch_gguf_dequant(uc_vm_t *vm, size_t nargs)
 	size_t blck, bytes;
 
 	if (qt < 0 || st_dtype_info(tn, &blck, &bytes))
-		RAISE("gguf_dequant: unsupported type (Q8_0, IQ4_NL, Q5_K, IQ2_XXS, IQ2_XS, IQ1_M, IQ1_S)");
+		RAISE("gguf_dequant: unsupported type (Q4_0, Q8_0, IQ4_NL, Q5_K, Q2_0, Q4_K, Q3_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_M, IQ1_S)");
 
 	at::ScalarType odt = at::kBFloat16;
 
@@ -7939,10 +7998,12 @@ torch_gguf_dequant(uc_vm_t *vm, size_t nargs)
 
 extern "C" int amp_gguf_gemv(int qtype, const void *x, const void *w, const void *ids, void *out, int M, int N, int K,
                              int xdiv, int slots, cudaStream_t stream);
+extern "C" int amp_gguf_gemv_pt(int qtype, const void *x, const void *ptrs, const void *ids, void *out, int M, int N, int K,
+                                int xdiv, int slots, cudaStream_t stream);
 extern "C" int amp_gguf_quant_x(const void *x, void *xq, void *xs, int R, int K, cudaStream_t stream);
 extern "C" int amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const void *w_up, const void *ids,
                                 const void *scale, void *out, int M, int N, int K, int xdiv, int slots, int G, float lim, int e0, int ne, int mr,
-                                int qx, cudaStream_t stream);
+                                int qx, const void *ptrs, cudaStream_t stream);
 extern "C" int amp_moe_group(const void *ids, void *grp, int S, cudaStream_t stream);
 
 /* The matrix-vector product on quantized rows: the integer-dot kernel for the types that have one (all but IQ4_NL) (the activation rows
@@ -7967,14 +8028,14 @@ gguf_gemv_run(int qt, at::Tensor &x, const void *w, const void *ids, void *out, 
 			(K % 32) == 0 && (((uintptr_t)x.data_ptr()) & 15) == 0;
 
 		if (qx)
-			return amp_gguf_gemv_i8(qt, x.data_ptr(), NULL, w, w_up, ids, scale, out, M, N, K, xdiv, slots, G, lim, e0, ne, mr, 1, st);
+			return amp_gguf_gemv_i8(qt, x.data_ptr(), NULL, w, w_up, ids, scale, out, M, N, K, xdiv, slots, G, lim, e0, ne, mr, 1, NULL, st);
 
 		at::Tensor xq = at::empty({ R, K * G }, x.options().dtype(at::kChar));
 		at::Tensor xs = at::empty({ R, K * G / 32 }, x.options().dtype(at::kFloat));
 		int rc = amp_gguf_quant_x(x.data_ptr(), xq.data_ptr(), xs.data_ptr(), R, K * G, st);
 
 		if (rc == 0)
-			rc = amp_gguf_gemv_i8(qt, xq.data_ptr(), xs.data_ptr(), w, w_up, ids, scale, out, M, N, K, xdiv, slots, G, lim, e0, ne, mr, 0, st);
+			rc = amp_gguf_gemv_i8(qt, xq.data_ptr(), xs.data_ptr(), w, w_up, ids, scale, out, M, N, K, xdiv, slots, G, lim, e0, ne, mr, 0, NULL, st);
 
 		return rc;
 	}
@@ -7985,12 +8046,19 @@ gguf_gemv_run(int qt, at::Tensor &x, const void *w, const void *ids, void *out, 
 	return amp_gguf_gemv(qt, x.data_ptr(), w, ids, out, M, N, K, xdiv, slots, st);
 }
 
+static bool
+gguf_i8_qtype(int qt)
+{
+	return qt == 0 || qt == 2 || qt == 3 || qt == 4 || qt == 5 || qt == 6;
+}
+
 static int
 gguf_qtype_id(const char *tn)
 {
-	static const char *names[] = { "Q8_0", "IQ4_NL", "Q5_K", "IQ2_XXS", "IQ2_XS", "IQ1_M", "IQ1_S" };
+	static const char *names[] = { "Q8_0", "IQ4_NL", "Q5_K", "IQ2_XXS", "IQ2_XS", "IQ1_M", "IQ1_S",
+		"Q2_0", "Q4_K", "Q3_K", "Q6_K", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "Q4_0" };
 
-	for (int i = 0; i < 7; i++)
+	for (int i = 0; i < 16; i++)
 		if (!strcmp(tn, names[i]))
 			return i;
 
@@ -8013,7 +8081,7 @@ torch_gguf_gemv(uc_vm_t *vm, size_t nargs)
 	size_t blck, bytes;
 
 	if (qt < 0 || st_dtype_info(ucv_string_get(tv), &blck, &bytes))
-		RAISE("gguf_gemv: unsupported type (Q8_0, IQ4_NL, Q5_K, IQ2_XXS, IQ2_XS, IQ1_M, IQ1_S)");
+		RAISE("gguf_gemv: unsupported type (Q4_0, Q8_0, IQ4_NL, Q5_K, Q2_0, Q4_K, Q3_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_M, IQ1_S)");
 
 	if (x->scalar_type() != at::kHalf || x->dim() != 2 || !x->is_contiguous() || !x->is_cuda() ||
 	    w->scalar_type() != at::kByte || w->dim() != 2 || !w->is_contiguous() || w->get_device() != x->get_device() ||
@@ -8057,7 +8125,7 @@ torch_gguf_gemv_grouped(uc_vm_t *vm, size_t nargs)
 	int qt = gguf_qtype_id(ucv_string_get(tv));
 	size_t blck, bytes;
 
-	if (qt < 0 || qt == 1 || st_dtype_info(ucv_string_get(tv), &blck, &bytes))
+	if (qt < 0 || !gguf_i8_qtype(qt) || st_dtype_info(ucv_string_get(tv), &blck, &bytes))
 		RAISE("gguf_gemv_grouped: unsupported type (Q8_0, Q5_K, IQ2_XXS, IQ2_XS, IQ1_M, IQ1_S)");
 
 	if (x->scalar_type() != at::kHalf || x->dim() != 2 || !x->is_contiguous() || !x->is_cuda() ||
@@ -8106,7 +8174,7 @@ torch_gguf_gate_up(uc_vm_t *vm, size_t nargs)
 	int qt = gguf_qtype_id(ucv_string_get(tv));
 	size_t blck, bytes;
 
-	if (qt < 0 || qt == 1 || st_dtype_info(ucv_string_get(tv), &blck, &bytes))
+	if (qt < 0 || !gguf_i8_qtype(qt) || st_dtype_info(ucv_string_get(tv), &blck, &bytes))
 		RAISE("gguf_gate_up: unsupported type (Q8_0, Q5_K, IQ2_XXS, IQ2_XS, IQ1_M, IQ1_S)");
 
 	if (x->scalar_type() != at::kHalf || x->dim() != 2 || !x->is_contiguous() || !x->is_cuda() || x->size(0) < 1 || x->size(0) > 8 ||
@@ -8163,7 +8231,7 @@ torch_gguf_moe_gate_up(uc_vm_t *vm, size_t nargs)
 	int qt = gguf_qtype_id(ucv_string_get(tv));
 	size_t blck, bytes;
 
-	if (qt < 0 || qt == 1 || st_dtype_info(ucv_string_get(tv), &blck, &bytes))
+	if (qt < 0 || !gguf_i8_qtype(qt) || st_dtype_info(ucv_string_get(tv), &blck, &bytes))
 		RAISE("gguf_moe_gate_up: unsupported type (Q8_0, Q5_K, IQ2_XXS, IQ2_XS, IQ1_M, IQ1_S)");
 
 	if (x->scalar_type() != at::kHalf || x->dim() != 2 || !x->is_contiguous() || !x->is_cuda() || ids->scalar_type() != at::kLong ||
@@ -8285,6 +8353,71 @@ torch_gguf_moe_prefill(uc_vm_t *vm, size_t nargs)
 
 extern "C" int amp_gguf_embed(int qtype, const void *w, const void *ids, void *out, long nrows, long vocab, int K, cudaStream_t stream);
 
+/* torch.gguf_moe_gemv_pt(x, ids, ptrs, type, xdiv, nrows): x (R, K) fp16; ids (S) int64 global expert ids; ptrs (E)
+ * int64 device pointers to each expert's row start (resident VRAM or mapped host memory); -> (S, nrows) fp32. */
+static uc_value_t *
+torch_gguf_moe_gemv_pt(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *x, *ids, *ptrs;
+	int64_t xdiv, nrows;
+	uc_value_t *tv = uc_fn_arg(3);
+
+	if (nargs != 6 || !(x = tensor_arg(vm, uc_fn_arg(0))) || !(ids = tensor_arg(vm, uc_fn_arg(1))) ||
+	    !(ptrs = tensor_arg(vm, uc_fn_arg(2))) || ucv_type(tv) != UC_STRING ||
+	    !arg_int(vm, uc_fn_arg(4), &xdiv) || !arg_int(vm, uc_fn_arg(5), &nrows))
+		RAISE("gguf_moe_gemv_pt: (x fp16 (R, K), ids int64 (S), ptrs int64 (E), type, xdiv, nrows)");
+
+	int qt = gguf_qtype_id(ucv_string_get(tv));
+	size_t blck, bytes;
+
+	if (qt < 0 || st_dtype_info(ucv_string_get(tv), &blck, &bytes))
+		RAISE("gguf_moe_gemv_pt: unsupported type");
+
+	if (x->scalar_type() != at::kHalf || x->dim() != 2 || !x->is_contiguous() || !x->is_cuda() ||
+	    ids->scalar_type() != at::kLong || ids->dim() != 1 || !ids->is_contiguous() || !ids->is_cuda() ||
+	    ptrs->scalar_type() != at::kLong || ptrs->dim() != 1 || !ptrs->is_contiguous() || !ptrs->is_cuda() ||
+	    ids->get_device() != x->get_device() || ptrs->get_device() != x->get_device() ||
+	    xdiv < 1 || nrows < 1 || ids->size(0) < 1 || x->size(0) * xdiv < ids->size(0))
+		RAISE("gguf_moe_gemv_pt: x fp16 (R, K), ids and ptrs int64 on one device, xdiv * R >= S");
+
+	int64_t K = x->size(1);
+
+	if (K % (int64_t)blck)
+		RAISE("gguf_moe_gemv_pt: K is not a whole number of blocks");
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		at::Tensor y = at::empty({ ids->size(0), nrows }, x->options().dtype(at::kFloat));
+		cudaStream_t st = c10::cuda::getCurrentCUDAStream().stream();
+		int rc;
+
+		if (gguf_i8_qtype(qt)) {
+			int R = (int)x->size(0);
+			at::Tensor xq = at::empty({ R, (int)K }, x->options().dtype(at::kChar));
+			at::Tensor xs = at::empty({ R, (int)K / 32 }, x->options().dtype(at::kFloat));
+
+			rc = amp_gguf_quant_x(x->data_ptr(), xq.data_ptr(), xs.data_ptr(), R, (int)K, st);
+
+			if (rc == 0)
+				rc = amp_gguf_gemv_i8(qt, xq.data_ptr(), xs.data_ptr(), NULL, NULL, ids->data_ptr(), NULL, y.data_ptr(),
+					1, (int)nrows, (int)K, (int)xdiv, (int)ids->size(0), 1, 0.f, 0, 1 << 30, 0, 0,
+					ptrs->data_ptr(), st);
+		} else {
+			rc = amp_gguf_gemv_pt(qt, x->data_ptr(), ptrs->data_ptr(), ids->data_ptr(), y.data_ptr(), 1, (int)nrows,
+				(int)K, (int)xdiv, (int)ids->size(0), st);
+		}
+
+		if (!launch_ok(vm, rc, "gguf_moe_gemv_pt"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(y), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 /* torch.gguf_embed(w, type, ids): w the uint8 rows (V, row bytes) of a quantized embedding table, ids an int64 CUDA tensor of any shape
  * -> ids.shape + [K] fp16, the dequantized rows (an id outside [0, V) gives row 0). Stateless: usable inside CUDA graphs. */
 static uc_value_t *
@@ -8392,7 +8525,7 @@ torch_gguf_moe_gemv(uc_vm_t *vm, size_t nargs)
 	size_t blck, bytes;
 
 	if (qt < 0 || st_dtype_info(ucv_string_get(tv), &blck, &bytes))
-		RAISE("gguf_moe_gemv: unsupported type (Q8_0, IQ4_NL, Q5_K, IQ2_XXS, IQ2_XS, IQ1_M, IQ1_S)");
+		RAISE("gguf_moe_gemv: unsupported type (Q4_0, Q8_0, IQ4_NL, Q5_K, Q2_0, Q4_K, Q3_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_M, IQ1_S)");
 
 	if (x->scalar_type() != at::kHalf || x->dim() != 2 || !x->is_contiguous() || !x->is_cuda() ||
 	    ids->scalar_type() != at::kLong || ids->dim() != 1 || !ids->is_contiguous() || w->scalar_type() != at::kByte ||
@@ -12206,6 +12339,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "zeros",	tensor_zeros },
 	{ "empty",	tensor_empty },
 	{ "pinned_empty",	torch_pinned_empty },
+	{ "host_mapped",	torch_host_mapped },
 	{ "ones",	tensor_ones },
 	{ "rand",	tensor_rand },
 	{ "full",	tensor_full },
@@ -12265,6 +12399,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "gguf_dequant",	torch_gguf_dequant },
 	{ "gguf_gemv",	torch_gguf_gemv },
 	{ "gguf_moe_gemv",	torch_gguf_moe_gemv },
+	{ "gguf_moe_gemv_pt",	torch_gguf_moe_gemv_pt },
 	{ "gguf_gemv_grouped",	torch_gguf_gemv_grouped },
 	{ "gguf_gate_up",	torch_gguf_gate_up },
 	{ "gguf_embed",	torch_gguf_embed },

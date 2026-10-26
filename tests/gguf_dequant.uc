@@ -23,7 +23,8 @@ function maxdiff(a, b) {
 	return a.to('float32').sub(b.to('float32')).abs().max().item();
 }
 
-for (let name in [ 'q8_0', 'iq4_nl', 'q5_k', 'iq2_xxs', 'iq2_xs', 'iq1_m', 'iq1_s', 'stack' ]) {
+for (let name in [ 'q4_0', 'q8_0', 'iq4_nl', 'q5_k', 'iq2_xxs', 'iq2_xs', 'iq1_m', 'iq1_s',
+	'q2_0', 'q4_k', 'q3_k', 'q6_k', 'iq2_s', 'iq3_xxs', 'iq3_s', 'iq4_xs', 'stack' ]) {
 	let ty = f.info(name).dtype;
 	let ref = r.tensor(name).cuda();
 	let raw = f.tensor(name).cuda();
@@ -49,7 +50,8 @@ function rel_err(a, b) {
 	return d / (b.to('float32').abs().max().item() + 1e-9);
 }
 
-for (let name in [ 'q8_0', 'iq4_nl', 'q5_k', 'iq2_xxs', 'iq2_xs', 'iq1_m', 'iq1_s' ]) {
+for (let name in [ 'q4_0', 'q8_0', 'iq4_nl', 'q5_k', 'iq2_xxs', 'iq2_xs', 'iq1_m', 'iq1_s',
+	'q2_0', 'q4_k', 'q3_k', 'q6_k', 'iq2_s', 'iq3_xxs', 'iq3_s', 'iq4_xs' ]) {
 	let ty = f.info(name).dtype;
 	let raw = f.tensor(name).cuda();
 	let ref = r.tensor(name).cuda();                 // (24, 768) float32
@@ -109,6 +111,20 @@ for (let name in [ 'q5_k', 'iq2_xxs', 'iq1_m', 'iq1_s', 'q8_0' ]) {
 	printf('moe gemv rel err %g\n', e);
 	assert(e < 2e-2, 'moe gemv differs from the matmul');          // (IQ2_XXS: int8 activations)
 	assert(y.narrow(0, 1, 1).abs().max().item() == 0, 'an expert id of -1 contributes nothing');
+
+	// the same grouped gemv through a pointer table (resident / mapped cold stacks)
+	let ptrs = [];
+	let rb = raw.shape()[2], nrows = raw.shape()[1];
+
+	for (let e = 0; e < raw.shape()[0]; e++)
+		push(ptrs, raw.data_ptr() + e * nrows * rb);
+
+	let pt = torch.from_array(ptrs, 'int64', 'cuda');
+	let ypt = torch.gguf_moe_gemv_pt(x, ids, pt, 'IQ2_XXS', 3, nrows);
+	let ep = rel_err(ypt, y);
+
+	printf('moe gemv pointer-table rel err %g\n', ep);
+	assert(ep < 1e-6, 'pointer-table moe gemv differs from the stack moe gemv');
 }
 
 // fused gate / up / SwiGLU (dense and experts) and the per-slot output scale, against the separate launches
@@ -147,7 +163,8 @@ for (let name in [ 'q5_k', 'iq2_xxs', 'iq1_m', 'iq1_s', 'q8_0' ]) {
 }
 
 // embedding rows by id: the same values as the dequantized table, any id shape, an id outside the table gives row 0
-for (let name in [ 'q5_k', 'q8_0', 'iq2_xxs', 'iq1_m', 'iq1_s', 'iq4_nl' ]) {
+for (let name in [ 'q4_0', 'q5_k', 'q8_0', 'iq2_xxs', 'iq1_m', 'iq1_s', 'iq4_nl',
+	'q2_0', 'q4_k', 'q3_k', 'q6_k', 'iq2_s', 'iq3_xxs', 'iq3_s', 'iq4_xs' ]) {
 	let ty = f.info(name).dtype, raw = f.tensor(name).cuda();
 	let full = torch.gguf_dequant(raw, ty, 'float16');
 	let ids = torch.from_array([ [ 3, 0 ], [ 23, 99 ] ], 'int64', 'cuda');
@@ -162,7 +179,7 @@ for (let name in [ 'q5_k', 'q8_0', 'iq2_xxs', 'iq1_m', 'iq1_s', 'iq4_nl' ]) {
 let raised = (fn) => { try { fn(); } catch (e) { return true; } return false; };
 let raw = f.tensor('q8_0').cuda();
 
-assert(raised(() => torch.gguf_dequant(raw, 'Q4_K')), 'unsupported type raises');
+assert(raised(() => torch.gguf_dequant(raw, 'Q2_K')), 'unsupported type raises');
 assert(raised(() => torch.gguf_dequant(raw, 'Q8_0', 'int8')), 'bad dtype raises');
 assert(raised(() => torch.gguf_dequant(f.tensor('q8_0'), 'Q8_0')), 'a CPU tensor raises');
 assert(raised(() => torch.gguf_dequant(f.tensor('plain_f32').cuda(), 'Q8_0')), 'a non-uint8 tensor raises');

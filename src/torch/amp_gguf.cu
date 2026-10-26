@@ -29,6 +29,8 @@
 
 enum {
 	AMP_Q_Q8_0, AMP_Q_IQ4_NL, AMP_Q_Q5_K, AMP_Q_IQ2_XXS, AMP_Q_IQ2_XS, AMP_Q_IQ1_M, AMP_Q_IQ1_S,
+	AMP_Q_Q2_0, AMP_Q_Q4_K, AMP_Q_Q3_K, AMP_Q_Q6_K, AMP_Q_IQ2_S, AMP_Q_IQ3_XXS, AMP_Q_IQ3_S, AMP_Q_IQ4_XS,
+	AMP_Q_Q4_0,
 };
 
 struct amp_qinfo {
@@ -36,17 +38,37 @@ struct amp_qinfo {
 	int bytes;       /* bytes per block */
 };
 
-static __host__ __device__ inline amp_qinfo amp_qtype_info(int t)
+static __host__ __device__ constexpr amp_qinfo amp_qtype_info(int t)
 {
 	switch (t) {
+	case AMP_Q_Q4_0:    return { 32, 18 };
 	case AMP_Q_Q8_0:    return { 32, 34 };
 	case AMP_Q_IQ4_NL:  return { 32, 18 };
 	case AMP_Q_Q5_K:    return { 256, 176 };
 	case AMP_Q_IQ2_XXS: return { 256, 66 };
 	case AMP_Q_IQ2_XS:  return { 256, 74 };
+	case AMP_Q_IQ1_M:   return { 256, 56 };
 	case AMP_Q_IQ1_S:   return { 256, 50 };
+	case AMP_Q_Q2_0:    return { 64, 18 };
+	case AMP_Q_Q4_K:    return { 256, 144 };
+	case AMP_Q_Q3_K:    return { 256, 110 };
+	case AMP_Q_Q6_K:    return { 256, 210 };
+	case AMP_Q_IQ2_S:   return { 256, 82 };
+	case AMP_Q_IQ3_XXS: return { 256, 98 };
+	case AMP_Q_IQ3_S:   return { 256, 110 };
+	case AMP_Q_IQ4_XS:  return { 256, 136 };
 	default:            return { 256, 56 };
 	}
+}
+
+static __host__ __device__ constexpr int amp_qgpb(int t)
+{
+	return t == AMP_Q_Q4_0 || t == AMP_Q_Q8_0 || t == AMP_Q_IQ4_NL ? 4 : t == AMP_Q_Q2_0 ? 8 : 32;
+}
+
+static __host__ __device__ constexpr int amp_qbytes(int t)
+{
+	return amp_qtype_info(t).bytes;
 }
 
 static __device__ inline float amp_h2f(const uint8_t *p)
@@ -72,9 +94,23 @@ static __device__ inline void amp_scale_min_k4(int j, const uint8_t *q, int *d, 
 
 /* group g (8 weights) of a block -> v[8] */
 /* gr / sg: the lookup tables (iq2xxs_grid or iq2xs_grid, ksigns_iq2xs): the global ones, or copies in shared memory */
-template <int T> __device__ void amp_dq_group(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg);
+template <int T> __device__ void amp_dq_group(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg);
 
-template <> __device__ void amp_dq_group<AMP_Q_Q8_0>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+template <> __device__ void amp_dq_group<AMP_Q_Q4_0>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+	const uint8_t *qs = b + 2 + (g & 1) * 8;
+	const int hi = g >> 1;
+
+#pragma unroll
+	for (int j = 0; j < 8; j++) {
+		const int q = hi ? qs[j] >> 4 : qs[j] & 0xf;
+
+		v[j] = (float)(q - 8) * d;
+	}
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_Q8_0>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
 {
 	const float d = amp_h2f(b);
 
@@ -83,7 +119,7 @@ template <> __device__ void amp_dq_group<AMP_Q_Q8_0>(const uint8_t *b, int g, fl
 		v[j] = (float)(int8_t)b[2 + g * 8 + j] * d;
 }
 
-template <> __device__ void amp_dq_group<AMP_Q_IQ4_NL>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+template <> __device__ void amp_dq_group<AMP_Q_IQ4_NL>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
 {
 	const float d = amp_h2f(b);
 	const uint8_t *qs = b + 2 + (g & 1) * 8;
@@ -94,7 +130,7 @@ template <> __device__ void amp_dq_group<AMP_Q_IQ4_NL>(const uint8_t *b, int g, 
 		v[j] = d * (float)kvalues_iq4nl[hi ? qs[j] >> 4 : qs[j] & 0xf];
 }
 
-template <> __device__ void amp_dq_group<AMP_Q_Q5_K>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+template <> __device__ void amp_dq_group<AMP_Q_Q5_K>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
 {
 	const float d = amp_h2f(b), dmin = amp_h2f(b + 2);
 	const uint8_t *scales = b + 4, *qh = b + 16, *qs = b + 48;
@@ -113,14 +149,14 @@ template <> __device__ void amp_dq_group<AMP_Q_Q5_K>(const uint8_t *b, int g, fl
 	}
 }
 
-template <> __device__ void amp_dq_group<AMP_Q_IQ2_XXS>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+template <> __device__ void amp_dq_group<AMP_Q_IQ2_XXS>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
 {
 	const float d = amp_h2f(b);
 	const int ib32 = g >> 2, l = g & 3;
 	const uint8_t *q = b + 2 + 8 * ib32;
 	const unsigned aux1 = (unsigned)q[4] | ((unsigned)q[5] << 8) | ((unsigned)q[6] << 16) | ((unsigned)q[7] << 24);
 	const float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
-	const uint64_t grid = gr[q[l]];
+	const uint64_t grid = ((const uint64_t *)gr)[q[l]];
 	const uint8_t signs = sg[(aux1 >> (7 * l)) & 127];
 
 #pragma unroll
@@ -128,14 +164,14 @@ template <> __device__ void amp_dq_group<AMP_Q_IQ2_XXS>(const uint8_t *b, int g,
 		v[j] = db * (float)((grid >> (8 * j)) & 0xff) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
 }
 
-template <> __device__ void amp_dq_group<AMP_Q_IQ2_XS>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+template <> __device__ void amp_dq_group<AMP_Q_IQ2_XS>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
 {
 	const float d = amp_h2f(b);
 	const int ib32 = g >> 2, l = g & 3;
 	const unsigned q = amp_u16(b + 2 + 2 * (4 * ib32 + l));
 	const uint8_t sc = b[2 + 64 + ib32];
 	const float db = d * (0.5f + (float)(l < 2 ? sc & 0xf : sc >> 4)) * 0.25f;
-	const uint64_t grid = gr[q & 511];
+	const uint64_t grid = ((const uint64_t *)gr)[q & 511];
 	const uint8_t signs = sg[q >> 9];
 
 #pragma unroll
@@ -143,7 +179,7 @@ template <> __device__ void amp_dq_group<AMP_Q_IQ2_XS>(const uint8_t *b, int g, 
 		v[j] = db * (float)((grid >> (8 * j)) & 0xff) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
 }
 
-template <> __device__ void amp_dq_group<AMP_Q_IQ1_M>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+template <> __device__ void amp_dq_group<AMP_Q_IQ1_M>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
 {
 	const uint8_t *qs = b, *qh = b + 32, *sb = b + 48;
 	const unsigned s0 = amp_u16(sb), s1 = amp_u16(sb + 2), s2 = amp_u16(sb + 4), s3 = amp_u16(sb + 6);
@@ -162,7 +198,7 @@ template <> __device__ void amp_dq_group<AMP_Q_IQ1_M>(const uint8_t *b, int g, f
 		v[j] = dl * ((float)(int8_t)((grid >> (8 * j)) & 0xff) + delta);
 }
 
-template <> __device__ void amp_dq_group<AMP_Q_IQ1_S>(const uint8_t *b, int g, float *v, const uint64_t *gr, const uint8_t *sg)
+template <> __device__ void amp_dq_group<AMP_Q_IQ1_S>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
 {
 	const float d = amp_h2f(b);
 	const int ib = g >> 2, l = g & 3;
@@ -175,6 +211,173 @@ template <> __device__ void amp_dq_group<AMP_Q_IQ1_S>(const uint8_t *b, int g, f
 #pragma unroll
 	for (int j = 0; j < 8; j++)
 		v[j] = dl * ((float)(int8_t)((grid >> (8 * j)) & 0xff) + delta);
+}
+
+
+template <> __device__ void amp_dq_group<AMP_Q_Q2_0>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+	const uint8_t *qs = b + 2 + 2 * g;
+
+#pragma unroll
+	for (int j = 0; j < 8; j++) {
+		const int q = (qs[j / 4] >> ((j % 4) * 2)) & 3;
+
+		v[j] = ((float)q - 1.f) * d;
+	}
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_Q4_K>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b), dmin = amp_h2f(b + 2);
+	const int c = g >> 3, half = (g >> 2) & 1, l0 = (g & 3) * 8;
+	int sc, m;
+
+	amp_scale_min_k4(2 * c + half, b + 4, &sc, &m);
+
+	const float d1 = d * (float)sc, m1 = dmin * (float)m;
+	const uint8_t *qs = b + 16 + 32 * c + l0;
+
+#pragma unroll
+	for (int l = 0; l < 8; l++) {
+		const int q = half ? qs[l] >> 4 : qs[l] & 0xF;
+
+		v[l] = d1 * (float)q - m1;
+	}
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_Q3_K>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b + 108);
+	const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+	uint32_t aux[4];
+
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		aux[i] = (uint32_t)b[96 + 4 * i] | ((uint32_t)b[97 + 4 * i] << 8) |
+		         ((uint32_t)b[98 + 4 * i] << 16) | ((uint32_t)b[99 + 4 * i] << 24);
+
+	const uint32_t tmp = aux[2];
+
+	aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+	aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+	aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+	aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+	const int8_t *scales = (const int8_t *)aux;
+	const int n = g >> 4, local = g & 15, j = local >> 2, sub = local & 3;
+	const int si = n * 8 + j * 2 + (sub >= 2 ? 1 : 0);
+	const float dl = d * ((float)scales[si] - 32.f);
+	const int shift = 2 * j, half2 = (sub >= 2);
+	const uint8_t mbit = (uint8_t)(1 << (j + 4 * n));
+	const int hm_off = (sub & 1) * 8 + (half2 ? 16 : 0);
+	const int q_off = 32 * n + (sub & 1) * 8 + (half2 ? 16 : 0);
+
+#pragma unroll
+	for (int l = 0; l < 8; l++) {
+		const int q = (b[32 + q_off + l] >> shift) & 3;
+		const int h = (b[hm_off + l] & mbit) ? 0 : 4;
+
+		v[l] = dl * ((float)q - (float)h);
+	}
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_Q6_K>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b + 208);
+	const int n = g >> 4, local = g & 15;
+	const int qidx = local >> 2, l0 = (local & 3) * 8;
+	const uint8_t *ql = b + n * 64, *qh = b + 128 + n * 32;
+	const int8_t *sc = (const int8_t *)(b + 192 + n * 8);
+	const float dl = d * (float)sc[l0 / 16 + 2 * qidx];
+
+#pragma unroll
+	for (int j = 0; j < 8; j++) {
+		const int l = l0 + j;
+		int q;
+
+		if (qidx == 0)
+			q = (int)(ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+		else if (qidx == 1)
+			q = (int)(ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+		else if (qidx == 2)
+			q = (int)(ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+		else
+			q = (int)(ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+
+		v[j] = dl * (float)(q - 32);
+	}
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_IQ2_S>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+	const uint8_t *qs = b + 2, *qh = qs + 64, *signs = qs + 32, *scales = qs + 64 + 8;
+	const int ib32 = g >> 2, l = g & 3;
+	const float db = d * (0.5f + (float)(l < 2 ? scales[ib32] & 0xf : scales[ib32] >> 4)) * 0.25f;
+	const uint64_t grid = ((const uint64_t *)gr)[qs[ib32 * 4 + l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)];
+	const uint8_t sgn = signs[ib32 * 4 + l];
+
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		v[j] = db * (float)((grid >> (8 * j)) & 0xff) * (sgn & kmask_iq2xs[j] ? -1.f : 1.f);
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_IQ3_XXS>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+	const uint8_t *qs = b + 2, *ss = qs + 64;
+	const int ib32 = g >> 2, l = g & 3;
+	const uint32_t aux = (uint32_t)ss[4 * ib32] | ((uint32_t)ss[4 * ib32 + 1] << 8) |
+	                     ((uint32_t)ss[4 * ib32 + 2] << 16) | ((uint32_t)ss[4 * ib32 + 3] << 24);
+	const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+	const uint8_t signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+	const uint32_t g1 = ((const uint32_t *)gr)[qs[ib32 * 8 + 2 * l]];
+	const uint32_t g2 = ((const uint32_t *)gr)[qs[ib32 * 8 + 2 * l + 1]];
+
+#pragma unroll
+	for (int j = 0; j < 4; j++) {
+		v[j] = db * (float)((g1 >> (8 * j)) & 0xff) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+		v[j + 4] = db * (float)((g2 >> (8 * j)) & 0xff) * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+	}
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_IQ3_S>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+	const uint8_t *qs = b + 2, *qh = qs + 64, *signs = qh + 8, *scales = signs + 32;
+	const int ib32 = g >> 2, p = ib32 >> 1, half = ib32 & 1, l = g & 3;
+	const float db = d * (1.f + 2.f * (float)(half ? scales[p] >> 4 : scales[p] & 0xf));
+	const uint8_t qhb = qh[2 * p + half];
+	const int qoff = p * 16 + half * 8 + 2 * l;
+	const uint32_t g1 = ((const uint32_t *)gr)[qs[qoff] | ((qhb << (8 - 2 * l)) & 256)];
+	const uint32_t g2 = ((const uint32_t *)gr)[qs[qoff + 1] | ((qhb << (7 - 2 * l)) & 256)];
+	const uint8_t sgn = signs[p * 8 + half * 4 + l];
+
+#pragma unroll
+	for (int j = 0; j < 4; j++) {
+		v[j] = db * (float)((g1 >> (8 * j)) & 0xff) * (sgn & kmask_iq2xs[j] ? -1.f : 1.f);
+		v[j + 4] = db * (float)((g2 >> (8 * j)) & 0xff) * (sgn & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+	}
+}
+
+template <> __device__ void amp_dq_group<AMP_Q_IQ4_XS>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
+{
+	const float d = amp_h2f(b);
+	const uint16_t sh = (uint16_t)(b[2] | (b[3] << 8));
+	const uint8_t *sl = b + 4, *qs = b + 8;
+	const int ib = g >> 2, sub = g & 3;
+	const int ls = ((sl[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
+	const float dl = d * (float)(ls - 32);
+	const int off = ib * 16 + (sub & 1) * 8;
+
+#pragma unroll
+	for (int j = 0; j < 8; j++) {
+		const int q = qs[off + j];
+		const int idx = (sub < 2) ? (q & 0xf) : (q >> 4);
+
+		v[j] = dl * (float)kvalues_iq4nl[idx];
+	}
 }
 
 template <typename O> __device__ inline void amp_store8(O *out, const float *v);
@@ -215,12 +418,17 @@ __global__ void amp_gguf_dequant_kernel(const uint8_t *__restrict__ x, O *__rest
 	if (i >= ngroups)
 		return;
 
-	constexpr int gpb = (T == AMP_Q_Q8_0 || T == AMP_Q_IQ4_NL) ? 4 : 32;       /* groups of 8 per block */
-	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_IQ4_NL ? 18 : T == AMP_Q_Q5_K ? 176 :
-	                      T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
+	constexpr int gpb = amp_qgpb(T);
+	constexpr int bytes = amp_qbytes(T);
+	const void *gr = T == AMP_Q_IQ2_XS ? (const void *)iq2xs_grid :
+	                 T == AMP_Q_IQ2_XXS ? (const void *)iq2xxs_grid :
+	                 T == AMP_Q_IQ2_S ? (const void *)iq2s_grid :
+	                 T == AMP_Q_IQ3_XXS ? (const void *)iq3xxs_grid :
+	                 T == AMP_Q_IQ3_S ? (const void *)iq3s_grid :
+	                 (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S) ? (const void *)iq1s_grid : NULL;
 	float v[8];
 
-	amp_dq_group<T>(x + (i / gpb) * bytes, (int)(i % gpb), v, T == AMP_Q_IQ2_XS ? iq2xs_grid : iq2xxs_grid, ksigns_iq2xs);
+	amp_dq_group<T>(x + (i / gpb) * bytes, (int)(i % gpb), v, gr, ksigns_iq2xs);
 	amp_store8<O>(y + i * 8, v);
 }
 
@@ -249,6 +457,7 @@ amp_gguf_dequant(int qtype, int odt, const void *x, void *y, long nblocks, cudaS
 		                  amp_gguf_dequant_launch<T, __nv_bfloat16>(x, y, nblocks, stream)
 
 	switch (qtype) {
+	AMP_DQ_CASE(AMP_Q_Q4_0);
 	AMP_DQ_CASE(AMP_Q_Q8_0);
 	AMP_DQ_CASE(AMP_Q_IQ4_NL);
 	AMP_DQ_CASE(AMP_Q_Q5_K);
@@ -256,6 +465,14 @@ amp_gguf_dequant(int qtype, int odt, const void *x, void *y, long nblocks, cudaS
 	AMP_DQ_CASE(AMP_Q_IQ2_XS);
 	AMP_DQ_CASE(AMP_Q_IQ1_M);
 	AMP_DQ_CASE(AMP_Q_IQ1_S);
+	AMP_DQ_CASE(AMP_Q_Q2_0);
+	AMP_DQ_CASE(AMP_Q_Q4_K);
+	AMP_DQ_CASE(AMP_Q_Q3_K);
+	AMP_DQ_CASE(AMP_Q_Q6_K);
+	AMP_DQ_CASE(AMP_Q_IQ2_S);
+	AMP_DQ_CASE(AMP_Q_IQ3_XXS);
+	AMP_DQ_CASE(AMP_Q_IQ3_S);
+	AMP_DQ_CASE(AMP_Q_IQ4_XS);
 	}
 #undef AMP_DQ_CASE
 
@@ -273,11 +490,10 @@ amp_gguf_dequant(int qtype, int odt, const void *x, void *y, long nblocks, cudaS
 template <int T, bool MOE>
 __global__ void amp_gguf_gemv_kernel(const __half *__restrict__ x, const uint8_t *__restrict__ w,
                                      const long long *__restrict__ ids, void *__restrict__ out, int M, int N, int K,
-                                     int xdiv)
+                                     int xdiv, const long long *__restrict__ ptrs)
 {
-	constexpr int gpb = (T == AMP_Q_Q8_0 || T == AMP_Q_IQ4_NL) ? 4 : 32;
-	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_IQ4_NL ? 18 : T == AMP_Q_Q5_K ? 176 :
-	                      T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
+	constexpr int gpb = amp_qgpb(T);
+	constexpr int bytes = amp_qbytes(T);
 	constexpr int blk = gpb * 8;
 
 	/* the i-quants' lookup tables in shared memory: a lane's index is random, the global copies miss */
@@ -294,6 +510,13 @@ __global__ void amp_gguf_gemv_kernel(const __half *__restrict__ x, const uint8_t
 
 		__syncthreads();
 	}
+
+	const void *gr = NGRID ? (const void *)s_grid :
+	                 T == AMP_Q_IQ2_S ? (const void *)iq2s_grid :
+	                 T == AMP_Q_IQ3_XXS ? (const void *)iq3xxs_grid :
+	                 T == AMP_Q_IQ3_S ? (const void *)iq3s_grid :
+	                 (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S) ? (const void *)iq1s_grid : NULL;
+	const uint8_t *sg = NGRID ? s_signs : ksigns_iq2xs;
 
 	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 	const int n = blockIdx.x * (blockDim.x >> 5) + warp;
@@ -317,7 +540,11 @@ __global__ void amp_gguf_gemv_kernel(const __half *__restrict__ x, const uint8_t
 			return;
 		}
 
-		row = w + ((size_t)e * N + n) * rb;
+		if (ptrs)
+			row = (const uint8_t *)ptrs[e] + (size_t)n * rb;
+		else
+			row = w + ((size_t)e * N + n) * rb;
+
 		xr = x + (size_t)(slot / xdiv) * K;
 		rows = 1;
 	} else {
@@ -335,7 +562,7 @@ __global__ void amp_gguf_gemv_kernel(const __half *__restrict__ x, const uint8_t
 	for (int g = lane; g < ngroups; g += 32) {
 		float v[8];
 
-		amp_dq_group<T>(row + (size_t)(g / gpb) * bytes, g % gpb, v, s_grid, s_signs);
+		amp_dq_group<T>(row + (size_t)(g / gpb) * bytes, g % gpb, v, gr, sg);
 
 #pragma unroll
 		for (int m = 0; m < 8; m++) {
@@ -375,7 +602,7 @@ __global__ void amp_gguf_gemv_kernel(const __half *__restrict__ x, const uint8_t
 
 template <int T>
 static int amp_gguf_gemv_launch(bool moe, const void *x, const void *w, const void *ids, void *out, int M, int N, int K,
-                                int xdiv, int slots, cudaStream_t stream)
+                                int xdiv, int slots, const void *ptrs, cudaStream_t stream)
 {
 	const dim3 blk(256);
 
@@ -383,12 +610,12 @@ static int amp_gguf_gemv_launch(bool moe, const void *x, const void *w, const vo
 		const dim3 grid((N + 7) / 8, slots);
 
 		amp_gguf_gemv_kernel<T, true><<<grid, blk, 0, stream>>>((const __half *)x, (const uint8_t *)w,
-			(const long long *)ids, out, M, N, K, xdiv);
+			(const long long *)ids, out, M, N, K, xdiv, (const long long *)ptrs);
 	} else {
 		const dim3 grid((N + 7) / 8, 1);
 
 		amp_gguf_gemv_kernel<T, false><<<grid, blk, 0, stream>>>((const __half *)x, (const uint8_t *)w, NULL, out, M,
-			N, K, xdiv);
+			N, K, xdiv, NULL);
 	}
 
 	return (int)cudaGetLastError();
@@ -408,9 +635,10 @@ amp_gguf_gemv(int qtype, const void *x, const void *w, const void *ids, void *ou
 		return (int)cudaErrorInvalidValue;
 
 #define AMP_GV_CASE(T) \
-	case T: return amp_gguf_gemv_launch<T>(moe, x, w, ids, out, M, N, K, xdiv, slots, stream)
+	case T: return amp_gguf_gemv_launch<T>(moe, x, w, ids, out, M, N, K, xdiv, slots, NULL, stream)
 
 	switch (qtype) {
+	AMP_GV_CASE(AMP_Q_Q4_0);
 	AMP_GV_CASE(AMP_Q_Q8_0);
 	AMP_GV_CASE(AMP_Q_IQ4_NL);
 	AMP_GV_CASE(AMP_Q_Q5_K);
@@ -418,8 +646,54 @@ amp_gguf_gemv(int qtype, const void *x, const void *w, const void *ids, void *ou
 	AMP_GV_CASE(AMP_Q_IQ2_XS);
 	AMP_GV_CASE(AMP_Q_IQ1_M);
 	AMP_GV_CASE(AMP_Q_IQ1_S);
+	AMP_GV_CASE(AMP_Q_Q2_0);
+	AMP_GV_CASE(AMP_Q_Q4_K);
+	AMP_GV_CASE(AMP_Q_Q3_K);
+	AMP_GV_CASE(AMP_Q_Q6_K);
+	AMP_GV_CASE(AMP_Q_IQ2_S);
+	AMP_GV_CASE(AMP_Q_IQ3_XXS);
+	AMP_GV_CASE(AMP_Q_IQ3_S);
+	AMP_GV_CASE(AMP_Q_IQ4_XS);
 	}
 #undef AMP_GV_CASE
+
+	return (int)cudaErrorInvalidValue;
+}
+
+/* Pointer-table variant: ptrs (E) int64 device pointers to each expert's row start (resident VRAM or mapped host
+ * memory). The same fp16 gemv kernel reads the quantized row from ptrs[e] + n * row bytes, so a mixed resident/cold
+ * expert set needs no split or staging. */
+extern "C" int
+amp_gguf_gemv_pt(int qtype, const void *x, const void *ptrs, const void *ids, void *out, int M, int N, int K, int xdiv,
+                 int slots, cudaStream_t stream)
+{
+	const amp_qinfo qi = amp_qtype_info(qtype);
+
+	if (!ptrs || !ids || N < 1 || K < qi.block || (K % qi.block) || slots < 1 || xdiv < 1 ||
+	    ((uintptr_t)x & 15) || ((uintptr_t)ptrs & 15))
+		return (int)cudaErrorInvalidValue;
+
+#define AMP_GV_PT_CASE(T) 	case T: return amp_gguf_gemv_launch<T>(true, x, NULL, ids, out, M, N, K, xdiv, slots, ptrs, stream)
+
+	switch (qtype) {
+	AMP_GV_PT_CASE(AMP_Q_Q4_0);
+	AMP_GV_PT_CASE(AMP_Q_Q8_0);
+	AMP_GV_PT_CASE(AMP_Q_IQ4_NL);
+	AMP_GV_PT_CASE(AMP_Q_Q5_K);
+	AMP_GV_PT_CASE(AMP_Q_IQ2_XXS);
+	AMP_GV_PT_CASE(AMP_Q_IQ2_XS);
+	AMP_GV_PT_CASE(AMP_Q_IQ1_M);
+	AMP_GV_PT_CASE(AMP_Q_IQ1_S);
+	AMP_GV_PT_CASE(AMP_Q_Q2_0);
+	AMP_GV_PT_CASE(AMP_Q_Q4_K);
+	AMP_GV_PT_CASE(AMP_Q_Q3_K);
+	AMP_GV_PT_CASE(AMP_Q_Q6_K);
+	AMP_GV_PT_CASE(AMP_Q_IQ2_S);
+	AMP_GV_PT_CASE(AMP_Q_IQ3_XXS);
+	AMP_GV_PT_CASE(AMP_Q_IQ3_S);
+	AMP_GV_PT_CASE(AMP_Q_IQ4_XS);
+	}
+#undef AMP_GV_PT_CASE
 
 	return (int)cudaErrorInvalidValue;
 }
@@ -527,7 +801,7 @@ template <> __device__ float amp_dec32_i8<AMP_Q_IQ1_M>(const uint8_t *b, int j, 
 	for (int l = 0; l < 4; l++) {
 		const unsigned h = (qh2 >> (8 * (l >> 1))) & 0xff;
 		const unsigned idx = ((qs4 >> (8 * l)) & 0xff) | (((l & 1) ? h << 4 : h << 8) & 0x700);
-		const uint64_t grid = gr[idx];
+		const uint64_t grid = ((const uint64_t *)gr)[idx];
 
 		w[2 * l] = (int)(unsigned)grid;
 		w[2 * l + 1] = (int)(unsigned)(grid >> 32);
@@ -584,7 +858,7 @@ template <> __device__ float amp_dec32_i8<AMP_Q_IQ1_S>(const uint8_t *b, int j, 
 
 #pragma unroll
 	for (int l = 0; l < 4; l++) {
-		const uint64_t grid = gr[b[2 + 4 * j + l] | (((qh >> (3 * l)) & 7) << 8)];
+		const uint64_t grid = ((const uint64_t *)gr)[b[2 + 4 * j + l] | (((qh >> (3 * l)) & 7) << 8)];
 
 		w[2 * l] = (int)(unsigned)grid;
 		w[2 * l + 1] = (int)(unsigned)(grid >> 32);
@@ -663,7 +937,8 @@ template <int T, bool MOE, bool GLU, int MR, int RPW, bool GRP = false, bool QX 
 __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const float *__restrict__ xs,
                                         const uint8_t *__restrict__ w, const uint8_t *__restrict__ w_up,
                                         const long long *__restrict__ ids, const float *__restrict__ scale,
-                                        void *__restrict__ out, int M, int N, int K, int xdiv, int G, float lim, int e0, int ne)
+                                        void *__restrict__ out, int M, int N, int K, int xdiv, int G, float lim, int e0, int ne,
+                                        const long long *__restrict__ ptrs)
 {
 	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_Q5_K ? 176 : T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
 	constexpr int IPB = T == AMP_Q_Q8_0 ? 1 : 8;                    /* items of 32 weights per block */
@@ -805,7 +1080,8 @@ __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const flo
 
 	#pragma unroll
 			for (int r = 0; r < RPW; r++) {
-				row[r] = w + ((size_t)e * N + n0 + r) * rb;
+				row[r] = ptrs ? (const uint8_t *)ptrs[e] + (size_t)(n0 + r) * rb
+					: w + ((size_t)e * N + n0 + r) * rb;
 				row_up[r] = GLU ? w_up + ((size_t)e * N + n0 + r) * rb : NULL;
 			}
 
@@ -969,7 +1245,8 @@ amp_gguf_quant_x(const void *x, void *xq, void *xs, int R, int K, cudaStream_t s
  * Returns cudaErrorNotSupported for the others (the caller then uses the fp16 kernel). */
 extern "C" int
 amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const void *w_up, const void *ids, const void *scale,
-                 void *out, int M, int N, int K, int xdiv, int slots, int G, float lim, int e0, int ne, int mr, int qx, cudaStream_t stream)
+                 void *out, int M, int N, int K, int xdiv, int slots, int G, float lim, int e0, int ne, int mr, int qx,
+                 const void *ptrs, cudaStream_t stream)
 {
 	const bool moe = ids != NULL;
 
@@ -977,7 +1254,7 @@ amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const
 		return (int)cudaErrorNotSupported;
 
 	if (N < 1 || K < amp_qtype_info(qtype).block || (K % amp_qtype_info(qtype).block) || (!moe && (M < 1 || M > 8)) ||
-	    (moe && (slots < 1 || xdiv < 1)) || (w_up && G != 1))
+	    (moe && (slots < 1 || xdiv < 1)) || (w_up && G != 1) || (!w && !ptrs))
 		return (int)cudaErrorInvalidValue;
 
 	const dim3 blk(256);
@@ -988,15 +1265,15 @@ amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const
 #define AMP_I8_K(T, MOE_, GLU_, MR_, RPW_) \
 	amp_gguf_gemv_i8_kernel<T, MOE_, GLU_, MR_, RPW_><<<dim3((N + 8 * RPW_ * amp_gemv_iter(T) - 1) / (8 * RPW_ * amp_gemv_iter(T)), moe ? slots : G), blk, 0, stream>>>( \
 		(const int8_t *)xq, (const float *)xs, (const uint8_t *)w, (const uint8_t *)w_up, (const long long *)ids, (const float *)scale, out, M, N, K, \
-		xdiv, G, lim, e0, ne)
+		xdiv, G, lim, e0, ne, (const long long *)ptrs)
 #define AMP_I8_KQ(T, MOE_, GLU_, RPW_) \
 	amp_gguf_gemv_i8_kernel<T, MOE_, GLU_, 1, RPW_, false, true><<<dim3((N + 8 * RPW_ * amp_gemv_iter(T) - 1) / (8 * RPW_ * amp_gemv_iter(T)), moe ? slots : G), \
 		blk, (size_t)K + (size_t)(K / 32) * 4, stream>>>((const int8_t *)xq, (const float *)xs, (const uint8_t *)w, (const uint8_t *)w_up, \
-		(const long long *)ids, (const float *)scale, out, M, N, K, xdiv, G, lim, e0, ne)
+		(const long long *)ids, (const float *)scale, out, M, N, K, xdiv, G, lim, e0, ne, (const long long *)ptrs)
 #define AMP_I8_KG(T, GLU_, MR_) \
 	amp_gguf_gemv_i8_kernel<T, true, GLU_, MR_, 1, true><<<dim3((N + 8 * amp_gemv_iter(T) - 1) / (8 * amp_gemv_iter(T)), slots), blk, 0, stream>>>( \
 		(const int8_t *)xq, (const float *)xs, (const uint8_t *)w, (const uint8_t *)w_up, (const long long *)ids, (const float *)scale, out, M, N, K, \
-		xdiv, G, lim, e0, ne)
+		xdiv, G, lim, e0, ne, (const long long *)ptrs)
 #define AMP_I8_GRP(T, GLU_) \
 	switch (mr) { \
 	case 2: AMP_I8_KG(T, GLU_, 2); break; \
@@ -1330,7 +1607,7 @@ template <> __device__ void amp_mma_dec<AMP_Q_IQ1_M>(const uint8_t *b, int j, in
 	const unsigned su = (((unsigned)sb >> 12) & 0xf) | (((unsigned)(sb >> 16) >> 8) & 0x00f0) | (((unsigned)(sb >> 32) >> 4) & 0x0f00) |
 	                    ((unsigned)(sb >> 48) & 0xf000);
 	const unsigned scw = (unsigned)(sb >> (16 * (j >> 1))) & 0xffff;
-	const uint64_t grid = gr[idx];
+	const uint64_t grid = ((const uint64_t *)gr)[idx];
 	const unsigned g = (tig & 1) ? (unsigned)(grid >> 32) : (unsigned)grid;
 	const unsigned g8 = (g << 3) & 0xF8F8F8F8u;                                   /* 8 * grid, bytewise (grid in -1..1) */
 	const bool neg = hh & ((l & 1) ? 0x80 : 0x08);
@@ -1344,7 +1621,7 @@ template <> __device__ void amp_mma_dec<AMP_Q_IQ1_S>(const uint8_t *b, int j, in
 {
 	const unsigned qh = amp_u16(b + 34 + 2 * j);
 	const int l = 2 * h + (tig >> 1);
-	const uint64_t grid = gr[b[2 + 4 * j + l] | (((qh >> (3 * l)) & 7) << 8)];
+	const uint64_t grid = ((const uint64_t *)gr)[b[2 + 4 * j + l] | (((qh >> (3 * l)) & 7) << 8)];
 	const unsigned g = (tig & 1) ? (unsigned)(grid >> 32) : (unsigned)grid;
 	const unsigned g8 = (g << 3) & 0xF8F8F8F8u;                                   /* 8 * grid, bytewise (grid in -1..1) */
 
@@ -1572,8 +1849,8 @@ template <int T>
 __global__ void amp_gguf_embed_kernel(const uint8_t *__restrict__ w, const long long *__restrict__ ids, __half *__restrict__ out, long nrows,
                                       long vocab, int K)
 {
-	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_IQ4_NL ? 18 : T == AMP_Q_Q5_K ? 176 : T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
-	constexpr int gpb = (T == AMP_Q_Q8_0 || T == AMP_Q_IQ4_NL) ? 4 : 32;       /* groups of 8 per block */
+	constexpr int bytes = amp_qbytes(T);
+	constexpr int gpb = amp_qgpb(T);       /* groups of 8 per block */
 	const int gper = K / 8;
 	const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -1591,7 +1868,13 @@ __global__ void amp_gguf_embed_kernel(const uint8_t *__restrict__ w, const long 
 
 	const size_t rb = (size_t)(K / (gpb * 8)) * bytes;
 
-	amp_dq_group<T>(w + (size_t)id * rb + (size_t)(g / gpb) * bytes, g % gpb, v, T == AMP_Q_IQ2_XS ? iq2xs_grid : iq2xxs_grid, ksigns_iq2xs);
+	const void *gr = T == AMP_Q_IQ2_XS ? (const void *)iq2xs_grid :
+	                 T == AMP_Q_IQ2_XXS ? (const void *)iq2xxs_grid :
+	                 T == AMP_Q_IQ2_S ? (const void *)iq2s_grid :
+	                 T == AMP_Q_IQ3_XXS ? (const void *)iq3xxs_grid :
+	                 T == AMP_Q_IQ3_S ? (const void *)iq3s_grid :
+	                 (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S) ? (const void *)iq1s_grid : NULL;
+	amp_dq_group<T>(w + (size_t)id * rb + (size_t)(g / gpb) * bytes, g % gpb, v, gr, ksigns_iq2xs);
 #pragma unroll
 	for (int j = 0; j < 8; j++)
 		h[j] = __float2half(v[j]);
@@ -1616,6 +1899,7 @@ amp_gguf_embed(int qtype, const void *w, const void *ids, void *out, long nrows,
 	case T: amp_gguf_embed_kernel<T><<<grid, 256, 0, stream>>>((const uint8_t *)w, (const long long *)ids, (__half *)out, nrows, vocab, K); break
 
 	switch (qtype) {
+	AMP_EMB_CASE(AMP_Q_Q4_0);
 	AMP_EMB_CASE(AMP_Q_Q8_0);
 	AMP_EMB_CASE(AMP_Q_IQ4_NL);
 	AMP_EMB_CASE(AMP_Q_Q5_K);
@@ -1623,6 +1907,14 @@ amp_gguf_embed(int qtype, const void *w, const void *ids, void *out, long nrows,
 	AMP_EMB_CASE(AMP_Q_IQ2_XS);
 	AMP_EMB_CASE(AMP_Q_IQ1_M);
 	AMP_EMB_CASE(AMP_Q_IQ1_S);
+	AMP_EMB_CASE(AMP_Q_Q2_0);
+	AMP_EMB_CASE(AMP_Q_Q4_K);
+	AMP_EMB_CASE(AMP_Q_Q3_K);
+	AMP_EMB_CASE(AMP_Q_Q6_K);
+	AMP_EMB_CASE(AMP_Q_IQ2_S);
+	AMP_EMB_CASE(AMP_Q_IQ3_XXS);
+	AMP_EMB_CASE(AMP_Q_IQ3_S);
+	AMP_EMB_CASE(AMP_Q_IQ4_XS);
 	default: return (int)cudaErrorInvalidValue;
 	}
 #undef AMP_EMB_CASE
