@@ -40,7 +40,7 @@ function usage() {
 	printf("  --survey-margin MiB   VRAM kept free per GPU after the warm-up (default 1024)\n");
 	printf("  --survey-min-resident F  smallest resident-expert fraction accepted before a feature is given up (default 0.3)\n");
 	printf("  --chunk N             prefill chunk size (default 1024; 4096 for Qwen --tp)\n");
-	printf("  --mtp N               speculative MTP window (default 3; 7 with --dflash)\n");
+	printf("  --mtp N               speculative MTP window (default 3; 4 on ROCm for Qwen3.5 / 3.8, its maximum there; 7 with --dflash)\n");
 	printf("  --lookup N            prompt-lookup drafts: verify up to N tokens copied from earlier text (GLM, default 0)\n");
 	printf("  --dflash DIR          DFlash 2 drafter (Qwen3.5/3.8 --tp): --mtp N is its window\n");
 	printf("  --tp                  tensor parallel\n");

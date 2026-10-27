@@ -14,11 +14,9 @@
 // ucode exceptions.
 
 #include <cstdint>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#include "amp_hip_compat.h"
 #include <cstdio>
 #include <cstdlib>
-#include <cuda_runtime.h>
 #include <stddef.h>
 
 #define AMP_RMS_BLOCK 256
@@ -999,6 +997,23 @@ amp_argmax_advance_fp16(const void *logits, int n,
 
 #define AMP_GDN_TB 16        /* tokens per staged tile */
 
+#ifdef AMPSTEIN_ROCM
+/* No cp.async on AMD: a staged copy is a plain synchronous load + store, and the commit / wait of a copy group are
+ * no-ops (the __syncthreads() that follows every stage already orders the shared-memory writes). Same results; the
+ * global loads of the next tile are no longer overlapped with the compute of the current one. */
+__device__ __forceinline__ void amp_cp_async16(void *dst, const void *src)
+{
+	*(uint4 *)dst = *(const uint4 *)src;
+}
+
+__device__ __forceinline__ void amp_cp_async4(void *dst, const void *src)
+{
+	*(float *)dst = *(const float *)src;
+}
+
+#define AMP_CP_COMMIT() do { } while (0)
+#define AMP_CP_WAIT(n) do { } while (0)
+#else
 __device__ __forceinline__ void amp_cp_async16(void *dst, const void *src)
 {
 	unsigned d = (unsigned)__cvta_generic_to_shared(dst);
@@ -1013,13 +1028,17 @@ __device__ __forceinline__ void amp_cp_async4(void *dst, const void *src)
 	asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(d), "l"(src));
 }
 
+#define AMP_CP_COMMIT() asm volatile("cp.async.commit_group;\n" ::)
+#define AMP_CP_WAIT(n) asm volatile("cp.async.wait_group " #n ";\n" ::)
+#endif
+
 template <int DK, int VT, int RS>
 __global__ __launch_bounds__(VT * RS)
 void amp_gdn_scan_kernel(const float *__restrict__ q, const float *__restrict__ k,
                         const float *__restrict__ v, const float *__restrict__ beta,
                         const float *__restrict__ gexp, float *__restrict__ state,
                         float *__restrict__ out, int S, int Hk, int Hv, int dv,
-                        float scale, float *__restrict__ states_out, int n_out)
+                        float scale, float *__restrict__ states_out, int n_out, int tiled)
 {
 	constexpr int NT = VT * RS;
 	constexpr int RPT = DK / RS;                 // state rows per thread
@@ -1031,7 +1050,7 @@ void amp_gdn_scan_kernel(const float *__restrict__ q, const float *__restrict__ 
 	const int jl = threadIdx.x / RS;
 	const int j0 = blockIdx.y * VT;
 	const int j = j0 + jl;
-	const int hk = h / (Hv / Hk);
+	const int hk = tiled ? h % Hk : h / (Hv / Hk);          // tiled: the value heads are [k0 k1 .. k0 k1 ..] (the GGUF converter's order), else grouped by key head
 
 	// tile buffer: q[TB][DK] | k[TB][DK] | v[TB][VT] | g[TB] | beta[TB]
 	__shared__ __align__(16) float sbuf[2 * BUF];
@@ -1075,7 +1094,7 @@ void amp_gdn_scan_kernel(const float *__restrict__ q, const float *__restrict__ 
 			amp_cp_async4(bb + tt, beta + (size_t)(t0 + tt) * Hv + h);
 		}
 
-		asm volatile("cp.async.commit_group;\n" ::);
+		AMP_CP_COMMIT();
 	};
 
 	stage(0, 0);
@@ -1083,10 +1102,10 @@ void amp_gdn_scan_kernel(const float *__restrict__ q, const float *__restrict__ 
 	for (int tile = 0; tile < ntiles; tile++) {
 		if (tile + 1 < ntiles) {
 			stage(tile + 1, (tile + 1) & 1);
-			asm volatile("cp.async.wait_group 1;\n" ::);
+			AMP_CP_WAIT(1);
 		}
 		else
-			asm volatile("cp.async.wait_group 0;\n" ::);
+			AMP_CP_WAIT(0);
 
 		__syncthreads();
 
@@ -1176,7 +1195,7 @@ void amp_gdn_scan_cb_kernel(const float *__restrict__ q, const float *__restrict
                            const float *__restrict__ v, const float *__restrict__ beta,
                            const float *__restrict__ gexp, float *__restrict__ state,
                            float *__restrict__ out, int S, int Hk, int Hv, int dv,
-                           float scale, float *__restrict__ states_out, int n_out)
+                           float scale, float *__restrict__ states_out, int n_out, int tiled)
 {
 	constexpr int C = AMP_GDN_CB_C;
 	constexpr int NT = (VT / C) * RS;
@@ -1190,7 +1209,7 @@ void amp_gdn_scan_cb_kernel(const float *__restrict__ q, const float *__restrict
 	const int cg = threadIdx.x / RS;              // column group
 	const int j0 = blockIdx.y * VT;
 	const int jc = j0 + cg * C;
-	const int hk = h / (Hv / Hk);
+	const int hk = tiled ? h % Hk : h / (Hv / Hk);          // tiled: the value heads are [k0 k1 .. k0 k1 ..] (the GGUF converter's order), else grouped by key head
 
 	__shared__ __align__(16) float sbuf[2 * BUF];
 
@@ -1240,7 +1259,7 @@ void amp_gdn_scan_cb_kernel(const float *__restrict__ q, const float *__restrict
 			amp_cp_async4(bb + tt, beta + (size_t)(t0 + tt) * Hv + h);
 		}
 
-		asm volatile("cp.async.commit_group;\n" ::);
+		AMP_CP_COMMIT();
 	};
 
 	stage(0, 0);
@@ -1248,10 +1267,10 @@ void amp_gdn_scan_cb_kernel(const float *__restrict__ q, const float *__restrict
 	for (int tile = 0; tile < ntiles; tile++) {
 		if (tile + 1 < ntiles) {
 			stage(tile + 1, (tile + 1) & 1);
-			asm volatile("cp.async.wait_group 1;\n" ::);
+			AMP_CP_WAIT(1);
 		}
 		else
-			asm volatile("cp.async.wait_group 0;\n" ::);
+			AMP_CP_WAIT(0);
 
 		__syncthreads();
 
@@ -1388,7 +1407,7 @@ extern "C" int
 amp_gdn_scan_f32(const void *q, const void *k, const void *v, const void *beta,
                 const void *gexp, void *state, void *out, int S, int Hk,
                 int Hv, int dk, int dv, float scale, void *states_out,
-                int n_out, cudaStream_t stream)
+                int n_out, int tiled, cudaStream_t stream)
 {
 	if (S <= 0)
 		return 0;
@@ -1407,7 +1426,7 @@ amp_gdn_scan_f32(const void *q, const void *k, const void *v, const void *beta,
 		amp_gdn_scan_cb_kernel<128, VT_, RS_><<<g, ((VT_) / AMP_GDN_CB_C) * (RS_), \
 			0, stream>>>((const float *)q, (const float *)k, (const float *)v, \
 			(const float *)beta, (const float *)gexp, (float *)state, \
-			(float *)out, S, Hk, Hv, dv, scale, (float *)states_out, n_out); \
+			(float *)out, S, Hk, Hv, dv, scale, (float *)states_out, n_out, tiled); \
 		return (int)cudaGetLastError(); \
 	} } while (0)
 
@@ -1437,7 +1456,7 @@ amp_gdn_scan_f32(const void *q, const void *k, const void *v, const void *beta,
 	amp_gdn_scan_kernel<DK, VT_, RS_><<<grid, (VT_) * (RS_), 0, stream>>>( \
 		(const float *)q, (const float *)k, (const float *)v, \
 		(const float *)beta, (const float *)gexp, (float *)state, \
-		(float *)out, S, Hk, Hv, dv, scale, (float *)states_out, n_out); \
+		(float *)out, S, Hk, Hv, dv, scale, (float *)states_out, n_out, tiled); \
 	return (int)cudaGetLastError(); } while (0)
 
 	if (dk == 128) {
@@ -2238,6 +2257,9 @@ amp_gdn_out_norm(const void *core, const void *z, const void *w, void *out,
 // is fp32. dk == dv == 128 only (Qwen3.5); other shapes use amp_gdn_scan.
 // ---------------------------------------------------------------------------
 
+// The chunked (WY/UT) gated delta rule: cudaFuncSetAttribute on kernel pointers and no ROCm user (qwen35 uses the sequential scan) -- CUDA only.
+#ifndef AMPSTEIN_ROCM
+
 #define AMP_GDC_C 64          // tokens per block
 #define AMP_GDC_D 128         // head dim (dk == dv)
 #define AMP_GDC_DP (AMP_GDC_D + 1)
@@ -2581,6 +2603,8 @@ amp_gdn_chunk_f32(const void *q, const void *k, const void *v, const void *beta,
 	return (int)cudaGetLastError();
 }
 
+#endif /* !AMPSTEIN_ROCM */
+
 // ---------------------------------------------------------------------------
 // Attention-layer fusions (qwen35 full-attention layers).
 //
@@ -2714,6 +2738,9 @@ amp_attn_gate_fp16(const void *a, long ast, long ash, const void *g, long gst,
 
 	return (int)cudaGetLastError();
 }
+
+// Multi-GPU PCIe P2P all-reduce (--tp): __ldcg / __trap / __syncwarp spin-waits with no portable HIP use here -- CUDA only.
+#ifndef AMPSTEIN_ROCM
 
 /*
  * N-way all-reduce over PCIe peer-to-peer (tensor parallelism over N
@@ -2958,6 +2985,8 @@ amp_comm_allreduce_fp16(const void *x, void *out, void *const *bufs,
 	return (int)cudaGetLastError();
 }
 
+#endif /* !AMPSTEIN_ROCM */
+
 /*
  * Batched contiguous copies on one device: up to AMP_CM_MAX (src, dst,
  * bytes) entries in one launch (the speculative-decoding rollback copies
@@ -3067,12 +3096,12 @@ __device__ __forceinline__ int amp_ad_nse(int len, int ns)
 /* SR: the number of query rows S, a template parameter so the per-row
  * register arrays are sized exactly (a 5-row worst case cost the S = 1
  * kernel half its occupancy) */
-template <int DPL, int SR>
+template <int DPL, int SR, bool Q8 = false>
 __global__ void
-amp_attn_dec_kernel(const __half *__restrict__ q, const __half *__restrict__ kc,
-                   const __half *__restrict__ vc, const int *__restrict__ lenp,
+amp_attn_dec_kernel(const __half *__restrict__ q, const void *__restrict__ kc,
+                   const void *__restrict__ vc, const int *__restrict__ lenp,
                    float *__restrict__ ws, int S_unused, int Hq, int Hk, int max_seq,
-                   int ns, float scale)
+                   int ns, float scale, const __half *__restrict__ ksc, const __half *__restrict__ vsc)
 {
 	constexpr int S = SR;
 
@@ -3099,11 +3128,14 @@ amp_attn_dec_kernel(const __half *__restrict__ q, const __half *__restrict__ kc,
 	/* all S rows of query head h in this warp: one K/V load serves them
 	 * all (row s attends keys < len - S + s + 1, causal) */
 	float qr[SR][DPL], acc[SR][DPL], m[SR], l[SR];
+	float qsum[SR], wsum[SR];                /* Q8: sum of the scaled query (the -128 of the code offset), sum of the V weights (same) */
 
 #pragma unroll
 	for (int s = 0; s < SR; s++) {
 		m[s] = -1e30f;
 		l[s] = 0.0f;
+		qsum[s] = 0.0f;
+		wsum[s] = 0.0f;
 
 #pragma unroll
 		for (int i = 0; i < DPL; i++) {
@@ -3121,22 +3153,73 @@ amp_attn_dec_kernel(const __half *__restrict__ q, const __half *__restrict__ kc,
 				qr[s][i] = f.x * scale;
 				qr[s][i + 1] = f.y * scale;
 			}
+
+			if (Q8) {
+#pragma unroll
+				for (int i = 0; i < DPL; i++)
+					qsum[s] += qr[s][i];
+			}
 		}
 	}
 
-	const __half *kb = kc + (size_t)j * max_seq * E + lane * DPL;
-	const __half *vb = vc + (size_t)j * max_seq * E + lane * DPL;
+	/* Q8: K / V are int8 codes (max_seq rows of E per kv head) with one fp16 scale per 32 values (kv_q8_put's rows); a lane's DPL values
+	 * (8, 4 or 2) lie in one group, so it dequantizes with one scale. fp16: the rows as they are. */
+	const __half *kb = Q8 ? NULL : (const __half *)kc + (size_t)j * max_seq * E + lane * DPL;
+	const __half *vb = Q8 ? NULL : (const __half *)vc + (size_t)j * max_seq * E + lane * DPL;
+	/* wave-uniform bases + 32-bit lane / key offsets: the loads use the scalar-base form (no 64-bit address arithmetic per load) */
+	const signed char *kqb = Q8 ? (const signed char *)kc + (size_t)j * max_seq * E : NULL;
+	const signed char *vqb = Q8 ? (const signed char *)vc + (size_t)j * max_seq * E : NULL;
+	const __half *ksb = Q8 ? ksc + (size_t)j * max_seq * (E / 32) : NULL;
+	const __half *vsb = Q8 ? vsc + (size_t)j * max_seq * (E / 32) : NULL;
+	const unsigned qlo = lane * DPL, slo = (lane * DPL) >> 5;
 	constexpr int UN = 4;
 
 	for (int t0 = begin; t0 < end; t0 += UN) {
-		__half2 kh[UN][DPL / 2], vh[UN][DPL / 2];
+		__half2 kh[Q8 ? 1 : UN][DPL / 2], vh[Q8 ? 1 : UN][DPL / 2];
+		float kf8[Q8 ? UN : 1][DPL], vf8[Q8 ? UN : 1][DPL], ksc8[Q8 ? UN : 1], vsc8[Q8 ? UN : 1];
 
 #pragma unroll
 		for (int u = 0; u < UN; u++) {
 			int t = t0 + u;
 			bool ok = t < end;
 
-			if (DPL == 8) {
+			if (Q8) {
+				unsigned long long kw = 0, vw = 0;
+				float kscl = 0.0f, vscl = 0.0f;
+
+				if (ok) {
+					const unsigned qo = (unsigned)t * E + qlo, so = (unsigned)t * (E / 32) + slo;
+
+					if (DPL == 8) {
+						kw = *(const unsigned long long *)(kqb + qo);
+						vw = *(const unsigned long long *)(vqb + qo);
+					}
+					else if (DPL == 4) {
+						kw = *(const unsigned *)(kqb + qo);
+						vw = *(const unsigned *)(vqb + qo);
+					}
+					else {
+						kw = *(const unsigned short *)(kqb + qo);
+						vw = *(const unsigned short *)(vqb + qo);
+					}
+
+					kscl = __half2float(ksb[so]);
+					vscl = __half2float(vsb[so]);
+				}
+
+/* the codes with the sign bit flipped are unsigned bytes u = c + 128: one v_cvt_f32_ubyteN each; the -128 is folded into qsum / wsum */
+				kw ^= 0x8080808080808080ull;
+				vw ^= 0x8080808080808080ull;
+				ksc8[u] = kscl;
+				vsc8[u] = vscl;
+
+#pragma unroll
+				for (int i = 0; i < DPL; i++) {
+					kf8[u][i] = (float)((unsigned)(kw >> (8 * i)) & 0xffu);
+					vf8[u][i] = (float)((unsigned)(vw >> (8 * i)) & 0xffu);
+				}
+			}
+			else if (DPL == 8) {
 				*(uint4 *)kh[u] = ok ? *(const uint4 *)(kb + (size_t)t * E) : make_uint4(0, 0, 0, 0);
 				*(uint4 *)vh[u] = ok ? *(const uint4 *)(vb + (size_t)t * E) : make_uint4(0, 0, 0, 0);
 			}
@@ -3159,12 +3242,21 @@ amp_attn_dec_kernel(const __half *__restrict__ q, const __half *__restrict__ kc,
 			for (int u = 0; u < UN; u++) {
 				float part = 0.0f;
 
+				if (Q8) {
 #pragma unroll
-				for (int i = 0; i < DPL / 2; i++) {
-					float2 kf = __half22float2(kh[u][i]);
+					for (int i = 0; i < DPL; i++)
+						part = fmaf(qr[s][i], kf8[u][i], part);
 
-					part = fmaf(qr[s][2 * i], kf.x, part);
-					part = fmaf(qr[s][2 * i + 1], kf.y, part);
+					part = ksc8[u] * fmaf(-128.0f, qsum[s], part);
+				}
+				else {
+#pragma unroll
+					for (int i = 0; i < DPL / 2; i++) {
+						float2 kf = __half22float2(kh[u][i]);
+
+						part = fmaf(qr[s][2 * i], kf.x, part);
+						part = fmaf(qr[s][2 * i + 1], kf.y, part);
+					}
 				}
 
 #pragma unroll
@@ -3186,18 +3278,31 @@ amp_attn_dec_kernel(const __half *__restrict__ q, const __half *__restrict__ kc,
 			for (int i = 0; i < DPL; i++)
 				acc[s][i] *= corr;
 
+			wsum[s] *= corr;
+
 #pragma unroll
 			for (int u = 0; u < UN; u++) {
 				float e = __expf(sc[u] - mn);
 
 				ls += e;
 
-#pragma unroll
-				for (int i = 0; i < DPL / 2; i++) {
-					float2 vf = __half22float2(vh[u][i]);
+				if (Q8) {
+					const float wv = e * vsc8[u];
 
-					acc[s][2 * i] = fmaf(e, vf.x, acc[s][2 * i]);
-					acc[s][2 * i + 1] = fmaf(e, vf.y, acc[s][2 * i + 1]);
+					wsum[s] += wv;
+
+#pragma unroll
+					for (int i = 0; i < DPL; i++)
+						acc[s][i] = fmaf(wv, vf8[u][i], acc[s][i]);
+				}
+				else {
+#pragma unroll
+					for (int i = 0; i < DPL / 2; i++) {
+						float2 vf = __half22float2(vh[u][i]);
+
+						acc[s][2 * i] = fmaf(e, vf.x, acc[s][2 * i]);
+						acc[s][2 * i + 1] = fmaf(e, vf.y, acc[s][2 * i + 1]);
+					}
 				}
 			}
 
@@ -3219,7 +3324,7 @@ amp_attn_dec_kernel(const __half *__restrict__ q, const __half *__restrict__ kc,
 
 #pragma unroll
 		for (int i = 0; i < DPL; i++)
-			w[4 + lane * DPL + i] = any ? acc[s][i] : 0.0f;
+			w[4 + lane * DPL + i] = any ? (Q8 ? fmaf(-128.0f, wsum[s], acc[s][i]) : acc[s][i]) : 0.0f;
 	}
 }
 
@@ -3337,6 +3442,508 @@ amp_attn_dec_combine(const float *ws, __half *out, int S, int Hq, int Hk, int E,
 			Hk, ns, len, max_seq);
 }
 
+#ifdef AMPSTEIN_ROCM
+/* ---- decode attention on the WMMA matrix units (gfx11, wave32) ----------------------------------------------------------
+ *
+ * The scalar kernel above spends ~85 vector instructions per key and query row; here a block takes one kv head and a split of its
+ * keys, and all rep * S query rows (<= 32, padded to 16 * MT) share every K / V tile: S = Q K^T and O += P V are v_wmma_f32_16x16x16_f16.
+ *   gfx11 wave32 fragments: A (16 x 16): lane l holds row l % 16, 16 consecutive k; B (16 x 16): lane l holds column l % 16, 16 consecutive k
+ *   (lanes l and l + 16 hold the same); C / D: VGPR i of lane l is row 2 * i + l / 16, column l % 16.
+ * Per tile of BK = 32 keys:  stage K (row-major, padded rows) and V (TRANSPOSED: a B fragment of P V is 16 consecutive keys of one
+ * dimension) in LDS, dequantizing the Q8 codes on the way -> S partials (the 8 warps split the k steps of the 2 * MT tiles) ->
+ * softmax of the fp32 scores through LDS (which is also the C -> A transposition: P is written row-major) -> O += P V.
+ * Partial results go to the workspace in the scalar kernel's layout; amp_attn_dec_combine merges the splits.
+ * Q8 codes: the byte with its sign bit flipped is an unsigned u = c + 128; 0x6400 | u is the half 1024 + u (exact), so
+ * c = that - 1152 (exact) and the group scale is one packed multiply. */
+typedef _Float16 amp_v16h __attribute__((ext_vector_type(16)));
+typedef _Float16 amp_v2h __attribute__((ext_vector_type(2)));
+typedef float amp_v8f __attribute__((ext_vector_type(8)));
+
+#define AMP_WM_BK 32
+#define AMP_WM_W 8
+
+static __device__ __forceinline__ amp_v16h amp_wm_frag(const __half *p)
+{
+	union { uint4 u[2]; amp_v16h v; } r;
+
+	r.u[0] = ((const uint4 *)p)[0];
+	r.u[1] = ((const uint4 *)p)[1];
+
+	return r.v;
+}
+
+/* four int8 codes -> four halves (two dwords), scaled by sc2 (a packed half2 scale) */
+static __device__ __forceinline__ void amp_wm_dq4(unsigned x, amp_v2h sc2, unsigned &o0, unsigned &o1)
+{
+	x ^= 0x80808080u;
+
+	const unsigned a = __builtin_amdgcn_perm(x, 0x64646464u, 0x00050004u);
+	const unsigned b = __builtin_amdgcn_perm(x, 0x64646464u, 0x00070006u);
+	const amp_v2h k1152 = { (_Float16)1152.0f, (_Float16)1152.0f };
+	amp_v2h ha = __builtin_bit_cast(amp_v2h, a), hb = __builtin_bit_cast(amp_v2h, b);
+
+	ha = (ha - k1152) * sc2;
+	hb = (hb - k1152) * sc2;
+	o0 = __builtin_bit_cast(unsigned, ha);
+	o1 = __builtin_bit_cast(unsigned, hb);
+}
+
+/* PF (prefill): the S query positions are the S positions of a block of a chunk of Sq,
+ * blockIdx.y indexes the position block, the keys are the whole causal prefix (no split, no workspace): the normalized output is written. */
+template <int MT, bool Q8, bool PF = false>
+__global__ void __launch_bounds__(256)
+amp_attn_dec_wmma_kernel(const __half *__restrict__ q, const void *__restrict__ kc, const void *__restrict__ vc,
+                         const int *__restrict__ lenp, float *__restrict__ ws, __half *__restrict__ outp, int S, int Sq, int Hq, int Hk,
+                         int max_seq, int ns, float scale, const __half *__restrict__ ksc, const __half *__restrict__ vsc)
+{
+	constexpr int E = 256, BK = AMP_WM_BK, W = AMP_WM_W;
+	constexpr int MR = 16 * MT;
+	constexpr int NTL = 2 * MT;                  /* (m tile, 16 keys) score tiles */
+	constexpr int KSPLIT = W / NTL;              /* warps sharing a score tile's k steps */
+	constexpr int KPW = (E / 16) / KSPLIT;       /* k steps per warp */
+	constexpr int RPW = MR / W;                  /* softmax rows per warp */
+	constexpr int NPV = 16 / W;                  /* PV n tiles (16 dims) per warp */
+	constexpr int KST = E + 8, VST = BK + 8;     /* LDS row strides (halves): conflict-free 128-bit fragment reads */
+	constexpr int WSROW = 4 + E;
+
+	__shared__ __align__(16) __half Kt[BK * KST];
+	__shared__ __align__(16) __half Vt[E * VST];
+	__shared__ __align__(16) __half Pt[MR * VST];
+	__shared__ __align__(16) float Sb[KSPLIT * MR * BK];
+	__shared__ float cs[MR];
+
+	const int j = blockIdx.x, sp = blockIdx.y;
+	const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, hh = lane >> 4, l16 = lane & 15;
+	const int rep = Hq / Hk;
+
+	int len = *lenp;
+
+	len = (len < 0) ? 0 : (len > max_seq ? max_seq : len);
+
+	int begin, end, Sx = S, s0 = 0;
+
+	if (PF) {
+		/* the block's positions s0 .. s0 + Sx - 1 of the chunk (its last position is len - Sq + s0 + Sx - 1) */
+		s0 = sp * S;
+		Sx = min(S, Sq - s0);
+		begin = 0;
+		end = len - Sq + s0 + Sx;
+	}
+	else {
+		const int nse = amp_ad_nse(len, ns);
+
+		if (sp >= nse)
+			return;
+
+		const int chunk = (len + nse - 1) / nse;
+
+		begin = sp * chunk;
+		end = min(len, begin + chunk);
+	}
+
+	const int R = rep * Sx;
+	const int ntiles = (end - begin + BK - 1) / BK;
+	const int lenx = PF ? end : len;                 /* row s attends the keys below lenx - Sx + s + 1 */
+
+	const int tl = warp % NTL, ks = warp / NTL;
+	const int smt = tl >> 1, snb = tl & 1;       /* this warp's score tile: m tile, 16-key half */
+
+	amp_v16h qa[KPW];
+
+	{
+		const int r = smt * 16 + l16;
+
+#pragma unroll
+		for (int kk = 0; kk < KPW; kk++) {
+			union { uint4 u[2]; amp_v16h v; } t;
+
+			t.u[0] = make_uint4(0u, 0u, 0u, 0u);
+			t.u[1] = t.u[0];
+
+			if (r < R) {
+				const __half *qp = q + ((size_t)(s0 + r / rep) * Hq + j * rep + r % rep) * E + (ks * KPW + kk) * 16;
+
+				t.u[0] = ((const uint4 *)qp)[0];
+				t.u[1] = ((const uint4 *)qp)[1];
+			}
+
+			qa[kk] = t.v;
+		}
+	}
+
+	amp_v8f acc[MT][NPV];
+
+#pragma unroll
+	for (int m = 0; m < MT; m++)
+#pragma unroll
+		for (int n = 0; n < NPV; n++)
+			acc[m][n] = (amp_v8f){ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+
+	float mrun[RPW], lrun[RPW];
+
+#pragma unroll
+	for (int i = 0; i < RPW; i++) {
+		mrun[i] = -1e30f;
+		lrun[i] = 0.0f;
+	}
+
+	/* staging roles: K: key tid / 8, dims 32 * (tid % 8) ..; V: key pair tid % 16, dims 16 * (tid / 16) .. */
+	const int kkey = tid >> 3, kchunk = tid & 7;
+	const int vpair = tid & 15, vchunk = tid >> 4;
+	const size_t base = (size_t)j * max_seq;
+
+	/* tile staging, split in two so the global loads of tile t + 1 are in flight while tile t is computed:
+	 * load_raw: the codes / halves of this thread's K chunk and V key pair (zeros past the split's end);
+	 * store_lds: dequantize (Q8) and write K row-major, V transposed */
+	struct Raw {
+		uint4 k[4], v[4];
+		unsigned ksc, vsc[2];
+	};
+
+	auto load_raw = [&](int tb, Raw &r) {
+		const int key = tb + kkey;
+
+#pragma unroll
+		for (int i = 0; i < 4; i++) {
+			r.k[i] = make_uint4(0u, 0u, 0u, 0u);
+			r.v[i] = r.k[i];
+		}
+
+		r.ksc = 0u;
+		r.vsc[0] = r.vsc[1] = 0u;
+
+		if (key < end) {
+			if (Q8) {
+				const signed char *p = (const signed char *)kc + (base + key) * E + kchunk * 32;
+
+				r.k[0] = ((const uint4 *)p)[0];
+				r.k[1] = ((const uint4 *)p)[1];
+				r.ksc = __builtin_bit_cast(unsigned short, ksc[(base + key) * (E / 32) + kchunk]);
+			}
+			else {
+				const __half *p = (const __half *)kc + (base + key) * E + kchunk * 32;
+
+#pragma unroll
+				for (int i = 0; i < 4; i++)
+					r.k[i] = ((const uint4 *)p)[i];
+			}
+		}
+
+#pragma unroll
+		for (int kp = 0; kp < 2; kp++) {
+			const int vk = tb + 2 * vpair + kp;
+
+			if (vk < end) {
+				if (Q8) {
+					r.v[kp] = *(const uint4 *)((const signed char *)vc + (base + vk) * E + vchunk * 16);
+					r.vsc[kp] = __builtin_bit_cast(unsigned short, vsc[(base + vk) * (E / 32) + (vchunk >> 1)]);
+				}
+				else {
+					const __half *p = (const __half *)vc + (base + vk) * E + vchunk * 16;
+
+					r.v[2 * kp] = ((const uint4 *)p)[0];
+					r.v[2 * kp + 1] = ((const uint4 *)p)[1];
+				}
+			}
+		}
+	};
+
+	auto store_lds = [&](const Raw &r) {
+		uint4 o[4];
+
+		if (Q8) {
+			const unsigned cw[8] = { r.k[0].x, r.k[0].y, r.k[0].z, r.k[0].w, r.k[1].x, r.k[1].y, r.k[1].z, r.k[1].w };
+			const _Float16 sh = __builtin_bit_cast(_Float16, (unsigned short)r.ksc);
+			const amp_v2h sc2 = { sh, sh };
+			unsigned ow[16];
+
+#pragma unroll
+			for (int i = 0; i < 8; i++)
+				amp_wm_dq4(cw[i], sc2, ow[2 * i], ow[2 * i + 1]);
+
+#pragma unroll
+			for (int i = 0; i < 4; i++)
+				o[i] = make_uint4(ow[4 * i], ow[4 * i + 1], ow[4 * i + 2], ow[4 * i + 3]);
+		}
+		else {
+#pragma unroll
+			for (int i = 0; i < 4; i++)
+				o[i] = r.k[i];
+		}
+
+#pragma unroll
+		for (int i = 0; i < 4; i++)
+			((uint4 *)(Kt + kkey * KST + kchunk * 32))[i] = o[i];
+
+		unsigned w0[8], w1[8];
+
+#pragma unroll
+		for (int kp = 0; kp < 2; kp++) {
+			unsigned *w = kp ? w1 : w0;
+
+			if (Q8) {
+				const uint4 c = r.v[kp];
+				const unsigned cw[4] = { c.x, c.y, c.z, c.w };
+				const _Float16 sh = __builtin_bit_cast(_Float16, (unsigned short)r.vsc[kp]);
+				const amp_v2h sc2 = { sh, sh };
+
+#pragma unroll
+				for (int i = 0; i < 4; i++)
+					amp_wm_dq4(cw[i], sc2, w[2 * i], w[2 * i + 1]);
+			}
+			else {
+				const uint4 a = r.v[2 * kp], b = r.v[2 * kp + 1];
+
+				w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
+				w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+			}
+		}
+
+		unsigned *vt = (unsigned *)Vt;
+
+#pragma unroll
+		for (int i = 0; i < 8; i++) {
+			const int d = vchunk * 16 + 2 * i;
+
+			vt[d * (VST / 2) + vpair] = __builtin_amdgcn_perm(w1[i], w0[i], 0x05040100u);
+			vt[(d + 1) * (VST / 2) + vpair] = __builtin_amdgcn_perm(w1[i], w0[i], 0x07060302u);
+		}
+	};
+
+	Raw cur, nxt;
+
+	if (ntiles > 0)
+		load_raw(begin, cur);
+
+	for (int t = 0; t < ntiles; t++) {
+		const int tb = begin + t * BK;
+
+		store_lds(cur);
+
+		if (t + 1 < ntiles)
+			load_raw(tb + BK, nxt);
+
+		__syncthreads();
+
+		/* ---- S partials ---- */
+		{
+			amp_v8f c = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+
+#pragma unroll
+			for (int kk = 0; kk < KPW; kk++) {
+				const amp_v16h b = amp_wm_frag(Kt + (snb * 16 + l16) * KST + (ks * KPW + kk) * 16);
+
+				c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qa[kk], b, c);
+			}
+
+#pragma unroll
+			for (int i = 0; i < 8; i++)
+				Sb[(ks * MR + smt * 16 + 2 * i + hh) * BK + snb * 16 + l16] = c[i];
+		}
+
+		__syncthreads();
+
+		/* ---- softmax: warp w owns rows RPW * w ..; lane = key ---- */
+#pragma unroll
+		for (int ri = 0; ri < RPW; ri++) {
+			const int ro = warp * RPW + ri;
+			float sc = 0.0f;
+
+#pragma unroll
+			for (int k2 = 0; k2 < KSPLIT; k2++)
+				sc += Sb[(k2 * MR + ro) * BK + lane];
+
+			sc *= scale;
+
+			const int kidx = tb + lane;
+			const bool ok = ro < R && kidx < end && kidx < lenx - Sx + ro / rep + 1;
+			float mx = ok ? sc : -1e30f;
+
+#pragma unroll
+			for (int off = 1; off < 32; off <<= 1)
+				mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+
+			const float mn = fmaxf(mrun[ri], mx);
+			const float corr = __expf(mrun[ri] - mn);
+			const __half ph = __float2half(ok ? __expf(sc - mn) : 0.0f);
+			float sum = __half2float(ph);
+
+#pragma unroll
+			for (int off = 1; off < 32; off <<= 1)
+				sum += __shfl_xor_sync(0xffffffffu, sum, off);
+
+			lrun[ri] = lrun[ri] * corr + sum;
+			mrun[ri] = mn;
+			Pt[ro * VST + lane] = ph;
+
+			if (lane == 0)
+				cs[ro] = corr;
+		}
+
+		__syncthreads();
+
+		/* ---- O = O * corr + P V ---- */
+#pragma unroll
+		for (int m = 0; m < MT; m++) {
+#pragma unroll
+			for (int i = 0; i < 8; i++) {
+				const float cr = cs[m * 16 + 2 * i + hh];
+
+#pragma unroll
+				for (int n = 0; n < NPV; n++)
+					acc[m][n][i] *= cr;
+			}
+		}
+
+#pragma unroll
+		for (int kk = 0; kk < BK / 16; kk++) {
+			amp_v16h bv[NPV];
+
+#pragma unroll
+			for (int n = 0; n < NPV; n++)
+				bv[n] = amp_wm_frag(Vt + ((warp * NPV + n) * 16 + l16) * VST + kk * 16);
+
+#pragma unroll
+			for (int m = 0; m < MT; m++) {
+				const amp_v16h a = amp_wm_frag(Pt + (m * 16 + l16) * VST + kk * 16);
+
+#pragma unroll
+				for (int n = 0; n < NPV; n++)
+					acc[m][n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bv[n], acc[m][n]);
+			}
+		}
+
+		cur = nxt;
+
+		__syncthreads();
+	}
+
+	if (PF) {
+		/* normalized output (S, Hq, E): 1 / l of every row through LDS, then each warp scales and writes its columns */
+#pragma unroll
+		for (int ri = 0; ri < RPW; ri++) {
+			if (lane == 0)
+				cs[warp * RPW + ri] = lrun[ri] > 0.0f ? 1.0f / lrun[ri] : 0.0f;
+		}
+
+		__syncthreads();
+
+#pragma unroll
+		for (int m = 0; m < MT; m++) {
+#pragma unroll
+			for (int n = 0; n < NPV; n++) {
+#pragma unroll
+				for (int i = 0; i < 8; i++) {
+					const int r = m * 16 + 2 * i + hh;
+
+					if (r < R)
+						outp[((size_t)(s0 + r / rep) * Hq + j * rep + r % rep) * E + (warp * NPV + n) * 16 + l16] =
+							__float2half(acc[m][n][i] * cs[r]);
+				}
+			}
+		}
+
+		return;
+	}
+
+	/* ---- partials in the scalar kernel's workspace layout: row = s * rep + g ---- */
+	float *wbase = ws + ((size_t)j * ns + sp) * rep * S * WSROW;
+
+#pragma unroll
+	for (int m = 0; m < MT; m++) {
+#pragma unroll
+		for (int n = 0; n < NPV; n++) {
+#pragma unroll
+			for (int i = 0; i < 8; i++) {
+				const int r = m * 16 + 2 * i + hh;
+
+				if (r < R)
+					wbase[(size_t)r * WSROW + 4 + (warp * NPV + n) * 16 + l16] = acc[m][n][i];
+			}
+		}
+	}
+
+#pragma unroll
+	for (int ri = 0; ri < RPW; ri++) {
+		const int ro = warp * RPW + ri;
+
+		if (lane == 0 && ro < R) {
+			wbase[(size_t)ro * WSROW] = mrun[ri];
+			wbase[(size_t)ro * WSROW + 1] = lrun[ri];
+		}
+	}
+}
+
+/* 1 when the WMMA kernel handles this shape (head dim 256, <= 32 query rows per kv head) */
+extern "C" int
+amp_attn_dec_wmma_ok(int S, int Hq, int Hk, int E)
+{
+	return E == 256 && Hk > 0 && Hq % Hk == 0 && S >= 1 && S <= AMP_AD_MAXS && (Hq / Hk) * S <= 32;
+}
+
+extern "C" int
+amp_attn_dec_wmma(const void *q, const void *k, const void *v, const void *ksc, const void *vsc, const int *len,
+                  void *ws, void *out, int S, int Hq, int Hk, int E, int max_seq, int ns, float scale, int q8,
+                  cudaStream_t stream)
+{
+	if (!amp_attn_dec_wmma_ok(S, Hq, Hk, E) || ns < 1 || ns > AMP_AD_MAXNS) {
+		fprintf(stderr, "amp_attn_dec_wmma: unsupported config (S %d, Hq %d, Hk %d, E %d, ns %d)\n", S, Hq, Hk, E, ns);
+		return -1;
+	}
+
+	const dim3 grid(Hk, ns);
+	const bool mt1 = (Hq / Hk) * S <= 16;
+
+#define AMP_WM_L(MT_, Q8_) amp_attn_dec_wmma_kernel<MT_, Q8_><<<grid, 256, 0, stream>>>((const __half *)q, k, v, len, (float *)ws, \
+		NULL, S, 0, Hq, Hk, max_seq, ns, scale, (const __half *)ksc, (const __half *)vsc)
+
+	if (q8) {
+		if (mt1) AMP_WM_L(1, true); else AMP_WM_L(2, true);
+	}
+	else {
+		if (mt1) AMP_WM_L(1, false); else AMP_WM_L(2, false);
+	}
+
+#undef AMP_WM_L
+
+	amp_attn_dec_combine((const float *)ws, (__half *)out, S, Hq, Hk, E, ns, len, max_seq, stream);
+
+	return (int)cudaGetLastError();
+}
+
+/* Prefill attention for a chunk of Sq query positions (q (Sq, Hq, E) fp16) whose last position is len - 1 (len: device int32, the keys in the
+ * cache including the chunk's own): causal, bottom-right aligned. fp16 k / v (Hk, max_seq, E) or, q8 = 1, the Q8 cache rows. out (Sq, Hq, E). */
+extern "C" int
+amp_attn_prefill_wmma(const void *q, const void *k, const void *v, const void *ksc, const void *vsc, const int *len, void *out,
+                      int Sq, int Hq, int Hk, int E, int max_seq, float scale, int q8, cudaStream_t stream)
+{
+	const int rep = Hk > 0 ? Hq / Hk : 0;
+
+	if (E != 256 || Hk <= 0 || Hq % Hk || rep < 1 || rep > 32 || Sq < 1) {
+		fprintf(stderr, "amp_attn_prefill_wmma: unsupported config (Sq %d, Hq %d, Hk %d, E %d)\n", Sq, Hq, Hk, E);
+		return -1;
+	}
+
+	const int sblk = 32 / rep;                       /* query positions per block: 32 rows = sblk * rep (two blocks fit a CU; 64 rows with 16 warps measured no faster) */
+
+	if (sblk < 1) {
+		fprintf(stderr, "amp_attn_prefill_wmma: %d query heads per kv head do not fit 32 rows\n", rep);
+		return -1;
+	}
+
+	const dim3 grid(Hk, (Sq + sblk - 1) / sblk);
+
+	if (q8)
+		amp_attn_dec_wmma_kernel<2, true, true><<<grid, 256, 0, stream>>>((const __half *)q, k, v, len, NULL, (__half *)out, sblk, Sq, Hq, Hk,
+			max_seq, 1, scale, (const __half *)ksc, (const __half *)vsc);
+	else
+		amp_attn_dec_wmma_kernel<2, false, true><<<grid, 256, 0, stream>>>((const __half *)q, k, v, len, NULL, (__half *)out, sblk, Sq, Hq, Hk,
+			max_seq, 1, scale, NULL, NULL);
+
+	return (int)cudaGetLastError();
+}
+#endif /* AMPSTEIN_ROCM */
+
 extern "C" long
 amp_attn_dec_ws_floats(int S, int Hq, int Hk, int E, int ns)
 {
@@ -3360,8 +3967,8 @@ amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
 	int block = (Hq / Hk) * 32;            /* one warp per query head */
 
 #define AMP_AD_K(D, SR) amp_attn_dec_kernel<D, SR><<<grid, block, 0, stream>>>( \
-		(const __half *)q, (const __half *)k, (const __half *)v, len, (float *)ws, \
-		S, Hq, Hk, max_seq, ns, scale)
+		(const __half *)q, k, v, len, (float *)ws, \
+		S, Hq, Hk, max_seq, ns, scale, NULL, NULL)
 #define AMP_AD_LAUNCH(D) do { \
 	switch (S) { \
 	case 1: AMP_AD_K(D, 1); break; \
@@ -3383,6 +3990,51 @@ amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
 
 #undef AMP_AD_LAUNCH
 #undef AMP_AD_K
+
+	return (int)cudaGetLastError();
+}
+
+/* The same with int8 K / V (the Q8 cache): k, v (Hk * max_seq, E) int8 codes, ks, vs (Hk * max_seq, E / 32) fp16 scales (kv_q8_put's rows). */
+extern "C" int
+amp_attn_dec_q8_fp16(const void *q, const void *k, const void *v, const void *ks, const void *vs, const int *len,
+                 void *ws, void *out, int S, int Hq, int Hk, int E,
+                 int max_seq, int ns, float scale, cudaStream_t stream)
+{
+	if (Hk <= 0 || Hq % Hk || S < 1 || S > AMP_AD_MAXS || Hq / Hk > 32 ||
+	    (Hq / Hk) * S > 32 || ns < 1 || ns > AMP_AD_MAXNS ||
+	    (E != 64 && E != 128 && E != 256)) {
+		fprintf(stderr, "amp_attn_dec: unsupported config (S %d, Hq %d, Hk %d, E %d, ns %d)\n",
+			S, Hq, Hk, E, ns);
+		return -1;
+	}
+
+	dim3 grid(Hk, ns);
+	int block = (Hq / Hk) * 32;            /* one warp per query head */
+
+#define AMP_ADQ_K(D, SR) amp_attn_dec_kernel<D, SR, true><<<grid, block, 0, stream>>>( \
+		(const __half *)q, k, v, len, (float *)ws, \
+		S, Hq, Hk, max_seq, ns, scale, (const __half *)ks, (const __half *)vs)
+#define AMP_ADQ_LAUNCH(D) do { \
+	switch (S) { \
+	case 1: AMP_ADQ_K(D, 1); break; \
+	case 2: AMP_ADQ_K(D, 2); break; \
+	case 3: AMP_ADQ_K(D, 3); break; \
+	case 4: AMP_ADQ_K(D, 4); break; \
+	default: AMP_ADQ_K(D, 5); break; \
+	} } while (0)
+
+	if (E == 256)
+		AMP_ADQ_LAUNCH(8);
+	else if (E == 128)
+		AMP_ADQ_LAUNCH(4);
+	else
+		AMP_ADQ_LAUNCH(2);
+
+	amp_attn_dec_combine((const float *)ws, (__half *)out, S, Hq, Hk, E, ns, len,
+		max_seq, stream);
+
+#undef AMP_ADQ_LAUNCH
+#undef AMP_ADQ_K
 
 	return (int)cudaGetLastError();
 }
@@ -3514,6 +4166,9 @@ amp_kda_scan_f32(const void *q, const void *k, const void *v, const void *beta,
 
 	return (int)cudaGetLastError();
 }
+
+// GLM-5.3-only (__ldcg): CUDA only.
+#ifndef AMPSTEIN_ROCM
 
 // Skinny fp32 product for decode / verify rows: out (M, N) = x (M, K) @ w (K, N)
 // with M <= 8, all fp32 row-major. cuBLAS runs these as GEMVs for one row but
@@ -3695,6 +4350,8 @@ amp_skinny_f32(const float *x, const float *w, float *out, float *part, int *cnt
 	default: return amp_skinny_launch_m<8>(x, w, out, part, cnt, K, N, rpc, ntiles, nchunks, vec4, stream);
 	}
 }
+
+#endif /* !AMPSTEIN_ROCM */
 
 // KDA gates: g = lb * sigmoid(decay_h * (f + dt_bias)) (log-decay, per key
 // channel; decay_h = exp(A_log_h)), beta = sigmoid(braw * beta_scale).
@@ -3987,25 +4644,6 @@ amp_kvq4_get(const void *q, const void *s, void *out, const long long *idx,
 	return (int)cudaGetLastError();
 }
 
-// DSA indexer scoring, fused (GLM-5.3 sparse attention):
-//
-//   out[r][p] = valid(r, p) ? fp16( sum_h w[r][h] * scale * relu(q[r][h] . pool[p]) )
-//                           : -65504
-//
-// with HI = 32 index heads of D = 128 dims and valid = (p * P + P - 1 <=
-// pos0 + r) (a pool is selectable once all of its tokens are visible). The
-// composite ATen path materialised the (R * HI, n_pools) score matrix and
-// made six passes over it (matmul, scale, clamp, weighted bmm: 800 MB per
-// 32-query slab at 65k pools); this reads the pooled keys once per 8 queries
-// and writes only (R, n_pools).
-//
-// One CTA = 8 queries (one warp each: its 32 heads are two m16 tiles) x 64
-// pools. The pool tile sits in shared memory (row stride 136 halves: the
-// B-fragment loads are bank-conflict free); the q fragments of a warp stay in
-// registers for the whole K = 128 loop. mma.sync m16n8k16 (fp16 in, fp32
-// accumulate); relu, the per-head weight and the sum over heads happen on the
-// accumulator fragments (a shuffle reduction over the 8 lanes that share a
-// column).
 /* 8 elements of a Q8 row (int8 codes, one fp16 scale per 32 elements, as kv_q8_put writes them) as 8 halves:
  * row = the row's codes, sc = the row's scales, u = the index of the 8-element group within the row */
 __device__ __forceinline__ uint4 amp_q8x8(const signed char *row, const __half *sc, int u)
@@ -4026,6 +4664,28 @@ __device__ __forceinline__ uint4 amp_q8x8(const signed char *row, const __half *
 	return v;
 }
 
+// Sparse-attention indexer, QSA and the tensor-core decode attention: raw PTX (mma.sync, ldmatrix, cp.async), __match_any_sync -- CUDA only.
+#ifndef AMPSTEIN_ROCM
+
+// DSA indexer scoring, fused (GLM-5.3 sparse attention):
+//
+//   out[r][p] = valid(r, p) ? fp16( sum_h w[r][h] * scale * relu(q[r][h] . pool[p]) )
+//                           : -65504
+//
+// with HI = 32 index heads of D = 128 dims and valid = (p * P + P - 1 <=
+// pos0 + r) (a pool is selectable once all of its tokens are visible). The
+// composite ATen path materialised the (R * HI, n_pools) score matrix and
+// made six passes over it (matmul, scale, clamp, weighted bmm: 800 MB per
+// 32-query slab at 65k pools); this reads the pooled keys once per 8 queries
+// and writes only (R, n_pools).
+//
+// One CTA = 8 queries (one warp each: its 32 heads are two m16 tiles) x 64
+// pools. The pool tile sits in shared memory (row stride 136 halves: the
+// B-fragment loads are bank-conflict free); the q fragments of a warp stay in
+// registers for the whole K = 128 loop. mma.sync m16n8k16 (fp16 in, fp32
+// accumulate); relu, the per-head weight and the sum over heads happen on the
+// accumulator fragments (a shuffle reduction over the 8 lanes that share a
+// column).
 #define IDX_D 128
 #define IDX_TILE 64
 #define IDX_QPB 8
@@ -5579,6 +6239,8 @@ amp_qsa_attn_fp16(const void *q, const void *kc, const void *vc, const void *ks,
 }
 
 
+#endif /* !AMPSTEIN_ROCM */
+
 /* ------------------------------------------------------------------ */
 /* Block-scaled FP8 weights (DeepSeek-V4.1 checkpoints)                */
 /*
@@ -6720,6 +7382,9 @@ amp_v41_partial_kernel(const __half *__restrict__ q, const __half *__restrict__ 
 }
 
 
+// DeepSeek-V4.1's tensor-core attention variant: raw PTX -- CUDA only (amp_v41_attn takes the portable partial kernel).
+#ifndef AMPSTEIN_ROCM
+
 /* Tensor-core variant (prefill chunks): one block per (token, 16 heads, key split). The 16 keys of a tile are
  * staged in shared memory; QK^T runs as m16n8k16 mma with the head rows as M (k split over four warp pairs,
  * partial sums reduced through shared memory), the online softmax is done by 16 threads, P V as mma with the
@@ -6960,6 +7625,8 @@ amp_v41_tc_kernel(const __half *__restrict__ q, const __half *__restrict__ kvw, 
 
 #define V41T_SMEM ((size_t)(2 * 16 * V41T_QS * 2 + 4 * 16 * 16 * 4 + 16 * V41T_PS * 2 + 16 * 4))
 
+#endif /* !AMPSTEIN_ROCM */
+
 __global__ void __launch_bounds__(64)
 amp_v41_combine_kernel(const float *__restrict__ ws_m, const float *__restrict__ ws_l,
                        const float *__restrict__ ws_o, const float *__restrict__ sinks,
@@ -7052,6 +7719,7 @@ amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc
 	dim3 grid(T, H / V41_HG, nsplit);
 	size_t smem = (size_t)V41_TILE * 64 * sizeof(uint4);
 
+#ifndef AMPSTEIN_ROCM
 	static const bool tc_off = getenv("AMP_V41_NO_TC") != NULL;
 
 	if (!tc_off && T >= 8 && H % 16 == 0) {
@@ -7070,6 +7738,7 @@ amp_v41_attn(const void *q, const void *kvw, long wbase, int Nw, const void *kvc
 			nsplit, scale, pos0, pos_ptr, ring, (const signed char *)kvq, (const __half *)kvs);
 	}
 	else
+#endif
 		amp_v41_partial_kernel<<<grid, 256, smem, stream>>>((const __half *)q, (const __half *)kvw, wbase, Nw,
 			(const __half *)kvc, Nc, (const int *)idx, Kc, ws_m, ws_l, ws_o, H, W, nsplit, scale, pos0, pos_ptr, ring,
 			(const signed char *)kvq, (const __half *)kvs);

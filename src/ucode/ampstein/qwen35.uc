@@ -34,6 +34,7 @@
 // hand-off; every cache/state tensor lives on its layer's device.
 
 import * as models from './models.uc';
+import * as ggufq from './ggufq.uc';
 import * as weights from './weights.uc';
 import * as sampler from './sampler.uc';
 import * as math from 'math';
@@ -564,9 +565,9 @@ export function gdn_forward(cfg, L, x, cl) {
 		cfg.ln_v_head_dim == 128) ? torch.gdn_chunk : torch.gdn_scan;
 	let core = spec ?
 		torch.gdn_scan(qkv3[0], qkv3[1], qkv3[2], gates[0], gates[1],
-			cl.rec_state, 1.0 / math.sqrt(cfg.ln_k_head_dim), cl.spec_states) :
+			cl.rec_state, 1.0 / math.sqrt(cfg.ln_k_head_dim), cl.spec_states, cfg.ln_tiled) :
 		scan(qkv3[0], qkv3[1], qkv3[2], gates[0], gates[1],
-			cl.rec_state, 1.0 / math.sqrt(cfg.ln_k_head_dim));
+			cl.rec_state, 1.0 / math.sqrt(cfg.ln_k_head_dim), null, cfg.ln_tiled);
 
 	// fused: gated RMSNorm over v_head_dim, * silu(z)
 	let gated = torch.gdn_out_norm(core, z.contiguous(), L.norm_w,
@@ -632,7 +633,7 @@ export function gdn_forward_ref(cfg, L, x, cl) {
 	let core = torch.gdn_scan(q.contiguous(), kk.contiguous(), v.contiguous(),
 		beta.view([S, cfg.ln_num_v_heads]).contiguous(),
 		g.exp().view([S, cfg.ln_num_v_heads]).contiguous(), cl.rec_state,
-		1.0 / math.sqrt(cfg.ln_k_head_dim));
+		1.0 / math.sqrt(cfg.ln_k_head_dim), null, cfg.ln_tiled);
 
 	// gated RMSNorm over v_head_dim: norm(core) * w, then * silu(z)
 	let f = core;
@@ -642,6 +643,29 @@ export function gdn_forward_ref(cfg, L, x, cl) {
 		.silu());
 
 	return L.out_proj.forward(gated.view([1, S, cfg.ln_v_dim]));
+}
+
+let rocm_be = null;
+let ones_f32 = {};
+
+/* a (1) int32 device tensor holding n, made by a kernel: a host-to-device copy of pageable memory waits for everything queued on the stream */
+function key_count(dev, n) {
+	ones_f32[dev] ??= torch.ones([ 1 ], 'float32', 'cuda:' + dev);
+
+	return ones_f32[dev].mul(n).to('int32');
+}
+
+function rocm_backend() {
+	rocm_be ??= (torch.device_count() > 0 && torch.device_props(0).backend == 'rocm') ? 1 : 0;
+
+	return rocm_be == 1;
+}
+
+/* the WMMA prefill attention (AMP_NO_WMMA_PREFILL=1: ATen FlashAttention, with the dequantized prefix for a Q8 cache) */
+const WMMA_PREFILL = getenv('AMP_NO_WMMA_PREFILL') == null;
+
+function wmma_prefill() {
+	return WMMA_PREFILL && rocm_backend();
 }
 
 /* One full-attention layer. */
@@ -672,9 +696,44 @@ export function attn_forward(cfg, L, x, cos, sin, cl, pos) {
 	kk = kk.transpose(1, 2);
 	v = v.transpose(1, 2);
 
-	let K, V;
+	let K, V, attn;
 
-	if (cl) {
+	if (cl && cl.kq) {
+		// Q8 cache (kv_q8_put's rows: int8 codes + an fp16 scale per 32 values; row = head * max_seq + position)
+		for (let h = 0; h < kvh; h++) {
+			torch.kv_q8_put(kk.narrow(1, h, 1).contiguous().view([ S, hd ]), cl.kq, cl.ks, h * cl.max_seq + pos);
+			torch.kv_q8_put(v.narrow(1, h, 1).contiguous().view([ S, hd ]), cl.vq, cl.vs, h * cl.max_seq + pos);
+		}
+
+		if (hd == 256 && wmma_prefill()) {
+			// WMMA prefill attention straight over the Q8 cache rows (no dequantized copy of the prefix)
+			let ln = key_count(cl.dev, pos + S);
+
+			attn = torch.attn_prefill_q8(q.transpose(1, 2).contiguous().view([ S, nh, hd ]), cl.kq, cl.ks, cl.vq, cl.vs, ln, kvh,
+				1.0 / math.sqrt(hd)).view([ 1, S, nh, hd ]).transpose(1, 2);
+		}
+		else if (pos == 0) {
+			// the first chunk attends to itself: the exact keys and values, no dequantization
+			K = kk;
+			V = v;
+		}
+		else {
+			// the prefix, dequantized one kv head at a time (a transient fp16 copy of that head's keys and values of [0, pos + S)
+			// and its group of query heads attends to it), so the transient stays at 1 / kvh of the whole prefix
+			let len = pos + S;
+			let rep = nh / kvh;
+			let parts = [];
+
+			for (let h = 0; h < kvh; h++) {
+				let Kh = torch.kv_q8_get(cl.kq, cl.ks, h * cl.max_seq, len).view([ 1, 1, len, hd ]);
+				let Vh = torch.kv_q8_get(cl.vq, cl.vs, h * cl.max_seq, len).view([ 1, 1, len, hd ]);
+
+				push(parts, torch.flash_attn(q.narrow(1, h * rep, rep), Kh, Vh, true));
+			}
+
+			attn = torch.cat(parts, 1);
+		}
+	} else if (cl) {
 		let len = pos + S;
 
 		cl.k_cache.narrow(2, pos, S).copy_(kk);
@@ -682,6 +741,18 @@ export function attn_forward(cfg, L, x, cos, sin, cl, pos) {
 
 		K = cl.k_cache.narrow(2, 0, len);
 		V = cl.v_cache.narrow(2, 0, len);
+
+		// a few query rows (the MTP draft steps): FlashAttention has no parallelism over one row -- 10 ms for 160k keys on a gfx1100 against
+		// 0.8 ms for the split-KV decode kernel
+		if (rocm_backend() && (S <= 5 || (hd == 256 && wmma_prefill()))) {
+			let ln = key_count(cl.dev, len);
+			let qs = q.transpose(1, 2).contiguous().view([ S, nh, hd ]);
+			let kc = cl.k_cache.view([ kvh, cl.k_cache.shape()[2], hd ]), vc = cl.v_cache.view([ kvh, cl.v_cache.shape()[2], hd ]);
+
+			// (the WMMA prefill attention is ~15 % faster than the ATen FlashAttention here, which runs at 33 TFLOPS)
+			attn = (S <= 5 ? torch.attn_decode(qs, kc, vc, ln, 1.0 / math.sqrt(hd), null, 1) :
+				torch.attn_prefill(qs, kc, vc, ln, 1.0 / math.sqrt(hd))).view([ 1, S, nh, hd ]).transpose(1, 2);
+		}
 	} else {
 		K = kk;
 		V = v;
@@ -693,7 +764,7 @@ export function attn_forward(cfg, L, x, cos, sin, cl, pos) {
 	// matrix (the masked sdpa fell back to the fp32 math path, ~12% of
 	// prefill time at 16k context). chunk_mask above remains for
 	// reference/tests.
-	let attn = torch.flash_attn(q, K, V, true);      // (1, nh, S, hd)
+	attn ??= torch.flash_attn(q, K, V, true);      // (1, nh, S, hd)
 
 	// sigmoid output gate, fused with the (1, nh, S, hd) -> (1, S, nh*hd)
 	// relayout
@@ -712,7 +783,7 @@ export function attn_forward_dev(cfg, L, x, cl, st) {
 	let nh = cfg.num_q_heads;
 	let kvh = cfg.num_kv_heads;
 	let hd = cfg.head_dim;
-	let max_seq = cl.k_cache.shape()[2];
+	let max_seq = cl.kq ? cl.max_seq : cl.k_cache.shape()[2];
 
 	let qg = L.q_proj.forward(x).view([1, S, nh, 2 * hd]);
 	let q = qg.narrow(-1, 0, hd);
@@ -723,6 +794,20 @@ export function attn_forward_dev(cfg, L, x, cl, st) {
 
 	q = torch.qk_norm_rope(q, L.q_norm_w, st.cos, st.sin, cfg.rotary_dim, eps);
 	kk = torch.qk_norm_rope(kk, L.k_norm_w, st.cos, st.sin, cfg.rotary_dim, eps);
+
+	if (cl.kq) {
+		// Q8 cache: quantize the S new rows of every kv head into the rows head * max_seq + position (device-side positions)
+		if (S > 5)
+			die(`qwen35: the Q8 KV cache decodes at most 5 rows per step (got ${S})`);
+
+		let rows = cl.kv_hoff.add(st.pos_idx.view([ 1, S ])).view([ -1 ]);
+
+			torch.kv_q8_put(kk.transpose(1, 2).contiguous().view([ kvh * S, hd ]), cl.kq, cl.ks, rows);
+		torch.kv_q8_put(v.transpose(1, 2).contiguous().view([ kvh * S, hd ]), cl.vq, cl.vs, rows);
+
+		return L.o_proj.forward(torch.attn_gate(torch.attn_decode_q8(q.contiguous().view([ S, nh, hd ]), cl.kq, cl.ks, cl.vq, cl.vs,
+			st.seqused, kvh, 1.0 / math.sqrt(hd)).view([ 1, S, nh, hd ]).transpose(1, 2), g));
+	}
 
 	cl.k_cache.index_copy_(2, st.pos_idx, kk.transpose(1, 2));
 	cl.v_cache.index_copy_(2, st.pos_idx, v.transpose(1, 2));
@@ -787,6 +872,13 @@ function mlp_bundle(L, S) {
 
 export function mlp_forward(L, x) {
 	let S = x.shape()[1];
+
+	// GGUF: gate, up and SwiGLU as one launch for the decode / verify rows
+	let fused = ggufq.gate_up(L.gate_proj, L.up_proj, x);
+
+	if (fused)
+		return L.down_proj.forward(fused);
+
 	let gu = (S <= 8 && x.shape()[0] == 1) ? mlp_bundle(L, S) : null;
 
 	if (gu) {
@@ -1268,6 +1360,10 @@ export function load(model_dir, opts) {
 	let ws = weights.open(model_dir);
 	let devs = dev_list(cfg, opts.devices);
 
+	// a GGUF checkpoint (llama.cpp's converter) stores the gated delta net's value heads tiled ([k0 k1 .. k0 k1 ..]) instead of grouped by
+	// key head (ggufw.uc): the scan then maps value head h to key head h % Hk
+	cfg.ln_tiled = ws.gguf && cfg.ln_num_k_heads != cfg.ln_num_v_heads;
+
 	let first_dev = devs[0];
 	let last_dev = devs[cfg.num_hidden_layers - 1];
 
@@ -1302,7 +1398,7 @@ export function load(model_dir, opts) {
 	// optional MTP draft head: route its tensors to the last device
 	let mtp = null;
 
-	if (opts.mtp != false && ws.has('mtp.fc.trellis')) {
+	if (opts.mtp != false && (ws.has('mtp.fc.trellis') || ws.has('mtp.fc.weight'))) {
 		let mprefix = 'mtp.';
 
 		ws.upload(function (key) {
@@ -1328,12 +1424,13 @@ export function load(model_dir, opts) {
 	if (ws.has('lm_head.trellis'))
 		head = models.LinearEXL3Seq(ws, 'lm_head', last_dev);
 	else if (ws.has('lm_head.weight'))
-		head = models.LinearFP16(ws, 'lm_head', last_dev);
+		head = models.linear(ws, 'lm_head', true, last_dev);          // (plain fp16 / bf16, or a GGUF block-quantized head)
 	else
 		die('qwen35.load: no lm_head weight and embeddings are not tied');
 
 	let model = {
 		cfg: cfg,
+		kv_q8: !!opts.kv_q8,          // full-attention layers keep int8 K / V (+ a scale per 32 values): half the memory of fp16
 		layers: layers,
 		devs: devs,
 		embed_tokens: embed_tokens,
@@ -1345,6 +1442,7 @@ export function load(model_dir, opts) {
 		 * recurrent state, full-attention KV. */
 		new_cache: function (max_seq) {
 			let cfg = this.cfg;
+			let kv_q8 = this.kv_q8;
 			let cache = {max_seq: max_seq, length: 0, layers: []};
 
 			// rope tables per device that hosts a full-attention layer
@@ -1362,6 +1460,17 @@ export function load(model_dir, opts) {
 						[cfg.ln_num_v_heads, cfg.ln_k_head_dim,
 						 cfg.ln_v_head_dim],
 						'float32', 'cuda:' + L.dev);
+				} else if (kv_q8) {
+					// Q8 KV cache: (kv heads * max_seq, head_dim) int8 codes and an fp16 scale per 32 values, for keys and values
+					// (no k_cache / v_cache: the engine's host-RAM store, which copies those, then stays off)
+					let dv = 'cuda:' + L.dev, rows = cfg.num_kv_heads * max_seq;
+
+					cl.kq = torch.zeros([ rows, cfg.head_dim ], 'int8', dv);
+					cl.ks = torch.zeros([ rows, cfg.head_dim / 32 ], 'float16', dv);
+					cl.vq = torch.zeros([ rows, cfg.head_dim ], 'int8', dv);
+					cl.vs = torch.zeros([ rows, cfg.head_dim / 32 ], 'float16', dv);
+					cl.max_seq = max_seq;
+					cl.kv_hoff = torch.arange(cfg.num_kv_heads, 'int64', dv).mul(max_seq).to('int64').view([ cfg.num_kv_heads, 1 ]);
 				} else {
 					cl.k_cache = torch.zeros(
 						[1, cfg.num_kv_heads, max_seq, cfg.head_dim],
@@ -1369,17 +1478,14 @@ export function load(model_dir, opts) {
 					cl.v_cache = torch.zeros(
 						[1, cfg.num_kv_heads, max_seq, cfg.head_dim],
 						'float16', 'cuda:' + L.dev);
+				}
 
-					if (!rope_by_dev[L.dev]) {
-						let rc = rope_cache(cfg, max_seq, L.dev);
+				if (L.type != 'linear_attention') {
+					if (!rope_by_dev[L.dev])
+						rope_by_dev[L.dev] = rope_cache(cfg, max_seq, L.dev);
 
-						rope_by_dev[L.dev] = rc;
-					}
-
-					let rc = rope_by_dev[L.dev];
-
-					cl.cos = rc.cos;
-					cl.sin = rc.sin;
+					cl.cos = rope_by_dev[L.dev].cos;
+					cl.sin = rope_by_dev[L.dev].sin;
 				}
 
 				push(cache.layers, cl);

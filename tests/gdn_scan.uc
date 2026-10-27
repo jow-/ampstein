@@ -173,9 +173,27 @@ function check_chunk(S, Hk, Hv, split) {
 		Hk, Hv, S, split ? ` (split at ${split})` : '', d_out, d_st);
 }
 
-check_chunk(37, 4, 12, 0);
-check_chunk(200, 4, 12, 0);
-check_chunk(200, 2, 6, 130);
+// (the 64-token-block WY/UT kernel is CUDA only: the ROCm backend raises "not available" and runs the sequential scan only)
+let have_chunk = true;
+
+try {
+	torch.gdn_chunk(torch.zeros([1, 1, 128], 'float32', 'cuda:0'), torch.zeros([1, 1, 128], 'float32', 'cuda:0'),
+		torch.zeros([1, 1, 128], 'float32', 'cuda:0'), torch.zeros([1, 1], 'float32', 'cuda:0'), torch.zeros([1, 1], 'float32', 'cuda:0'),
+		torch.zeros([1, 128, 128], 'float32', 'cuda:0'), 1.0);
+}
+catch (e) {
+	if (index(e.message, 'ROCm') >= 0)
+		have_chunk = false;
+}
+
+if (have_chunk) {
+	check_chunk(37, 4, 12, 0);
+	check_chunk(200, 4, 12, 0);
+	check_chunk(200, 2, 6, 130);
+}
+else {
+	print('gdn_chunk: not available on this backend, skipped\n');
+}
 
 // bad input is rejected, not executed
 let bad = false;

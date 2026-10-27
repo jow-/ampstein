@@ -41,6 +41,9 @@ export function open(model_dir, only_file) {
 	if (!only_file && ggufw.is_gguf_dir(model_dir))
 		return ggufw.open(model_dir);
 
+	if (only_file && match(only_file, /\.gguf$/))              // one GGUF file of the directory by itself (the vision projector)
+		return ggufw.open(model_dir, only_file);
+
 	let shards = {};      // shard filename -> stfile resource (lazy)
 	let map = null;       // sharded: key -> shard filename
 	let single = null;    // single-file: stfile resource

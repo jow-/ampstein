@@ -39,6 +39,8 @@ cmake --install build --prefix /opt/ampstein
 /opt/ampstein/bin/ampstein --model /path/to/exl3-model
 ```
 
+- ROCm: `cmake -B build-rocm -DAMPSTEIN_GPU_BACKEND=rocm ...` (selected automatically
+  when no `nvcc` is found); `docs/ROCM.md` says what it covers.
 - libtorch and the NVIDIA runtime wheels are downloaded once into
   `${XDG_CACHE_HOME:-~/.cache}/ampstein` (`-DAMPSTEIN_TORCH_DIST_DIR=` to use an
   existing site-packages instead). `nvcc` and the GPU architecture are detected.
@@ -59,8 +61,12 @@ cmake --install build --prefix /opt/ampstein
 3. **Vendored kernels stay bit-exact.** Do not "clean up" kernel math. A change in
    `vendor/exl3/` needs a numerics test against the exllamav3 oracle and an entry
    in `PATCHES.md`.
-4. **libtorch, CUDA and ucode are hard requirements** — no enablement flag, no
-   CUDA-less build.
+4. **libtorch, a GPU backend (CUDA or ROCm) and ucode are hard requirements** —
+   no enablement flag, no GPU-less build. The backend is chosen at configure time
+   (`AMPSTEIN_GPU_BACKEND`), never at run time, and the ucode layer is
+   backend-agnostic (`docs/ROCM.md`). The vendored EXL3 kernels are CUDA only, so
+   a ROCm build serves GGUF checkpoints only; kernels added to `src/torch/` should
+   compile for both.
 5. **MIT only** in `src/` and `vendor/`; vendored code keeps its licence file and
    a version note.
 

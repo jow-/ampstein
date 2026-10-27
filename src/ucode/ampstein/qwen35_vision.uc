@@ -24,6 +24,7 @@
 import * as math from 'math';
 import * as weights from './weights.uc';
 import * as models from './models.uc';
+import * as ggufw from './ggufw.uc';
 import {readfile} from 'fs';
 
 const PREFIX = 'model.visual.';
@@ -212,12 +213,12 @@ function build_block(ws, i, dev) {
 		n1b: ws.gpu16(k + 'norm1.bias', dev).to('float32'),
 		n2w: ws.gpu16(k + 'norm2.weight', dev).to('float32'),
 		n2b: ws.gpu16(k + 'norm2.bias', dev).to('float32'),
-		q: models.LinearEXL3(ws, k + 'attn.q_proj', dev),
-		k: models.LinearEXL3(ws, k + 'attn.k_proj', dev),
-		v: models.LinearEXL3(ws, k + 'attn.v_proj', dev),
-		o: models.LinearEXL3(ws, k + 'attn.proj', dev),
-		fc1: models.LinearEXL3(ws, k + 'mlp.linear_fc1', dev),
-		fc2: models.LinearEXL3(ws, k + 'mlp.linear_fc2', dev)
+		q: models.linear(ws, k + 'attn.q_proj', false, dev),
+		k: models.linear(ws, k + 'attn.k_proj', false, dev),
+		v: models.linear(ws, k + 'attn.v_proj', false, dev),
+		o: models.linear(ws, k + 'attn.proj', false, dev),
+		fc1: models.linear(ws, k + 'mlp.linear_fc1', false, dev),
+		fc2: models.linear(ws, k + 'mlp.linear_fc2', false, dev)
 	};
 }
 
@@ -255,7 +256,9 @@ export function load(model_dir, opts) {
 
 	let cfg = load_config(model_dir);
 	let dev = opts.device || 0;
-	let ws = weights.open(model_dir);
+	// a GGUF checkpoint keeps the tower in its mmproj-*.gguf (ggufw.uc maps it to the HF names); EXL3 / safetensors packs have it in the shards
+	let mm = ggufw.mmproj_file(model_dir);
+	let ws = mm ? weights.open(model_dir, mm) : weights.open(model_dir);
 
 	if (opts.max_pixels != null)
 		cfg.max_pixels = opts.max_pixels;
@@ -286,8 +289,8 @@ export function load(model_dir, opts) {
 		pos_table: ws.gpu16(PREFIX + 'pos_embed.weight', dev),
 		mnw: ws.gpu16(PREFIX + 'merger.norm.weight', dev).to('float32'),
 		mnb: ws.gpu16(PREFIX + 'merger.norm.bias', dev).to('float32'),
-		fc1: models.LinearEXL3(ws, PREFIX + 'merger.linear_fc1', dev),
-		fc2: models.LinearEXL3(ws, PREFIX + 'merger.linear_fc2', dev),
+		fc1: models.linear(ws, PREFIX + 'merger.linear_fc1', false, dev),
+		fc2: models.linear(ws, PREFIX + 'merger.linear_fc2', false, dev),
 
 		/* Preprocess encoded image bytes: {patches (CPU fp16), grid,
 		 * width, height, new_width, new_height}. */

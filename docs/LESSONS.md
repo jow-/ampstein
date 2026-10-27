@@ -783,3 +783,14 @@ all-reduce buffers; `tests/glm5_moe.uc` checks 1-16 rows against the composite p
 every size). A graph size above `P2P_ROWS` is silently not captured (`graphs()` skips it) and the engine then
 verifies eagerly with last-row logits: `shape '[12, -1]' is invalid`. Cost: ~100 MiB per GPU (spec states, graphs);
 the cache-slot allocation was already 0 on this layout.
+
+## L174 — Qwen3.8-27B on ROCm: better drafts (prompt lookup) measured, not worth it
+
+`AMP_LK_SHADOW=1` (engine.uc; no effect on the output) asks the lookup rule what it WOULD have drafted at every MTP round and resolves it against the final
+token history. 5 prompts, greedy, MTP window 4: the copy rounds are few. Rounds with a draft matching >= 5 of 7 tokens (what a long-window lookup needs): code edit
+(add type hints to a 5 KB file) 8 %, JSON -> YAML 4 - 6 %, verbatim quote 25 - 28 %, fresh code 4 - 8 %, fresh prose ~0. A looser rule (match context 3 - 4) adds rounds
+that match worse than MTP, not good ones. In the rounds where a draft exists MTP already accepts 3.4 - 3.7 tokens, so a lookup of the window's size
+(3 drafts, same 4-row verify graph, no draft chain; `spec_any` + `--lookup 3` tried) gave 82.8 / 91.6 / 100.2 / 100.7 tok/s against 82.8 / 93.9 / 99.0 / 102.5: the chain
+it skips is ~4 ms of a 33 ms round. A 7-draft lookup would save ~5 % (code edit) to ~20 % (quoting) but needs per-position GDN states for any window (~0.5 GB, ~15k tokens of
+Q8 context), more step graphs and a 48-row attention: not done. MTP window 5 (`--mtp 5`, the WMMA attention takes 5 rows): short answers +7 %, code equal, prose -8 %: default stays 4.
+

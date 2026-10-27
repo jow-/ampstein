@@ -187,9 +187,11 @@ let t_shuf = min_time(() => {
 
 warn('timing @' + CS + ' keys S=3: mma path ' + t_mma +
 	' ms vs shuffle ' + t_shuf + ' ms\n');
-check('mma path is the fast kernel (<= 0.95x shuffle time at 16k keys)',
-	t_mma <= t_shuf * 0.95,
-	'' + t_mma + ' vs ' + t_shuf);
+// (on ROCm the tensor-core kernel does not exist: the mma flag runs the shuffle kernel, there is nothing to be faster than)
+if (torch.device_props(0).backend != 'rocm')
+	check('mma path is the fast kernel (<= 0.95x shuffle time at 16k keys)',
+		t_mma <= t_shuf * 0.95,
+		'' + t_mma + ' vs ' + t_shuf);
 
 if (fails) {
 	warn(fails + ' failures\n');

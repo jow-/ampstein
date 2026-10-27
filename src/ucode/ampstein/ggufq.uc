@@ -18,7 +18,13 @@ const GROUPED_OFF = getenv('AMP_GGUF_NO_GROUPED') != null || getenv('AMP_GGUF_FP
 
 /* x (M, K) fp16 @ dequant(raw[r0 .. r0 + n))^T -> (M, n) fp16, in row slices */
 function matmul_rows(x, raw, qt, K, r0, n) {
+	// the slice height is a multiple of 128 rows: the BLAS gemm of a slice runs at 80 TFLOPS on a gfx1100 for 1536 output columns and
+	// at 33 for 1638 (the tiles of the odd shape waste most of their work)
 	let per = max(1, int(SCRATCH_ELEMS / K));
+
+	if (per >= 192)
+		per = int(per / 128 + 0.5) * 128;
+
 	let parts = [];
 
 	for (let a = 0; a < n; a += per) {
@@ -45,6 +51,7 @@ export function linear_from(raw, qt, dev) {
 	return {
 		raw: raw, qtype: qt, dev: dev, out_features: raw.shape()[0], in_features: raw.shape()[1] / blk[1] * blk[0],
 
+		/* x: (M, K) fp16, or (B, S, K) (flattened to B * S rows and reshaped back: the dense models' layers pass sequences) */
 		forward: function (x) {
 			let s = x.shape();
 			let flat = (length(s) == 2) ? x : x.view([-1, this.in_features]);
@@ -103,6 +110,23 @@ export function mlp_from(gate, up, down) {
 			return torch.gguf_gate_up(x.contiguous(), gate.raw, up.raw, gate.qtype, lim);
 		}
 	};
+}
+
+/* silu(x gate^T) * (x up^T) of two GGUF linears of one type as ONE launch (decode / verify rows: up to 8) -- null when they do not qualify.
+ * x: (M, K) or (B, S, K) fp16; the result has the shape of x with the last dimension the gate's out_features. */
+export function gate_up(gate, up, x) {
+	if (FUSED_OFF || !gate.raw || !up.raw || gate.qtype != up.qtype || !I8_TYPES[gate.qtype])
+		return null;
+
+	let s = x.shape();
+	let rows = (length(s) == 3) ? s[0] * s[1] : s[0];
+
+	if (rows > 8)
+		return null;
+
+	let h = torch.gguf_gate_up(x.contiguous().view([ rows, -1 ]), gate.raw, up.raw, gate.qtype, 0);
+
+	return (length(s) == 3) ? h.view([ s[0], s[1], gate.out_features ]) : h;
 }
 
 /* The shared expert (key + '.w1' / '.w3' / '.w2' = gate / up / down) */

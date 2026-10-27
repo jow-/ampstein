@@ -2,15 +2,22 @@
 #
 # libtorch has no packaged C++ release we can rely on for the ABI our module
 # was developed against, so we take the pip distribution: the `torch` wheel
-# (libtorch*.so, headers, TorchConfig.cmake) plus the NVIDIA runtime wheels it
-# links (cudnn, cublas, nccl, ...). Extracted side by side in ONE root with the
-# same layout as site-packages:
+# (libtorch*.so, headers, TorchConfig.cmake) plus, on cuda, the NVIDIA runtime
+# wheels it links (cudnn, cublas, nccl, ...). Extracted side by side in ONE
+# root with the same layout as site-packages:
 #
 #     <root>/torch/{lib,include,share/cmake}
-#     <root>/nvidia/<pkg>/lib
+#     <root>/nvidia/<pkg>/lib        (cuda only)
 #
-# which is exactly what the wheels' own RPATHs ($ORIGIN/../../nvidia/*/lib)
-# expect, so the installed copy works unchanged.
+# which is exactly what the cuda wheels' own RPATHs ($ORIGIN/../../nvidia/*/lib)
+# expect, so the installed copy works unchanged. The rocm wheel has no such
+# split-package layout — its ROCm runtime libs (rocblas, hipblaslt, MIOpen,
+# ...) are bundled straight into torch/lib, so AMPSTEIN_TORCH_NVIDIA_LIBDIRS
+# is simply empty on that backend and every nvidia-specific step downstream
+# (CMakeLists.txt's install loop) is a no-op.
+#
+# Which manifest is used depends on AMPSTEIN_GPU_BACKEND (set in
+# CMakeLists.txt before this file is included).
 #
 # Caching: everything lives OUTSIDE the build tree (default
 # ${XDG_CACHE_HOME:-~/.cache}/ampstein/libtorch, override with
@@ -26,11 +33,33 @@
 # Output variables: AMPSTEIN_TORCH_DIST_ROOT, AMPSTEIN_TORCH_DIST_NAME
 # (install dir name, torch-dist-<version>), AMPSTEIN_TORCH_NVIDIA_LIBDIRS.
 
-set(AMPSTEIN_TORCH_VERSION "2.11.0+cu128" CACHE STRING "libtorch (pip torch) version")
+if(NOT DEFINED AMPSTEIN_TORCH_VERSION)
+    if(AMPSTEIN_GPU_BACKEND STREQUAL "rocm")
+        set(AMPSTEIN_TORCH_VERSION "2.16.0.dev20261006+rocm7.14")
+    else()
+        set(AMPSTEIN_TORCH_VERSION "2.11.0+cu128")
+    endif()
+endif()
+set(AMPSTEIN_TORCH_VERSION "${AMPSTEIN_TORCH_VERSION}" CACHE STRING "libtorch (pip torch) version")
 set(AMPSTEIN_TORCH_DIST_DIR "" CACHE PATH
     "Use this existing torch distribution root (contains torch/ and nvidia/) instead of downloading")
 
-if(AMPSTEIN_TORCH_VERSION STREQUAL "2.11.0+cu128")
+if(AMPSTEIN_TORCH_VERSION STREQUAL "2.16.0.dev20261006+rocm7.14")
+    # torch's native libraries are python-version independent; cp313 is just a
+    # carrier. No nvidia_*-style split packages: the wheel bundles its own
+    # ROCm runtime libs directly under torch/lib. No STABLE release wheel
+    # matches this host's ROCm 7.1.0 (the newest stable is rocm7.0, torch
+    # 2.10.0); this is a nightly build tagged for rocm7.1-series specifically.
+    # Nightly builds roll off PyTorch's CDN after a while and don't publish a
+    # stable URL/hash the way release wheels do -- this one was downloaded
+    # and hashed by hand on 2026-10-26; if the cache is ever cleared and the
+    # URL below 404s, pick a current one from
+    # https://download.pytorch.org/whl/nightly/rocm7.14/torch/ and update
+    # both the version string above and the entry below together.
+    set(_AMP_WHEELS
+        "torch-2.16.0.dev20261006%2Brocm7.14-cp313-cp313-manylinux_2_28_x86_64.whl|https://download.pytorch.org/whl/nightly/rocm7.14/torch-2.16.0.dev20261006%2Brocm7.14-cp313-cp313-manylinux_2_28_x86_64.whl|6d55b718c9e2ac48e324e54665b13f2a66642e40448e8befcc52d16871316ec3"
+    )
+elseif(AMPSTEIN_TORCH_VERSION STREQUAL "2.11.0+cu128")
     # torch's native libraries are python-version independent; cp312 is just a
     # carrier. Hashes come from the index page / PyPI JSON API.
     set(_AMP_WHEELS

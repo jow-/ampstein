@@ -96,6 +96,16 @@ amp_test(utpl_template)
 # --- Qwen3.5 / 3.8 hybrid (Gated DeltaNet + attention)
 # gdn_scan: fused gated delta rule kernel vs the per-token recurrence
 amp_test(gdn_scan)
+
+# gdn_scan with tiled value heads (a GGUF checkpoint's order) vs the grouped order on permuted data
+amp_test(gdn_scan_tiled)
+
+# attn_decode_q8: decode attention over an int8 KV cache vs the fp16 kernel on the dequantized cache
+amp_test(attn_decode_q8)
+# attn_decode_wmma: the ROCm WMMA decode attention vs the scalar kernel (fp16 and Q8 caches)
+amp_test(attn_decode_wmma)
+# attn_prefill_wmma: the ROCm WMMA prefill attention vs ATen flash_attn (fp16 and Q8 caches)
+amp_test(attn_prefill_wmma)
 # gdn_fused: fused GDN layer kernels vs the composite ATen reference
 amp_test(gdn_fused)
 # qwen35_layers: per-layer oracle (GDN + full attention)

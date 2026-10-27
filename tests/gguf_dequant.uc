@@ -73,7 +73,7 @@ for (let name in [ 'q4_0', 'q8_0', 'iq4_nl', 'q5_k', 'iq2_xxs', 'iq2_xs', 'iq1_m
 
 // grouped gemv (the attention's wo_a): G groups of rows, group g seeing columns [g * K, (g + 1) * K) of x, in one launch; the
 // result equals the per-group launches
-for (let name in [ 'q5_k', 'iq2_xxs', 'iq1_m', 'iq1_s', 'q8_0' ]) {
+for (let name in [ 'q5_k', 'iq2_xxs', 'iq1_m', 'iq1_s', 'iq3_s', 'q8_0' ]) {
 	let ty = f.info(name).dtype, raw = f.tensor(name).cuda();                 // (24, 768)
 	let G = 3, R = 8, K = 768;
 	let x = torch.rand([2, G * K], 'float32', 'cuda').sub(0.5).to('float16');
@@ -132,7 +132,7 @@ for (let name in [ 'q5_k', 'iq2_xxs', 'iq1_m', 'iq1_s', 'q8_0' ]) {
 	let lim = 10.0;
 	let act = (g, u) => g.clamp(null, lim).mul(g.clamp(null, lim).sigmoid()).mul(u.clamp(-lim, lim));
 
-	for (let name in [ 'q5_k', 'iq2_xxs', 'iq2_xs', 'iq1_m', 'iq1_s', 'q8_0' ]) {
+	for (let name in [ 'q5_k', 'iq2_xxs', 'iq2_xs', 'iq1_m', 'iq1_s', 'iq3_s', 'q8_0' ]) {
 		let ty = f.info(name).dtype, wg = f.tensor(name).cuda(), wu = f.tensor('q8_0').cuda();
 		let up = (name == 'q8_0') ? f.tensor('q5_k').cuda() : f.tensor(name).narrow(0, 0, 24).cuda();     // (a second matrix of the same type)
 		let x = torch.rand([3, 768], 'float32', 'cuda').sub(0.5).to('float16');                    // outputs far beyond the clamp (10) but inside fp16

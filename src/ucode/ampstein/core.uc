@@ -326,13 +326,23 @@ export function serve(args) {
 	// default device count: every GPU for GLM (117 GB) and Qwen-Flash-Next (100 GB),
 	// two for the dense Qwen
 	if (args.gpus == null)
-		args.gpus = (GLM || Q4 || DS || D41) ? torch.device_count() : 2;
+		args.gpus = (GLM || Q4 || DS || D41) ? torch.device_count() : min(2, torch.device_count());
 
 	if (GEM) {
 		// layer split (prefill pipelines over the stages: the fastest prefill) or --tp (tensor parallel: faster decode)
 		args.tp = !!args.tp && args.gpus >= 2;
 		args.mtp = 0;
 	}
+
+	// ROCm: the decode attention verifies at most 5 rows (the WMMA kernel: 32 rows per kv head; the scalar one: 5 rows)
+	if (args.mtp > 5 && !GLM && !Q4 && !DS && !D41 && !GEM && torch.device_props(0).backend == 'rocm') {
+		warn(`ampstein: --mtp ${args.mtp} lowered to 5 (the ROCm decode attention verifies at most 5 rows)\n`);
+		args.mtp = 5;
+	}
+
+	// ROCm, Qwen3.5 / 3.8: a window of 4 is faster than 3 on short answers and code, equal on prose (Qwen3.8-27B on a 7900 XTX: 94 vs 81 - 89 tok/s)
+	if (!args.mtp_set && args.mtp == 3 && args.arch == 'qwen35' && !args.dflash && torch.device_props(0).backend == 'rocm')
+		args.mtp = 4;
 
 	// Qwen3.8-Flash-Next: the verify window is the draft window, so a window of 1 verifies a
 	// single row and cannot gain anything; 3 measured best (2: 1.25-1.45x, 3: 1.4-1.8x, 4: same)
@@ -440,8 +450,11 @@ export function serve(args) {
 
 	let kv_bits = (args.cache_mode == 'Q8') ? 8 : null;
 
-	if (kv_bits && !GLM && !Q4)
-		warn('ampstein: --cache-mode Q8 is implemented for GLM and Qwen3.8-Flash-Next only (ignored)\n');
+	// Qwen3.5 / 3.8 on one device (layer split): the full-attention layers keep an int8 KV cache (qwen35.uc)
+	const Q35_Q8 = kv_bits && args.arch == 'qwen35' && !args.tp && !args.dflash;
+
+	if (kv_bits && !GLM && !Q4 && !Q35_Q8)
+		warn('ampstein: --cache-mode Q8 is implemented for GLM, Qwen3.8-Flash-Next and single-chain Qwen3.5 / 3.8 only (ignored)\n');
 
 	if (kv_bits && Q4)
 		qwen4.set_kv_q8(true);      // the QSA K / V caches as int8 codes + a scale per 32 values
@@ -595,7 +608,7 @@ export function serve(args) {
 			qwen4.load(args.model, {devices: args.gpus, mtp: args.mtp > 0});
 	}
 	else {
-		model = qwen35.load(args.model, {devices: devs, mtp: args.mtp > 0 && !args.dflash});
+		model = qwen35.load(args.model, {devices: devs, mtp: args.mtp > 0 && !args.dflash, kv_q8: Q35_Q8});
 	}
 
 	if (DS && args.tp && args.mtp > 0) {
@@ -682,7 +695,7 @@ export function serve(args) {
 		slot_margin: args.slot_margin,
 		slice_ms: args.slice_ms,
 		slice_tokens: args.slice_tokens,
-		graphs: ((GLM || Q4) && getenv('AMP_GLM5_NO_GRAPHS')) ? false : null
+		graphs: (((GLM || Q4) && getenv('AMP_GLM5_NO_GRAPHS')) || getenv('AMP_NO_GRAPHS')) ? false : null
 	});
 
 	if (args.fit_probe) {
@@ -1206,6 +1219,13 @@ export function serve(args) {
 		if (info.mtp && info.mtp.lk_rounds)
 			mtp += sprintf(', lookup %d rounds, %.0f%% of %d drafts', info.mtp.lk_rounds,
 				100.0 * info.mtp.lk_accepted / info.mtp.lk_drafted, info.mtp.lk_drafted);
+
+		if (info.mtp && info.mtp.sh) {
+			let h = info.mtp.sh;
+
+			mtp += sprintf(', SHADOW lookup: %d of %d rounds had a draft; matched %.2f tokens/round vs MTP accepted %.2f there; matched >= 5: %d, full 7: %d; hist %J',
+				h.rounds, info.mtp.rounds, h.match * 1.0 / h.rounds, h.mtp * 1.0 / h.rounds, h.ge5, h.full, h.hist);
+		}
 
 		let why = '';
 		let d = info.reuse_detail;

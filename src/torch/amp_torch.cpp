@@ -23,6 +23,15 @@
 // early and nulls the slot so double-free is impossible.
 
 #include <torch/torch.h>
+#include <cuda_fp16.h>
+#ifdef AMPSTEIN_ROCM
+// ATen/cuda/CUDAGraph.h only forward-declares at::CUDAGeneratorState and
+// stores it by intrusive_ptr in a flat_hash_map member; something upstream
+// in the CUDA build's header graph makes the full type visible before this
+// point, but not here -- the destructor instantiation then needs a
+// complete type. Pull it in explicitly.
+#include <ATen/cuda/CUDAGeneratorImpl.h>
+#endif
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAStream.h>
@@ -2956,7 +2965,7 @@ graph_capture_begin(uc_vm_t *vm, size_t nargs)
 			uc_value_t *v = ucv_array_get(arr, i);
 			int64_t d = (ucv_type(v) == UC_INTEGER) ? ucv_int64_get(v) : -1;
 
-			if (d < 0 || d >= at::cuda::device_count() || d == dev.index()) {
+			if (d < 0 || d >= c10::cuda::device_count() || d == dev.index()) {
 				uc_vm_raise_exception(vm, EXCEPTION_TYPE,
 					"bad extra device index");
 				return NULL;
@@ -3717,6 +3726,14 @@ torch_st_tensor(uc_vm_t *vm, size_t nargs)
 }
 
 /* --- EXL3 kernels (vendored, see vendor/exl3) --------------------------- */
+//
+// CUDA-only (raw NVPTX inline asm, nvcuda::wmma, see cmake/exl3.cmake):
+// exl3_kernels is not built on a rocm configuration (see the ROCm backend
+// note in AGENTS.md / docs/GGUF.md), so every declaration, call site and
+// torch_fns row below is excluded too -- otherwise the link would fail on
+// these undefined symbols. Calling any of these from ucode on this backend
+// raises ucode's normal "unknown function" error.
+#ifndef AMPSTEIN_ROCM
 
 // quant/exl3_moe_coop.cu: fused decode-shaped MoE (two launches per layer)
 void exl3_moe_coop
@@ -3845,6 +3862,8 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& had_src_list = {},
     int num_had_src = 0
 );
+
+#endif /* !AMPSTEIN_ROCM */
 
 /*
  * synchronize()
@@ -4435,7 +4454,7 @@ extern "C" int
 amp_gdn_scan_f32(const void *q, const void *k, const void *v, const void *beta,
                 const void *gexp, void *state, void *out, int S, int Hk,
                 int Hv, int dk, int dv, float scale, void *states_out,
-                int n_out, cudaStream_t stream);
+                int n_out, int tiled, cudaStream_t stream);
 
 extern "C" int
 amp_kda_scan_f32(const void *q, const void *k, const void *v, const void *beta,
@@ -4459,16 +4478,32 @@ amp_copy_many(const void *const *src, void *const *dst, const long *bytes,
 extern "C" long
 amp_attn_dec_ws_floats(int S, int Hq, int Hk, int E, int ns);
 
+#ifdef AMPSTEIN_ROCM
+extern "C" int amp_attn_dec_wmma_ok(int S, int Hq, int Hk, int E);
+extern "C" int amp_attn_prefill_wmma(const void *q, const void *k, const void *v, const void *ksc, const void *vsc, const int *len, void *out,
+                                     int Sq, int Hq, int Hk, int E, int max_seq, float scale, int q8, cudaStream_t stream);
+extern "C" int amp_attn_dec_wmma(const void *q, const void *k, const void *v, const void *ksc, const void *vsc, const int *len,
+                                 void *ws, void *out, int S, int Hq, int Hk, int E, int max_seq, int ns, float scale, int q8,
+                                 cudaStream_t stream);
+#endif
+
 extern "C" int
 amp_attn_dec_fp16(const void *q, const void *k, const void *v, const int *len,
                  void *ws, void *out, int S, int Hq, int Hk, int E,
                  int max_seq, int ns, float scale, cudaStream_t stream);
 
 extern "C" int
+amp_attn_dec_q8_fp16(const void *q, const void *k, const void *v, const void *ks, const void *vs,
+                    const int *len, void *ws, void *out, int S, int Hq, int Hk, int E,
+                    int max_seq, int ns, float scale, cudaStream_t stream);
+
+#ifndef AMPSTEIN_ROCM
+extern "C" int
 amp_attn_dec_mma_fp16(const void *q, const void *k, const void *v,
                      const int *len, void *ws, void *out, int S, int Hq,
                      int Hk, int E, int max_seq, int ns, float scale,
                      cudaStream_t stream);
+#endif
 
 extern "C" int
 amp_qk_norm_rope_fp16(const void *x, long st, long sh, const void *w,
@@ -4507,6 +4542,7 @@ extern "C" int
 amp_attn_gate_fp16(const void *a, long ast, long ash, const void *g, long gst,
                   long gsh, void *out, int S, int H, int hd, cudaStream_t stream);
 
+#ifndef AMPSTEIN_ROCM
 extern "C" long
 amp_gdn_chunk_ws_floats(int S, int Hv);
 
@@ -4520,6 +4556,7 @@ amp_gdn_chunk_f32(const void *q, const void *k, const void *v, const void *beta,
                  const void *gexp, void *state, void *out, void *ws, int S,
                  int Hk, int Hv, int dk, int dv, float scale,
                  cudaStream_t stream);
+#endif
 
 extern "C" int
 amp_gdn_prep_fp16(const void *qkv, void *conv_state, const void *conv_w,
@@ -4969,6 +5006,12 @@ torch_silu_mul(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+// DSA/QSA indexer scoring and pool selection: amp_idx_score* / amp_dsa_select
+// are excluded above in amp_kernels.cu (raw PTX, not reachable from a plain
+// `full_attention` model). Declarations, functions and torch_fns rows
+// excluded together.
+#ifndef AMPSTEIN_ROCM
+
 /*
  * idx_score(q, pools, w, scale, pos0, P): torch.tensor
  *
@@ -5143,6 +5186,8 @@ torch_dsa_select(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+#endif /* !AMPSTEIN_ROCM */
+
 /*
  * mem_info(dev): [allocated, reserved, free, total, retries, mallocs, frees] of CUDA device
  * `dev` — what the caching allocator hands to tensors, what it holds from
@@ -5201,7 +5246,7 @@ torch_mem_info(uc_vm_t *vm, size_t nargs)
 }
 
 /*
- * device_props(dev): { name, major, minor, total, sm_count } of CUDA device
+ * device_props(dev): { name, backend ("cuda" | "rocm"), major, minor, total, sm_count } of CUDA device
  * `dev` (cudaGetDeviceProperties) — the identity an RPC worker announces in
  * its hello (docs/RPC.md). Does not create a context on the device.
  */
@@ -5228,6 +5273,11 @@ torch_device_props(uc_vm_t *vm, size_t nargs)
 	uc_value_t *o = ucv_object_new(vm);
 
 	ucv_object_add(o, "name", ucv_string_new(pr.name));
+#ifdef AMPSTEIN_ROCM
+	ucv_object_add(o, "backend", ucv_string_new("rocm"));
+#else
+	ucv_object_add(o, "backend", ucv_string_new("cuda"));
+#endif
 	ucv_object_add(o, "major", ucv_int64_new(pr.major));
 	ucv_object_add(o, "minor", ucv_int64_new(pr.minor));
 	ucv_object_add(o, "total", ucv_int64_new((int64_t)pr.totalGlobalMem));
@@ -5952,9 +6002,9 @@ gdn_scan_impl(uc_vm_t *vm, size_t nargs, bool chunked)
 {
 	double scale;
 
-	if ((nargs != 7 && nargs != 8) || !arg_number(vm, uc_fn_arg(6), &scale)) {
+	if ((nargs < 7 || nargs > 9) || !arg_number(vm, uc_fn_arg(6), &scale)) {
 		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
-			"expected (q, k, v, beta, gexp, state, scale, states_out?)");
+			"expected (q, k, v, beta, gexp, state, scale, states_out?, tiled?)");
 		return NULL;
 	}
 
@@ -5973,7 +6023,15 @@ gdn_scan_impl(uc_vm_t *vm, size_t nargs, bool chunked)
 	at::Tensor *so = NULL;
 	uc_value_t *sov = uc_fn_arg(7);
 
-	if (nargs == 8 && ucv_type(sov) != UC_NULL) {
+	/* tiled: the value heads are in the order [k0 k1 .. k0 k1 ..] (a GGUF checkpoint, converted by llama.cpp) instead of grouped by key head */
+	bool tiled = nargs == 9 && ucv_is_truish(uc_fn_arg(8));
+
+	if (tiled && chunked) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "gdn_chunk: tiled value heads are not supported");
+		return NULL;
+	}
+
+	if (nargs >= 8 && ucv_type(sov) != UC_NULL) {
 		if (chunked) {
 			uc_vm_raise_exception(vm, EXCEPTION_TYPE,
 				"gdn_chunk: states_out is not supported");
@@ -6020,7 +6078,13 @@ gdn_scan_impl(uc_vm_t *vm, size_t nargs, bool chunked)
 
 		int rc;
 
+#ifdef AMPSTEIN_ROCM
+		if (chunked)
+			RAISE("gdn_chunk: not available on the ROCm backend (use gdn_scan)");
+#endif
+
 		if (chunked) {
+#ifndef AMPSTEIN_ROCM
 			at::Tensor ws = at::empty({ (int64_t)amp_gdn_chunk_ws_floats(
 				(int)q->size(0), (int)v->size(1)) }, v->options());
 
@@ -6030,6 +6094,9 @@ gdn_scan_impl(uc_vm_t *vm, size_t nargs, bool chunked)
 				(int)q->size(0), (int)q->size(1), (int)v->size(1),
 				(int)q->size(2), (int)v->size(2), (float)scale,
 				c10::cuda::getCurrentCUDAStream().stream());
+#else
+			rc = -1;
+#endif
 		}
 		else {
 			rc = amp_gdn_scan_f32(q->data_ptr(), k->data_ptr(),
@@ -6037,7 +6104,7 @@ gdn_scan_impl(uc_vm_t *vm, size_t nargs, bool chunked)
 				st->data_ptr(), out.data_ptr(), (int)q->size(0),
 				(int)q->size(1), (int)v->size(1), (int)q->size(2),
 				(int)v->size(2), (float)scale,
-				so ? so->data_ptr() : NULL, so ? (int)so->size(0) : 0,
+				so ? so->data_ptr() : NULL, so ? (int)so->size(0) : 0, tiled ? 1 : 0,
 				c10::cuda::getCurrentCUDAStream().stream());
 		}
 
@@ -6786,6 +6853,17 @@ torch_attn_decode(uc_vm_t *vm, size_t nargs)
 		return NULL;
 	}
 
+#ifdef AMPSTEIN_ROCM
+	/* amp_attn_dec_mma_fp16 is excluded on this backend (mma.sync / ldmatrix
+	 * raw PTX, no HIP port yet) -- always take the scalar fallback
+	 * regardless of what the caller asked for (qwen35.uc's attn_forward_dev
+	 * passes mma=1 by default whenever the head dim allows it). */
+	/* (the tensor-core variant is the WMMA kernel below; it takes head dim 256, <= 32 query rows per kv head) */
+	const bool use_wmma = use_mma && !getenv("AMP_ATTN_SCALAR");
+
+	use_mma = 0;
+#endif
+
 	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
 	at::Tensor *k = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
 	at::Tensor *v = k ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
@@ -6811,6 +6889,10 @@ torch_attn_decode(uc_vm_t *vm, size_t nargs)
 	int S = (int)q->size(0), Hq = (int)q->size(1), Hk = (int)k->size(0);
 	int E = (int)q->size(2), max_seq = (int)k->size(1);
 
+#ifdef AMPSTEIN_ROCM
+	const bool wmma = use_wmma && amp_attn_dec_wmma_ok(S, Hq, Hk, E);
+#endif
+
 	TensorDeviceGuard dg(*q);
 
 	try {
@@ -6825,6 +6907,13 @@ torch_attn_decode(uc_vm_t *vm, size_t nargs)
 			 * costs up to 40% (measured on a 3090, L132) */
 			splits = use_mma ? std::max<int64_t>(1, (int64_t)sms / Hk) :
 				std::max<int64_t>(1, (4 * (int64_t)sms + Hk - 1) / Hk);
+#ifdef AMPSTEIN_ROCM
+			if (wmma) {
+				static const int wsp = getenv("AMP_WMMA_SPLITS") ? atoi(getenv("AMP_WMMA_SPLITS")) : 0;
+
+				splits = wsp > 0 ? wsp : std::max<int64_t>(1, (2 * (int64_t)sms + Hk - 1) / Hk);
+			}
+#endif
 		}
 
 		at::Tensor ws = at::empty({ (int64_t)amp_attn_dec_ws_floats(S, Hq, Hk, E, (int)splits) },
@@ -6832,6 +6921,13 @@ torch_attn_decode(uc_vm_t *vm, size_t nargs)
 		at::Tensor out = at::empty_like(*q);
 		int rc;
 
+#ifdef AMPSTEIN_ROCM
+		if (wmma)
+			rc = amp_attn_dec_wmma(q->data_ptr(), k->data_ptr(), v->data_ptr(), NULL, NULL, (const int *)len->data_ptr(),
+				ws.data_ptr(), out.data_ptr(), S, Hq, Hk, E, max_seq, (int)splits, (float)scale, 0,
+				c10::cuda::getCurrentCUDAStream().stream());
+		else
+#else
 		if (use_mma)
 			rc = amp_attn_dec_mma_fp16(q->data_ptr(), k->data_ptr(),
 				v->data_ptr(), (const int *)len->data_ptr(),
@@ -6839,6 +6935,7 @@ torch_attn_decode(uc_vm_t *vm, size_t nargs)
 				(int)splits, (float)scale,
 				c10::cuda::getCurrentCUDAStream().stream());
 		else
+#endif
 			rc = amp_attn_dec_fp16(q->data_ptr(), k->data_ptr(), v->data_ptr(),
 				(const int *)len->data_ptr(), ws.data_ptr(), out.data_ptr(), S, Hq,
 				Hk, E, max_seq, (int)splits, (float)scale,
@@ -6853,6 +6950,180 @@ torch_attn_decode(uc_vm_t *vm, size_t nargs)
 		RAISE(e.what());
 	}
 }
+
+/*
+ * attn_decode_q8(q, kq, ks, vq, vs, len, Hk, scale, splits?): torch.tensor
+ *
+ * attn_decode over a Q8 KV cache: kq / vq (Hk * max_seq, E) int8 codes and ks / vs (Hk * max_seq, E / 32) fp16 scales, the rows
+ * kv_q8_put writes (row h * max_seq + pos). The scalar split-KV kernel dequantizes in registers; q (S, Hq, E) fp16, len a device int32
+ * key count, S <= 5 rows. Returns (S, Hq, E) fp16.
+ */
+static uc_value_t *
+torch_attn_decode_q8(uc_vm_t *vm, size_t nargs)
+{
+	double scale;
+	int64_t splits = 0, Hk64 = 0, use_mma = 1;
+
+	if ((nargs < 8 || nargs > 10) || !arg_int(vm, uc_fn_arg(6), &Hk64) || !arg_number(vm, uc_fn_arg(7), &scale) ||
+	    (nargs >= 9 && ucv_type(uc_fn_arg(8)) != UC_NULL && !arg_int(vm, uc_fn_arg(8), &splits)) ||
+	    (nargs == 10 && ucv_type(uc_fn_arg(9)) != UC_NULL && !arg_int(vm, uc_fn_arg(9), &use_mma))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "expected (q, kq, ks, vq, vs, len, Hk, scale, splits?, mma?)");
+		return NULL;
+	}
+
+	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *kq = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *ks = kq ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+	at::Tensor *vq = ks ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+	at::Tensor *vs = vq ? tensor_arg(vm, uc_fn_arg(4)) : NULL;
+	at::Tensor *len = vs ? tensor_arg(vm, uc_fn_arg(5)) : NULL;
+
+	if (!len)
+		return NULL;
+
+	int dev = q->get_device();
+	int Hk = (int)Hk64;
+
+	if (Hk < 1 || q->dim() != 3 || kq->dim() != 2 || ks->dim() != 2 || vq->sizes() != kq->sizes() || vs->sizes() != ks->sizes() ||
+	    q->scalar_type() != at::kHalf || ks->scalar_type() != at::kHalf || vs->scalar_type() != at::kHalf ||
+	    kq->scalar_type() != at::kChar || vq->scalar_type() != at::kChar || len->scalar_type() != at::kInt ||
+	    !q->is_contiguous() || !kq->is_contiguous() || !ks->is_contiguous() || !vq->is_contiguous() || !vs->is_contiguous() ||
+	    q->size(2) != kq->size(1) || ks->size(1) != kq->size(1) / 32 || (kq->size(1) % 32) || (kq->size(0) % Hk) ||
+	    ks->size(0) != kq->size(0) || kq->get_device() != dev || vq->get_device() != dev || ks->get_device() != dev ||
+	    vs->get_device() != dev || len->get_device() != dev) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
+			"attn_decode_q8: q (S, Hq, E) fp16, kq / vq (Hk * max_seq, E) int8, ks / vs (Hk * max_seq, E / 32) fp16, "
+			"len int32, contiguous, one device");
+		return NULL;
+	}
+
+	int S = (int)q->size(0), Hq = (int)q->size(1), E = (int)q->size(2), max_seq = (int)(kq->size(0) / Hk);
+
+#ifdef AMPSTEIN_ROCM
+	const bool wmma = use_mma && !getenv("AMP_ATTN_SCALAR") && amp_attn_dec_wmma_ok(S, Hq, Hk, E);
+#else
+	const bool wmma = false;
+#endif
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		if (splits <= 0) {
+			int sms = 0;
+
+			C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+			splits = std::max<int64_t>(1, (4 * (int64_t)sms + Hk - 1) / Hk);
+#ifdef AMPSTEIN_ROCM
+			if (wmma) {
+				static const int wsp = getenv("AMP_WMMA_SPLITS") ? atoi(getenv("AMP_WMMA_SPLITS")) : 0;
+
+				splits = wsp > 0 ? wsp : std::max<int64_t>(1, (2 * (int64_t)sms + Hk - 1) / Hk);
+			}
+#endif
+		}
+
+		at::Tensor ws = at::empty({ (int64_t)amp_attn_dec_ws_floats(S, Hq, Hk, E, (int)splits) }, q->options().dtype(at::kFloat));
+		at::Tensor out = at::empty_like(*q);
+		int rc;
+
+#ifdef AMPSTEIN_ROCM
+		if (wmma)
+			rc = amp_attn_dec_wmma(q->data_ptr(), kq->data_ptr(), vq->data_ptr(), ks->data_ptr(), vs->data_ptr(),
+				(const int *)len->data_ptr(), ws.data_ptr(), out.data_ptr(), S, Hq, Hk, E, max_seq, (int)splits, (float)scale, 1,
+				c10::cuda::getCurrentCUDAStream().stream());
+		else
+#endif
+			rc = amp_attn_dec_q8_fp16(q->data_ptr(), kq->data_ptr(), vq->data_ptr(), ks->data_ptr(), vs->data_ptr(),
+				(const int *)len->data_ptr(), ws.data_ptr(), out.data_ptr(), S, Hq, Hk, E, max_seq, (int)splits, (float)scale,
+				c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "attn_decode_q8"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+#ifdef AMPSTEIN_ROCM
+/*
+ * attn_prefill(q, k_cache, v_cache, len, scale): torch.tensor
+ * attn_prefill_q8(q, kq, ks, vq, vs, len, Hk, scale): torch.tensor
+ *
+ * Causal attention of a chunk of S query positions (q (S, Hq, 256) fp16 contiguous) over the cache, on the WMMA matrix units (ROCm; the
+ * FlashAttention of ATen runs at ~33 TFLOPS here). The chunk's last position is len - 1 (len: a device int32 key count, the chunk's own keys already
+ * in the cache): query i sees the keys [0, len - S + i]. fp16 caches (Hk, max_seq, 256), or the Q8 cache rows of attn_decode_q8. Returns (S, Hq, 256).
+ */
+static uc_value_t *
+torch_attn_prefill_common(uc_vm_t *vm, size_t nargs, bool q8)
+{
+	double scale;
+	int64_t Hk64 = 0;
+
+	if (q8 ? (nargs != 8 || !arg_int(vm, uc_fn_arg(6), &Hk64) || !arg_number(vm, uc_fn_arg(7), &scale))
+	       : (nargs != 5 || !arg_number(vm, uc_fn_arg(4), &scale))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, q8 ? "expected (q, kq, ks, vq, vs, len, Hk, scale)" : "expected (q, k_cache, v_cache, len, scale)");
+		return NULL;
+	}
+
+	at::Tensor *q = tensor_arg(vm, uc_fn_arg(0));
+	at::Tensor *k = q ? tensor_arg(vm, uc_fn_arg(1)) : NULL;
+	at::Tensor *ks = NULL, *vs = NULL, *v, *len;
+
+	if (q8) {
+		ks = k ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+		v = ks ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+		vs = v ? tensor_arg(vm, uc_fn_arg(4)) : NULL;
+		len = vs ? tensor_arg(vm, uc_fn_arg(5)) : NULL;
+	}
+	else {
+		v = k ? tensor_arg(vm, uc_fn_arg(2)) : NULL;
+		len = v ? tensor_arg(vm, uc_fn_arg(3)) : NULL;
+	}
+
+	if (!len)
+		return NULL;
+
+	int dev = q->get_device();
+	int Hk = q8 ? (int)Hk64 : (k->dim() == 3 ? (int)k->size(0) : 0);
+
+	if (Hk < 1 || q->dim() != 3 || q->scalar_type() != at::kHalf || !q->is_contiguous() || len->scalar_type() != at::kInt ||
+	    v->sizes() != k->sizes() || k->get_device() != dev || v->get_device() != dev || len->get_device() != dev ||
+	    (q8 ? (k->dim() != 2 || k->scalar_type() != at::kChar || v->scalar_type() != at::kChar || ks->scalar_type() != at::kHalf ||
+	           vs->scalar_type() != at::kHalf || !k->is_contiguous() || !v->is_contiguous() || !ks->is_contiguous() || !vs->is_contiguous() ||
+	           k->size(1) != q->size(2) || (k->size(0) % Hk) || ks->size(0) != k->size(0) || ks->size(1) != k->size(1) / 32)
+	        : (k->dim() != 3 || k->scalar_type() != at::kHalf || v->scalar_type() != at::kHalf || !k->is_contiguous() || !v->is_contiguous() ||
+	           k->size(2) != q->size(2)))) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "attn_prefill: q (S, Hq, 256) fp16, caches fp16 (Hk, max_seq, 256) or Q8 rows, len int32, one device");
+		return NULL;
+	}
+
+	int S = (int)q->size(0), Hq = (int)q->size(1), E = (int)q->size(2);
+	int max_seq = q8 ? (int)(k->size(0) / Hk) : (int)k->size(1);
+
+	TensorDeviceGuard dg(*q);
+
+	try {
+		at::Tensor out = at::empty_like(*q);
+		int rc = amp_attn_prefill_wmma(q->data_ptr(), k->data_ptr(), v->data_ptr(), q8 ? ks->data_ptr() : NULL, q8 ? vs->data_ptr() : NULL,
+			(const int *)len->data_ptr(), out.data_ptr(), S, Hq, Hk, E, max_seq, (float)scale, q8 ? 1 : 0,
+			c10::cuda::getCurrentCUDAStream().stream());
+
+		if (!launch_ok(vm, rc, "attn_prefill"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+static uc_value_t *torch_attn_prefill(uc_vm_t *vm, size_t nargs) { return torch_attn_prefill_common(vm, nargs, false); }
+static uc_value_t *torch_attn_prefill_q8(uc_vm_t *vm, size_t nargs) { return torch_attn_prefill_common(vm, nargs, true); }
+#endif
 
 /*
  * copy_many(dsts, srcs): null
@@ -7287,8 +7558,17 @@ torch_common_prefix(uc_vm_t *vm, size_t nargs)
 static uc_value_t *
 torch_device_count(uc_vm_t *vm, size_t nargs)
 {
-	return ucv_int64_new(at::cuda::device_count());
+	return ucv_int64_new(c10::cuda::device_count());
 }
+
+// Multi-GPU PCIe P2P communicator (amp_comm_allreduce_kernel, excluded on
+// this backend, see amp_kernels.cu) and the EXL3 MoE/trellis-GEMM kernels
+// (exl3_kernels, CUDA-only, not built on a rocm configuration — see the
+// ROCm backend note in AGENTS.md / docs/GGUF.md). Declarations, every call
+// site and torch_fns row are excluded together so the link doesn't fail on
+// these undefined symbols; calling any of them from ucode on this backend
+// raises ucode's normal "unknown function" error.
+#ifndef AMPSTEIN_ROCM
 
 /*
  * N-way P2P communicator (src/amp_kernels.cu amp_comm_allreduce_kernel).
@@ -7369,7 +7649,7 @@ torch_p2p_comm(uc_vm_t *vm, size_t nargs)
 			uc_value_t *v = ucv_array_get(devs, i);
 
 			if (ucv_type(v) != UC_INTEGER || ucv_int64_get(v) < 0 ||
-			    ucv_int64_get(v) >= at::cuda::device_count())
+			    ucv_int64_get(v) >= c10::cuda::device_count())
 				throw std::runtime_error("bad device index");
 
 			c->dev.push_back((int)ucv_int64_get(v));
@@ -7555,6 +7835,8 @@ void exl3_moe
     const c10::optional<at::Tensor>& bits_d
 );
 
+#endif /* !AMPSTEIN_ROCM */
+
 /* torch.moe_coop(x, sel, rw, cfg, sh_out?)
  *
  * Fused decode-shaped MoE: two launches run every (token, expert) slot of
@@ -7566,6 +7848,7 @@ void exl3_moe
  * d_out ctr out (scratch, see exl3_moe_coop_prepare) and numbers Hi Kg Ku
  * Kd act act_limit, booleans mcg mul1. sh_out: optional fp32 (bsz, H)
  * shared-expert output added into the sum. */
+#ifndef AMPSTEIN_ROCM
 static uc_value_t *
 torch_moe_coop(uc_vm_t *vm, size_t nargs)
 {
@@ -7649,6 +7932,7 @@ torch_moe_coop(uc_vm_t *vm, size_t nargs)
 
 	return NULL;
 }
+#endif /* !AMPSTEIN_ROCM */
 
 extern "C" int amp_fp8_gemv(const void *x, const void *w, const void *s, void *out, int M, int K,
                             int N, cudaStream_t stream);
@@ -8024,7 +8308,11 @@ gguf_gemv_run(int qt, at::Tensor &x, const void *w, const void *ids, void *out, 
 		/* AMP_GGUF_QX=dense|experts|all: the block quantizes the activation row it reads itself (saves a launch and its gap): the experts (one row per
 		 * block), a dense product of one row. Not the 129k-row head (every block would quantize the same 5120 values: ~16000 times) nor the grouped verify
 		 * kernel. Measured on jai (decode, 40 layers): no faster than the separate kernel (the redundant work in every block costs more than the launch). */
+		#ifdef AMPSTEIN_ROCM
+		static const char *qxe = getenv("AMP_GGUF_QX") ?: "dense";    /* ROCm: on for the dense products (+1.3 % decode); AMP_GGUF_QX=off */
+#else
 		static const char *qxe = getenv("AMP_GGUF_QX");           /* unset: off; "dense", "experts" or "all" */
+#endif
 		const bool qx_dense = qxe && (!strcmp(qxe, "dense") || !strcmp(qxe, "all")), qx_exp = qxe && (!strcmp(qxe, "experts") || !strcmp(qxe, "all"));
 		const bool qx = mr == 0 && ((ids != NULL && qx_exp) || (ids == NULL && qx_dense && M == 1 && R == 1 && (double)N * G * K <= 6.4e7)) && K <= 8192 &&
 			(K % 32) == 0 && (((uintptr_t)x.data_ptr()) & 15) == 0;
@@ -8265,6 +8553,12 @@ torch_gguf_moe_gate_up(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+// MoE prefill tensor-core kernels excluded above in amp_gguf.cu (nvcuda::wmma
+// / raw PTX mma.sync, not reachable from a dense model anyway). Declaration,
+// function and torch_fns row excluded together; ggufq.uc's per-expert
+// cuBLAS/rocBLAS fallback (torch.gguf_moe_gate_up + gguf_gemv) covers any
+// MoE model that does load on this backend, just without the speedup.
+#ifndef AMPSTEIN_ROCM
 extern "C" int amp_gguf_moe_prefill_mma(int t13, int t2, const void *yq, const void *ys, const void *tok, const void *wts, const void *count,
                                         const void *start, const void *w1, const void *w3, const void *w2, void *hbuf, void *hq, void *hs,
                                         void *out, int E, int H, int I, int A, int max_rows, float lim, int det, cudaStream_t stream);
@@ -8352,6 +8646,7 @@ torch_gguf_moe_prefill(uc_vm_t *vm, size_t nargs)
 		RAISE(e.what());
 	}
 }
+#endif /* !AMPSTEIN_ROCM */
 
 extern "C" int amp_gguf_moe_prefill_pt(int t13, int t2, const void *y, const void *tok, const void *wts, const void *count, const void *start,
 	const void *p1, const void *p3, const void *p2, void *hbuf, void *out, void *wsc, int E, int H, int I, int max_rows, float lim, cudaStream_t stream);
@@ -8867,6 +9162,11 @@ torch_v41_attn(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+// torch.skinny (GLM-5.3 only, amp_skinny_f32 excluded, see amp_kernels.cu)
+// and torch.moe_concurrency (EXL3 MoE, exl3_kernels excluded, CUDA-only):
+// declarations, functions and torch_fns rows excluded together.
+#ifndef AMPSTEIN_ROCM
+
 extern "C" int
 amp_skinny_f32(const float *x, const float *w, float *out, float *part, int *cnt,
               int M, int K, int N, long part_floats, int cnt_len, cudaStream_t stream);
@@ -9066,6 +9366,8 @@ torch_moe_gather(uc_vm_t *vm, size_t nargs)
 	return NULL;
 }
 
+#endif /* !AMPSTEIN_ROCM */
+
 /* --- stream fork / join (intra-graph concurrency) ------------------------ */
 
 /* Side-stream branches for independent op chains. Slot k of a device is one
@@ -9098,7 +9400,7 @@ fork_slot_arg(uc_vm_t *vm, size_t nargs)
 	int64_t dev, k;
 
 	if (nargs != 2 || !arg_int(vm, uc_fn_arg(0), &dev) || !arg_int(vm, uc_fn_arg(1), &k) ||
-	    dev < 0 || dev >= AMP_FORK_MAXD || dev >= at::cuda::device_count() ||
+	    dev < 0 || dev >= AMP_FORK_MAXD || dev >= c10::cuda::device_count() ||
 	    k < 0 || k >= AMP_FORK_MAXK) {
 		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
 			"expected (device index, branch slot 0..3)");
@@ -9241,7 +9543,7 @@ torch_expert_exchange(uc_vm_t *vm, size_t nargs)
 	std::vector<int> ps;
 
 	if (nargs != 9 || !arg_int(vm, uc_fn_arg(0), &dev) || !arg_int(vm, uc_fn_arg(1), &slot) || dev < 0 ||
-	    dev >= AMP_FORK_MAXD || dev >= at::cuda::device_count() || slot < 0 || slot >= AMP_FORK_MAXK) {
+	    dev >= AMP_FORK_MAXD || dev >= c10::cuda::device_count() || slot < 0 || slot >= AMP_FORK_MAXK) {
 		uc_vm_raise_exception(vm, EXCEPTION_TYPE,
 			"expected (device, slot 0..3, up_dst, up_src, down_dst, down_src, d2h_dst, d2h_src, pokes)");
 		return NULL;
@@ -9529,7 +9831,7 @@ torch_notifier_arm(uc_vm_t *vm, size_t nargs)
 
 	for (auto &dev : devs) {
 		if (dev.type() != at::kCUDA || dev.index() < 0 ||
-		    dev.index() >= at::cuda::device_count())
+		    dev.index() >= c10::cuda::device_count())
 			RAISE("arm: not a CUDA device");
 
 		cudaStream_t st = c10::cuda::getCurrentCUDAStream(
@@ -9876,6 +10178,7 @@ torch_rms_norm_res(uc_vm_t *vm, size_t nargs)
  *   had_src_list (num_slices,) int32 — source index per slice
  *   num_had_src  number — one A_had slab + suh entry per source
  */
+#ifndef AMPSTEIN_ROCM
 static uc_value_t *
 torch_mgemm(uc_vm_t *vm, size_t nargs)
 {
@@ -10006,6 +10309,7 @@ torch_mgemm(uc_vm_t *vm, size_t nargs)
 		RAISE(e.what());
 	}
 }
+#endif /* !AMPSTEIN_ROCM */
 
 /*
  * ptr_array(values: array): torch.tensor
@@ -10696,6 +11000,7 @@ torch_read_into(uc_vm_t *vm, size_t nargs)
  * tensor is present in the weight map). mcg (optional bool, default
  * false) selects the mcg codebook (cb=1; the .mcg marker tensor).
  */
+#ifndef AMPSTEIN_ROCM
 static uc_value_t *
 torch_exl3_reconstruct(uc_vm_t *vm, size_t nargs)
 {
@@ -10975,6 +11280,7 @@ torch_exl3_gemm(uc_vm_t *vm, size_t nargs)
 
 	return ucv_get(C_v);
 }
+#endif /* !AMPSTEIN_ROCM */
 
 void ngram_gather_cpu(int64_t fd, int64_t base_offset, int64_t row_bytes, const at::Tensor& uids,
                       int64_t uid_base, at::Tensor out);
@@ -11434,6 +11740,13 @@ torch_image_prepare(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+// mHC hyper-connections, gated-residual mix, n-gram/PLE and the QSA sparse-
+// attention indexer: all vendored EXL3 kernels (hc_mix.cu, ngram.cu, ple.cu)
+// or the QSA attention excluded above in amp_kernels.cu -- CUDA-only / not
+// reachable from a plain `full_attention` model either way. Declarations,
+// every call site and torch_fns row excluded together.
+#ifndef AMPSTEIN_ROCM
+
 /*
  * hc_mix(streams, fn, base, scale, rms_eps, hc_eps, sinkhorn_iters):
  *   [post, comb, collapsed]
@@ -11698,6 +12011,8 @@ torch_ngram_hash(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+#endif /* !AMPSTEIN_ROCM */
+
 /*
  * stfile.gather(name, rows, out): out
  *
@@ -11958,6 +12273,7 @@ torch_st_drop_cache(uc_vm_t *vm, size_t nargs)
  * Decode packed n-gram rows (U, 1 + 10*K) int16 on the GPU into out
  * (U, 160) fp16: mul1 codebook * row scale + the per-hash-head bias row.
  */
+#ifndef AMPSTEIN_ROCM
 static uc_value_t *
 torch_ngram_dequant(uc_vm_t *vm, size_t nargs)
 {
@@ -12234,6 +12550,8 @@ torch_qsa_attn(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+#endif /* !AMPSTEIN_ROCM */
+
 /*
  * kda_scan(q, k, v, beta, g, state, scale, states_out?): torch.tensor
  *
@@ -12504,8 +12822,10 @@ static const uc_function_list_t torch_fns[] = {
 	{ "rms_norm",	torch_rms_norm },
 	{ "rope",	torch_rope },
 	{ "silu_mul",	torch_silu_mul },
+#ifndef AMPSTEIN_ROCM
 	{ "idx_score",	torch_idx_score },
 	{ "dsa_select",	torch_dsa_select },
+#endif
 	{ "mem_info",	torch_mem_info },
 	{ "device_props",	torch_device_props },
 	{ "empty_cache",	torch_empty_cache },
@@ -12514,6 +12834,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "kv_q4_put",	torch_kv_q4_put },
 	{ "kv_q4_get",	torch_kv_q4_get },
 	{ "layer_norm",	torch_layer_norm },
+#ifndef AMPSTEIN_ROCM
 	{ "hc_mix",	torch_hc_mix },
 	{ "hc_apply",	torch_hc_apply },
 	{ "gr_mix",	torch_gr_mix },
@@ -12521,13 +12842,16 @@ static const uc_function_list_t torch_fns[] = {
 	{ "ngram_hash",	torch_ngram_hash },
 	{ "ngram_dequant",	torch_ngram_dequant },
 	{ "ple_forward",	torch_ple_forward },
+#endif
 	{ "image_prepare",	torch_image_prepare },
 	{ "gdn_scan",	torch_gdn_scan },
 	{ "kda_scan",	torch_kda_scan },
 	{ "kda_gates",	torch_kda_gates },
 	{ "kda_out_norm",	torch_kda_out_norm },
 	{ "flash_attn_kvcache",	torch_flash_attn_kvcache },
+#ifndef AMPSTEIN_ROCM
 	{ "p2p_comm",	torch_p2p_comm },
+#endif
 	{ "device_count",	torch_device_count },
 	{ "common_prefix",	torch_common_prefix },
 	{ "copy_many",	torch_copy_many },
@@ -12537,13 +12861,17 @@ static const uc_function_list_t torch_fns[] = {
 	{ "fd_read",	torch_fd_read },
 	{ "fd_send_all",	torch_fd_send_all },
 	{ "fd_recv_all",	torch_fd_recv_all },
+#ifndef AMPSTEIN_ROCM
 	{ "moe_coop",	torch_moe_coop },
 	{ "skinny",	torch_skinny },
+#endif
 	{ "fp8_gemv",	torch_fp8_gemv },
 	{ "v41_attn",	torch_v41_attn },
 	{ "fp8_dequant",	torch_fp8_dequant },
 	{ "fp8_gemv_grouped",	torch_fp8_gemv_grouped },
+#ifndef AMPSTEIN_ROCM
 	{ "hc_mix2",	torch_hc_mix2 },
+#endif
 	{ "gather_wait",	torch_gather_wait },
 	{ "v41_rope",	torch_v41_rope },
 	{ "v41_route",	torch_v41_route },
@@ -12556,8 +12884,10 @@ static const uc_function_list_t torch_fns[] = {
 	{ "gguf_gemv_grouped",	torch_gguf_gemv_grouped },
 	{ "gguf_gate_up",	torch_gguf_gate_up },
 	{ "gguf_embed",	torch_gguf_embed },
+#ifndef AMPSTEIN_ROCM
 	{ "gguf_moe_prefill",	torch_gguf_moe_prefill },
 	{ "gguf_moe_prefill_pt",	torch_gguf_moe_prefill_pt },
+#endif
 	{ "gguf_moe_gate_up",	torch_gguf_moe_gate_up },
 	{ "gguf_moe_group",	torch_gguf_moe_group },
 	{ "fp4_dequant",	torch_fp4_dequant },
@@ -12568,11 +12898,18 @@ static const uc_function_list_t torch_fns[] = {
 	{ "expert_exchange",	torch_expert_exchange },
 	{ "moe_cpu_threads",	torch_moe_cpu_threads },
 	{ "moe_cpu_prof",	torch_moe_cpu_prof },
+#ifndef AMPSTEIN_ROCM
 	{ "moe_fused",	torch_moe_fused },
 	{ "moe_gather",	torch_moe_gather },
 	{ "moe_concurrency",	torch_moe_concurrency },
+#endif
 	{ "notifier",	torch_notifier },
 	{ "attn_decode",	torch_attn_decode },
+	{ "attn_decode_q8",	torch_attn_decode_q8 },
+#ifdef AMPSTEIN_ROCM
+	{ "attn_prefill",	torch_attn_prefill },
+	{ "attn_prefill_q8",	torch_attn_prefill_q8 },
+#endif
 	{ "qk_norm_rope",	torch_qk_norm_rope },
 	{ "dsv4_qkv",	torch_dsv4_qkv },
 	{ "dsv4_comp",	torch_dsv4_comp },
@@ -12595,7 +12932,9 @@ static const uc_function_list_t torch_fns[] = {
 	{ "rms_norm_res",	torch_rms_norm_res },
 	{ "decode_attn",	torch_decode_attn },
 	{ "argmax_advance",	torch_argmax_advance },
+#ifndef AMPSTEIN_ROCM
 	{ "mgemm",	torch_mgemm },
+#endif
 	{ "ptr_array",	torch_ptr_array },
 	{ "h2d",		torch_h2d },
 	{ "h2d_file",	torch_h2d_file },
@@ -12611,9 +12950,11 @@ static const uc_function_list_t torch_fns[] = {
 	{ "matmul",	torch_matmul },
 	{ "sdpa",	torch_sdpa },
 	{ "where",	torch_where },
+#ifndef AMPSTEIN_ROCM
 	{ "exl3_reconstruct",	torch_exl3_reconstruct },
 	{ "exl3_gemm_recon",	torch_exl3_gemm_recon },
 	{ "exl3_gemm",	torch_exl3_gemm },
+#endif
 };
 
 void
@@ -12634,13 +12975,41 @@ uc_module_init(uc_vm_t *vm, uc_value_t *scope)
 	 * first used, i.e. after this runs; an explicit environment value wins
 	 * (PYTORCH_CUDA_ALLOC_CONF is also the older spelling's name for
 	 * PYTORCH_ALLOC_CONF — set either to override). */
-	if (!getenv("PYTORCH_ALLOC_CONF"))
+	if (!getenv("PYTORCH_ALLOC_CONF")) {
+#ifdef AMPSTEIN_ROCM
+		/* HIPCachingAllocator's setAccess (the expandable-segments virtual-
+		 * memory path) raises hipErrorInvalidValue on this backend/GPU
+		 * (gfx1100) with this libtorch build -- the very first CUDA-style
+		 * tensor allocation fails. Default off here; CUDA keeps the
+		 * fragmentation-free growth above. */
+		setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False", 0);
+#else
 		setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True", 0);
+#endif
+	}
+
+#ifdef AMPSTEIN_ROCM
+	/* The HIP runtime's graph packet capture (ROCm 7.1 / libtorch 2.16 nightly, gfx1100) leaks per replayed kernel node: a
+	 * captured decode step crashes the process inside libhsa-runtime64 after about 10000 launched nodes (a 64-layer graph:
+	 * the third replay). Off, 100 % of the replays of the same graphs run. An explicit environment value wins. */
+	setenv("DEBUG_CLR_GRAPH_PACKET_CAPTURE", "0", 0);
+
+	/* libamd_smi (ROCm 7.1, pulled in by libtorch_hip) double-frees a std::map in a static destructor at exit, so every process that
+	 * loaded this module died with SIGABRT after finishing its work (exit status 134). Handlers run in reverse order of registration
+	 * and the library registered its destructor first (libtorch_hip depends on it): leave from here, with the real status, before
+	 * it gets to run. Nothing that matters is left to tear down once the exit handlers of the VM are done. */
+	on_exit([](int status, void *) {
+		fflush(NULL);
+		_exit(status);
+	}, NULL);
+#endif
 
 	uc_type_declare(vm, TENSOR_TYPE, tensor_methods, tensor_free);
 	uc_type_declare(vm, STFILE_TYPE, stfile_methods, stfile_free);
 	uc_type_declare(vm, GRAPH_TYPE, graph_methods, graph_free);
+#ifndef AMPSTEIN_ROCM
 	uc_type_declare(vm, COMM_TYPE, comm_methods, comm_free);
+#endif
 	uc_type_declare(vm, NOTIFIER_TYPE, notifier_methods, notifier_free);
 	uc_function_list_register(scope, torch_fns);
 	amp_tokenizer_init(vm, scope);

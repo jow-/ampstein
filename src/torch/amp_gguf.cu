@@ -14,10 +14,11 @@
 //   IQ2_XS            74: d f16, qs[32] u16 (9-bit grid index + 7-bit signs), scales[8] (two 4-bit scales per 32 w)
 //   IQ1_M             56: qs[32], qh[16], scales[8] (four u16: 3-bit scales, the top nibbles carry the f16 super scale)
 //   IQ1_S             50: d f16, qs[32], qh[8] u16 (per 32 w: a 3-bit scale, a sign of the +-1/8 offset and 4 x 3 high bits of the grid indices)
+//   IQ3_XXS / IQ4_XS / Q2_K / Q4_K / Q6_K / IQ2_S: see their amp_dq_group below (98 / 136 / 84 / 144 / 210 / 82 bytes)
+//   IQ3_S            110: d f16, qs[64] (two 8-bit grid indices into iq3s_grid per 8 w), qh[8] (high bit of each index),
+//                         signs[32] (raw per-weight sign byte, ANDed with kmask_iq2xs directly, no indirection table), scales[4] (two 4-bit scales per 32 w)
 
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "amp_hip_compat.h"
 #include <stdint.h>
 
 #define NGRID_IQ1S 2048
@@ -1052,6 +1053,198 @@ template <> __device__ float amp_dec32_i8<AMP_Q_IQ1_S>(const uint8_t *b, int j, 
 	return amp_h2f(b);
 }
 
+/* bit i of the byte `b` -> byte i of the mask (0xff / 0), for the four low or high bits: the bit-spread multiply puts bit k of the nibble at bit 8k */
+static __device__ __forceinline__ unsigned amp_bytemask4(unsigned nib)
+{
+	return ((nib * 0x00204081u) & 0x01010101u) * 0xffu;
+}
+
+/* IQ3_S: j is a 32-weight item (outer = j >> 1 picks the scale/qh pair, half = j & 1 picks db1 vs db2, matching
+ * amp_dq_group's breakdown). No ksigns_iq2xs indirection (unlike IQ2_XXS/XS): the raw sign byte is tested against
+ * kmask_iq2xs directly and packed into the two 4-byte masks __vsub4's XOR-sign trick needs. base = d, mult[l] =
+ * 1 + 2*scale_nibble (IQ3_S's own scale formula is already in "2n+1" form, no extra constant factor). */
+template <> __device__ float amp_dec32_i8<AMP_Q_IQ3_S>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                       const uint64_t *sg)
+{
+	const uint8_t *qs = b + 2, *qh = b + 66, *signs = b + 74, *scales = b + 106;
+	const int outer = j >> 1, half = j & 1;
+	const uint8_t sc = scales[outer];
+	const int m = 2 * (int)(half ? (sc >> 4) : (sc & 0xf)) + 1;
+	const unsigned qhv = qh[2 * outer + half];
+	const uint8_t *qsl = qs + outer * 16 + half * 8;
+	const uint8_t *sgnl = signs + outer * 8 + half * 4;
+
+#pragma unroll
+	for (int l = 0; l < 4; l++) {
+		const uint32_t grid1 = iq3s_grid[qsl[2 * l + 0] | ((qhv << (8 - 2 * l)) & 256)];
+		const uint32_t grid2 = iq3s_grid[qsl[2 * l + 1] | ((qhv << (7 - 2 * l)) & 256)];
+		const uint64_t sm = sg[sgnl[l]];                    /* the raw sign byte -> two byte masks (LDS table, amp_gguf_gemv_i8_kernel) */
+		const unsigned m0 = (unsigned)sm, m1 = (unsigned)(sm >> 32);
+
+		w[2 * l] = (int)__vsub4(grid1 ^ m0, m0);
+		w[2 * l + 1] = (int)__vsub4(grid2 ^ m1, m1);
+		mult[l] = m;
+	}
+
+	return amp_h2f(b);
+}
+
+/* IQ3_XXS: a 32-weight item is 8 grid-index bytes (qs[2l], qs[2l + 1]) and a u32 with four 7-bit sign indices and a 4-bit scale on top:
+ * weights = d * (2s + 1) / 4 * grid * sign. */
+template <> __device__ float amp_dec32_i8<AMP_Q_IQ3_XXS>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                         const uint64_t *sg)
+{
+	const uint8_t *qs = b + 2 + 8 * j;
+	const unsigned aux = amp_u16(b + 66 + 4 * j) | (amp_u16(b + 68 + 4 * j) << 16);
+	const int ls = 2 * (int)(aux >> 28) + 1;
+
+#pragma unroll
+	for (int l = 0; l < 4; l++) {
+		const uint64_t m = sg[(aux >> (7 * l)) & 127];
+		const unsigned m0 = (unsigned)m, m1 = (unsigned)(m >> 32);
+		const unsigned g0 = iq3xxs_grid[qs[2 * l]], g1 = iq3xxs_grid[qs[2 * l + 1]];
+
+		w[2 * l] = (int)__vsub4(g0 ^ m0, m0);
+		w[2 * l + 1] = (int)__vsub4(g1 ^ m1, m1);
+		mult[l] = ls;
+	}
+
+	return amp_h2f(b) * 0.25f;
+}
+
+/* IQ2_S: 4 grid-index low bytes + the high bits of qh[j], 4 raw sign bytes, two 4-bit scales: weights = d * (2s + 1) / 8 * grid * sign. */
+template <> __device__ float amp_dec32_i8<AMP_Q_IQ2_S>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                       const uint64_t *sg)
+{
+	const uint8_t *qs = b + 2 + 4 * j, *signs = b + 34 + 4 * j;
+	const unsigned qh = b[66 + j], sc = b[74 + j];
+
+#pragma unroll
+	for (int l = 0; l < 4; l++) {
+		const uint64_t grid = iq2s_grid[qs[l] | ((qh << (8 - 2 * l)) & 0x300)];
+		const unsigned sgn = signs[l];
+		const unsigned m0 = amp_bytemask4(sgn & 0xf), m1 = amp_bytemask4(sgn >> 4);
+
+		w[2 * l] = (int)__vsub4((unsigned)grid ^ m0, m0);
+		w[2 * l + 1] = (int)__vsub4((unsigned)(grid >> 32) ^ m1, m1);
+		mult[l] = 2 * (int)(l < 2 ? sc & 0xf : sc >> 4) + 1;
+	}
+
+	return amp_h2f(b) * 0.125f;
+}
+
+/* kvalues_iq4nl for four nibble indices at once (one per byte of n, 0..15): byte-permute lookups in the two halves of the table
+ * (entries 0..7, 8..15 as four packed words), then a per-byte select on bit 3. Replaces 4 table loads and the shifts / ors. */
+static __device__ __forceinline__ unsigned amp_iq4nl4(unsigned n)
+{
+#ifdef AMPSTEIN_ROCM
+	const unsigned sel = n & 0x07070707u;
+	const unsigned a = __builtin_amdgcn_perm(0xF6EADDCFu, 0xBFAD9881u, sel);            /* entries 4..7 | 0..3 */
+	const unsigned c = __builtin_amdgcn_perm(0x71594535u, 0x26190D01u, sel);            /* entries 12..15 | 8..11 */
+	const unsigned hb = (n >> 3) & 0x01010101u, m = (hb << 8) - hb;
+
+	return ((a ^ c) & m) ^ a;
+#else
+	unsigned r = 0;
+
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		r |= ((unsigned)(uint8_t)kvalues_iq4nl[(n >> (8 * i)) & 0xf]) << (8 * i);
+
+	return r;
+#endif
+}
+
+/* IQ4_XS: 16 bytes of two 4-bit indices into kvalues_iq4nl (low nibbles = weights 0..15, high = 16..31), one signed 6-bit scale (ls - 32). */
+template <> __device__ float amp_dec32_i8<AMP_Q_IQ4_XS>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                        const uint64_t *sg)
+{
+	const uint4 qv = *(const uint4 *)(b + 8 + 16 * j);                  /* (8-byte aligned: a block is 136 bytes; one dword-aligned 128-bit global load) */
+	const int ls = ((b[4 + (j >> 1)] >> (4 * (j & 1))) & 0xf) | (((amp_u16(b + 2) >> (2 * j)) & 3) << 4);
+	const unsigned q[4] = { qv.x, qv.y, qv.z, qv.w };
+
+#pragma unroll
+	for (int k = 0; k < 4; k++) {
+		w[k] = (int)amp_iq4nl4(q[k] & 0x0f0f0f0fu);
+		w[4 + k] = (int)amp_iq4nl4((q[k] >> 4) & 0x0f0f0f0fu);
+	}
+
+#pragma unroll
+	for (int l = 0; l < 4; l++)
+		mult[l] = ls - 32;
+
+	return amp_h2f(b);
+}
+
+/* Q2_K: an item is 32 weights = bytes qs[32n .. 32n + 31] >> (2 * jj) & 3 (n = the 128-weight half, jj = the item in it), two 16-weight halves
+ * with a scale (low nibble) and a minimum (high nibble) each: weights = d * sc * q - dmin * m. mult[] = the scales (per 8 weights), dlt[] = the
+ * minimums times dmin; the dot product subtracts dlt * (sum of the activations), as IQ1's does. */
+template <> __device__ float amp_dec32_i8<AMP_Q_Q2_K>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                     const uint64_t *sg)
+{
+	const int n = j >> 2, jj = j & 3;
+	const uint4 q0 = ((const uint4 *)(b + 16 + 32 * n))[0], q1 = ((const uint4 *)(b + 16 + 32 * n))[1];
+	const unsigned qs[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+	const unsigned sa = b[8 * n + 2 * jj], sb = b[8 * n + 2 * jj + 1];
+	const float dmin = amp_h2f(b + 82);
+
+#pragma unroll
+	for (int k = 0; k < 8; k++)
+		w[k] = (int)((qs[k] >> (2 * jj)) & 0x03030303u);
+
+	mult[0] = mult[1] = (int)(sa & 0xf);
+	mult[2] = mult[3] = (int)(sb & 0xf);
+	dlt[0] = dlt[1] = dmin * (float)(sa >> 4);
+	dlt[2] = dlt[3] = dmin * (float)(sb >> 4);
+
+	return amp_h2f(b + 80);
+}
+
+/* Q4_K (affine, as Q5_K without the fifth bit): an item is 32 weights 0..15, one scale and one minimum. */
+template <> __device__ float amp_dec32_i8<AMP_Q_Q4_K>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                      const uint64_t *sg)
+{
+	const int jj = j >> 1, half = j & 1;
+	const uint4 q0 = ((const uint4 *)(b + 16 + 32 * jj))[0], q1 = ((const uint4 *)(b + 16 + 32 * jj))[1];
+	const unsigned qs[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+	int sc, m;
+
+	amp_scale_min_k4(j, b + 4, &sc, &m);
+
+#pragma unroll
+	for (int k = 0; k < 8; k++)
+		w[k] = (int)((half ? qs[k] >> 4 : qs[k]) & 0x0f0f0f0fu);
+
+	dlt[0] = amp_h2f(b + 2) * (float)m;
+
+	return amp_h2f(b) * (float)sc;
+}
+
+/* Q6_K: 32 weights = one quarter of a 128-weight half: 6-bit values (low 4 bits from ql, high 2 from qh) minus 32, one int8 scale per 16. */
+template <> __device__ float amp_dec32_i8<AMP_Q_Q6_K>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                      const uint64_t *sg)
+{
+	const int n = j >> 2, q = j & 3;
+	const uint4 a0 = ((const uint4 *)(b + 64 * n + (q & 1) * 32))[0], a1 = ((const uint4 *)(b + 64 * n + (q & 1) * 32))[1];
+	const uint4 h0 = ((const uint4 *)(b + 128 + 32 * n))[0], h1 = ((const uint4 *)(b + 128 + 32 * n))[1];
+	const unsigned ql[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
+	const unsigned qh[8] = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w };
+
+#pragma unroll
+	for (int k = 0; k < 8; k++) {
+		const unsigned lo = (q < 2 ? ql[k] : ql[k] >> 4) & 0x0f0f0f0fu;
+		const unsigned hi = ((qh[k] >> (2 * q)) & 0x03030303u) << 4;
+
+		w[k] = (int)__vsub4(lo | hi, 0x20202020u);
+	}
+
+#pragma unroll
+	for (int l = 0; l < 4; l++)
+		mult[l] = (int)(int8_t)b[192 + 8 * n + (l >> 1) + 2 * q];
+
+	return amp_h2f(b + 208);
+}
+
 /* The picks of a verify step grouped by expert: ids (S) int64 -> grp (S, 9) int32, row g = {expert, up to 8 slots that picked it (-1 pads)}, the groups first
  * in order of their first slot, the unused rows {-1, -1 ...}. A pick < 0 is a group of its own (so the kernels still write its zero row). */
 __global__ void amp_moe_group_kernel(const long long *__restrict__ ids, int *__restrict__ grp, int S)
@@ -1140,11 +1333,7 @@ __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const flo
 	for (int i = threadIdx.x; !NOLUT && i < 128; i += blockDim.x) {
 		uint64_t m = 0;
 
-		for (int b = 0; b < 8; b++)
-			if (ksigns_iq2xs[i] & kmask_iq2xs[b])
-				m |= (uint64_t)0xff << (8 * b);
-
-		s_signs[i] = m;
+		s_signs[i] = (uint64_t)amp_bytemask4(sb & 0xf) | ((uint64_t)amp_bytemask4(sb >> 4) << 32);
 	}
 
 	const int8_t *xqe = xq;               /* where the main loop reads the quantized activation (and its scales) */
@@ -1334,12 +1523,17 @@ __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const flo
 								const int sx = __dp4a(0x01010101, xv[m][2 * l], 0) + __dp4a(0x01010101, xv[m][2 * l + 1], 0);
 
 								sf += (float)mult[l] * ((float)ig + dlt[l] * (float)sx);
+							} else if (T == AMP_Q_Q2_K) {
+								const int sx = __dp4a(0x01010101, xv[m][2 * l], 0) + __dp4a(0x01010101, xv[m][2 * l + 1], 0);
+
+								s += mult[l] * ig;
+								sf += dlt[l] * (float)sx;
 							} else {
 								s += mult[l] * ig;
 							}
 						}
 
-						accv[m] += (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S ? sf : (float)s) * ds * xsc[m];
+						accv[m] += T == AMP_Q_Q2_K ? (ds * (float)s - sf) * xsc[m] : (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S ? sf : (float)s) * ds * xsc[m];
 					}
 				}
 			}
@@ -1538,6 +1732,14 @@ amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const
 
 	return (int)cudaGetLastError();
 }
+
+// MoE prefill tensor-core kernels (fp16 WMMA and int8 mma.sync): nvcuda::wmma
+// and raw PTX mma.sync, no HIP/AMD-ISA equivalent used here. Not reachable
+// from a dense model (no routed experts) — the GGUF/ROCm model this backend
+// was first built for has none — and ggufq.uc's per-expert cuBLAS/rocBLAS
+// fallback covers any MoE model that does load on this backend, just
+// without the tensor-core speedup. Excluded rather than ported.
+#ifndef AMPSTEIN_ROCM
 
 /* ---- grouped GEMM for the routed experts of a prefill chunk (tensor cores) ----------------------------------------------
  *
@@ -2318,6 +2520,8 @@ amp_gguf_moe_prefill_mma(int t13, int t2, const void *yq, const void *ys, const 
 
 	return (int)cudaGetLastError();
 }
+
+#endif /* !AMPSTEIN_ROCM */
 
 /* ---- embedding rows: gather + dequantize from a quantized table, by device-side ids (usable inside CUDA graphs) ----------- */
 

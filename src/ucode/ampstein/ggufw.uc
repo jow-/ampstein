@@ -1,4 +1,4 @@
-// ucode/ggufw.uc — weight resolution over GGUF files (ggml-quantized checkpoints) for DeepSeek-V4.1.
+// ucode/ggufw.uc — weight resolution over GGUF files (ggml-quantized checkpoints) for DeepSeek-V4.1 and the Qwen3.5 family.
 //
 // The same interface as weights.uc (has / tensor / info / list / gpu / gpu16 / upload / release / drop / file), addressed
 // by the HF checkpoint names the engine uses (layers.N.attn.wq_a.weight, ...): each is mapped to the GGUF tensor of the
@@ -39,6 +39,62 @@ const BLK = {
 };
 
 const TOP = {'token_embd.weight': 'embed.weight', 'output.weight': 'head.weight', 'output_norm.weight': 'norm.weight'};
+
+/* Qwen3.5 family (general.architecture "qwen35": llama.cpp's convert_hf_to_gguf.py, conversion/qwen.py). gguf suffix -> [hf suffix, value transform].
+ * The converter changes some values, which the transforms undo so that qwen35.uc reads the tensors as it reads an HF checkpoint:
+ *   norm  every "*norm.weight" but the gated-delta-net's own is stored as 1 + w (qwen35.uc adds the 1 itself)   -> w - 1
+ *   alog  ssm_a is -exp(A_log)                                                                                  -> log(-a)
+ *   conv  the conv1d kernel is squeezed to (channels, taps)                                                     -> (channels, 1, taps)
+ * NOT undone: the converter also reorders the value heads of the gated delta net from HF's grouped order (the heads of one key head
+ * together) to a tiled one, in in_proj_qkv / in_proj_z / in_proj_a / in_proj_b / A_log / dt_bias / conv1d / out_proj; the weights stay in
+ * the file's order (a column permutation of a block-quantized out_proj is impossible without dequantizing it) and the gated-delta-net
+ * kernels take the tiled value-head -> key-head mapping instead (cfg.ln_tiled, qwen35.uc). */
+const BLK_Q35 = {
+	'attn_norm.weight': [ 'input_layernorm.weight', 'norm' ], 'post_attention_norm.weight': [ 'post_attention_layernorm.weight', 'norm' ],
+	'attn_q.weight': [ 'self_attn.q_proj.weight' ], 'attn_k.weight': [ 'self_attn.k_proj.weight' ],
+	'attn_v.weight': [ 'self_attn.v_proj.weight' ], 'attn_output.weight': [ 'self_attn.o_proj.weight' ],
+	'attn_q_norm.weight': [ 'self_attn.q_norm.weight', 'norm' ], 'attn_k_norm.weight': [ 'self_attn.k_norm.weight', 'norm' ],
+	'ffn_gate.weight': [ 'mlp.gate_proj.weight' ], 'ffn_up.weight': [ 'mlp.up_proj.weight' ], 'ffn_down.weight': [ 'mlp.down_proj.weight' ],
+	'attn_qkv.weight': [ 'linear_attn.in_proj_qkv.weight' ], 'attn_gate.weight': [ 'linear_attn.in_proj_z.weight' ],
+	'ssm_alpha.weight': [ 'linear_attn.in_proj_a.weight' ], 'ssm_beta.weight': [ 'linear_attn.in_proj_b.weight' ],
+	'ssm_out.weight': [ 'linear_attn.out_proj.weight' ], 'ssm_a': [ 'linear_attn.A_log', 'alog' ],
+	'ssm_dt.bias': [ 'linear_attn.dt_bias' ], 'ssm_conv1d.weight': [ 'linear_attn.conv1d.weight', 'conv' ],
+	'ssm_norm.weight': [ 'linear_attn.norm.weight' ]
+};
+
+const MTP_Q35 = {
+	'nextn.eh_proj.weight': [ 'mtp.fc.weight' ], 'nextn.enorm.weight': [ 'mtp.pre_fc_norm_embedding.weight', 'norm' ],
+	'nextn.hnorm.weight': [ 'mtp.pre_fc_norm_hidden.weight', 'norm' ], 'nextn.shared_head_norm.weight': [ 'mtp.norm.weight', 'norm' ]
+};
+
+const TOP_Q35 = {
+	'token_embd.weight': [ 'model.language_model.embed_tokens.weight' ], 'output.weight': [ 'lm_head.weight' ],
+	'output_norm.weight': [ 'model.language_model.norm.weight', 'norm' ]
+};
+
+/* [hf key, transform or null] of a GGUF tensor of a qwen35 checkpoint with nmain regular layers (blk.nmain.* is the MTP block), or null */
+function hf_name_q35(g, nmain) {
+	if (TOP_Q35[g])
+		return TOP_Q35[g];
+
+	let m = match(g, /^blk\.([0-9]+)\.(.*)$/);
+
+	if (!m)
+		return null;
+
+	let n = +m[1];
+
+	if (n < nmain)
+		return BLK_Q35[m[2]] ? [ `model.language_model.layers.${n}.${BLK_Q35[m[2]][0]}`, BLK_Q35[m[2]][1] ] : null;
+
+	if (n != nmain)
+		return null;
+
+	if (MTP_Q35[m[2]])
+		return MTP_Q35[m[2]];
+
+	return BLK_Q35[m[2]] ? [ `mtp.layers.0.${BLK_Q35[m[2]][0]}`, BLK_Q35[m[2]][1] ] : null;
+}
 
 /* Qwen3.8-Flash-Next (qwen4exp): blk.N.<gguf name> -> layers.N.<hf name> */
 const Q4BLK = {
@@ -134,12 +190,63 @@ function hf_name(g, arch) {
 	return null;
 }
 
+/* The vision projector of a Qwen3.5 GGUF checkpoint (mmproj-*.gguf, general.architecture "clip", projector "qwen3vl_merger") under the HF names
+ * qwen35_vision.uc reads. conversion/qwen3vl.py changes nothing but the structure: the fused attn_qkv (rows q | k | v) is one tensor (split here:
+ * transform ['rows', i, n] = rows [i * n, (i + 1) * n)), the Conv3d patch embedding is two Conv2d tensors along the temporal axis ('patch': stacked
+ * back on dim 2), the merger's linears are mm.0 / mm.2. -> [[hf key, transform], ...] */
+function hf_names_clip(g, hidden) {
+	const SIMPLE = {
+		'v.patch_embd.bias': 'patch_embed.proj.bias', 'v.position_embd.weight': 'pos_embed.weight', 'v.post_ln.weight': 'merger.norm.weight',
+		'v.post_ln.bias': 'merger.norm.bias', 'mm.0.weight': 'merger.linear_fc1.weight', 'mm.0.bias': 'merger.linear_fc1.bias',
+		'mm.2.weight': 'merger.linear_fc2.weight', 'mm.2.bias': 'merger.linear_fc2.bias'
+	};
+	const BLOCK = {
+		'ln1.weight': 'norm1.weight', 'ln1.bias': 'norm1.bias', 'ln2.weight': 'norm2.weight', 'ln2.bias': 'norm2.bias',
+		'attn_out.weight': 'attn.proj.weight', 'attn_out.bias': 'attn.proj.bias',
+		'ffn_up.weight': 'mlp.linear_fc1.weight', 'ffn_up.bias': 'mlp.linear_fc1.bias',
+		'ffn_down.weight': 'mlp.linear_fc2.weight', 'ffn_down.bias': 'mlp.linear_fc2.bias'
+	};
+
+	if (g == 'v.patch_embd.weight')
+		return [ [ 'model.visual.patch_embed.proj.weight', 'patch' ] ];
+
+	if (SIMPLE[g])
+		return [ [ 'model.visual.' + SIMPLE[g] ] ];
+
+	let m = match(g, /^v\.blk\.([0-9]+)\.(.*)$/);
+
+	if (!m)
+		return [];
+
+	let k = `model.visual.blocks.${m[1]}.`;
+
+	if (BLOCK[m[2]])
+		return [ [ k + BLOCK[m[2]] ] ];
+
+	let q = match(m[2], /^attn_qkv\.(weight|bias)$/);
+
+	if (q)
+		return [ [ `${k}attn.q_proj.${q[1]}`, [ 'rows', 0, hidden ] ], [ `${k}attn.k_proj.${q[1]}`, [ 'rows', 1, hidden ] ],
+		         [ `${k}attn.v_proj.${q[1]}`, [ 'rows', 2, hidden ] ] ];
+
+	return [];
+}
+
+/* the vision projector file of a model directory (mmproj-*.gguf), or null */
+export function mmproj_file(model_dir) {
+	for (let f in sort(lsdir(model_dir) ?? []))
+		if (match(f, /\.gguf$/) && index(f, 'mmproj') == 0)
+			return f;
+
+	return null;
+}
+
 /* the GGUF files of a model directory: [backbone shards (sorted), engram file or null] */
 export function files(model_dir) {
 	let shards = [], engram = null;
 
 	for (let f in sort(lsdir(model_dir) ?? [])) {
-		if (!match(f, /\.gguf$/))
+		if (!match(f, /\.gguf$/) || index(f, 'mmproj') == 0)
 			continue;
 
 		if (index(f, 'Engram') >= 0)
@@ -172,26 +279,47 @@ export function is_gguf_dir(model_dir) {
 	return length(f[0]) > 0 && !stat(model_dir + '/model.safetensors.index.json') && !stat(model_dir + '/model.safetensors');
 }
 
-export function open(model_dir) {
-	let fl = files(model_dir);
+export function open(model_dir, only_file) {
+	let fl = only_file ? [ [ only_file ], null ] : files(model_dir);
 	let kmap = {};             // hf key -> [stfile, gguf name]
 	let gmap = {};             // gguf name -> [stfile, gguf name] (the tensors that have no hf key: engram_* hash tables)
 	let keylist = [];
-	let gpu_raw = {}, gpu_cast = {};
-	let meta = null, arch = null;
+	let gpu_raw = {}, gpu_cast = {}, gpu_xf = {};
+	let xform = {};            // hf key -> value transform (norm / alog / conv), the Qwen3.5 converter's changes undone
+	let meta = null, arch = null, nmain = 0, vis_hidden = 0;
 
 	if (!length(fl[0]))
 		die(`ggufw: no .gguf files in ${model_dir}`);
 
 	function add(path, stf) {
 		for (let g in stf.list()) {
-			let k = hf_name(g, arch);
+			let names;
+
+			if (arch == 'qwen35') {
+				let q = hf_name_q35(g, nmain);
+
+				names = q ? [ q ] : [];
+			}
+			else if (arch == 'clip') {
+				names = hf_names_clip(g, vis_hidden);
+			}
+			else {
+				let k = hf_name(g, arch);
+
+				names = (k != null) ? [ [ k ] ] : [];
+			}
 
 			gmap[g] = [ stf, g ];
 
-			if (k != null && !kmap[k]) {
-				kmap[k] = [ stf, g ];
-				push(keylist, k);
+			for (let q in names) {
+				if (kmap[q[0]])
+					continue;
+
+				kmap[q[0]] = [ stf, g ];
+				push(keylist, q[0]);
+
+				if (q[1])
+					xform[q[0]] = q[1];
 			}
 		}
 	}
@@ -202,6 +330,8 @@ export function open(model_dir) {
 		if (meta == null) {
 			meta = json(stf.meta());
 			arch = meta['general.architecture'];
+			nmain = (meta[`${arch}.block_count`] ?? 0) - (meta[`${arch}.nextn_predict_layers`] ?? 0);
+			vis_hidden = meta['clip.vision.embedding_length'] ?? 0;
 		}
 
 		add(f, stf);
@@ -260,7 +390,23 @@ export function open(model_dir) {
 			if (!gpu_raw[ck])
 				gpu_raw[ck] = ent(key)[0].tensor(ent(key)[1]).cuda(dev);
 
-			return gpu_raw[ck];
+			if (!xform[key])
+				return gpu_raw[ck];
+
+			if (!gpu_xf[ck]) {
+				let x = xform[key], w = gpu_raw[ck];
+
+				if (type(x) == 'array')                    // ['rows', i, n]: rows [i * n, (i + 1) * n) of a fused tensor
+					gpu_xf[ck] = w.narrow(0, x[1] * x[2], x[2]).contiguous();
+				else if (x == 'patch')                     // the two temporal halves of a Conv3d kernel -> (out, in, 2, kh, kw)
+					gpu_xf[ck] = torch.stack([ w, gmap['v.patch_embd.weight.1'][0].tensor('v.patch_embd.weight.1').cuda(dev) ], 2);
+				else {
+					w = w.to('float32');
+					gpu_xf[ck] = (x == 'norm') ? w.sub(1.0) : (x == 'alog') ? w.neg().log() : w.unsqueeze(1);
+				}
+			}
+
+			return gpu_xf[ck];
 		}
 
 		let ck = key + '\x01' + dtype + '\x02' + dev;

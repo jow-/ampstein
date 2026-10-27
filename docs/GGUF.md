@@ -5,6 +5,9 @@ dequantize in registers (decode) or per matrix (prefill). No llama.cpp, no conve
 single-chain DeepSeek-V4.1 model (`dsv41.uc`, layers split over the GPUs), with the DSpark drafter (taken from an EXL3 pack of the same
 model); not yet `--tp` or the vision tower.
 
+> A second checkpoint family is covered in `docs/QWEN38.md`: Qwen3.8-27B (a Qwen3.5-family hybrid, ten ggml types incl. IQ3_S / IQ3_XXS /
+> IQ2_S / IQ4_XS / Q2_K / Q4_K / Q6_K, vision and MTP) on a ROCm GPU, `docs/ROCM.md`.
+
 ## The checkpoint
 
 | File | Content |

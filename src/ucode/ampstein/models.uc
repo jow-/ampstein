@@ -24,6 +24,8 @@
 //   let layer = models.linear(ws, 'model.layers.0.self_attn.q_proj');
 //   let y = layer.forward(x);
 
+import * as ggufq from './ggufq.uc';
+
 /* Rows above which an EXL3 linear dequantizes its weight to fp16 and runs
  * one cuBLAS gemm (torch.exl3_gemm_recon) instead of the on-the-fly
  * trellis-decode gemm (torch.exl3_gemm), which redoes the decode for
@@ -232,6 +234,9 @@ export function LinearFP16(ws, key, dev) {
  * seq: when true, EXL3 linears accept 3-D input (plain linears always
  * do). Returns null when the key carries no recognizable weight. */
 export function linear(ws, key, seq, dev) {
+	if (ws.gguf && ws.qtype(key + '.weight'))                   // a ggml block-quantized matrix of a GGUF checkpoint (ggufq.uc)
+		return ggufq.linear(ws, key, dev);
+
 	if (ws.has(key + '.trellis'))
 		return seq ? LinearEXL3Seq(ws, key, dev) : LinearEXL3(ws, key, dev);
 

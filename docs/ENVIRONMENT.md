@@ -160,6 +160,8 @@ Typical workflow (this is how the empty-split bug was found): run with
 | `AMP_QWEN4_QSA_REF` | off (only `1` enables) | Sparse attention via the composite ATen reference (`qsa_gather_attend_ref`) instead of the fused `torch.qsa_attn` kernel. **Useful to confirm or bypass kernel bugs** (it avoids the split-K workspace entirely). |
 | `AMP_QWEN4_MTP_TAP` | on (only `0` disables) | MTP input: per-stream stack (reference default) vs averaged. |
 | `AMP_QWEN4_NO_MTP_GRAPH` | unset | Do not CUDA-graph the MTP draft step. |
+| `AMP_GGUF_QX` | unset (CUDA: off; ROCm: `dense`) | `dense`, `experts`, `all` or `off`: the int8 GEMV blocks quantize their own activation row instead of a separate `gguf_quant_x` launch. |
+| `AMP_ATTN_SCALAR` / `AMP_NO_WMMA_PREFILL` / `AMP_WMMA_SPLITS` | unset (ROCm) | `AMP_ATTN_SCALAR=1`: the scalar decode attention instead of the WMMA kernel; `AMP_NO_WMMA_PREFILL=1`: ATen FlashAttention for prefill; `AMP_WMMA_SPLITS=N`: key splits per kv head of the WMMA decode kernel. |
 | `AMP_QWEN4_KV` | unset | `q8`: the QSA K / V caches as int8 + scales without the server flag (benchmarks, tests; `--cache-mode Q8` sets it). |
 | `AMP_QWEN4_NO_PAR` | unset | TP decode graphs: no forked stream for the shared expert. |
 | `AMP_QWEN4_NO_DSEL` | unset | Decode token selection through the composite ATen chain instead of `idx_score` + `dsa_select`. |
@@ -279,6 +281,8 @@ None of these affect the server (which takes `--model`); they select inputs for
 | `AMP_DSV41_GRAPH_BUCKETS` | all (GGUF: `1`) | Decode graphs: capture only the n largest context buckets (4k, 16k, 64k, ... `max_seq`); each costs ~0.5 GiB of graph memory over the GPUs and the pool is not shared. |
 | `AMP_DSV41_ROW_SIZES` | all (GGUF: `3,5`) | Verify (multi-row) graph sizes to capture, plus the largest requested; a size without a graph runs the next larger one and takes the extra rows back. |
 | `AMP_DSV41_IDX_SLAB` | `33554432` (GGUF: `4194304`) | Score elements of one tile of the prefill indexer (rows x pool entries); its `topk` needs a few times that as workspace. |
+| `AMP_NO_GRAPHS` | unset | Run the decode steps eagerly instead of through captured CUDA graphs (any model; the GLM / Qwen3.8-Flash-Next specific `AMP_GLM5_NO_GRAPHS` still works). |
+| `DEBUG_CLR_GRAPH_PACKET_CAPTURE` | `0` (ROCm builds) | HIP runtime: graph packet capture leaks and crashes a captured step after ~10000 launched nodes; `torch.so` sets it to `0` unless the environment says otherwise (`docs/ROCM.md`). |
 | `AMP_GGUF_SLICE` | `8388608` | GGUF: elements of one dequantized fp16 slice of a dense prefill matmul (16 MiB). |
 | `AMP_GGUF_EMBED_FP16` | unset | GGUF: dequantize the embedding table to fp16 on the GPU (1.3 GiB) instead of keeping Q5_K and dequantizing rows by id (0.42 GiB). |
 | `AMP_GGUF_FP16` | unset | GGUF checkpoints: the matrix-vector kernels with fp16 activations and exactly dequantized weights instead of the int8 `dp4a` kernels (about 3 - 8x slower; also switches the grouped / fused launches off). |

@@ -18,9 +18,7 @@
 // Rounding points follow the composite path in ucode/dsv4.uc (rms_norm in
 // fp32 with an fp16 cast before the weight multiply, rope in fp32).
 
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
+#include "amp_hip_compat.h"
 #include <stdint.h>
 #include <stdio.h>
 

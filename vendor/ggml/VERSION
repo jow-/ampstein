@@ -1,6 +1,6 @@
 ggml tables and quantization formats from llama.cpp (https://github.com/ggml-org/llama.cpp), MIT, Copyright (c) 2023-2026 The ggml authors.
 commit 83078fec0db82d6b5a00d9599062c38c39145755 (ggml/src/ggml-common.h)
 
-ggml_tables.inc: kmask_iq2xs, ksigns_iq2xs, iq2xxs_grid, iq2xs_grid, iq1s_grid, kvalues_iq4nl, verbatim.
+ggml_tables.inc: kmask_iq2xs, ksigns_iq2xs, iq2xxs_grid, iq2xs_grid, iq1s_grid, kvalues_iq4nl, iq3s_grid, iq3xxs_grid, iq2s_grid, verbatim.
 The dequantization kernels of src/torch/amp_gguf.cu are written from the reference dequantize_row_* functions of
 ggml/src/ggml-quants.c (the results are bit-identical to them); nothing else of ggml is vendored.

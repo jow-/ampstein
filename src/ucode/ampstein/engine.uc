@@ -498,6 +498,8 @@ export function create(model, opts) {
 		push(lk_sizes, LK_N + 1);
 	}
 
+	const LK_SHADOW = getenv('AMP_LK_SHADOW') != null && !LK_N;
+	let sh_resolve = null;                   // (assigned below: finish() is defined before it)
 	const LK_START = min(LK_N, 7);          // drafts of the first lookup round; a full acceptance doubles it, a miss shrinks it
 
 	const SPEC_N = max(mtp_planned, LK_N + 1);              // rows of the largest verify window
@@ -2008,7 +2010,8 @@ export function create(model, opts) {
 			preemptions: j.preempted || 0,
 			mtp: j.rounds ? {rounds: j.rounds, drafted: j.drafted,
 				accepted: j.accepted, lk_rounds: j.lk_r || 0, lk_drafted: j.lk_d || 0,
-				lk_accepted: j.lk_a || 0} : null,
+				lk_accepted: j.lk_a || 0,
+				sh: j.sh_list ? sh_resolve(j) : null} : null,
 			timings: {
 				prefill_ms: j.t_prefill_done - j.t_start,
 				prefill_tokens: length(j.ids) - j.reuse_start,
@@ -2692,6 +2695,65 @@ export function create(model, opts) {
 		return slice(ids, i + 1, i + 1 + k);
 	}
 
+	/* AMP_LK_SHADOW=1 (measurement only, no effect on the output): what the lookup rule would have drafted for the seed t, compared after the round
+	 * with what the model actually produced (mtp_finish): up to 7 drafts, the same key / match rules as lk_draft */
+	function sh_draft(t) {
+		let n = length(ids);
+
+		if (n < LK_NGRAM)
+			return null;
+
+		lk_sync();
+
+		let i = lk_pos[lk_key(ids[n - 2], ids[n - 1], t)];
+
+		if (i == null || i + 1 >= n)
+			return null;
+
+		let k = min(7, n - 1 - i);
+
+		if (k < LK_MIN)
+			return null;
+
+		let m = LK_NGRAM;
+
+		while (m < LK_CTX && i - m >= 0 && ids[i - m] == ids[n - m])
+			m++;
+
+		return (m < LK_CTX) ? null : slice(ids, i + 1, i + 1 + k);
+	}
+
+	/* the shadow drafts against the token history: the draft of a round that started at ids length n predicts ids[n + 1 ...] (ids[n] is the seed) */
+	sh_resolve = function (j) {
+		let r = {rounds: 0, len: 0, match: 0, mtp: 0, full: 0, ge5: 0, ge8: 0, gain: 0, hist: [ 0, 0, 0, 0, 0, 0, 0, 0 ]};
+
+		for (let e in j.sh_list) {
+			if (e.a == null)
+				continue;
+
+			let mt = 0, k = length(e.d);
+
+			while (mt < k && e.n + 1 + mt < length(ids) && ids[e.n + 1 + mt] == e.d[mt])
+				mt++;
+
+			r.rounds++;
+			r.len += k;
+			r.match += mt;
+			r.mtp += e.a;
+			r.hist[mt]++;
+
+			if (mt >= k)
+				r.full++;
+
+			if (mt >= 5)
+				r.ge5++;
+
+			r.gain += mt - e.a;
+		}
+
+		return r.rounds ? r : null;
+	};
+
 	/* write the draft-cache rows of the lookup rounds since the last chain (positions < p + 1) */
 	function lk_flush(p) {
 		let g = lk_gap;
@@ -2726,6 +2788,11 @@ export function create(model, opts) {
 		j.rounds++;
 		j.drafted += W;
 		j.accepted += a;
+
+		if (j.sh_cur) {
+			j.sh_cur.a = a;
+			j.sh_cur = null;
+		}
 
 		if (lk) {
 			j.lk_r = (j.lk_r || 0) + 1;
@@ -2909,6 +2976,16 @@ export function create(model, opts) {
 
 		// prompt lookup: drafts copied from earlier text replace the chain when there are enough of them
 		let lkd = null, lkV = 0, lkk = 0;
+
+		if (LK_SHADOW) {
+			let sd = sh_draft(j.t_next);
+
+			j.sh_list ??= [];
+			j.sh_cur = sd ? {n: length(ids), d: sd, a: null} : null;
+
+			if (j.sh_cur)
+				push(j.sh_list, j.sh_cur);
+		}
 
 		if (LK_N) {
 			if (lk_cool > 0)
