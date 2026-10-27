@@ -8006,7 +8006,7 @@ extern "C" int amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const
                                 int qx, const void *ptrs, const void *ptrs_up, cudaStream_t stream);
 extern "C" int amp_moe_group(const void *ids, void *grp, int S, cudaStream_t stream);
 
-/* The matrix-vector product on quantized rows: the integer-dot kernel for the types that have one (all but IQ4_NL) (the activation rows
+/* The matrix-vector product on quantized rows: the integer-dot kernel for the types that have one (all but Q4_0 and Q3_K) (the activation rows
  * quantized to int8 first), the fp16 kernel otherwise. AMP_GGUF_FP16=1 forces the fp16 kernel (exact dequantized weights
  * times fp16 activations). */
 static bool gguf_i8_qtype(int qt);
@@ -8051,7 +8051,7 @@ gguf_gemv_run(int qt, at::Tensor &x, const void *w, const void *ids, void *out, 
 static bool
 gguf_i8_qtype(int qt)
 {
-	return qt == 0 || qt == 2 || qt == 3 || qt == 4 || qt == 5 || qt == 6 || qt == 10 || qt == 1 || qt == 8 || qt == 14;
+	return qt == 0 || qt == 2 || qt == 3 || qt == 4 || qt == 5 || qt == 6 || qt == 10 || qt == 1 || qt == 8 || qt == 14 || qt == 7 || qt == 11 || qt == 12 || qt == 13;
 }
 
 static int
@@ -8161,7 +8161,7 @@ torch_gguf_gemv_grouped(uc_vm_t *vm, size_t nargs)
 
 /* torch.gguf_gate_up(x, w_gate, w_up, type, limit): the fused gate / up product of a gated MLP (dense, M <= 8 rows): x (M, K) fp16, w_gate / w_up
  * the uint8 rows (N, row bytes) of one type -> (M, N) fp16 = silu(min(x Wg^T, limit)) * clamp(x Wu^T, -limit, limit) (limit 0: no clamp).
- * Types with an integer kernel (all but IQ4_NL). */
+ * Types with an integer kernel (all but Q4_0 and Q3_K). */
 static uc_value_t *
 torch_gguf_gate_up(uc_vm_t *vm, size_t nargs)
 {

@@ -133,7 +133,9 @@ and 64k with a 128-token chunk load and serve; 64k with a 512-token chunk does n
 
 - **Dequantization** (`gguf_dequant`) is bit-identical to ggml; it feeds prefill (cuBLAS on fp16 slices of a matrix) and the
   embedding.
-- **Decode matrix-vector products** (`gguf_gemv`, `gguf_moe_gemv`) run in int8 for every type but IQ4_NL: the activation rows
+- **Decode matrix-vector products** (`gguf_gemv`, `gguf_moe_gemv`) run in int8 for every type but Q4_0 and Q3_K (which keep the fp16 kernel; the
+  Qwen4 "IQ3_XXS" pack mixes Q6_K, Q4_K, IQ4_XS, IQ4_NL, Q2_0, IQ2_S, IQ3_S and IQ3_XXS, all int8 now: +40% plain decode
+  over the fp16 kernels for those types): the activation rows
   are quantized once per call (fp32 scale per 32 values, ggml's q8_1), the weights are decoded to signed bytes and multiplied
   with `dp4a` (Q5_K and IQ1_M add a `sum(x)` term for their minimum / +-1/8 offset). About 2 instructions per weight where the
   first version (fp16 activations, per-element decode) needed 12. RTX A5000 (768 GB/s), `examples/bench_gguf.uc`:
