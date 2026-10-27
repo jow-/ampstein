@@ -66,8 +66,8 @@ for (let name in [ 'q4_0', 'q8_0', 'iq4_nl', 'q5_k', 'iq2_xxs', 'iq2_xs', 'iq1_m
 		worst = max(worst, e);
 	}
 
-	// (all types but IQ4_NL run in int8 against a quantized activation row: ~1 % of the largest output)
-	assert(worst < ((ty != 'IQ4_NL') ? 2e-2 : 3e-3), `${name}: gemv differs from the matmul by ${worst}`);
+	// (these types run in int8 against a quantized activation row: ~1 % of the largest output)
+	assert(worst < 2e-2, `${name}: gemv differs from the matmul by ${worst}`);
 	printf('%-8s %-8s gemv rel err %g\n', name, ty, worst);
 }
 

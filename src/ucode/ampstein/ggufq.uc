@@ -8,7 +8,7 @@
 const SCRATCH_ELEMS = +(getenv("AMP_GGUF_SLICE") ?? 8 * 1024 * 1024);     // dequantized slice of a prefill matmul, elements (fp16: 16 MiB)
 const PF_OFF = getenv('AMP_GGUF_NO_PF') != null;                    // the per-expert dequantize + cuBLAS prefill instead of the grouped kernel
 const PF_TYPES = {IQ2_XXS: true, IQ2_XS: true, IQ1_M: true, IQ1_S: true};
-const I8_TYPES = {Q8_0: true, Q5_K: true, IQ2_XXS: true, IQ2_XS: true, IQ1_M: true, IQ1_S: true};
+const I8_TYPES = {Q8_0: true, Q5_K: true, Q6_K: true, Q4_K: true, IQ4_XS: true, IQ4_NL: true, IQ2_XXS: true, IQ2_XS: true, IQ1_M: true, IQ1_S: true};
 const FUSED_OFF = getenv('AMP_GGUF_NO_FUSED') != null || getenv('AMP_GGUF_FP16') != null;           // separate gate / up launches
 const SHARED_PAR_OFF = getenv('AMP_GGUF_NO_SHARED_PAR') != null;                                       // the shared expert on the compute stream
 const GROUP_OFF = getenv('AMP_GGUF_GROUP') == null;                                                    // verify steps: one slot per pick (AMP_GGUF_GROUP=1: grouped by expert, slower on random picks)
@@ -289,9 +289,19 @@ export function moe_forward(cfg, M, y, H) {
 		let xg = y.index(xt).contiguous();
 		let ids = r.idx.reshape([-1]).contiguous();
 
-		let g = torch.gguf_moe_gemv_pt(xg, ids, M.pt1, gq.tw1, 1, gq.inter).to('float16');
-		let u = torch.gguf_moe_gemv_pt(xg, ids, M.pt3, gq.tw3, 1, gq.inter).to('float16');
-		let h = H.act(cfg, g, u);
+		let h;
+
+		if (!FUSED_OFF && gq.tw1 == gq.tw3 && I8_TYPES[gq.tw1]) {
+			// gate and up in one pointer-table launch (the same fused kernel as the non-pointer i8 path)
+			h = torch.gguf_moe_gate_up_pt(xg, ids, M.pt1, M.pt3, gq.tw1, 1, gq.inter, cfg.swiglu_limit + 0.0);
+		}
+		else {
+			let g = torch.gguf_moe_gemv_pt(xg, ids, M.pt1, gq.tw1, 1, gq.inter).to('float16');
+			let u = torch.gguf_moe_gemv_pt(xg, ids, M.pt3, gq.tw3, 1, gq.inter).to('float16');
+
+			h = H.act(cfg, g, u);
+		}
+
 		let d = torch.gguf_moe_gemv_pt(h, ids, M.pt2, gq.tw2, 1, Hd);
 
 		let wflat = r.w.reshape([-1]);

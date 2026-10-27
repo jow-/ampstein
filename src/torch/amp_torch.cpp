@@ -8003,12 +8003,14 @@ extern "C" int amp_gguf_gemv_pt(int qtype, const void *x, const void *ptrs, cons
 extern "C" int amp_gguf_quant_x(const void *x, void *xq, void *xs, int R, int K, cudaStream_t stream);
 extern "C" int amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const void *w_up, const void *ids,
                                 const void *scale, void *out, int M, int N, int K, int xdiv, int slots, int G, float lim, int e0, int ne, int mr,
-                                int qx, const void *ptrs, cudaStream_t stream);
+                                int qx, const void *ptrs, const void *ptrs_up, cudaStream_t stream);
 extern "C" int amp_moe_group(const void *ids, void *grp, int S, cudaStream_t stream);
 
 /* The matrix-vector product on quantized rows: the integer-dot kernel for the types that have one (all but IQ4_NL) (the activation rows
  * quantized to int8 first), the fp16 kernel otherwise. AMP_GGUF_FP16=1 forces the fp16 kernel (exact dequantized weights
  * times fp16 activations). */
+static bool gguf_i8_qtype(int qt);
+
 static int
 gguf_gemv_run(int qt, at::Tensor &x, const void *w, const void *ids, void *out, int M, int N, int K, int xdiv, int slots, int G = 1,
               const void *w_up = NULL, const void *scale = NULL, float lim = 0.f, int e0 = 0, int ne = 1 << 30, int mr = 0)
@@ -8016,7 +8018,7 @@ gguf_gemv_run(int qt, at::Tensor &x, const void *w, const void *ids, void *out, 
 	static const bool force16 = getenv("AMP_GGUF_FP16") != NULL;
 	cudaStream_t st = c10::cuda::getCurrentCUDAStream().stream();
 
-	if (!force16 && (qt == 0 || qt == 2 || qt == 3 || qt == 4 || qt == 5 || qt == 6)) {
+	if (!force16 && gguf_i8_qtype(qt)) {
 		int R = (int)x.size(0);
 
 		/* AMP_GGUF_QX=dense|experts|all: the block quantizes the activation row it reads itself (saves a launch and its gap): the experts (one row per
@@ -8028,14 +8030,14 @@ gguf_gemv_run(int qt, at::Tensor &x, const void *w, const void *ids, void *out, 
 			(K % 32) == 0 && (((uintptr_t)x.data_ptr()) & 15) == 0;
 
 		if (qx)
-			return amp_gguf_gemv_i8(qt, x.data_ptr(), NULL, w, w_up, ids, scale, out, M, N, K, xdiv, slots, G, lim, e0, ne, mr, 1, NULL, st);
+			return amp_gguf_gemv_i8(qt, x.data_ptr(), NULL, w, w_up, ids, scale, out, M, N, K, xdiv, slots, G, lim, e0, ne, mr, 1, NULL, NULL, st);
 
 		at::Tensor xq = at::empty({ R, K * G }, x.options().dtype(at::kChar));
 		at::Tensor xs = at::empty({ R, K * G / 32 }, x.options().dtype(at::kFloat));
 		int rc = amp_gguf_quant_x(x.data_ptr(), xq.data_ptr(), xs.data_ptr(), R, K * G, st);
 
 		if (rc == 0)
-			rc = amp_gguf_gemv_i8(qt, xq.data_ptr(), xs.data_ptr(), w, w_up, ids, scale, out, M, N, K, xdiv, slots, G, lim, e0, ne, mr, 0, NULL, st);
+			rc = amp_gguf_gemv_i8(qt, xq.data_ptr(), xs.data_ptr(), w, w_up, ids, scale, out, M, N, K, xdiv, slots, G, lim, e0, ne, mr, 0, NULL, NULL, st);
 
 		return rc;
 	}
@@ -8049,7 +8051,7 @@ gguf_gemv_run(int qt, at::Tensor &x, const void *w, const void *ids, void *out, 
 static bool
 gguf_i8_qtype(int qt)
 {
-	return qt == 0 || qt == 2 || qt == 3 || qt == 4 || qt == 5 || qt == 6;
+	return qt == 0 || qt == 2 || qt == 3 || qt == 4 || qt == 5 || qt == 6 || qt == 10 || qt == 1 || qt == 8 || qt == 14;
 }
 
 static int
@@ -8402,13 +8404,73 @@ torch_gguf_moe_gemv_pt(uc_vm_t *vm, size_t nargs)
 			if (rc == 0)
 				rc = amp_gguf_gemv_i8(qt, xq.data_ptr(), xs.data_ptr(), NULL, NULL, ids->data_ptr(), NULL, y.data_ptr(),
 					1, (int)nrows, (int)K, (int)xdiv, (int)ids->size(0), 1, 0.f, 0, 1 << 30, 0, 0,
-					ptrs->data_ptr(), st);
+					ptrs->data_ptr(), NULL, st);
 		} else {
 			rc = amp_gguf_gemv_pt(qt, x->data_ptr(), ptrs->data_ptr(), ids->data_ptr(), y.data_ptr(), 1, (int)nrows,
 				(int)K, (int)xdiv, (int)ids->size(0), st);
 		}
 
 		if (!launch_ok(vm, rc, "gguf_moe_gemv_pt"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(y), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
+/* torch.gguf_moe_gate_up_pt(x, ids, pt_gate, pt_up, type, xdiv, nrows, limit): x (R, K) fp16, ids (S) int64,
+ * pt_gate / pt_up (E) int64 device pointers; -> (S, nrows) fp16 clamped SwiGLU. The gate/up pair is one launch
+ * over the mixed resident/cold pointer tables, and the down projection is a second launch. */
+static uc_value_t *
+torch_gguf_moe_gate_up_pt(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *x, *ids, *ptg, *ptu;
+	int64_t xdiv, nrows;
+	double lim;
+	uc_value_t *tv = uc_fn_arg(4);
+
+	if (nargs != 8 || !(x = tensor_arg(vm, uc_fn_arg(0))) || !(ids = tensor_arg(vm, uc_fn_arg(1))) ||
+	    !(ptg = tensor_arg(vm, uc_fn_arg(2))) || !(ptu = tensor_arg(vm, uc_fn_arg(3))) || ucv_type(tv) != UC_STRING ||
+	    !arg_int(vm, uc_fn_arg(5), &xdiv) || !arg_int(vm, uc_fn_arg(6), &nrows) || !arg_number(vm, uc_fn_arg(7), &lim))
+		RAISE("gguf_moe_gate_up_pt: (x fp16 (R, K), ids int64 (S), pt_gate int64 (E), pt_up int64 (E), type, xdiv, nrows, limit)");
+
+	int qt = gguf_qtype_id(ucv_string_get(tv));
+	size_t blck, bytes;
+
+	if (qt < 0 || !gguf_i8_qtype(qt) || st_dtype_info(ucv_string_get(tv), &blck, &bytes))
+		RAISE("gguf_moe_gate_up_pt: unsupported type (an integer-dot expert type)");
+
+	if (x->scalar_type() != at::kHalf || x->dim() != 2 || !x->is_contiguous() || !x->is_cuda() ||
+	    ids->scalar_type() != at::kLong || ids->dim() != 1 || !ids->is_contiguous() || !ids->is_cuda() ||
+	    ptg->scalar_type() != at::kLong || ptg->dim() != 1 || !ptg->is_contiguous() || !ptg->is_cuda() ||
+	    ptu->scalar_type() != at::kLong || ptu->dim() != 1 || !ptu->is_contiguous() || !ptu->is_cuda() ||
+	    ids->get_device() != x->get_device() || ptg->get_device() != x->get_device() || ptu->get_device() != x->get_device() ||
+	    ptg->size(0) != ptu->size(0) || xdiv < 1 || nrows < 1 || ids->size(0) < 1 || x->size(0) * xdiv < ids->size(0))
+		RAISE("gguf_moe_gate_up_pt: x fp16 (R, K), ids / ptr tables int64 on one device, xdiv * R >= S");
+
+	int64_t K = x->size(1);
+
+	if (K % (int64_t)blck)
+		RAISE("gguf_moe_gate_up_pt: K is not a whole number of blocks");
+
+	TensorDeviceGuard dg(*x);
+
+	try {
+		int S = (int)ids->size(0), R = (int)x->size(0);
+		at::Tensor y = at::empty({ S, nrows }, x->options().dtype(at::kHalf));
+		at::Tensor xq = at::empty({ R, (int)K }, x->options().dtype(at::kChar));
+		at::Tensor xs = at::empty({ R, (int)K / 32 }, x->options().dtype(at::kFloat));
+		cudaStream_t st = c10::cuda::getCurrentCUDAStream().stream();
+		int rc = amp_gguf_quant_x(x->data_ptr(), xq.data_ptr(), xs.data_ptr(), R, (int)K, st);
+
+		if (rc == 0)
+			rc = amp_gguf_gemv_i8(qt, xq.data_ptr(), xs.data_ptr(), NULL, NULL, ids->data_ptr(), NULL, y.data_ptr(),
+				1, (int)nrows, (int)K, (int)xdiv, S, 1, (float)lim, 0, 1 << 30, 0, 0,
+				ptg->data_ptr(), ptu->data_ptr(), st);
+
+		if (!launch_ok(vm, rc, "gguf_moe_gate_up_pt"))
 			return NULL;
 
 		return tensor_wrap(vm, std::move(y), 0);
@@ -12432,6 +12494,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "gguf_gemv",	torch_gguf_gemv },
 	{ "gguf_moe_gemv",	torch_gguf_moe_gemv },
 	{ "gguf_moe_gemv_pt",	torch_gguf_moe_gemv_pt },
+	{ "gguf_moe_gate_up_pt",	torch_gguf_moe_gate_up_pt },
 	{ "gguf_gemv_grouped",	torch_gguf_gemv_grouped },
 	{ "gguf_gate_up",	torch_gguf_gate_up },
 	{ "gguf_embed",	torch_gguf_embed },

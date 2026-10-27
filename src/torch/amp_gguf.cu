@@ -848,6 +848,102 @@ template <> __device__ float amp_dec32_i8<AMP_Q_Q5_K>(const uint8_t *b, int j, i
 	return amp_h2f(b) * (float)sc;
 }
 
+/* Q6_K: an item is 32 weights, a half h = j >> 2 and quarter r = j & 3 of the block: the low nibbles of ql[64 h + 32 (r & 1) ..] (high nibbles
+ * for r >= 2) plus two bits of qh[32 h ..] at 2 r, minus 32; two int8 scales of 16 weights each (groups 0, 1 and 2, 3). */
+template <> __device__ float amp_dec32_i8<AMP_Q_Q6_K>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                      const uint64_t *sg)
+{
+	const int h = j >> 2, r = j & 3;
+	const uint8_t *ql = b + 64 * h + 32 * (r & 1), *qh = b + 128 + 32 * h;
+
+#pragma unroll
+	for (int k = 0; k < 8; k++) {
+		const unsigned lo = amp_u16(ql + 4 * k) | (amp_u16(ql + 4 * k + 2) << 16);
+		const unsigned hi = amp_u16(qh + 4 * k) | (amp_u16(qh + 4 * k + 2) << 16);
+		const unsigned q = ((r < 2 ? lo : lo >> 4) & 0x0f0f0f0fu) | (((hi >> (2 * r)) & 0x03030303u) << 4);
+
+		w[k] = (int)__vsub4(q, 0x20202020u);
+	}
+
+	mult[0] = mult[1] = (int)(int8_t)b[192 + 2 * j];
+	mult[2] = mult[3] = (int)(int8_t)b[192 + 2 * j + 1];
+
+	return amp_h2f(b + 208);
+}
+
+/* kvalues_iq4nl[nibble] for the eight nibbles of q4, as two ints: .x the low nibbles of its four bytes, .y the high nibbles (byte_perm tables of 4 entries). */
+static __device__ inline int2 amp_iq4_lut(int q4)
+{
+	const unsigned W0 = 0xBFAD9881u, W1 = 0xF6EADDCFu, W2 = 0x26190D01u, W3 = 0x71594535u;        /* kvalues_iq4nl, little-endian */
+	const unsigned sel = 0x32103210u | (((unsigned)q4 & 0x88888888u) >> 1);
+	unsigned tmp[2];
+
+#pragma unroll
+	for (int i = 0; i < 2; i++) {
+		const unsigned lo = __byte_perm(W0, W1, (unsigned)q4 >> (16 * i)), hi = __byte_perm(W2, W3, (unsigned)q4 >> (16 * i));
+
+		tmp[i] = __byte_perm(lo, hi, sel >> (16 * i));
+	}
+
+	return make_int2((int)__byte_perm(tmp[0], tmp[1], 0x6420), (int)__byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
+/* Q4_K: Q5_K without the fifth bit (the nibbles are at b + 16). IQ4_XS: an item is a 32-weight sub-block with one 6-bit scale; the weights are
+ * the table values of the nibbles of qs[16 j ..] (low nibbles: weights 0 .. 15, high: 16 .. 31). IQ4_NL: the same for a whole 18-byte block. */
+template <> __device__ float amp_dec32_i8<AMP_Q_Q4_K>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                      const uint64_t *sg)
+{
+	const int jj = j >> 1, half = j & 1;
+	const uint4 q0 = ((const uint4 *)(b + 16 + 32 * jj))[0], q1 = ((const uint4 *)(b + 16 + 32 * jj))[1];
+	const unsigned qs[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+	int sc, m;
+
+	amp_scale_min_k4(j, b + 4, &sc, &m);
+
+#pragma unroll
+	for (int k = 0; k < 8; k++)
+		w[k] = (int)((half ? qs[k] >> 4 : qs[k]) & 0x0f0f0f0fu);
+
+	dlt[0] = amp_h2f(b + 2) * (float)m;
+
+	return amp_h2f(b) * (float)sc;
+}
+
+template <> __device__ float amp_dec32_i8<AMP_Q_IQ4_XS>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                        const uint64_t *sg)
+{
+	const unsigned sh = amp_u16(b + 2);
+	const int ls = (int)(((b[4 + (j >> 1)] >> (4 * (j & 1))) & 0xf) | (((sh >> (2 * j)) & 3) << 4)) - 32;
+	const uint2 a = ((const uint2 *)(b + 8 + 16 * j))[0], c = ((const uint2 *)(b + 8 + 16 * j))[1];
+	const int q4[4] = { (int)a.x, (int)a.y, (int)c.x, (int)c.y };
+
+#pragma unroll
+	for (int k = 0; k < 4; k++) {
+		const int2 v = amp_iq4_lut(q4[k]);
+
+		w[k] = v.x;
+		w[4 + k] = v.y;
+		mult[k] = ls;
+	}
+
+	return amp_h2f(b);
+}
+
+template <> __device__ float amp_dec32_i8<AMP_Q_IQ4_NL>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
+                                                        const uint64_t *sg)
+{
+#pragma unroll
+	for (int k = 0; k < 4; k++) {
+		const int2 v = amp_iq4_lut((int)(amp_u16(b + 2 + 4 * k) | (amp_u16(b + 4 + 4 * k) << 16)));
+
+		w[k] = v.x;
+		w[4 + k] = v.y;
+		mult[k] = 1;
+	}
+
+	return amp_h2f(b);
+}
+
 /* IQ1_S: one scale (3 bits) and one offset sign per 32 weights; the groups of 8 take 3 high bits of their grid index from qh. */
 template <> __device__ float amp_dec32_i8<AMP_Q_IQ1_S>(const uint8_t *b, int j, int *w, int *mult, float *dlt, const uint64_t *gr,
                                                        const uint64_t *sg)
@@ -938,20 +1034,21 @@ __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const flo
                                         const uint8_t *__restrict__ w, const uint8_t *__restrict__ w_up,
                                         const long long *__restrict__ ids, const float *__restrict__ scale,
                                         void *__restrict__ out, int M, int N, int K, int xdiv, int G, float lim, int e0, int ne,
-                                        const long long *__restrict__ ptrs)
+                                        const long long *__restrict__ ptrs, const long long *__restrict__ ptrs_up)
 {
-	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_Q5_K ? 176 : T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : 56;
-	constexpr int IPB = T == AMP_Q_Q8_0 ? 1 : 8;                    /* items of 32 weights per block */
-	constexpr bool AFFINE = T == AMP_Q_Q8_0 || T == AMP_Q_Q5_K;
+	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_Q5_K ? 176 : T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : T == AMP_Q_Q6_K ? 210 : T == AMP_Q_Q4_K ? 144 : T == AMP_Q_IQ4_XS ? 136 : T == AMP_Q_IQ4_NL ? 18 : 56;
+	constexpr int IPB = (T == AMP_Q_Q8_0 || T == AMP_Q_IQ4_NL) ? 1 : 8;                    /* items of 32 weights per block */
+	constexpr bool AFFINE = T == AMP_Q_Q8_0 || T == AMP_Q_Q5_K || T == AMP_Q_Q4_K;
 	constexpr int ITER = amp_gemv_iter(T);
-	constexpr int NGRID = AFFINE ? 0 : T == AMP_Q_IQ2_XXS ? 256 : T == AMP_Q_IQ2_XS ? 512 : 2048;
+	constexpr bool NOLUT = AFFINE || T == AMP_Q_Q6_K || T == AMP_Q_IQ4_XS || T == AMP_Q_IQ4_NL;               /* (no lookup tables) */
+	constexpr int NGRID = NOLUT ? 0 : T == AMP_Q_IQ2_XXS ? 256 : T == AMP_Q_IQ2_XS ? 512 : 2048;
 	__shared__ uint64_t s_grid[NGRID ? NGRID : 1];
-	__shared__ uint64_t s_signs[AFFINE ? 1 : 128];
+	__shared__ uint64_t s_signs[NOLUT ? 1 : 128];
 
 	for (int i = threadIdx.x; i < NGRID; i += blockDim.x)
 		s_grid[i] = (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S) ? iq1s_grid[i] : (T == AMP_Q_IQ2_XS) ? iq2xs_grid[i] : iq2xxs_grid[i];
 
-	for (int i = threadIdx.x; !AFFINE && i < 128; i += blockDim.x) {
+	for (int i = threadIdx.x; !NOLUT && i < 128; i += blockDim.x) {
 		uint64_t m = 0;
 
 		for (int b = 0; b < 8; b++)
@@ -1082,7 +1179,8 @@ __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const flo
 			for (int r = 0; r < RPW; r++) {
 				row[r] = ptrs ? (const uint8_t *)ptrs[e] + (size_t)(n0 + r) * rb
 					: w + ((size_t)e * N + n0 + r) * rb;
-				row_up[r] = GLU ? w_up + ((size_t)e * N + n0 + r) * rb : NULL;
+				row_up[r] = GLU ? (ptrs_up ? (const uint8_t *)ptrs_up[e] + (size_t)(n0 + r) * rb
+					: w_up + ((size_t)e * N + n0 + r) * rb) : NULL;
 			}
 
 			if (!GRP) {
@@ -1093,7 +1191,8 @@ __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const flo
 	#pragma unroll
 			for (int r = 0; r < RPW; r++) {
 				row[r] = w + ((size_t)grp * N + n0 + r) * rb;
-				row_up[r] = GLU ? w_up + ((size_t)grp * N + n0 + r) * rb : NULL;
+				row_up[r] = GLU ? (ptrs_up ? (const uint8_t *)ptrs_up[grp] + (size_t)(n0 + r) * rb
+					: w_up + ((size_t)grp * N + n0 + r) * rb) : NULL;
 			}
 		}
 
@@ -1127,7 +1226,7 @@ __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const flo
 						for (int k = 0; k < 8; k++)
 							ig = __dp4a(wv[k], xv[m][k], ig);
 
-						if (T == AMP_Q_Q5_K) {
+						if (T != AMP_Q_Q8_0) {
 	#pragma unroll
 							for (int k = 0; k < 8; k++)
 								sx = __dp4a(0x01010101, xv[m][k], sx);
@@ -1246,34 +1345,35 @@ amp_gguf_quant_x(const void *x, void *xq, void *xs, int R, int K, cudaStream_t s
 extern "C" int
 amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const void *w_up, const void *ids, const void *scale,
                  void *out, int M, int N, int K, int xdiv, int slots, int G, float lim, int e0, int ne, int mr, int qx,
-                 const void *ptrs, cudaStream_t stream)
+                 const void *ptrs, const void *ptrs_up, cudaStream_t stream)
 {
 	const bool moe = ids != NULL;
 
-	if (qtype != AMP_Q_IQ2_XXS && qtype != AMP_Q_IQ2_XS && qtype != AMP_Q_IQ1_M && qtype != AMP_Q_IQ1_S && qtype != AMP_Q_Q5_K && qtype != AMP_Q_Q8_0)
+	if (qtype != AMP_Q_IQ2_XXS && qtype != AMP_Q_IQ2_XS && qtype != AMP_Q_IQ1_M && qtype != AMP_Q_IQ1_S && qtype != AMP_Q_Q5_K && qtype != AMP_Q_Q6_K && qtype != AMP_Q_Q4_K && qtype != AMP_Q_IQ4_XS && qtype != AMP_Q_IQ4_NL && qtype != AMP_Q_Q8_0)
 		return (int)cudaErrorNotSupported;
 
 	if (N < 1 || K < amp_qtype_info(qtype).block || (K % amp_qtype_info(qtype).block) || (!moe && (M < 1 || M > 8)) ||
-	    (moe && (slots < 1 || xdiv < 1)) || (w_up && G != 1) || (!w && !ptrs))
+	    (moe && (slots < 1 || xdiv < 1)) || (w_up && G != 1) || (ptrs_up && G != 1) || (!w && !ptrs))
 		return (int)cudaErrorInvalidValue;
 
 	const dim3 blk(256);
 	static const bool rpw1 = getenv("AMP_GGUF_RPW1") != NULL;
 	const bool rpw2 = moe && !rpw1 && (N % 16) == 0;                 /* two output rows per warp for the experts (AMP_GGUF_RPW1=1: one) */
 	const bool rpw2d = !moe && !rpw1 && (N % 16) == 0;               /* ... and for a single-row dense product */
+	const bool glu = w_up || ptrs_up;                                 /* fused gate/up: raw stack or pointer table */
 
 #define AMP_I8_K(T, MOE_, GLU_, MR_, RPW_) \
 	amp_gguf_gemv_i8_kernel<T, MOE_, GLU_, MR_, RPW_><<<dim3((N + 8 * RPW_ * amp_gemv_iter(T) - 1) / (8 * RPW_ * amp_gemv_iter(T)), moe ? slots : G), blk, 0, stream>>>( \
 		(const int8_t *)xq, (const float *)xs, (const uint8_t *)w, (const uint8_t *)w_up, (const long long *)ids, (const float *)scale, out, M, N, K, \
-		xdiv, G, lim, e0, ne, (const long long *)ptrs)
+		xdiv, G, lim, e0, ne, (const long long *)ptrs, (const long long *)ptrs_up)
 #define AMP_I8_KQ(T, MOE_, GLU_, RPW_) \
 	amp_gguf_gemv_i8_kernel<T, MOE_, GLU_, 1, RPW_, false, true><<<dim3((N + 8 * RPW_ * amp_gemv_iter(T) - 1) / (8 * RPW_ * amp_gemv_iter(T)), moe ? slots : G), \
 		blk, (size_t)K + (size_t)(K / 32) * 4, stream>>>((const int8_t *)xq, (const float *)xs, (const uint8_t *)w, (const uint8_t *)w_up, \
-		(const long long *)ids, (const float *)scale, out, M, N, K, xdiv, G, lim, e0, ne, (const long long *)ptrs)
+		(const long long *)ids, (const float *)scale, out, M, N, K, xdiv, G, lim, e0, ne, (const long long *)ptrs, (const long long *)ptrs_up)
 #define AMP_I8_KG(T, GLU_, MR_) \
 	amp_gguf_gemv_i8_kernel<T, true, GLU_, MR_, 1, true><<<dim3((N + 8 * amp_gemv_iter(T) - 1) / (8 * amp_gemv_iter(T)), slots), blk, 0, stream>>>( \
 		(const int8_t *)xq, (const float *)xs, (const uint8_t *)w, (const uint8_t *)w_up, (const long long *)ids, (const float *)scale, out, M, N, K, \
-		xdiv, G, lim, e0, ne, (const long long *)ptrs)
+		xdiv, G, lim, e0, ne, (const long long *)ptrs, (const long long *)ptrs_up)
 #define AMP_I8_GRP(T, GLU_) \
 	switch (mr) { \
 	case 2: AMP_I8_KG(T, GLU_, 2); break; \
@@ -1293,23 +1393,23 @@ amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const
 	}
 #define AMP_I8_LAUNCH(T) \
 	do { \
-		if (qx && moe && w_up) { \
+		if (qx && moe && glu) { \
 			if (rpw2) AMP_I8_KQ(T, true, true, 2); else AMP_I8_KQ(T, true, true, 1); \
 		} else if (qx && moe) { \
 			if (rpw2) AMP_I8_KQ(T, true, false, 2); else AMP_I8_KQ(T, true, false, 1); \
-		} else if (qx && w_up) { \
+		} else if (qx && glu) { \
 			if (rpw2d) AMP_I8_KQ(T, false, true, 2); else AMP_I8_KQ(T, false, true, 1); \
 		} else if (qx) { \
 			if (rpw2d) AMP_I8_KQ(T, false, false, 2); else AMP_I8_KQ(T, false, false, 1); \
-		} else if (moe && mr > 1 && w_up) { \
+		} else if (moe && mr > 1 && glu) { \
 			AMP_I8_GRP(T, true) \
 		} else if (moe && mr > 1) { \
 			AMP_I8_GRP(T, false) \
-		} else if (moe && w_up) { \
+		} else if (moe && glu) { \
 			if (rpw2) AMP_I8_K(T, true, true, 1, 2); else AMP_I8_K(T, true, true, 1, 1); \
 		} else if (moe) { \
 			if (rpw2) AMP_I8_K(T, true, false, 1, 2); else AMP_I8_K(T, true, false, 1, 1); \
-		} else if (w_up) { \
+		} else if (glu) { \
 			AMP_I8_ROWS(T, true) \
 		} else { \
 			AMP_I8_ROWS(T, false) \
@@ -1326,6 +1426,14 @@ amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const
 		AMP_I8_LAUNCH(AMP_Q_IQ1_S);
 	else if (qtype == AMP_Q_Q5_K)
 		AMP_I8_LAUNCH(AMP_Q_Q5_K);
+	else if (qtype == AMP_Q_Q6_K)
+		AMP_I8_LAUNCH(AMP_Q_Q6_K);
+	else if (qtype == AMP_Q_Q4_K)
+		AMP_I8_LAUNCH(AMP_Q_Q4_K);
+	else if (qtype == AMP_Q_IQ4_XS)
+		AMP_I8_LAUNCH(AMP_Q_IQ4_XS);
+	else if (qtype == AMP_Q_IQ4_NL)
+		AMP_I8_LAUNCH(AMP_Q_IQ4_NL);
 	else
 		AMP_I8_LAUNCH(AMP_Q_Q8_0);
 #undef AMP_I8_K
