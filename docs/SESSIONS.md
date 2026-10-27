@@ -52,6 +52,8 @@ it back (about a second for 100k tokens against ~100 s of prefill).
   never drops below int8. `--cache-quant off`, `--cache-quant-min N`,
   `--cache-quant-tail N`, `--cache-quant-q8 N` control it. The far past
   matters least to the next token, so the loss is placed where it hurts least.
+- GGUF Qwen3.8-27B on ROCm (single GPU) parks through this path with the fp16 or the Q8 KV cache (Q8 rows are stored verbatim,
+  never age-tiered).
 - Supported for the Qwen3.5-family models, GLM-5.3-Flash and DeepSeek-V4
   (through the engine's `cache_export` / `cache_import` hooks). GLM-5.3 entries
   hold the MLA latent rows (age-tiered like KV; the Q8 cache form is kept as

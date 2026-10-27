@@ -1462,7 +1462,7 @@ export function load(model_dir, opts) {
 						'float32', 'cuda:' + L.dev);
 				} else if (kv_q8) {
 					// Q8 KV cache: (kv heads * max_seq, head_dim) int8 codes and an fp16 scale per 32 values, for keys and values
-					// (no k_cache / v_cache: the engine's host-RAM store, which copies those, then stays off)
+					// (no k_cache / v_cache: the engine's host-RAM store parks these four tensors as they are)
 					let dv = 'cuda:' + L.dev, rows = cfg.num_kv_heads * max_seq;
 
 					cl.kq = torch.zeros([ rows, cfg.head_dim ], 'int8', dv);

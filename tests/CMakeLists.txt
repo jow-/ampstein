@@ -261,6 +261,11 @@ amp_test(engine_store)
 amp_test(engine_turn)
 # engine_store_quant: tiered KV quantization of stored state at long context
 amp_test(engine_store_quant)
+# engine_store_gguf: host-RAM store for the GGUF Qwen3.8-27B, fp16 and Q8 KV (single GPU)
+amp_test(engine_store_gguf SCRIPT engine_store_gguf ENV "AMP_STORE_Q8=0;AMP_STORE_W=0")
+amp_test(engine_store_gguf_mtp SCRIPT engine_store_gguf ENV "AMP_STORE_Q8=0;AMP_STORE_W=3")
+amp_test(engine_store_gguf_q8 SCRIPT engine_store_gguf ENV "AMP_STORE_Q8=1;AMP_STORE_W=0")
+amp_test(engine_store_gguf_q8_mtp SCRIPT engine_store_gguf ENV "AMP_STORE_Q8=1;AMP_STORE_W=3")
 # engine_store_glm5: host-RAM store for GLM-5.3 (MLA latent rows, KDA states, MTP draft cache)
 amp_test(engine_store_glm5)
 # engine_state_glm5: hot reload (save_state / restore_state) of GLM-5.3 live state + snapshot

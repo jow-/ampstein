@@ -94,8 +94,10 @@ activations after a very deep prefill; a text-only server (`--no-vision`) has be
 Short-context quality with Q8: correct one-sentence answer, code generation, needle at 10.8k, MTP acceptance 69 - 85 % (fp16: 59 - 81 %).
 
 Q8 limits: single chain only (no `--tp`, no `--dflash`); decode takes at most 5 rows per step (`--mtp` <= 4, already the ROCm limit; the WMMA decode kernel takes 32 query rows per kv head);
-the MTP head's own cache stays fp16; the host-RAM cache store (`cache_export` / `cache_import`) turns itself off because it copies
-fp16 caches.
+the MTP head's own cache stays fp16. The host-RAM cache store (`--cache-ram`, session parking) works with Q8: the engine parks the
+`kq` / `ks` / `vq` / `vs` rows [0, n) of every attention layer as they are (lossless, no age tiers; ~0.12 MiB per token, 0.4 GiB for 3.2k
+tokens against 0.5 GiB for fp16 with tiers off), and the hot-reload file holds them too. A 3.2k-token state parks in ~0.3 s and swaps
+back in 10-30 ms on the 7900 XTX (`tests/engine_store_gguf*.uc`: restore == unparked continuation, token for token).
 
 ## Performance work on ROCm
 

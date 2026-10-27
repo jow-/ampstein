@@ -918,11 +918,11 @@ export function create(model, opts) {
 			}
 
 			for (let cl in sts)
-				if (cl.k_cache)
+				if (cl.k_cache || cl.kq)
 					kv = true;
 
 			for (let cl in sts)
-				if (!cl.k_cache)
+				if (!cl.k_cache && !cl.kq)
 					return false;
 		}
 
@@ -1000,7 +1000,46 @@ export function create(model, opts) {
 		return (t == 16) ? vals * 2 : (t == 8) ? vals + vals / 16 : vals / 2 + vals / 16;
 	}
 
+	/* A Q8 attention cache (qwen35 --cache-mode Q8): int8 codes + fp16 scales, rows head * max_seq + position.
+	 * Parked as it is (the rows [0, n) of every head, lossless: no age tiers). */
+	const Q8_FIELDS = [ 'kq', 'ks', 'vq', 'vs' ];
+
+	function q8_rows(c, f, n) {
+		let sh = c[f].shape();
+
+		return c[f].view([ sh[0] / c.max_seq, c.max_seq, sh[1] ]).narrow(1, 0, n);
+	}
+
+	function q8_bytes(c, n) {
+		let b = 0;
+
+		for (let f in Q8_FIELDS) {
+			let sh = c[f].shape();
+
+			b += n * (sh[0] / c.max_seq) * sh[1] * elsize(c[f]);
+		}
+
+		return b;
+	}
+
+	function q8_to_host(c, n, e) {
+		let o = {q8: true};
+
+		for (let f in Q8_FIELDS)
+			o[f] = to_host(q8_rows(c, f, n), e);
+
+		return o;
+	}
+
+	function q8_from_host(c, d, n) {
+		for (let f in Q8_FIELDS)
+			q8_rows(c, f, n).copy_(d[f].narrow(1, 0, n));
+	}
+
 	function kv_to_host(c, dev, n, e) {
+		if (c.kq != null)
+			return q8_to_host(c, n, e);
+
 		let chunks = [];
 		let sh = c.k_cache.shape();
 		let kvh = sh[1], hd = sh[3];
@@ -1037,6 +1076,9 @@ export function create(model, opts) {
 	}
 
 	function kv_from_host(c, dev, chunks, n) {
+		if (c.kq != null)
+			return q8_from_host(c, chunks, n);
+
 		let sh = c.k_cache.shape();
 		let kvh = sh[1], hd = sh[3];
 
@@ -1337,7 +1379,9 @@ export function create(model, opts) {
 			}
 
 			for (let cl in sts) {
-				if (!is_gdn(i)) {
+				if (!is_gdn(i) && cl.kq != null)
+					b += q8_bytes(cl, n);
+				else if (!is_gdn(i)) {
 					let sh = cl.k_cache.shape();
 
 					for (let o = 0; o < n; o += KV_CHUNK) {
@@ -1782,7 +1826,7 @@ export function create(model, opts) {
 					else
 						mla_from_host(sts[r], sts[r].dev, e.kv[i][0], start);
 				}
-				else if (!is_gdn(i) && !sts[r].k_cache) {
+				else if (!is_gdn(i) && !sts[r].k_cache && !sts[r].kq) {
 					// a rank without the layer's cache (QSA: the owner rank holds it)
 				}
 				else if (!is_gdn(i))
@@ -3847,6 +3891,11 @@ export function create(model, opts) {
 				let cl = sts[r];
 				let pfx = `l${i}.r${r}`;
 
+				if (cl.kq) {
+					for (let f in Q8_FIELDS)
+						push(ents, [ `${pfx}.${f}`, q8_rows(cl, f, cache.length) ]);
+				}
+
 				if (cl.k_cache) {
 					push(ents, [ pfx + '.k',
 						cl.k_cache.narrow(2, 0, cache.length) ]);
@@ -3905,6 +3954,11 @@ export function create(model, opts) {
 			for (let r = 0; r < length(sts); r++) {
 				let cl = sts[r];
 				let pfx = `l${i}.r${r}`;
+
+				if (cl.kq && has(pfx + '.kq')) {
+					for (let f in Q8_FIELDS)
+						q8_rows(cl, f, N).copy_(st.tensor(`${pfx}.${f}`));
+				}
 
 				if (cl.k_cache && has(pfx + '.k')) {
 					cl.k_cache.narrow(2, 0, N)
