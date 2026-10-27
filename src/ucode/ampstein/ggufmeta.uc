@@ -192,6 +192,16 @@ export function ensure(model_dir) {
 	if (m['general.architecture'] != 'qwen4exp')
 		return [];
 
+	// (a lone drafter shard or a truncated download has the architecture but not the model)
+	for (let k in [ 'qwen4exp.block_count', 'qwen4exp.expert_count', 'qwen4exp.embedding_length', 'qwen4exp.attention.compress_ratios',
+	    'qwen4exp.ple.head_vocab_sizes', 'tokenizer.ggml.tokens', 'tokenizer.ggml.merges', 'tokenizer.ggml.token_type' ]) {
+		if (m[k] == null) {
+			warn(`ampstein: ${model_dir}: the GGUF metadata has no ${k}, so the side files cannot be made from it ` +
+				'(are all shards of the model present? a directory with only the mtp-*.gguf cannot be served)\n');
+			exit(1);
+		}
+	}
+
 	for (let f in todo) {
 		let v = files[f](m);
 

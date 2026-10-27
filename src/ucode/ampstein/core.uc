@@ -13,7 +13,7 @@
 import * as struct from 'struct';
 import * as uloop from 'uloop';
 import * as math from 'math';
-import {readfile, writefile, unlink, stat} from 'fs';
+import {readfile, writefile, unlink, stat, lsdir, dirname} from 'fs';
 
 import * as httpd from './httpd.uc';
 import * as engine from './engine.uc';
@@ -110,7 +110,88 @@ function utf8_complete(s) {
  * (the first ones) and loads only those from its own copy of the model, then answers forward
  * commands until the coordinator says bye. After a drop it dials in again and keeps its weights
  * when the assignment is the same. Plain TCP, no TLS: put a VPN / overlay under it. */
+/* Stop with a clear message unless --model names a directory ampstein can load, and say which layout it is: 'gguf' (shards, the
+ * side files are made from their metadata when missing) or 'safetensors' (a Hugging Face / EXL3 repository with its config.json).
+ * A path that does not exist lists the model directories next to it, the most similar names first. */
+function check_model(path) {
+	function fail(msg) {
+		warn(`ampstein: ${msg}\n`);
+		exit(1);
+	}
+
+	function holds_model(d) {
+		for (let f in lsdir(d) ?? [])
+			if (match(f, /\.(gguf|safetensors)$/))
+				return true;
+
+		return false;
+	}
+
+	function grams(n) {
+		let g = {};
+
+		n = lc(n);
+
+		for (let i = 0; i + 3 <= length(n); i++)
+			g[substr(n, i, 3)] = true;
+
+		return g;
+	}
+
+	if (path == null || path == '')
+		fail('--model DIR is required (a directory with the .gguf shards or the safetensors files; see --help)');
+
+	let st = stat(path);
+
+	if (!st) {
+		let parent = dirname(path), want = grams(basename(path)), cand = [];
+
+		for (let d in lsdir(parent) ?? []) {
+			let full = parent + '/' + d, score = 0;
+
+			if (stat(full)?.type != 'directory' || !holds_model(full))
+				continue;
+
+			for (let g, _ in grams(d))
+				if (want[g])
+					score++;
+
+			push(cand, {name: d, score: score});
+		}
+
+		sort(cand, (a, b) => (b.score - a.score) || (a.name < b.name ? -1 : 1));
+
+		fail(`model directory ${path} does not exist` + (length(cand) ?
+			`; models in ${parent}:\n  ${join('\n  ', map(slice(cand, 0, 6), (c) => parent + '/' + c.name))}` : ''));
+	}
+
+	if (st.type != 'directory')
+		fail(`--model ${path} is not a directory: pass the directory that holds the .gguf shards or the safetensors files`);
+
+	let names = lsdir(path);
+
+	if (names == null)
+		fail(`cannot read the model directory ${path}`);
+
+	if (ggufw.is_gguf_dir(path))
+		return 'gguf';
+
+	if (length(filter(names, (f) => match(f, /\.safetensors$/))) || stat(path + '/model.safetensors.index.json')) {
+		if (!stat(path + '/config.json'))
+			fail(`${path} has safetensors files but no config.json (a Hugging Face / EXL3 repository needs it)`);
+
+		return 'safetensors';
+	}
+
+	sort(names);
+
+	fail(`${path} holds neither .gguf shards nor .safetensors files (found: ` +
+		(length(names) ? join(', ', slice(names, 0, 8)) + (length(names) > 8 ? ', ...' : '') : 'nothing') + ')');
+}
+
 export function worker(args) {
+	check_model(args.model);
+
 	if (!args.connect) {
 		warn('ampstein: --worker needs --connect HOST:PORT\n');
 		exit(1);
@@ -201,8 +282,15 @@ export function serve(args) {
 	let served_name = args.name || basename(args.model);
 
 	// a directory with only the .gguf files: config, generation config, chat template and tokenizer come from their metadata
-	if (ggufw.is_gguf_dir(args.model))
+	if (check_model(args.model) == 'gguf') {
 		ggufmeta.ensure(args.model);
+
+		if (!stat(args.model + '/config.json')) {
+			warn(`ampstein: ${args.model} has no config.json, and it can only be made from the metadata of Qwen3.8-Flash-Next GGUF files ` +
+				`(general.architecture ${ggufw.open(args.model).meta['general.architecture']}): copy the model's config.json next to the shards\n`);
+			exit(1);
+		}
+	}
 
 	let gen_cfg = {};
 
