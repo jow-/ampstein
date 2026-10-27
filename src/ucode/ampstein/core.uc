@@ -1341,8 +1341,47 @@ export function serve(args) {
 		let rb = body.reasoning_budget || {};
 		let nudge_at = budget_num(body.reasoning_nudge_tokens, rb.nudge, args.reasoning_nudge);
 		let limit_at = budget_num(body.reasoning_max_tokens, rb.limit, args.reasoning_limit);
-		let budgeted = r.thinking && (nudge_at > 0 || limit_at > 0);
-		let rtoks = 0, nudged = false, closed = false, pending = null, pending_kind = null;
+
+		// Automatic budget (--reasoning-pct, default "50,70,85"; "off" disables): with no explicit budget above, the
+		// thresholds follow the output cap of the request (max_tokens, or the room left in the context, whichever is
+		// smaller) and count every generated token: at the first a budget notice is appended to the model's thinking, at
+		// the second the nudge to wrap up, at the third the block is closed by force, so the answer or tool call that
+		// follows still has room (the reasoning shares max_tokens with it) instead of ending in finish_reason "length".
+		let cap = max_new_of(body, length(ids));
+		let auto = null;
+
+		if (r.thinking && nudge_at == 0 && limit_at == 0 && cap >= 512 && args.reasoning_pct != 'off') {
+			let pc = map(split(args.reasoning_pct ?? '50,70,85', ','), (v) => int(v));
+
+			if (length(pc) == 3 && pc[0] >= 0 && pc[0] <= pc[1] && pc[1] <= pc[2] && pc[2] < 100)
+				auto = {cap: cap, notice: int(cap * pc[0] / 100), nudge: int(cap * pc[1] / 100), limit: int(cap * pc[2] / 100)};
+		}
+
+		let budgeted = r.thinking && (nudge_at > 0 || limit_at > 0 || auto != null);
+		let rtoks = 0, nudged = false, closed = false, noticed = false, pending = null, pending_kind = null, pending_mode = 'reason';
+
+		// A tool call that would run into the output cap (a long file written through a write call or a heredoc) is cut
+		// off and not worth sending: at --call-pct of the cap (default 90, 0 off) an unfinished call is dropped (the client
+		// never sees it) and the model gets a hidden tool result that says so and asks for smaller steps, which it
+		// can still write in the room that is left. Once per response; formats with a tool-result turn (tool_feedback) only.
+		let cut_at = (args.call_pct > 0 && cap >= 2048 && chat.tool_feedback && length(body.tools || []) > 0) ?
+			int(cap * args.call_pct / 100) : 0;
+		let cut_done = false;
+
+		function call_cut_check() {
+			if (cut_at <= 0 || cut_done || pending != null || p.mode() != 'tool' || hnum < cut_at)
+				return;
+
+			let left = max(0, cap - hnum - 160);
+
+			cut_done = true;
+			pending_kind = 'call cut';
+			pending_mode = 'tool';
+			pending = tok.encode(chat.tool_feedback(sprintf('[The tool call was cut off because the output limit of this response (%d tokens) was ' +
+				'reached while it was being written. It was NOT executed. Do not repeat it in full: split the work into smaller steps, ' +
+				'e.g. write a long file in several parts (the first part now, the following ones appended or edited with further calls in ' +
+				'later turns). About %d tokens are left in this response, so keep the next call well within that.]', cap, left), r.thinking), true);
+		}
 
 		if (nudge_at > 0 && limit_at > 0 && nudge_at >= limit_at)
 			nudge_at = 0;
@@ -1350,6 +1389,30 @@ export function serve(args) {
 		function budget_check() {
 			if (!budgeted || pending != null || p.mode() != 'reason')
 				return;
+
+			if (auto) {
+				let left = auto.cap - hnum;
+				let note = (what) => sprintf('\n\n[Output budget: %s -- %d of %d tokens (%d%%) left, shared by my thinking and the final reply.', what,
+					left, auto.cap, int(100 * left / auto.cap));
+
+				if (auto.limit > 0 && hnum >= auto.limit && !closed) {
+					closed = true;
+					pending_kind = 'limit (auto)';
+					pending = tok.encode(note('almost used up') + ' I have to give the answer now.]' + chat.THINK_END, true);
+				}
+				else if (auto.nudge > 0 && hnum >= auto.nudge && !nudged && !closed) {
+					nudged = true;
+					pending_kind = 'nudge (auto)';
+					pending = tok.encode(note('running low') + ' I should wrap up my reasoning and move on to the answer.]\n\n', true);
+				}
+				else if (auto.notice > 0 && hnum >= auto.notice && !noticed && !nudged && !closed) {
+					noticed = true;
+					pending_kind = 'notice (auto)';
+					pending = tok.encode(note('half used') + ' I should keep the remaining reasoning focused.]\n\n', true);
+				}
+
+				return;
+			}
 
 			if (limit_at > 0 && rtoks >= limit_at && !closed) {
 				closed = true;
@@ -1525,6 +1588,7 @@ export function serve(args) {
 
 				emit(p.feed(gpush(t)));
 				budget_check();
+				call_cut_check();
 
 				if (stopped)
 					return false;
@@ -1595,7 +1659,7 @@ export function serve(args) {
 			},
 
 			// the engine polls this at every step boundary
-			force: !(budgeted || call_policy) ? null : function () {
+			force: !(budgeted || cut_at > 0 || call_policy) ? null : function () {
 				if (call_note != null) {
 					let f = call_note;
 
@@ -1616,9 +1680,21 @@ export function serve(args) {
 
 				pending = null;
 
-				// the model may have closed the block itself since the check
-				if (p.mode() != 'reason')
+				// the model may have closed the block (or the call) itself since the check
+				if (p.mode() != pending_mode)
 					return null;
+
+				if (pending_mode == 'tool') {
+					// the unfinished call goes nowhere: a fresh parser for what follows the hidden tool result, whose
+					// reasoning (if any) gets the closing budget stage at once (the cap is nearly reached)
+					warn(`chat ${id}: ${pending_kind} after ${hnum} tokens, forcing ${length(f)} tokens\n`);
+					p = chat.parser(r.thinking, stops_of(body));
+					closed = false;
+					pending_mode = 'reason';
+					hnum += length(f);
+
+					return f;
+				}
 
 				warn(`chat ${id}: reasoning ${pending_kind} ` +
 					`after ${rtoks} tokens, forcing ${length(f)} tokens\n`);
@@ -1628,6 +1704,7 @@ export function serve(args) {
 					emit(p.feed(gpush(f[i])));
 
 				rtoks += length(f);
+				hnum += length(f);
 
 				return f;
 			},

@@ -68,6 +68,11 @@ function usage() {
 	printf("  --slice-ms N          time-slice by wall-clock ms (default 0 off)\n");
 	printf("  --reasoning-nudge N   after N reason tokens append soft close nudge (default 0 off)\n");
 	printf("  --reasoning-limit Y   force-close reasoning after Y tokens (default 0 off)\n");
+	printf("  --call-pct N          a tool call still unfinished at N%% of the output cap is dropped and the model is told to split the\n");
+	printf("                        work into smaller calls (default 90, 0 off)\n");
+	printf("  --reasoning-pct A,B,C with no explicit budget, follow the request's output cap (max_tokens or the room left): at A%% of it a\n");
+	printf("                        budget notice is added to the thinking, at B%% a nudge to wrap up, at C%% the block is closed by\n");
+	printf("                        force (default 50,70,85; 'off' disables)\n");
 	printf("  --eos-hook SCRIPT     call SCRIPT when the model ends its turn\n");
 	printf("  --call-hook SCRIPT    call SCRIPT when the model completes a tool call\n");
 	printf("  --prompt-hook SCRIPT  call SCRIPT with each request's prompt (may rewrite messages / tools)\n");
@@ -121,6 +126,8 @@ function parse_args() {
 		draft_vocab: 0,
 		reasoning_nudge: 0,
 		reasoning_limit: 0,
+		reasoning_pct: '50,70,85',
+		call_pct: 90,
 		cache_ram: 32,
 		slots: 'auto',
 		slot_margin: 512,
@@ -169,6 +176,8 @@ function parse_args() {
 		case '--cache-mode': a.cache_mode = uc(v); i++; break;
 		case '--reasoning-nudge': a.reasoning_nudge = int(v); i++; break;
 		case '--reasoning-limit': a.reasoning_limit = int(v); i++; break;
+		case '--reasoning-pct': a.reasoning_pct = v; i++; break;
+		case '--call-pct': a.call_pct = int(v); i++; break;
 		case '--eos-hook': a.eos_hook = v; i++; break;
 		case '--eos-hook-max': a.eos_hook_max = int(v); i++; break;
 		case '--call-hook': a.call_hook = v; i++; break;

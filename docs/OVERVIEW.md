@@ -262,6 +262,15 @@ reasoning, content and tool calls (Qwen XML-ish calls, GLM, DeepSeek DSML).
 - Hot reload: the KV state survives a server restart (Qwen3.5 family, GLM-5.3).
 - Reasoning budget: soft nudge after X reasoning tokens, forced close after
   Y (`--reasoning-nudge`, `--reasoning-limit`, per request too).
+- Output-cap awareness (`--reasoning-pct`, `--call-pct`): clients share `max_tokens`
+  between thinking and the reply, so a runaway reasoning phase ends the response
+  with `finish_reason: length` and nothing usable. With no explicit budget the
+  server follows the request's cap (`max_tokens`, or the room left in the context):
+  at 50% a budget notice (tokens left) is added to the thinking, at 70% a nudge
+  to wrap up, at 85% the block is closed by force. A tool call still unfinished
+  at 90% (a long file in a write call or heredoc) is dropped, never sent, and
+  the model gets a hidden tool result asking for smaller steps (once per response;
+  needs `tool_feedback` in the chat format: Qwen, GLM). Off with `off` / `0`.
 - **End-of-turn hook** (`--eos-hook`): a script run when the model samples
   its end token, whose return value lets the turn end, redraws the position
   with the stop token penalized, or forces text. Built for agent harnesses
@@ -420,6 +429,7 @@ Common flags (`ampstein --help` lists them all):
 | `--slots auto\|N` | resident device slots for parked conversations |
 | `--slice-tokens N` | time slice length for co-generation |
 | `--reasoning-nudge X`, `--reasoning-limit Y` | reasoning budget |
+| `--reasoning-pct A,B,C`, `--call-pct N` | automatic budget stages (default 50,70,85) and call cut-off (default 90) as % of the output cap |
 | `--eos-hook FILE`, `--eos-hook-max N` | end-of-turn policy script |
 | `--call-hook FILE`, `--call-hook-max N` | tool-call policy script (default 3 verdicts per request) |
 | `--prompt-hook FILE`, `--prompt-hook-max N` | prompt policy script (default 3 rounds per request) |
