@@ -1752,6 +1752,277 @@ amp_gguf_moe_prefill(int t13, int t2, const void *y, const void *tok, const void
 	return (int)cudaGetLastError();
 }
 
+/* ---- the grouped prefill GEMM over per-expert pointer tables, for every GGUF type ------------------------------------------
+ *
+ * Expert e's rows start at ptr[e] (a device pointer into the resident VRAM stack or into mapped host memory, the tables of
+ * torch.gguf_moe_gemv_pt), so one set of launches covers resident and cold experts and the host never loops over the experts. The
+ * experts go in groups of PT_G: one kernel dequantizes the matrices of the group's experts that have tokens (count[e] > 0) once to an
+ * fp16 scratch (every weight is decoded once per chunk, not once per token tile), then the tensor-core kernel runs the group's token
+ * tiles on fp16 tiles. Stage A: gate and up -> clamped SwiGLU -> hbuf[slot]; stage B: down of hbuf -> out[slot] = routing weight * result
+ * (one row per sorted slot: the caller sums them per token in a fixed order). */
+
+#define PT_G 16
+
+template <int T>
+__global__ void __launch_bounds__(256)
+amp_gguf_pt_dequant_kernel(const long long *__restrict__ ptr, const long long *__restrict__ count, __half *__restrict__ dst, int e0,
+                           int N, int K)
+{
+	const int e = e0 + blockIdx.y;
+
+	if (count[e] < 1)
+		return;
+
+	constexpr int bytes = amp_qbytes(T);
+	constexpr int blk = amp_qtype_info(T).block;
+	const void *gr = T == AMP_Q_IQ2_XS ? (const void *)iq2xs_grid :
+	                 T == AMP_Q_IQ2_XXS ? (const void *)iq2xxs_grid :
+	                 T == AMP_Q_IQ2_S ? (const void *)iq2s_grid :
+	                 T == AMP_Q_IQ3_XXS ? (const void *)iq3xxs_grid :
+	                 T == AMP_Q_IQ3_S ? (const void *)iq3s_grid :
+	                 (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S) ? (const void *)iq1s_grid : NULL;
+	const long gpr = K / 8;                                /* groups of 8 weights per row */
+	const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i >= (long)N * gpr)
+		return;
+
+	const long row = i / gpr, g = i % gpr;
+	const size_t rb = (size_t)(K / blk) * bytes;
+	const uint8_t *b = (const uint8_t *)ptr[e] + (size_t)row * rb + (size_t)((g * 8) / blk) * bytes;
+	float v[8];
+	__half h[8];
+
+	amp_dq_group<T>(b, (int)(((g * 8) % blk) / 8), v, gr, ksigns_iq2xs);
+#pragma unroll
+	for (int j = 0; j < 8; j++)
+		h[j] = __float2half(v[j]);
+	*(uint4 *)(dst + (size_t)blockIdx.y * N * K + (size_t)i * 8) = *(uint4 *)h;
+}
+
+template <bool STAGE_A>
+__global__ void __launch_bounds__(128)
+amp_gguf_moe_h_kernel(const __half *__restrict__ xin, const long long *__restrict__ tok, const __half *__restrict__ wts,
+                      const long long *__restrict__ count, const long long *__restrict__ start, const __half *__restrict__ w0,
+                      const __half *__restrict__ w1, __half *__restrict__ hbuf, float *__restrict__ out, int e0, int N, int K,
+                      float lim)
+{
+	using namespace nvcuda;
+
+	__shared__ __align__(16) __half s_x[PF_BM * PF_LD];
+	__shared__ __align__(16) __half s_w0[PF_BN * PF_LD];
+	__shared__ __align__(16) __half s_w1[STAGE_A ? PF_BN * PF_LD : 8];
+
+	const int e = e0 + blockIdx.y;
+	const int cnt = (int)count[e];
+	const int m0 = blockIdx.z * PF_BM;
+
+	if (m0 >= cnt)
+		return;
+
+	const int n0 = blockIdx.x * PF_BN;
+	const long long st = start[e];
+	const int tid = threadIdx.x, warp = tid >> 5;
+	const int wm = warp >> 1, wn = warp & 1;
+	const __half *a0 = w0 + (size_t)blockIdx.y * N * K + (size_t)n0 * K;
+	const __half *a1 = STAGE_A ? w1 + (size_t)blockIdx.y * N * K + (size_t)n0 * K : NULL;
+
+	wmma::fragment<wmma::accumulator, 16, 16, 16, float> c0[2], c1[2];
+
+#pragma unroll
+	for (int j = 0; j < 2; j++) {
+		wmma::fill_fragment(c0[j], 0.f);
+		wmma::fill_fragment(c1[j], 0.f);
+	}
+
+	for (int k0 = 0; k0 < K; k0 += PF_BK) {
+		for (int i = tid; i < PF_BM * 8; i += 128) {
+			const int r = i >> 3, c8 = i & 7;
+			uint4 v = make_uint4(0, 0, 0, 0);
+
+			if (m0 + r < cnt) {
+				const size_t row = STAGE_A ? (size_t)tok[st + m0 + r] : (size_t)(st + m0 + r);
+
+				v = *(const uint4 *)(xin + row * K + k0 + c8 * 8);
+			}
+
+			*(uint4 *)(s_x + r * PF_LD + c8 * 8) = v;
+		}
+
+		for (int i = tid; i < PF_BN * 8; i += 128) {
+			const int r = i >> 3, g8 = i & 7;
+
+			*(uint4 *)(s_w0 + r * PF_LD + g8 * 8) = *(const uint4 *)(a0 + (size_t)r * K + k0 + g8 * 8);
+
+			if (STAGE_A)
+				*(uint4 *)(s_w1 + r * PF_LD + g8 * 8) = *(const uint4 *)(a1 + (size_t)r * K + k0 + g8 * 8);
+		}
+
+		__syncthreads();
+
+#pragma unroll
+		for (int kk = 0; kk < PF_BK; kk += 16) {
+			wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+
+			wmma::load_matrix_sync(a, s_x + wm * 16 * PF_LD + kk, PF_LD);
+
+#pragma unroll
+			for (int j = 0; j < 2; j++) {
+				wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+
+				wmma::load_matrix_sync(b, s_w0 + (wn * 32 + j * 16) * PF_LD + kk, PF_LD);
+				wmma::mma_sync(c0[j], a, b, c0[j]);
+
+				if (STAGE_A) {
+					wmma::load_matrix_sync(b, s_w1 + (wn * 32 + j * 16) * PF_LD + kk, PF_LD);
+					wmma::mma_sync(c1[j], a, b, c1[j]);
+				}
+			}
+		}
+
+		__syncthreads();
+	}
+
+	float *sc0 = (float *)s_w0;
+	float *sc1 = (float *)s_w1;
+
+#pragma unroll
+	for (int j = 0; j < 2; j++) {
+		wmma::store_matrix_sync(sc0 + wm * 16 * PF_BN + wn * 32 + j * 16, c0[j], PF_BN, wmma::mem_row_major);
+
+		if (STAGE_A)
+			wmma::store_matrix_sync(sc1 + wm * 16 * PF_BN + wn * 32 + j * 16, c1[j], PF_BN, wmma::mem_row_major);
+	}
+
+	__syncthreads();
+
+	for (int i = tid; i < PF_BM * PF_BN; i += 128) {
+		const int r = i / PF_BN, c = i % PF_BN;
+
+		if (m0 + r >= cnt)
+			continue;
+
+		if (STAGE_A) {
+			float g = sc0[i], u = sc1[i];
+
+			if (lim > 0.f) {
+				g = fminf(g, lim);
+				u = fminf(fmaxf(u, -lim), lim);
+			}
+
+			hbuf[(size_t)(st + m0 + r) * N + n0 + c] = __float2half(g / (1.f + __expf(-g)) * u);
+		} else
+			out[(size_t)(st + m0 + r) * N + n0 + c] = __half2float(wts[st + m0 + r]) * sc0[i];
+	}
+}
+
+static int
+amp_gguf_pt_dequant(int t, const long long *ptr, const long long *count, __half *dst, int e0, int g, int N, int K, cudaStream_t stream)
+{
+	const dim3 grid((unsigned)(((long)N * (K / 8) + 255) / 256), (unsigned)g);
+
+#define AMP_PTDQ_CASE(T) \
+	case T: amp_gguf_pt_dequant_kernel<T><<<grid, 256, 0, stream>>>(ptr, count, dst, e0, N, K); break
+
+	switch (t) {
+	AMP_PTDQ_CASE(AMP_Q_Q4_0); AMP_PTDQ_CASE(AMP_Q_Q8_0); AMP_PTDQ_CASE(AMP_Q_IQ4_NL); AMP_PTDQ_CASE(AMP_Q_Q5_K);
+	AMP_PTDQ_CASE(AMP_Q_IQ2_XXS); AMP_PTDQ_CASE(AMP_Q_IQ2_XS); AMP_PTDQ_CASE(AMP_Q_IQ1_M); AMP_PTDQ_CASE(AMP_Q_IQ1_S);
+	AMP_PTDQ_CASE(AMP_Q_Q2_0); AMP_PTDQ_CASE(AMP_Q_Q4_K); AMP_PTDQ_CASE(AMP_Q_Q3_K); AMP_PTDQ_CASE(AMP_Q_Q6_K);
+	AMP_PTDQ_CASE(AMP_Q_IQ2_S); AMP_PTDQ_CASE(AMP_Q_IQ3_XXS); AMP_PTDQ_CASE(AMP_Q_IQ3_S); AMP_PTDQ_CASE(AMP_Q_IQ4_XS);
+	default: return (int)cudaErrorNotSupported;
+	}
+#undef AMP_PTDQ_CASE
+
+	return (int)cudaGetLastError();
+}
+
+/* y (T, H) fp16 tokens; tok / wts / count / start from torch.moe_prep over E experts; p1 / p3 / p2 (E) device pointers to each expert's gate / up
+ * (I rows of H) and down (H rows of I) matrices of type t13 / t2; out (A, H) fp32 receives, per sorted slot, routing weight * down(swiglu(gate, up));
+ * hbuf (A, I) fp16 scratch; wsc: 2 buffers of 3 * PT_G * H * I halves of dequantized weights; max_rows: an upper bound of the tokens one expert gets. */
+extern "C" int
+amp_gguf_moe_prefill_pt(int t13, int t2, const void *y, const void *tok, const void *wts, const void *count, const void *start,
+                        const void *p1, const void *p3, const void *p2, void *hbuf, void *out, void *wsc, int E, int H, int I,
+                        int max_rows, float lim, cudaStream_t stream)
+{
+	if (E < 1 || (H % PF_BK) || (I % PF_BK) || (H % PF_BN) || (I % PF_BN) || (H % amp_qtype_info(t13).block) ||
+	    (I % amp_qtype_info(t2).block) || max_rows < 1 || ((uintptr_t)y & 15) || ((uintptr_t)hbuf & 15) || ((uintptr_t)wsc & 15))
+		return (int)cudaErrorInvalidValue;
+
+	const dim3 blk(128);
+	const unsigned mt = (unsigned)((max_rows + PF_BM - 1) / PF_BM);
+	const size_t sz = (size_t)H * I;
+	const int ng = (E + PT_G - 1) / PT_G;
+
+	/* two scratch buffers: a side stream dequantizes group i (host-mapped experts: PCIe-bound, the SMs mostly idle) while the main stream runs
+	 * the tensor-core kernels of group i - 1 */
+	struct pt_dev {
+		cudaStream_t aux;
+		cudaEvent_t in, dq[2], fr[2];
+	};
+	static pt_dev devs[16];
+	int dev = 0;
+
+	cudaGetDevice(&dev);
+
+	if (dev < 0 || dev >= 16)
+		return (int)cudaErrorInvalidDevice;
+
+	pt_dev &d = devs[dev];
+
+	if (!d.aux) {
+		if (cudaStreamCreateWithFlags(&d.aux, cudaStreamNonBlocking) || cudaEventCreateWithFlags(&d.in, cudaEventDisableTiming))
+			return (int)cudaGetLastError();
+
+		for (int i = 0; i < 2; i++)
+			if (cudaEventCreateWithFlags(&d.dq[i], cudaEventDisableTiming) || cudaEventCreateWithFlags(&d.fr[i], cudaEventDisableTiming))
+				return (int)cudaGetLastError();
+	}
+
+	cudaEventRecord(d.in, stream);
+	cudaStreamWaitEvent(d.aux, d.in, 0);
+
+	auto bufs = [&](int b, __half *&wa, __half *&wb, __half *&wd) {
+		wa = (__half *)wsc + (size_t)b * 3 * PT_G * sz;
+		wb = wa + PT_G * sz;
+		wd = wb + PT_G * sz;
+	};
+	auto group = [&](int i) { return E - i * PT_G < PT_G ? E - i * PT_G : PT_G; };
+
+	for (int i = 0; i <= ng; i++) {
+		if (i < ng) {
+			__half *wa, *wb, *wd;
+			int rc;
+
+			bufs(i & 1, wa, wb, wd);
+
+			if (i >= 2)
+				cudaStreamWaitEvent(d.aux, d.fr[i & 1], 0);
+
+			if ((rc = amp_gguf_pt_dequant(t13, (const long long *)p1, (const long long *)count, wa, i * PT_G, group(i), I, H, d.aux)) ||
+			    (rc = amp_gguf_pt_dequant(t13, (const long long *)p3, (const long long *)count, wb, i * PT_G, group(i), I, H, d.aux)) ||
+			    (rc = amp_gguf_pt_dequant(t2, (const long long *)p2, (const long long *)count, wd, i * PT_G, group(i), H, I, d.aux)))
+				return rc;
+
+			cudaEventRecord(d.dq[i & 1], d.aux);
+		}
+
+		if (i > 0) {
+			const int j = i - 1, e0 = j * PT_G, g = group(j);
+			__half *wa, *wb, *wd;
+
+			bufs(j & 1, wa, wb, wd);
+			cudaStreamWaitEvent(stream, d.dq[j & 1], 0);
+			amp_gguf_moe_h_kernel<true><<<dim3(I / PF_BN, g, mt), blk, 0, stream>>>((const __half *)y, (const long long *)tok,
+				(const __half *)wts, (const long long *)count, (const long long *)start, wa, wb, (__half *)hbuf, (float *)out, e0, I, H, lim);
+			amp_gguf_moe_h_kernel<false><<<dim3(H / PF_BN, g, mt), blk, 0, stream>>>((const __half *)hbuf, (const long long *)tok,
+				(const __half *)wts, (const long long *)count, (const long long *)start, wd, NULL, (__half *)hbuf, (float *)out, e0, H, I, lim);
+			cudaEventRecord(d.fr[j & 1], stream);
+		}
+	}
+
+	return (int)cudaGetLastError();
+}
+
 /* ---- the same on int8 tensor cores (mma.sync m16n8k16 s8) -------------------------------------------------------------------
  *
  * The weight rows are the M operand, the tokens the N operand. A thread decodes straight from the quantized bytes the 4 weights of

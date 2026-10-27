@@ -286,6 +286,8 @@ amp_test(qwen4_vision)
 amp_test(qwen4_tp)
 # qwen4_host_experts: part of the experts in pinned host memory (prefill staging, zero-copy decode) vs all in VRAM
 amp_test(qwen4_host_experts)
+# qwen4_gguf_moe_prefill: the GGUF pointer-table prefill kernel (resident + host-mapped experts) vs an fp32 reference and the per-expert loop
+amp_test(qwen4_gguf_moe_prefill)
 # qwen4_depth: quality vs exllamav3 as a function of context depth
 amp_test(qwen4_depth)
 # qwen4_depth_decode: decode at depth: graph vs eager, determinism

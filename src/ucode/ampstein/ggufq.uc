@@ -7,6 +7,7 @@
 
 const SCRATCH_ELEMS = +(getenv("AMP_GGUF_SLICE") ?? 8 * 1024 * 1024);     // dequantized slice of a prefill matmul, elements (fp16: 16 MiB)
 const PF_OFF = getenv('AMP_GGUF_NO_PF') != null;                    // the per-expert dequantize + cuBLAS prefill instead of the grouped kernel
+const PT_OFF = getenv('AMP_GGUF_NO_PT') != null;                    // the pointer-table prefill kernel off (per-expert loop for cold experts)
 const PF_TYPES = {IQ2_XXS: true, IQ2_XS: true, IQ1_M: true, IQ1_S: true};
 const I8_TYPES = {Q8_0: true, Q5_K: true, Q6_K: true, Q4_K: true, IQ4_XS: true, IQ4_NL: true, Q2_0: true, IQ2_S: true, IQ3_XXS: true, IQ3_S: true, IQ2_XXS: true, IQ2_XS: true, IQ1_M: true, IQ1_S: true};
 const FUSED_OFF = getenv('AMP_GGUF_NO_FUSED') != null || getenv('AMP_GGUF_FP16') != null;           // separate gate / up launches
@@ -347,6 +348,20 @@ export function moe_forward(cfg, M, y, H) {
 		let out = d.mul(wflat.view([S, 1])).view([T, Kt, Hd]).sum(1).to('float32');
 
 		return out.add(shared());
+	}
+
+	// prefill: one tensor-core launch per stage over the pointer tables (resident and cold experts together, any type), the
+	// routing-weighted outputs summed per token in a fixed order
+	if (T > 8 && M.pt1 && !PF_OFF && !PT_OFF && gq.tw1 == gq.tw3) {
+		let E = M.n_experts_total;
+		let pr = torch.moe_prep(r.idx.contiguous(), r.w.contiguous(), E, 0);
+		let scratch = torch.gguf_moe_prefill_pt(y.contiguous(), pr[2], pr[3], pr[4], pr[5], M.pt1, M.pt3, M.pt2, gq.tw1, gq.tw2,
+			gq.inter, cfg.swiglu_limit + 0.0);
+		let sum = torch.zeros([T, Hd], 'float32', 'cuda:' + M.dev);
+
+		torch.moe_gather(sum, scratch, pr[0], pr[6], pr[5].narrow(0, 0, E), pr[5].narrow(0, 0, E), pr[7].narrow(0, 0, E), pr[3]);
+
+		return sum.add(shared());
 	}
 
 	if (M.gq_cold) {

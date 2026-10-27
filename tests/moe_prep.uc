@@ -63,4 +63,7 @@ check(5, 6, 384, 0, 384);
 check(40, 6, 192, 192, 384);
 check(300, 6, 192, 0, 384);
 check(128, 3, 64, 64, 128);
+check(4096, 10, 512, 0, 512);         // a prefill chunk: the warp-segmented sort
+check(1000, 10, 256, 100, 512);
+check(33, 10, 512, 0, 512);
 printf('moe_prep: all ok\n');

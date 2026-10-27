@@ -6250,6 +6250,115 @@ amp_moe_prep_kernel(const long long *__restrict__ idx, const float *__restrict__
 	}
 }
 
+/* The same dispatch in O(A + E) per thread: the assignments are cut into 32 contiguous segments, one per warp. Pass 1 histograms each
+ * segment (a warp handles 32 consecutive assignments at a time; __match_any_sync groups the lanes of one bucket, the lowest lane adds
+ * the group), the buckets' per-segment bases follow from a prefix over the segments, pass 2 walks the segments again and places every
+ * assignment at start[b] + (assignments of b in earlier segments) + (earlier ones in its own segment): the stable order of the serial
+ * kernel, bit for bit. Needs 32 * (E + 1) 16-bit counters, so a segment holds at most 65535 assignments. */
+#define AMP_PREP2_WARPS 32
+
+__global__ void __launch_bounds__(AMP_PREP2_WARPS * 32)
+amp_moe_prep2_kernel(const long long *__restrict__ idx, const float *__restrict__ w, int A, int K, int E, long long e0,
+                     long long *__restrict__ fe, long long *__restrict__ order, long long *__restrict__ tok,
+                     __half *__restrict__ wts, long long *__restrict__ count, long long *__restrict__ start,
+                     long long *__restrict__ inv, long long *__restrict__ kind)
+{
+	extern __shared__ int sh[];                 /* total[E + 1], start[E + 1], then 32 x (E + 1) uint16 */
+	int *stot = sh, *sst = sh + (E + 1);
+	unsigned short *wh = (unsigned short *)(sh + 2 * (E + 1));
+	const int nb = E + 1;
+	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+	const int seg = (A + AMP_PREP2_WARPS - 1) / AMP_PREP2_WARPS;
+	const int a0 = min(warp * seg, A), a1 = min(a0 + seg, A);
+
+	for (int i = threadIdx.x; i < AMP_PREP2_WARPS * nb; i += blockDim.x)
+		wh[i] = 0;
+
+	__syncthreads();
+
+	for (int step = a0; step < a1; step += 32) {
+		const int a = step + lane;
+		const bool live = a < a1;
+		int b = E;
+
+		if (live) {
+			long long loc = idx[a] - e0;
+
+			b = (loc >= 0 && loc < E) ? (int)loc : E;
+			fe[a] = b;
+		}
+
+		const unsigned live_m = __ballot_sync(0xffffffffu, live);
+		const unsigned m = __match_any_sync(0xffffffffu, b) & live_m;
+
+		if (live && lane == __ffs(m) - 1)
+			wh[warp * nb + b] += (unsigned short)__popc(m);
+	}
+
+	__syncthreads();
+
+	/* per bucket: total over the segments, and each segment's base (exclusive prefix over the earlier segments) */
+	for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+		int acc = 0;
+
+		for (int wp = 0; wp < AMP_PREP2_WARPS; wp++) {
+			int c = wh[wp * nb + b];
+
+			wh[wp * nb + b] = (unsigned short)acc;
+			acc += c;
+		}
+
+		stot[b] = acc;
+	}
+
+	__syncthreads();
+
+	if (threadIdx.x == 0) {
+		int acc = 0;
+
+		for (int b = 0; b < nb; b++) {
+			sst[b] = acc;
+			acc += stot[b];
+		}
+	}
+
+	__syncthreads();
+
+	for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+		count[b] = stot[b];
+		start[b] = sst[b];
+
+		if (b < E)
+			kind[b] = stot[b] > 0;
+	}
+
+	for (int step = a0; step < a1; step += 32) {
+		const int a = step + lane;
+		const bool live = a < a1;
+		const int b = live ? (int)fe[a] : E;
+		const unsigned live_m = __ballot_sync(0xffffffffu, live);
+		const unsigned m = __match_any_sync(0xffffffffu, b) & live_m;
+		const int leader = __ffs(m) - 1;
+		int base = 0;
+
+		if (live && lane == leader) {
+			base = wh[warp * nb + b];
+			wh[warp * nb + b] = (unsigned short)(base + __popc(m));
+		}
+
+		base = __shfl_sync(0xffffffffu, base, leader < 0 ? 0 : leader);
+
+		if (live) {
+			const int pos = sst[b] + base + __popc(m & ((1u << lane) - 1));
+
+			order[pos] = a;
+			tok[pos] = a / K;
+			wts[pos] = __float2half(w[a]);
+			inv[a] = pos;
+		}
+	}
+}
+
 extern "C" int
 amp_moe_prep(const long long *idx, const float *w, int A, int K, int E, long long e0, long long *fe, long long *order,
              long long *tok, void *wts, long long *count, long long *start, long long *inv, long long *kind,
@@ -6258,8 +6367,15 @@ amp_moe_prep(const long long *idx, const float *w, int A, int K, int E, long lon
 	if (A < 1 || K < 1 || E < 1 || E > 4096 || (size_t)(2 * (E + 1)) * 4 > 48 * 1024)
 		return (int)cudaErrorInvalidValue;
 
-	amp_moe_prep_kernel<<<1, AMP_PREP_THREADS, (size_t)(2 * (E + 1)) * 4, stream>>>(idx, w, A, K, E, e0, fe, order, tok,
-		(__half *)wts, count, start, inv, kind);
+	const size_t sh2 = (size_t)(2 * (E + 1)) * 4 + (size_t)AMP_PREP2_WARPS * (E + 1) * 2;
+	static const bool serial = getenv("AMP_MOE_PREP_SERIAL") != NULL;
+
+	if (!serial && sh2 <= 48 * 1024 && (A + AMP_PREP2_WARPS - 1) / AMP_PREP2_WARPS < 65536)
+		amp_moe_prep2_kernel<<<1, AMP_PREP2_WARPS * 32, sh2, stream>>>(idx, w, A, K, E, e0, fe, order, tok, (__half *)wts, count, start,
+			inv, kind);
+	else
+		amp_moe_prep_kernel<<<1, AMP_PREP_THREADS, (size_t)(2 * (E + 1)) * 4, stream>>>(idx, w, A, K, E, e0, fe, order, tok,
+			(__half *)wts, count, start, inv, kind);
 
 	return (int)cudaGetLastError();
 }

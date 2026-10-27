@@ -8353,6 +8353,64 @@ torch_gguf_moe_prefill(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+extern "C" int amp_gguf_moe_prefill_pt(int t13, int t2, const void *y, const void *tok, const void *wts, const void *count, const void *start,
+	const void *p1, const void *p3, const void *p2, void *hbuf, void *out, void *wsc, int E, int H, int I, int max_rows, float lim, cudaStream_t stream);
+
+/* torch.gguf_moe_prefill_pt(y, tok, wts, count, start, pt1, pt3, pt2, type_gate_up, type_down, inter, limit): torch.gguf_moe_prefill over per-expert
+ * pointer tables (pt1 / pt3 gate / up, pt2 down: (E) int64 device pointers into VRAM or mapped host memory), any GGUF type; always the
+ * deterministic layout: -> (A, H) fp32, the routing-weighted output of every sorted slot, for torch.moe_gather. */
+static uc_value_t *
+torch_gguf_moe_prefill_pt(uc_vm_t *vm, size_t nargs)
+{
+	at::Tensor *y, *tok, *wts, *count, *start, *p1, *p3, *p2;
+	double lim;
+	int64_t I;
+	uc_value_t *t13v = uc_fn_arg(8), *t2v = uc_fn_arg(9);
+
+	if (nargs != 12 || !(y = tensor_arg(vm, uc_fn_arg(0))) || !(tok = tensor_arg(vm, uc_fn_arg(1))) || !(wts = tensor_arg(vm, uc_fn_arg(2))) ||
+	    !(count = tensor_arg(vm, uc_fn_arg(3))) || !(start = tensor_arg(vm, uc_fn_arg(4))) || !(p1 = tensor_arg(vm, uc_fn_arg(5))) ||
+	    !(p3 = tensor_arg(vm, uc_fn_arg(6))) || !(p2 = tensor_arg(vm, uc_fn_arg(7))) || ucv_type(t13v) != UC_STRING ||
+	    ucv_type(t2v) != UC_STRING || !arg_int(vm, uc_fn_arg(10), &I) || !arg_number(vm, uc_fn_arg(11), &lim))
+		RAISE("gguf_moe_prefill_pt: (y, tok, wts, count, start, pt1, pt3, pt2, type_gate_up, type_down, inter, limit)");
+
+	int q13 = gguf_qtype_id(ucv_string_get(t13v)), q2 = gguf_qtype_id(ucv_string_get(t2v));
+	size_t b, by;
+
+	if (q13 < 0 || q2 < 0 || st_dtype_info(ucv_string_get(t13v), &b, &by) || st_dtype_info(ucv_string_get(t2v), &b, &by))
+		RAISE("gguf_moe_prefill_pt: unsupported expert type");
+
+	if (y->scalar_type() != at::kHalf || y->dim() != 2 || !y->is_contiguous() || !y->is_cuda() || tok->scalar_type() != at::kLong ||
+	    wts->scalar_type() != at::kHalf || count->scalar_type() != at::kLong || start->scalar_type() != at::kLong ||
+	    p1->scalar_type() != at::kLong || p3->scalar_type() != at::kLong || p2->scalar_type() != at::kLong || p1->dim() != 1 ||
+	    p3->sizes() != p1->sizes() || p2->sizes() != p1->sizes() || count->numel() < p1->size(0) || start->numel() < p1->size(0) ||
+	    tok->numel() != wts->numel() || p1->get_device() != y->get_device() || tok->get_device() != y->get_device() ||
+	    p2->get_device() != y->get_device() || p3->get_device() != y->get_device() || I < 64)
+		RAISE("gguf_moe_prefill_pt: y (T, H) fp16; tok int64 / wts fp16 (A); count / start int64 (E + 1); pt1, pt3, pt2 int64 (E), on one device");
+
+	int64_t E = p1->size(0), H = y->size(1);
+
+	TensorDeviceGuard dg(*y);
+
+	try {
+		int64_t A = std::max<int64_t>(tok->numel(), 1);
+		at::Tensor out = at::empty({ A, H }, y->options().dtype(at::kFloat));
+		at::Tensor hbuf = at::empty({ A, I }, y->options());
+		at::Tensor wsc = at::empty({ 2 * 3 * 16 * H * I }, y->options());       // two buffers of PT_G experts' dequantized matrices
+		cudaStream_t st = c10::cuda::getCurrentCUDAStream().stream();
+		int rc = amp_gguf_moe_prefill_pt(q13, q2, y->data_ptr(), tok->data_ptr(), wts->data_ptr(), count->data_ptr(), start->data_ptr(),
+			p1->data_ptr(), p3->data_ptr(), p2->data_ptr(), hbuf.data_ptr(), out.data_ptr(), wsc.data_ptr(), (int)E, (int)H, (int)I, (int)y->size(0),
+			(float)lim, st);
+
+		if (!launch_ok(vm, rc, "gguf_moe_prefill_pt"))
+			return NULL;
+
+		return tensor_wrap(vm, std::move(out), 0);
+	}
+	catch (const std::exception &e) {
+		RAISE(e.what());
+	}
+}
+
 extern "C" int amp_gguf_embed(int qtype, const void *w, const void *ids, void *out, long nrows, long vocab, int K, cudaStream_t stream);
 
 /* torch.gguf_moe_gemv_pt(x, ids, ptrs, type, xdiv, nrows): x (R, K) fp16; ids (S) int64 global expert ids; ptrs (E)
@@ -12499,6 +12557,7 @@ static const uc_function_list_t torch_fns[] = {
 	{ "gguf_gate_up",	torch_gguf_gate_up },
 	{ "gguf_embed",	torch_gguf_embed },
 	{ "gguf_moe_prefill",	torch_gguf_moe_prefill },
+	{ "gguf_moe_prefill_pt",	torch_gguf_moe_prefill_pt },
 	{ "gguf_moe_gate_up",	torch_gguf_moe_gate_up },
 	{ "gguf_moe_group",	torch_gguf_moe_group },
 	{ "fp4_dequant",	torch_fp4_dequant },
