@@ -247,3 +247,38 @@ still cost ~0.4–0.5 GB of VRAM. With `AMP_QWEN4_EXPERT_RESIDENT=0.66`, `AMP_QW
 Q8 KV, chunk 4096, a 220k-token prompt gave PP 1196 tok/s and 20-token decode 19.9 tok/s (9 rounds, 56%
 accepted, 2.22 tok/round). Plain decode at the same context is faster (~24 tok/s at F = 0.70), so MTP is a
 win for short/medium contexts, not for 256k decode. At F = 0.70 with MTP the warm-up OOMs.
+
+## Serving the GGUF packs
+
+```sh
+ampstein --model /data/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS --ctx 262144 --cache-mode Q8 --chunk 4096 --mtp 4
+```
+
+That is all: no environment variables, no profile, no `--tp` (the GGUF path is the layer split; `--tp` is ignored with a
+warning). A model directory holds the `.gguf` shards (and `mtp-*.gguf`); the side files are optional.
+
+- **Side files.** `config.json`, `generation_config.json`, `chat_template.jinja` and `tokenizer.json` are written from the GGUF
+  metadata (`ggufmeta.uc`) when missing; files that exist are never touched. The result equals the original Hugging Face files
+  (`tests/ggufmeta.uc`: `text_config`, generation config, tokenizer vocabulary / merges / added tokens and token ids on real text),
+  except that the chat template is the GGUF's own, which can be newer than the repository's (it merges several system messages and
+  accepts a `developer` role). No vision tower: `vision_config` is left out.
+- **Expert placement.** `--expert-resident F` keeps the fraction F of the routed experts in VRAM, the rest in pinned host memory.
+  Left out, F follows from the VRAM: the weights may take 66% of it (`F = (0.66 * VRAM - dense weights) / expert bytes`, 0.65 for
+  the IQ3_XXS pack on 2 x 24 GB at 256k context). With MTP the draft head's experts stay in host memory (they do not fit next to
+  the cache at 256k); `--mtp 0` frees that room.
+- **Profile.** Which experts stay resident comes from a routing profile, `<model>/expert-profile.json`, and none is needed to start:
+  the router's picks are counted while serving (one `index_add_` per layer and step, also inside the decode graphs) and written
+  there every `--expert-profile-save` seconds (default 300); the next start places the experts by it. `--expert-profile FILE` names
+  another one to start from. A start without a profile places experts by index and decodes at ~25 tok/s; a matching profile 45-75.
+- **Online rebalancing.** Every `--expert-rebalance` seconds (default 120, 0 off), at the end of a request, the experts the router
+  picked most take the place of the least picked resident ones (`rebalance` in `qwen4_prof.uc`): an exchange copies the three
+  matrices between the host and VRAM stack on the compute stream and rewrites the two pointer-table entries (the captured decode
+  graphs read the table, they are not recaptured). An exchange (~0.2 ms) happens only if the expert gains at least 0.01 picks per
+  token over the one it replaces, which pays back within ~1200 decode tokens, a layer with fewer than 1000 counted tokens is left
+  alone, at most 1.5 s are spent per call, and the counts are multiplied by 0.7 afterwards so the placement follows the recent
+  workload. A cold start (no profile) did 3527 exchanges in 0.65 s after its first request: 25 -> 74 tok/s on the same prompt.
+  Exchanging on every decode step does not pay (an exchange moves ~3 MB each way, a miss costs ~85 us; section above).
+
+The `AMP_QWEN4_EXPERT_RESIDENT`, `AMP_QWEN4_MTP_EXPERT_RESIDENT`, `AMP_QWEN4_EXPERT_PROFILE` and `AMP_QWEN4_KV` variables still work
+as fallbacks for the options that are not given (tests, experiments).
+

@@ -23,6 +23,7 @@ import * as weights from './weights.uc';
 import * as qwen35 from './qwen35.uc';
 import * as glm5 from './glm5.uc';
 import * as ggufq from './ggufq.uc';
+import * as qprof from './qwen4_prof.uc';
 import * as math from 'math';
 import {readfile} from 'fs';
 
@@ -31,15 +32,44 @@ const NO_FUSED_MIX = (getenv('AMP_QWEN4_NO_FUSED_MIX') == '1');
 const QSA_REF = (getenv('AMP_QWEN4_QSA_REF') == '1');       // composite sparse attention instead of the kernel
 const MTP_TAP = (getenv('AMP_QWEN4_MTP_TAP') != '0');     // MTP input: per-stream (reference default) or averaged
 
+/* GGUF expert placement, set by the server from its options (configure(); the AMP_QWEN4_* variables are the fallback for
+ * tests and experiments): {resident: fraction in VRAM, mtp_resident, profile: file ranking the experts, count: count the
+ * router's picks, save: file the counts are written to (null: not written)} */
+let CONF = {};
+let PROF = null;                 // the profile read once: false when there is none
+let PROFILER = null;             // the live routing counters (qwen4_prof.uc)
+
+export function configure(o) {
+	CONF = o || {};
+	PROF = null;
+	PROFILER = null;
+}
+
 /* fraction of the routed experts kept in VRAM; the rest stay pinned on the host (GGUF only) */
 function expert_resident_fraction(layer) {
-	let v = (layer == null) ? getenv('AMP_QWEN4_MTP_EXPERT_RESIDENT') : getenv('AMP_QWEN4_EXPERT_RESIDENT');
+	let v = (layer == null) ? (CONF.mtp_resident ?? getenv('AMP_QWEN4_MTP_EXPERT_RESIDENT')) :
+		(CONF.resident ?? getenv('AMP_QWEN4_EXPERT_RESIDENT'));
 
 	// the draft head defaults to the backbone's fraction
 	if (v == null && layer == null)
-		v = getenv('AMP_QWEN4_EXPERT_RESIDENT');
+		v = CONF.resident ?? getenv('AMP_QWEN4_EXPERT_RESIDENT');
 
 	return (v == null) ? 1.0 : +v;
+}
+
+/* the profile (qwen4_prof.uc): the experts of `layer`, most picked first, or null */
+function profile_order(layer) {
+	if (PROF == null) {
+		let path = CONF.profile ?? getenv('AMP_QWEN4_EXPERT_PROFILE');
+
+		PROF = (path ? qprof.read(path) : null) ?? false;
+
+		if (path)
+			warn(PROF ? `qwen4: expert profile ${path} (${PROF.tokens ? PROF.tokens + ' tokens' : 'ranking only'})\n` :
+				`qwen4: expert profile ${path} not usable, experts placed by index\n`);
+	}
+
+	return PROF ? PROF.order[layer] : null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -830,12 +860,10 @@ function build_moe(ws, cfg, key, dev, layer) {
 		let E = cfg.n_routed_experts;
 		let f = expert_resident_fraction(layer);
 		let R = (f >= 1.0) ? E : max(1, min(E, int(E * f)));
-		let ids = [], cold_ids = [], prof = null;
-		let prof_path = getenv('AMP_QWEN4_EXPERT_PROFILE');
+		let ids = [], cold_ids = [];
 
-		if (prof_path && R < E && layer != null) {
-			prof = json(readfile(prof_path));
-			let p = prof[layer];
+		if (R < E && layer != null) {
+			let p = profile_order(layer);
 
 			if (p && length(p)) {
 				ids = slice(p, 0, min(R, length(p)));
@@ -905,6 +933,7 @@ function build_moe(ws, cfg, key, dev, layer) {
 		return {
 			type: 'moe', dev: dev, router: 'softmax', layer: layer,
 			gq: gq, gq_cold: gq_cold,
+			pt_host: {pt1: pt1, pt3: pt3, pt2: pt2},
 			pt1: torch.from_array(pt1, 'int64', 'cuda:' + dev),
 			pt3: torch.from_array(pt3, 'int64', 'cuda:' + dev),
 			pt2: torch.from_array(pt2, 'int64', 'cuda:' + dev),
@@ -1082,6 +1111,12 @@ export function build_layer_at(ws, cfg, key, type, dev, layer) {
 	L.attn_hc = build_gr(ws, cfg, key + '.attn_hyper_connection', dev, true);
 	L.mlp_hc = build_gr(ws, cfg, key + '.mlp_hyper_connection', dev, true);
 	L.moe = build_moe(ws, cfg, key + '.mlp', dev, layer);
+
+	// count the router's picks of the layers with host-resident experts (the profile of the next start)
+	if (CONF.count && layer != null && L.moe.gq_cold) {
+		PROFILER ??= qprof.create(cfg.n_routed_experts, cfg.num_experts_per_tok, PROF ? PROF.counts : null, PROF ? PROF.tokens : 0);
+		L.moe.prof = PROFILER.hook(layer, dev);
+	}
 
 	return L;
 }
@@ -1834,6 +1869,18 @@ export function load(model_dir, opts) {
 				f.drop_cache();
 		}
 	}
+
+	model.prof = PROFILER;
+
+	// move the experts the router picks most into VRAM (qwen4_prof.uc: rebalance), between two requests
+	model.rebalance = !PROFILER ? null : function (opts) {
+		let Ms = [];
+
+		for (let i = 0; i < nl; i++)
+			Ms[i] = model.layers[i].moe;
+
+		return PROFILER.rebalance(Ms, ggufq.swap_experts, ggufq.sync_tables, opts);
+	};
 
 	return model;
 }

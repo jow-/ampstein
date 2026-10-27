@@ -236,6 +236,42 @@ export function experts_host_mapped(ws, key, ids, dev) {
 	return gq;
 }
 
+/* Exchange the cold expert `a` (a row of the mapped host stack) with the resident expert `b` (a row of the VRAM stack) in a layer
+ * of qwen4.build_moe: the three matrices move on the compute stream (a decode graph replayed later sees the finished copies), the
+ * placement tables res_of / cold_of and the host mirrors of the pointer tables follow. Call sync_tables(M) after a batch. */
+export function swap_experts(M, a, b) {
+	let r = M.res_of[b], c = M.cold_of[a];
+
+	if (r == null || c == null || r < 0 || c < 0)
+		return false;
+
+	for (let m in [ 'w1', 'w3', 'w2' ]) {
+		let dst = M.gq[m].narrow(0, r, 1), src = M.gq_cold[m].narrow(0, c, 1);
+		let tmp = torch.empty(dst.shape(), 'uint8', 'cuda:' + M.dev);
+		let sz = M.gq[m].shape()[1] * M.gq[m].shape()[2];
+		let pt = M.pt_host['pt' + substr(m, 1)];
+
+		tmp.copy_(dst);
+		dst.copy_(src);
+		src.copy_(tmp);
+
+		pt[a] = M.gq[m].data_ptr() + r * sz;
+		pt[b] = M.gq_cold[m].data_ptr() + c * sz;
+	}
+
+	M.res_of[a] = r;
+	M.cold_of[a] = -1;
+	M.res_of[b] = -1;
+	M.cold_of[b] = c;
+
+	return true;
+}
+
+export function sync_tables(M) {
+	for (let t in [ 'pt1', 'pt3', 'pt2' ])
+		M[t].copy_(torch.from_array(M.pt_host[t], 'int64', 'cuda:' + M.dev));
+}
+
 /* The cold complement of `experts_pick`, pinned on the host, local index 0 .. n-1. */
 export function experts_host_pick(ws, key, ids) {
 	let gq = {host: true, e0: 0};
@@ -263,6 +299,9 @@ export function moe_forward(cfg, M, y, H) {
 	let gq = M.gq;
 	let T = y.shape()[0], Kt = cfg.num_experts_per_tok, Hd = cfg.hidden_size;
 	let r = H.route(cfg, M, y);
+
+	if (M.prof)
+		M.prof(r.idx);                 // the picks of this step, for the routing profile (qwen4_prof.uc)
 	let out, sh = null;
 
 	function shared() {

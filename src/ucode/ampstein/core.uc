@@ -13,7 +13,7 @@
 import * as struct from 'struct';
 import * as uloop from 'uloop';
 import * as math from 'math';
-import {readfile, writefile, unlink} from 'fs';
+import {readfile, writefile, unlink, stat} from 'fs';
 
 import * as httpd from './httpd.uc';
 import * as engine from './engine.uc';
@@ -27,6 +27,7 @@ import * as chat_gemma4 from './chat_gemma4.uc';
 import * as gemma4 from './gemma4.uc';
 import * as dsv41 from './dsv41.uc';
 import * as ggufw from './ggufw.uc';
+import * as ggufmeta from './ggufmeta.uc';
 import * as dsv41_spark from './dsv41_spark.uc';
 import * as dsv41_tp from './dsv41_tp.uc';
 import * as dsv41_spark_tp from './dsv41_spark_tp.uc';
@@ -199,6 +200,10 @@ export function worker(args) {
 export function serve(args) {
 	let served_name = args.name || basename(args.model);
 
+	// a directory with only the .gguf files: config, generation config, chat template and tokenizer come from their metadata
+	if (ggufw.is_gguf_dir(args.model))
+		ggufmeta.ensure(args.model);
+
 	let gen_cfg = {};
 
 	try {
@@ -354,6 +359,7 @@ export function serve(args) {
 		qwen4.set_kv_q8(true);      // the QSA K / V caches as int8 codes + a scale per 32 values
 
 	let model;
+	let profile_file = null;         // GGUF Qwen3.8-Flash-Next with host-resident experts: where the routing counts are written
 
 	let rpc_load = {};
 
@@ -425,7 +431,60 @@ export function serve(args) {
 		}
 	}
 	else if (Q4) {
-		if (args.expert_resident != null && args.expert_resident < 1.0 && !(args.tp && args.expert_profile)) {
+		const QGGUF = ggufw.is_gguf_dir(args.model);
+
+		if (QGGUF) {
+			// GGUF packs: layer split over the GPUs (no --tp), experts beyond --expert-resident in pinned host memory.
+			// Nothing else is needed: the resident fraction follows from the VRAM, the profile is optional (the
+			// routing is counted while serving and written next to the model, the next start places the experts by it)
+			if (args.tp) {
+				warn('ampstein: --tp is not available for GGUF models, the layers are split over the GPUs\n');
+				args.tp = false;
+			}
+
+			let frac = args.expert_resident;
+
+			if (type(frac) == 'array') {
+				warn('ampstein: --expert-resident takes one fraction for GGUF models\n');
+				exit(1);
+			}
+
+			if (frac == null) {
+				// weights may take ~66% of the VRAM (the rest: KV cache, prefill buffers, workspace; 2 x 24 GB at 256k
+				// context gives 0.66 for the IQ3_XXS pack, the largest setting measured to fit); the PLE table streams from disk
+				let gw = ggufw.open(args.model), exps = 0, dense = 0, vram = 0;
+
+				for (let k in gw.list()) {
+					let nb = gw.info(k).nbytes;
+
+					if (index(k, '.mlp.exps.') >= 0)
+						exps += nb;
+					else if (index(k, 'ple_table') < 0)
+						dense += nb;
+				}
+
+				for (let d = 0; d < args.gpus; d++)
+					vram += torch.mem_info(d)[3];
+
+				frac = (exps > 0) ? (0.66 * vram - dense) / exps : 1.0;
+				frac = (frac >= 1.0) ? 1.0 : max(0.1, int(frac * 100) / 100.0);
+
+				warn(`ampstein: --expert-resident ${frac} (experts ${sprintf('%.1f', exps / 1073741824.0)} GiB, rest ${sprintf('%.1f', dense / 1073741824.0)} GiB, VRAM ${sprintf('%.1f', vram / 1073741824.0)} GiB)\n`);
+			}
+
+			let prof_save = (args.expert_profile_save != null && args.expert_profile_save > 0) ?
+				args.model + '/expert-profile.json' : null;
+			let prof_in = args.expert_profile ?? ((prof_save && stat(prof_save)) ? prof_save : null);
+
+			// (the draft head's experts stay in host memory: they would not fit next to the cache at 256k; it reads ten of
+			// them per draft step over PCIe, which the rounds' speed-up still pays for)
+			qwen4.configure({resident: frac, mtp_resident: (args.mtp > 0 && frac < 1.0) ? 0.0 : null, profile: prof_in,
+				count: frac < 1.0 && (prof_save != null || args.expert_rebalance > 0), save: (frac < 1.0) ? prof_save : null});
+
+			if (frac < 1.0)
+				profile_file = prof_save;
+		}
+		else if (args.expert_resident != null && args.expert_resident < 1.0 && !(args.tp && args.expert_profile)) {
 			warn('ampstein: --expert-resident below 1 needs --tp and --expert-profile\n');
 			exit(1);
 		}
@@ -467,6 +526,48 @@ export function serve(args) {
 			warn(`ampstein: DFlash drafter loaded (window ${args.mtp})\n`);
 		}
 	}
+	// the routing counts of the experts (qwen4_prof.uc) go next to the model every --expert-profile-save seconds, at the end
+	// of a request (the device is idle then)
+	// (the first rebalance and the first write need no wait: a start without a profile gains most, a short session still leaves one)
+	let profile_saved = time() - (args.expert_profile_save ?? 0), rebalanced = time() - (args.expert_rebalance ?? 0);
+
+	// and the experts the router picks most move into VRAM every --expert-rebalance seconds (the placement follows the workload)
+	function rebalance_experts() {
+		if (!model.rebalance || !(args.expert_rebalance > 0) || time() - rebalanced < args.expert_rebalance)
+			return;
+
+		rebalanced = time();
+
+		try {
+			let r = model.rebalance({});
+
+			if (r.swaps > 0)
+				warn(`ampstein: experts rebalanced: ${r.swaps} of ${r.planned} exchanges in ${r.ms} ms, ` +
+					`expected ${sprintf('%.1f', r.gain)} fewer host reads per token\n`);
+		}
+		catch (e) {
+			warn(`ampstein: expert rebalance failed (${e.message}); not trying again\n`);
+			model.rebalance = null;
+		}
+	}
+
+	function save_profile(force) {
+		if (!model.prof || !profile_file || (!force && time() - profile_saved < args.expert_profile_save))
+			return;
+
+		profile_saved = time();
+
+		try {
+			let n = model.prof.dump(profile_file);
+
+			warn(`ampstein: expert profile written to ${profile_file} (${n} tokens)\n`);
+		}
+		catch (e) {
+			warn(`ampstein: expert profile not written (${e.message}); not trying again\n`);
+			profile_file = null;
+		}
+	}
+
 	let eng = engine.create(model, {
 		max_ctx: args.ctx,
 		prefill_chunk: args.chunk,
@@ -973,6 +1074,9 @@ export function serve(args) {
 
 	function log_done(kind, info) {
 		let t = info.timings;
+
+		rebalance_experts();
+		save_profile(false);
 
 		if (!t) {
 			warn(`${kind}: ${info.reason}\n`);

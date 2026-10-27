@@ -274,6 +274,8 @@ amp_test(engine_store_gemma4)
 amp_test(engine_store_gemma4_tp SCRIPT engine_store_gemma4 ENV "AMP_GEMMA4_TP=1")
 # qwen4_qsa_sel: decode token selection (DSA kernels) vs the composite chain
 amp_test(qwen4_qsa_sel)
+# ggufmeta: config / generation config / tokenizer / chat template made from the GGUF metadata vs the original files
+amp_test(ggufmeta)
 # qwen4_full: full model vs the oracle
 amp_test(qwen4_full)
 # qwen4_mtp: MTP head acceptance
