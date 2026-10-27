@@ -93,6 +93,13 @@ SIGTERM to `/tmp/Ampstein-cache-PORT.safetensors` (+ `.json`, and `.tree` for
 the entry form) and restores at the next start; the saved placement (GPUs,
 TP, stages, KV form) must match.
 
+Every state file starts with a **header** (a `header` tensor of JSON inside the safetensors): format version, form of the state
+(dense / entry), KV cache format (`FP16` / `Q8`), layer count, and what the server passes as `state_header` (a CRC-32 of the model
+directory's manifest, or of name + size + mtime for a single file; GPUs, TP, stages, KV bits where they shape the state). A restore
+whose engine differs in any of these, or a file without a header, is refused (`incompatible state file: kv was "Q8", is "FP16"`) and the
+file is kept for the server it belongs to. Token count, `--ctx` and the MTP window are not compared. The CRC is an accident detector,
+not a seal.
+
 - **Qwen3.5 family:** the dense form: token ids, attention KV (used part),
   GDN states, draft cache, last hidden. The prompt snapshot is not saved.
 - **GLM-5.3 (and any model with the store's entry layout):** the state the

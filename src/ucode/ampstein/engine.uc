@@ -3875,6 +3875,50 @@ export function create(model, opts) {
 	 * prefill instead of a snapshot rewind). Refuses while a job is
 	 * running (mid-job cache contents are inconsistent with ids).
 	 * Returns the number of tokens saved. */
+	/* The header of a state file: a small uint8 tensor `header` holding JSON, so it travels inside the file. It says
+	 * what the tensors mean (the engine's part: format, form of the state, KV cache format, layer count) and what
+	 * model and placement they came from (opts.state_header, given by the server: model fingerprint, GPUs, TP,
+	 * stages). A restore into an engine that differs in any of these is refused instead of resuming with a
+	 * mismatching or half-empty cache (an fp16 file into a Q8 cache would copy no KV at all). Not compared: token
+	 * count, context size, MTP window. */
+	const STATE_FORMAT = 2;
+
+	function kv_format() {
+		for (let l in cache.layers)
+			if (l.kq != null)
+				return 'Q8';
+
+		return 'FP16';
+	}
+
+	function state_header(kind, n) {
+		return {format: STATE_FORMAT, kind: kind, kv: kv_format(), layers: cfg.num_hidden_layers, ...(opts.state_header ?? {}), tokens: n};
+	}
+
+	function header_entry(kind, n) {
+		let txt = sprintf('%J', state_header(kind, n));
+
+		return [ 'header', torch.from_array(map(split(txt, ''), (c) => ord(c)), 'uint8') ];
+	}
+
+	function header_check(st, kind) {
+		if (index(st.list(), 'header') < 0)
+			die('engine.restore_state: incompatible state file: it has no header (written before state headers existed)');
+
+		let saved = json(chr(...st.tensor('header').tolist()));
+		let now = state_header(kind, 0);
+
+		for (let k in now) {
+			if (k == 'tokens')
+				continue;
+
+			if (sprintf('%J', saved[k]) != sprintf('%J', now[k]))
+				die(`engine.restore_state: incompatible state file: ${k} was ${sprintf('%J', saved[k])}, is ${sprintf('%J', now[k])}`);
+		}
+
+		return saved;
+	}
+
 	function save_state_dense(path) {
 		if (job)
 			die('engine.save_state: a job is running');
@@ -3920,6 +3964,7 @@ export function create(model, opts) {
 		if (M && last_hidden)
 			push(ents, [ 'last_hidden', last_hidden ]);
 
+		push(ents, header_entry('dense', length(ids)));
 		torch.st_save(path, ents);
 
 		return length(ids);
@@ -3937,6 +3982,8 @@ export function create(model, opts) {
 		let st = torch.st(path);
 		let names = st.list();
 		let has = (n) => index(names, n) >= 0;
+
+		header_check(st, 'dense');
 
 		if (!has('ids'))
 			die('engine.restore_state: no ids in file');
@@ -4116,6 +4163,7 @@ export function create(model, opts) {
 		let ents = [];
 		let tree = tree_pack({...e, slot: null}, ents);
 
+		push(ents, header_entry('entry', e.n));
 		torch.st_save(path, ents);
 		writefile(path + '.tree', sprintf('%J', tree));
 
@@ -4138,7 +4186,11 @@ export function create(model, opts) {
 		if (job)
 			die('engine.restore_state: a job is running');
 
-		let e = tree_unpack(json(tree), torch.st(path));
+		let st = torch.st(path);
+
+		header_check(st, 'entry');
+
+		let e = tree_unpack(json(tree), st);
 
 		if (type(e) != 'object' || type(e.ids) != 'array' || !(e.n > 0))
 			die('engine.restore_state: malformed entry');

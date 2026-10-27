@@ -114,12 +114,12 @@ function same_head(a, b) {
 {
 	let W = +(getenv('AMP_STORE_W') || 0);
 
-	let eng;
+	let eng, hdr = { model: 'test-model' };
 
 	// (one 24 GB card: an engine from an earlier run must be collected before the next one allocates its caches;
 	// one cache mode and window per process, a second model or window does not fit next to the garbage)
 	let mk = () => { eng = null; gc(); return engine.create(model, { max_ctx: 8192, prefill_chunk: 512, mtp_window: W,
-		warmup: false, cache_ram: 6 }); };
+		warmup: false, cache_ram: 6, state_header: hdr }); };
 
 	// A's generation defines the A2 / A3 prompts
 	eng = mk();
@@ -206,6 +206,28 @@ function same_head(a, b) {
 			hx.info.reuse == 'live' && hx.info.cached_tokens >= length(A), `${hx.info.reuse} ${hx.info.cached_tokens}`);
 		check(`${Q8 ? 'Q8' : 'fp16'} W=${W}: hot reload: the continuation equals the original engine's`,
 			same_head(hx.toks, hr.toks) == length(hr.toks), `${same_head(hx.toks, hr.toks)} of ${length(hr.toks)}`);
+
+		// an engine of another model, and a file without a header, refuse the state instead of resuming from it
+		let refuse = function(name, what) {
+			let msg = null;
+
+			try {
+				eng.restore_state(path);
+			}
+			catch (err) {
+				msg = err.message;
+			}
+
+			check(`${Q8 ? 'Q8' : 'fp16'} W=${W}: hot reload: ${name} is refused`,
+				msg != null && index(msg, 'incompatible state file') >= 0 && index(msg, what) >= 0, msg);
+		};
+
+		hdr.model = 'another-model';     // (the engine reads the header object when it saves and restores)
+		refuse('a state of another model', 'model');
+
+		hdr.model = 'test-model';
+		torch.st_save(path, [ [ 'ids', torch.from_array(H2, 'int64') ] ]);
+		refuse('a state file without a header', 'no header');
 	}
 }
 }

@@ -680,6 +680,31 @@ export function serve(args) {
 		}
 	}
 
+	/* identity of the loaded model for hot-reload files: a CRC-32 (an accident detector, not a seal) of the manifest of
+	 * its directory (names, sizes, safetensors header lengths), or of name, size and mtime of a single file */
+	function crc32(str) {
+		let c = 0xffffffff;
+
+		for (let i = 0; i < length(str); i++) {
+			c ^= ord(str, i);
+
+			for (let k = 0; k < 8; k++)
+				c = (c & 1) ? ((c >> 1) ^ 0xedb88320) : (c >> 1);
+		}
+
+		return sprintf('%08x', c ^ 0xffffffff);
+	}
+
+	function model_fingerprint() {
+		let st = stat(args.model);
+
+		return crc32((st && st.type == 'file') ? `${args.model}:${st.size}:${st.mtime}` : rpc.manifest(args.model).id);
+	}
+
+	const layout = (GLM || Q4) ? {gpus: args.gpus, tp: !!args.tp, stages: args.stages ?? 0, kv_bits: kv_bits ?? 0} :
+		GEM ? {gpus: args.gpus, tp: !!args.tp} : {};
+	let state_header = {model: model_fingerprint(), ...layout};
+
 	let eng = engine.create(model, {
 		max_ctx: args.ctx,
 		prefill_chunk: args.chunk,
@@ -689,6 +714,7 @@ export function serve(args) {
 		draft_vocab: args.draft_vocab,
 		warmup: args.warmup,
 		cache_ram: args.cache_ram,
+		state_header: state_header,           // what a hot-reload file must match (model files, placement)
 		remote_key: `${args.port}`,           // names the worker's half of a saved state (hot reload)
 		cache_quant: args.cache_quant,
 		slots: args.fit_probe ? 0 : args.slots,
@@ -739,9 +765,6 @@ export function serve(args) {
 	 * The port-qualified path keeps concurrent servers apart. */
 	const CACHE_ST = `/tmp/Ampstein-cache-${args.port}.safetensors`;
 	const CACHE_META = `${CACHE_ST}.json`;
-	const layout = (GLM || Q4) ? {gpus: args.gpus, tp: !!args.tp, stages: args.stages ?? 0, kv_bits: kv_bits ?? 0} :
-		GEM ? {gpus: args.gpus, tp: !!args.tp} : {};
-
 	(function restore_cache() {
 		let meta;
 
@@ -775,6 +798,10 @@ export function serve(args) {
 		}
 		catch (e) {
 			warn(`ampstein: cache restore failed: ${e.message}\n`);
+
+			// a file of another model or setting stays for the server it belongs to
+			if (index(e.message, 'incompatible state file') >= 0)
+				return;
 
 			try {
 				unlink(CACHE_ST);
