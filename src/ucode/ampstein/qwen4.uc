@@ -45,7 +45,10 @@ export function configure(o) {
 	PROFILER = null;
 }
 
-/* fraction of the routed experts kept in VRAM; the rest stay pinned on the host (GGUF only) */
+let LAYER_DEV = [];              // device of every layer (set by load), for per-GPU resident fractions
+
+/* fraction of the routed experts kept in VRAM; the rest stay pinned on the host (GGUF only). CONF.resident is one
+ * fraction or one per GPU (the last GPU also carries lm_head and the draft head, so it usually takes fewer) */
 function expert_resident_fraction(layer) {
 	let v = (layer == null) ? (CONF.mtp_resident ?? getenv('AMP_QWEN4_MTP_EXPERT_RESIDENT')) :
 		(CONF.resident ?? getenv('AMP_QWEN4_EXPERT_RESIDENT'));
@@ -54,7 +57,50 @@ function expert_resident_fraction(layer) {
 	if (v == null && layer == null)
 		v = CONF.resident ?? getenv('AMP_QWEN4_EXPERT_RESIDENT');
 
+	if (type(v) == 'array') {
+		let d = (layer == null) ? length(v) - 1 : LAYER_DEV[layer];
+
+		v = v[min(d ?? length(v) - 1, length(v) - 1)];
+	}
+
 	return (v == null) ? 1.0 : +v;
+}
+
+/* Placement numbers of a loaded GGUF model for the fit survey (fit.uc): per GPU the layer count, the bytes of all routed
+ * experts of its layers and the bytes of those resident now (the backbone's experts, not the draft head's). */
+export function fit_info(model) {
+	let out = [];
+
+	for (let i = 0; i < model.nl; i++) {
+		let L = model.layers[i], M = L.moe;
+
+		if (!M || !M.gq)
+			continue;
+
+		let E = M.n_experts_total, R = M.gq.w1.shape()[0];
+		let per = M.gq.w1.shape()[1] * M.gq.w1.shape()[2] + M.gq.w3.shape()[1] * M.gq.w3.shape()[2] +
+			M.gq.w2.shape()[1] * M.gq.w2.shape()[2];
+		let o = out[L.dev];
+
+		if (!o)
+			o = out[L.dev] = {layers: 0, all: 0, resident: 0};
+
+		o.layers++;
+		o.all += E * per;
+		o.resident += R * per;
+	}
+
+	return out;
+}
+
+/* true when some layer keeps routed experts on the host */
+function any_cold() {
+	let v = CONF.resident ?? getenv('AMP_QWEN4_EXPERT_RESIDENT');
+
+	if (type(v) == 'array')
+		return length(filter(v, (x) => +x < 1.0)) > 0;
+
+	return v != null && +v < 1.0;
 }
 
 /* the profile (qwen4_prof.uc): the experts of `layer`, most picked first, or null */
@@ -1486,6 +1532,9 @@ export function load(model_dir, opts) {
 	let cfg = load_config(model_dir);
 	let ws = weights.open(model_dir);
 	let devs = dev_list(cfg, opts.devices);
+
+	LAYER_DEV = devs;
+
 	let nl = opts.layers || cfg.num_hidden_layers;    // partial models for tests
 	let partial = nl < cfg.num_hidden_layers;
 	let first_dev = devs[0], last_dev = devs[cfg.num_hidden_layers - 1];
@@ -1495,7 +1544,7 @@ export function load(model_dir, opts) {
 			let rest = substr(key, length(LP));
 			let idx = +substr(rest, 0, index(rest, '.'));
 
-			if (expert_resident_fraction() < 1.0 && index(rest, '.mlp.exps.') >= 0)
+			if (any_cold() && index(rest, '.mlp.exps.') >= 0)
 				return null;
 
 			return (idx >= 0 && idx < nl) ? devs[idx] : null;

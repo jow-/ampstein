@@ -35,6 +35,10 @@ function usage() {
 	printf("  --ctx N               context length (default 65536)\n");
 	printf("  --gpus N              number of GPUs (default: all)\n");
 	printf("  --split N             layers per GPU (layer split)\n");
+	printf("  --survey              find the launch line that fits the GPUs (GGUF Qwen3.8-Flash-Next): probes with the given\n");
+	printf("                        options, steps down --chunk, --cache-mode, --mtp, --ctx until it fits, prints the line, exits\n");
+	printf("  --survey-margin MiB   VRAM kept free per GPU after the warm-up (default 1024)\n");
+	printf("  --survey-min-resident F  smallest resident-expert fraction accepted before a feature is given up (default 0.3)\n");
 	printf("  --chunk N             prefill chunk size (default 1024; 4096 for Qwen --tp)\n");
 	printf("  --mtp N               speculative MTP window (default 3; 7 with --dflash)\n");
 	printf("  --lookup N            prompt-lookup drafts: verify up to N tokens copied from earlier text (GLM, default 0)\n");
@@ -231,6 +235,10 @@ function parse_args() {
 		case '--rpc-name': a.rpc_name = v; i++; break;
 		case '--dspark-window': a.dspark_window = int(v); i++; break;
 		case '--layer-split': a.layer_split = true; break;
+		case '--fit-probe': a.fit_probe = true; break;
+		case '--survey': a.survey = true; break;
+		case '--survey-margin': a.survey_margin = int(v); i++; break;
+		case '--survey-min-resident': a.survey_min_resident = +v; i++; break;
 		default:
 			warn(`unknown argument '${k}'\n`);
 			exit(1);
@@ -259,6 +267,10 @@ if (args.model == null) {
 const root = sourcepath(0, true) + '/..';
 
 push(REQUIRE_SEARCH_PATH, root + '/lib/*.so', root + '/share/*.uc');
+
+// the survey runs the server as child processes and must not hold a CUDA context itself
+if (args.survey)
+	exit(import('ampstein.fit').run(args, {script: sourcepath(0), argv: ARGV}));
 
 global.torch = require('ampstein.torch');
 

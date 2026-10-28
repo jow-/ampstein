@@ -530,10 +530,19 @@ export function serve(args) {
 				args.tp = false;
 			}
 
+			// --fit-probe (the survey's child, fit.uc): the experts at their floor unless the survey names a placement
+			if (args.fit_probe && args.expert_resident == null) {
+				args.expert_resident = [];
+
+				for (let d = 0; d < args.gpus; d++)
+					push(args.expert_resident, 0.0);
+			}
+
 			let frac = args.expert_resident;
 
-			if (type(frac) == 'array') {
-				warn('ampstein: --expert-resident takes one fraction for GGUF models\n');
+			// one fraction, or one per GPU (--expert-resident 0.7,0.6): the last GPU also holds lm_head and the draft head
+			if (type(frac) == 'array' && length(frac) != args.gpus) {
+				warn(`ampstein: --expert-resident needs one fraction or ${args.gpus} (one per GPU) for GGUF models\n`);
 				exit(1);
 			}
 
@@ -566,10 +575,12 @@ export function serve(args) {
 
 			// (the draft head's experts stay in host memory: they would not fit next to the cache at 256k; it reads ten of
 			// them per draft step over PCIe, which the rounds' speed-up still pays for)
-			qwen4.configure({resident: frac, mtp_resident: (args.mtp > 0 && frac < 1.0) ? 0.0 : null, profile: prof_in,
-				count: frac < 1.0 && (prof_save != null || args.expert_rebalance > 0), save: (frac < 1.0) ? prof_save : null});
+			let cold = (type(frac) == 'array') ? length(filter(frac, (x) => x < 1.0)) > 0 : frac < 1.0;
 
-			if (frac < 1.0)
+			qwen4.configure({resident: frac, mtp_resident: (args.mtp > 0 && cold) ? 0.0 : null, profile: prof_in,
+				count: cold && (prof_save != null || args.expert_rebalance > 0), save: cold ? prof_save : null});
+
+			if (cold)
 				profile_file = prof_save;
 		}
 		else if (args.expert_resident != null && args.expert_resident < 1.0 && !(args.tp && args.expert_profile)) {
@@ -667,12 +678,26 @@ export function serve(args) {
 		cache_ram: args.cache_ram,
 		remote_key: `${args.port}`,           // names the worker's half of a saved state (hot reload)
 		cache_quant: args.cache_quant,
-		slots: args.slots,
+		slots: args.fit_probe ? 0 : args.slots,
 		slot_margin: args.slot_margin,
 		slice_ms: args.slice_ms,
 		slice_tokens: args.slice_tokens,
 		graphs: ((GLM || Q4) && getenv('AMP_GLM5_NO_GRAPHS')) ? false : null
 	});
+
+	if (args.fit_probe) {
+		// the survey child stops here: the weights, caches and the warm-up's working set are in place, report what is left
+		let gpus = [];
+
+		for (let d = 0; d < args.gpus; d++) {
+			let mi = torch.mem_info(d);
+
+			push(gpus, {free: mi[2], total: mi[3]});
+		}
+
+		printf('AMP_FIT %J\n', {gpus: gpus, experts: Q4 ? qwen4.fit_info(model) : null, experts_total: null});
+		exit(0);
+	}
 
 	let banner = `ampstein: model loaded in ${time() - t0}s`;
 
