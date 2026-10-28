@@ -29,7 +29,9 @@ enum {
 	AMP_Q_Q8_0, AMP_Q_IQ4_NL, AMP_Q_Q5_K, AMP_Q_IQ2_XXS, AMP_Q_IQ2_XS, AMP_Q_IQ1_M, AMP_Q_IQ1_S,
 	AMP_Q_Q2_0, AMP_Q_Q4_K, AMP_Q_Q3_K, AMP_Q_Q6_K, AMP_Q_IQ2_S, AMP_Q_IQ3_XXS, AMP_Q_IQ3_S, AMP_Q_IQ4_XS,
 	AMP_Q_Q4_0,
+#ifdef AMPSTEIN_ROCM
 	AMP_Q_Q2_K,
+#endif
 };
 
 struct amp_qinfo {
@@ -49,7 +51,9 @@ static __host__ __device__ constexpr amp_qinfo amp_qtype_info(int t)
 	case AMP_Q_IQ1_M:   return { 256, 56 };
 	case AMP_Q_IQ1_S:   return { 256, 50 };
 	case AMP_Q_Q2_0:    return { 64, 18 };
+#ifdef AMPSTEIN_ROCM
 	case AMP_Q_Q2_K:    return { 256, 84 };
+#endif
 	case AMP_Q_Q4_K:    return { 256, 144 };
 	case AMP_Q_Q3_K:    return { 256, 110 };
 	case AMP_Q_Q6_K:    return { 256, 210 };
@@ -227,6 +231,7 @@ template <> __device__ void amp_dq_group<AMP_Q_Q2_0>(const uint8_t *b, int g, fl
 	}
 }
 
+#ifdef AMPSTEIN_ROCM
 /* Q2_K: scales[16] (4-bit scale | 4-bit min per 16 weights), qs[64] (2-bit values), d f16, dmin f16. */
 template <> __device__ void amp_dq_group<AMP_Q_Q2_K>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
 {
@@ -241,6 +246,7 @@ template <> __device__ void amp_dq_group<AMP_Q_Q2_K>(const uint8_t *b, int g, fl
 	for (int l = 0; l < 8; l++)
 		v[l] = dl * (float)((q[l] >> (2 * j)) & 3) - ml;
 }
+#endif
 
 template <> __device__ void amp_dq_group<AMP_Q_Q4_K>(const uint8_t *b, int g, float *v, const void *gr, const uint8_t *sg)
 {
@@ -481,7 +487,9 @@ amp_gguf_dequant(int qtype, int odt, const void *x, void *y, long nblocks, cudaS
 	AMP_DQ_CASE(AMP_Q_IQ1_M);
 	AMP_DQ_CASE(AMP_Q_IQ1_S);
 	AMP_DQ_CASE(AMP_Q_Q2_0);
+#ifdef AMPSTEIN_ROCM
 	AMP_DQ_CASE(AMP_Q_Q2_K);
+#endif
 	AMP_DQ_CASE(AMP_Q_Q4_K);
 	AMP_DQ_CASE(AMP_Q_Q3_K);
 	AMP_DQ_CASE(AMP_Q_Q6_K);
@@ -663,7 +671,9 @@ amp_gguf_gemv(int qtype, const void *x, const void *w, const void *ids, void *ou
 	AMP_GV_CASE(AMP_Q_IQ1_M);
 	AMP_GV_CASE(AMP_Q_IQ1_S);
 	AMP_GV_CASE(AMP_Q_Q2_0);
+#ifdef AMPSTEIN_ROCM
 	AMP_GV_CASE(AMP_Q_Q2_K);
+#endif
 	AMP_GV_CASE(AMP_Q_Q4_K);
 	AMP_GV_CASE(AMP_Q_Q3_K);
 	AMP_GV_CASE(AMP_Q_Q6_K);
@@ -702,7 +712,9 @@ amp_gguf_gemv_pt(int qtype, const void *x, const void *ptrs, const void *ids, vo
 	AMP_GV_PT_CASE(AMP_Q_IQ1_M);
 	AMP_GV_PT_CASE(AMP_Q_IQ1_S);
 	AMP_GV_PT_CASE(AMP_Q_Q2_0);
+#ifdef AMPSTEIN_ROCM
 	AMP_GV_PT_CASE(AMP_Q_Q2_K);
+#endif
 	AMP_GV_PT_CASE(AMP_Q_Q4_K);
 	AMP_GV_PT_CASE(AMP_Q_Q3_K);
 	AMP_GV_PT_CASE(AMP_Q_Q6_K);
@@ -925,6 +937,7 @@ static __device__ inline int2 amp_iq4_lut(int q4)
 #endif
 }
 
+#ifdef AMPSTEIN_ROCM
 /* Q2_K: an item is 32 weights = bytes qs[32n .. 32n + 31] >> (2 * jj) & 3 (n = the 128-weight half, jj = the item in it), two 16-weight halves
  * with a scale (low nibble) and a minimum (high nibble) each: weights = d * sc * q - dmin * m. mult[] = the scales (per 8 weights), dlt[] = the
  * minimums times dmin; the dot product subtracts dlt * (sum of the activations), as IQ1's does. */
@@ -948,6 +961,7 @@ template <> __device__ float amp_dec32_i8<AMP_Q_Q2_K>(const uint8_t *b, int j, i
 
 	return amp_h2f(b + 80);
 }
+#endif
 
 /* Q4_K: Q5_K without the fifth bit (the nibbles are at b + 16). IQ4_XS: an item is a 32-weight sub-block with one 6-bit scale; the weights are
  * the table values of the nibbles of qs[16 j ..] (low nibbles: weights 0 .. 15, high: 16 .. 31). IQ4_NL: the same for a whole 18-byte block. */
@@ -1189,11 +1203,20 @@ __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const flo
                                         void *__restrict__ out, int M, int N, int K, int xdiv, int G, float lim, int e0, int ne,
                                         const long long *__restrict__ ptrs, const long long *__restrict__ ptrs_up)
 {
+#ifdef AMPSTEIN_ROCM
 	constexpr int bytes = amp_qbytes(T);
+#else
+	constexpr int bytes = T == AMP_Q_Q8_0 ? 34 : T == AMP_Q_Q5_K ? 176 : T == AMP_Q_IQ2_XXS ? 66 : T == AMP_Q_IQ2_XS ? 74 : T == AMP_Q_IQ1_S ? 50 : T == AMP_Q_Q6_K ? 210 : T == AMP_Q_Q4_K ? 144 : T == AMP_Q_IQ4_XS ? 136 : T == AMP_Q_IQ4_NL ? 18 : T == AMP_Q_Q2_0 ? 18 : T == AMP_Q_IQ3_XXS ? 98 : T == AMP_Q_IQ3_S ? 110 : T == AMP_Q_IQ2_S ? 82 : 56;
+#endif
 	constexpr int IPB = (T == AMP_Q_Q8_0 || T == AMP_Q_IQ4_NL) ? 1 : T == AMP_Q_Q2_0 ? 2 : 8;                    /* items of 32 weights per block */
 	constexpr bool AFFINE = T == AMP_Q_Q8_0 || T == AMP_Q_Q5_K || T == AMP_Q_Q4_K;
 	constexpr int ITER = amp_gemv_iter(T);
-	constexpr bool NOLUT = AFFINE || T == AMP_Q_Q2_K || T == AMP_Q_Q6_K || T == AMP_Q_IQ4_XS || T == AMP_Q_IQ4_NL || T == AMP_Q_Q2_0;   /* (no lookup tables) */
+#ifdef AMPSTEIN_ROCM
+	constexpr bool Q2K = T == AMP_Q_Q2_K;
+#else
+	constexpr bool Q2K = false;
+#endif
+	constexpr bool NOLUT = AFFINE || Q2K || T == AMP_Q_Q6_K || T == AMP_Q_IQ4_XS || T == AMP_Q_IQ4_NL || T == AMP_Q_Q2_0;   /* (no lookup tables) */
 	constexpr int NGRID = NOLUT ? 0 : T == AMP_Q_IQ2_XXS ? 256 : T == AMP_Q_IQ2_XS ? 512 : T == AMP_Q_IQ3_XXS ? 128 : T == AMP_Q_IQ3_S ? 256 : T == AMP_Q_IQ2_S ? 1024 : 2048;
 	__shared__ uint64_t s_grid[NGRID ? NGRID : 1];
 #ifdef AMPSTEIN_ROCM
@@ -1409,7 +1432,7 @@ __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const flo
 								const int sx = __dp4a(0x01010101, xv[m][2 * l], 0) + __dp4a(0x01010101, xv[m][2 * l + 1], 0);
 
 								sf += (float)mult[l] * ((float)ig + dlt[l] * (float)sx);
-							} else if (T == AMP_Q_Q2_K) {
+							} else if (Q2K) {
 								const int sx = __dp4a(0x01010101, xv[m][2 * l], 0) + __dp4a(0x01010101, xv[m][2 * l + 1], 0);
 
 								s += mult[l] * ig;
@@ -1419,7 +1442,7 @@ __global__ void amp_gguf_gemv_i8_kernel(const int8_t *__restrict__ xq, const flo
 							}
 						}
 
-						accv[m] += T == AMP_Q_Q2_K ? (ds * (float)s - sf) * xsc[m] : (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S ? sf : (float)s) * ds * xsc[m];
+						accv[m] += Q2K ? (ds * (float)s - sf) * xsc[m] : (T == AMP_Q_IQ1_M || T == AMP_Q_IQ1_S ? sf : (float)s) * ds * xsc[m];
 					}
 				}
 			}
@@ -1518,7 +1541,12 @@ amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const
 {
 	const bool moe = ids != NULL;
 
-	if (qtype != AMP_Q_IQ2_XXS && qtype != AMP_Q_IQ2_XS && qtype != AMP_Q_IQ1_M && qtype != AMP_Q_IQ1_S && qtype != AMP_Q_Q5_K && qtype != AMP_Q_Q6_K && qtype != AMP_Q_Q4_K && qtype != AMP_Q_IQ4_XS && qtype != AMP_Q_IQ4_NL && qtype != AMP_Q_Q2_0 && qtype != AMP_Q_Q2_K && qtype != AMP_Q_IQ3_XXS && qtype != AMP_Q_IQ3_S && qtype != AMP_Q_IQ2_S && qtype != AMP_Q_Q8_0)
+#ifdef AMPSTEIN_ROCM
+	const bool q2k = qtype == AMP_Q_Q2_K;
+#else
+	const bool q2k = false;
+#endif
+	if (qtype != AMP_Q_IQ2_XXS && qtype != AMP_Q_IQ2_XS && qtype != AMP_Q_IQ1_M && qtype != AMP_Q_IQ1_S && qtype != AMP_Q_Q5_K && qtype != AMP_Q_Q6_K && qtype != AMP_Q_Q4_K && qtype != AMP_Q_IQ4_XS && qtype != AMP_Q_IQ4_NL && qtype != AMP_Q_Q2_0 && qtype != AMP_Q_IQ3_XXS && qtype != AMP_Q_IQ3_S && qtype != AMP_Q_IQ2_S && qtype != AMP_Q_Q8_0 && !q2k)
 		return (int)cudaErrorNotSupported;
 
 	if (N < 1 || K < amp_qtype_info(qtype).block || (K % amp_qtype_info(qtype).block) || (!moe && (M < 1 || M > 8)) ||
@@ -1611,8 +1639,10 @@ amp_gguf_gemv_i8(int qtype, const void *xq, const void *xs, const void *w, const
 		AMP_I8_LAUNCH(AMP_Q_IQ3_S);
 	else if (qtype == AMP_Q_IQ2_S)
 		AMP_I8_LAUNCH(AMP_Q_IQ2_S);
+#ifdef AMPSTEIN_ROCM
 	else if (qtype == AMP_Q_Q2_K)
 		AMP_I8_LAUNCH(AMP_Q_Q2_K);
+#endif
 	else
 		AMP_I8_LAUNCH(AMP_Q_Q8_0);
 #undef AMP_I8_K
@@ -2012,7 +2042,11 @@ amp_gguf_pt_dequant(int t, const long long *ptr, const long long *count, __half 
 	switch (t) {
 	AMP_PTDQ_CASE(AMP_Q_Q4_0); AMP_PTDQ_CASE(AMP_Q_Q8_0); AMP_PTDQ_CASE(AMP_Q_IQ4_NL); AMP_PTDQ_CASE(AMP_Q_Q5_K);
 	AMP_PTDQ_CASE(AMP_Q_IQ2_XXS); AMP_PTDQ_CASE(AMP_Q_IQ2_XS); AMP_PTDQ_CASE(AMP_Q_IQ1_M); AMP_PTDQ_CASE(AMP_Q_IQ1_S);
-	AMP_PTDQ_CASE(AMP_Q_Q2_0); AMP_PTDQ_CASE(AMP_Q_Q2_K); AMP_PTDQ_CASE(AMP_Q_Q4_K); AMP_PTDQ_CASE(AMP_Q_Q3_K); AMP_PTDQ_CASE(AMP_Q_Q6_K);
+	AMP_PTDQ_CASE(AMP_Q_Q2_0);
+#ifdef AMPSTEIN_ROCM
+	AMP_PTDQ_CASE(AMP_Q_Q2_K);
+#endif
+	AMP_PTDQ_CASE(AMP_Q_Q4_K); AMP_PTDQ_CASE(AMP_Q_Q3_K); AMP_PTDQ_CASE(AMP_Q_Q6_K);
 	AMP_PTDQ_CASE(AMP_Q_IQ2_S); AMP_PTDQ_CASE(AMP_Q_IQ3_XXS); AMP_PTDQ_CASE(AMP_Q_IQ3_S); AMP_PTDQ_CASE(AMP_Q_IQ4_XS);
 	default: return (int)cudaErrorNotSupported;
 	}
@@ -2471,7 +2505,9 @@ amp_gguf_embed(int qtype, const void *w, const void *ids, void *out, long nrows,
 	AMP_EMB_CASE(AMP_Q_IQ1_M);
 	AMP_EMB_CASE(AMP_Q_IQ1_S);
 	AMP_EMB_CASE(AMP_Q_Q2_0);
+#ifdef AMPSTEIN_ROCM
 	AMP_EMB_CASE(AMP_Q_Q2_K);
+#endif
 	AMP_EMB_CASE(AMP_Q_Q4_K);
 	AMP_EMB_CASE(AMP_Q_Q3_K);
 	AMP_EMB_CASE(AMP_Q_Q6_K);
