@@ -350,8 +350,9 @@ export function create(model, opts) {
 	let gdn_layers = [];
 
 	// The turn checkpoint is the generic path's (per-layer states + KV rewind by length);
-	// models with their own cache export or aux recurrent state keep one snapshot
-	const TS_OK = !model.aux_get && !model.cache_export;
+	// models with their own cache export keep one snapshot; aux recurrent state (qwen4's PLE
+	// layer) rides along with the checkpoint (tsnap_aux)
+	const TS_OK = !model.cache_export;
 
 	/* GPU completion notifier + pinned result buffers for the async
 	 * decode loop (see the async sampling section above). The engine
@@ -460,6 +461,7 @@ export function create(model, opts) {
 	let snap_ids = null;   // token prefix the snapshot represents
 	let tsnap_ids = null;  // ... the turn checkpoint (always a prefix of `ids`, else null)
 	let tsnap_hidden = null;
+	let tsnap_aux = null;  // model.aux_get() state at the turn checkpoint
 
 	// CUDA-graph decode steps (opts.graphs != false): sizes 1 (plain
 	// decode) and 1..W (MTP verify windows and replays). Captured now,
@@ -735,6 +737,9 @@ export function create(model, opts) {
 		snap_ids = null;
 		snap_hidden = null;
 		snap_aux = null;
+
+		if (model.aux_set && tsnap_aux)
+			model.aux_set(cache, tsnap_aux);
 
 		if (DF) {
 			DF.reset();
@@ -1668,6 +1673,9 @@ export function create(model, opts) {
 
 				if (tsnap_hidden)
 					e.tsnap_hid = to_host(tsnap_hidden, e);
+
+				if (model.aux_get && tsnap_aux)
+					e.tsnap_aux = aux_to_host(tsnap_aux, e);
 			}
 
 			if (slot) {
@@ -1801,6 +1809,7 @@ export function create(model, opts) {
 
 			tsnap_ids = slice(e.tsnap_ids);
 			tsnap_hidden = e.tsnap_hid ? e.tsnap_hid.cuda(M.dev) : null;
+			tsnap_aux = e.tsnap_aux || null;
 		}
 		else {
 			tsnap_ids = null;
@@ -2218,6 +2227,7 @@ export function create(model, opts) {
 		j.tcut = t_at;
 		j.tsnap_taken = false;
 		j.tsnap_hid = null;
+		j.tsnap_aux = null;
 
 		let cuts = [];
 
@@ -2259,6 +2269,9 @@ export function create(model, opts) {
 				}
 			},
 			on_aux: function (chunk_end) {
+				if (t_at && chunk_end == t_at && model.aux_get)
+					j.tsnap_aux = model.aux_get(cache);
+
 				if (snap_at && chunk_end == snap_at && model.aux_get) {
 					j.snap_aux = model.aux_get(cache);
 
@@ -3365,6 +3378,7 @@ export function create(model, opts) {
 			if (j.tsnap_taken) {
 				tsnap_ids = slice(j.ids, 0, j.tcut);
 				tsnap_hidden = (j.use_mtp && !DF) ? j.tsnap_hid : null;
+				tsnap_aux = j.tsnap_aux;
 			}
 
 			j.tsnap_hid = null;
