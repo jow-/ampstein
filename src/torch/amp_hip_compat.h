@@ -152,6 +152,19 @@ typedef hipError_t cudaError_t;
 #define __shfl_up_sync(mask, var, delta) __shfl_up((var), (delta))
 #define __shfl_down_sync(mask, var, delta) __shfl_down((var), (delta))
 
+// Full-mask vote / match (the callers pass 0xffffffffu; gfx1100 runs wave32, so the ballot fits 32 bits).
+#define __ballot_sync(mask, pred) ((unsigned)__ballot((pred)))
+static __device__ __forceinline__ unsigned amp_match_any(unsigned v)
+{
+	unsigned r = 0;
+
+	for (unsigned l = 0; l < 32; l++)
+		r |= (unsigned)(__shfl(v, l) == v) << l;
+
+	return r;
+}
+#define __match_any_sync(mask, v) amp_match_any((unsigned)(v))
+
 // The butterfly (xor) shuffle of the reductions, without the LDS pipe: HIP's __shfl_xor is ds_bpermute_b32 (an LDS round trip per
 // step); lane ^ 1, 2, 4, 8 stay inside a row of 16 lanes (DPP row_xmask, folded into the following add) and lane ^ 16 is the other
 // row (v_permlanex16 with the identity selection). All lanes must be active, as the full mask promises. Other widths and

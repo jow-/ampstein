@@ -809,6 +809,7 @@
 #define cudaFreeArray hipFreeArray
 #define cudaFreeAsync hipFreeAsync
 #define cudaFreeHost hipHostFree
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaFuncCache hipFuncCache_t
 #define cudaFuncCachePreferL1 hipFuncCachePreferL1

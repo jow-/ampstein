@@ -8223,7 +8223,7 @@ torch_gguf_dequant(uc_vm_t *vm, size_t nargs)
 	static const struct { const char *name; int id; } types[] = {
 		{ "Q8_0", 0 }, { "IQ4_NL", 1 }, { "Q5_K", 2 }, { "IQ2_XXS", 3 }, { "IQ2_XS", 4 }, { "IQ1_M", 5 }, { "IQ1_S", 6 },
 		{ "Q2_0", 7 }, { "Q4_K", 8 }, { "Q3_K", 9 }, { "Q6_K", 10 }, { "IQ2_S", 11 }, { "IQ3_XXS", 12 },
-		{ "IQ3_S", 13 }, { "IQ4_XS", 14 }, { "Q4_0", 15 },
+		{ "IQ3_S", 13 }, { "IQ4_XS", 14 }, { "Q4_0", 15 }, { "Q2_K", 16 },
 	};
 	at::Tensor *w;
 	uc_value_t *tv = uc_fn_arg(1), *dv = uc_fn_arg(2);
@@ -8339,16 +8339,16 @@ gguf_gemv_run(int qt, at::Tensor &x, const void *w, const void *ids, void *out, 
 static bool
 gguf_i8_qtype(int qt)
 {
-	return qt == 0 || qt == 2 || qt == 3 || qt == 4 || qt == 5 || qt == 6 || qt == 10 || qt == 1 || qt == 8 || qt == 14 || qt == 7 || qt == 11 || qt == 12 || qt == 13;
+	return qt == 0 || qt == 2 || qt == 3 || qt == 4 || qt == 5 || qt == 6 || qt == 10 || qt == 1 || qt == 8 || qt == 14 || qt == 7 || qt == 11 || qt == 12 || qt == 13 || qt == 16;
 }
 
 static int
 gguf_qtype_id(const char *tn)
 {
 	static const char *names[] = { "Q8_0", "IQ4_NL", "Q5_K", "IQ2_XXS", "IQ2_XS", "IQ1_M", "IQ1_S",
-		"Q2_0", "Q4_K", "Q3_K", "Q6_K", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "Q4_0" };
+		"Q2_0", "Q4_K", "Q3_K", "Q6_K", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "Q4_0", "Q2_K" };
 
-	for (int i = 0; i < 16; i++)
+	for (int i = 0; i < 17; i++)
 		if (!strcmp(tn, names[i]))
 			return i;
 
@@ -8646,7 +8646,6 @@ torch_gguf_moe_prefill(uc_vm_t *vm, size_t nargs)
 		RAISE(e.what());
 	}
 }
-#endif /* !AMPSTEIN_ROCM */
 
 extern "C" int amp_gguf_moe_prefill_pt(int t13, int t2, const void *y, const void *tok, const void *wts, const void *count, const void *start,
 	const void *p1, const void *p3, const void *p2, void *hbuf, void *out, void *wsc, int E, int H, int I, int max_rows, float lim, cudaStream_t stream);
@@ -8705,6 +8704,7 @@ torch_gguf_moe_prefill_pt(uc_vm_t *vm, size_t nargs)
 		RAISE(e.what());
 	}
 }
+#endif /* !AMPSTEIN_ROCM */
 
 extern "C" int amp_gguf_embed(int qtype, const void *w, const void *ids, void *out, long nrows, long vocab, int K, cudaStream_t stream);
 

@@ -23,7 +23,7 @@ assert(join(',', m['test.arr_i']) == '1,2,3' && join('|', m['test.arr_s']) == 'a
 
 let names = sort(f.list());
 
-assert(join(',', names) == 'iq1_m,iq1_s,iq2_s,iq2_xs,iq2_xxs,iq3_s,iq3_xxs,iq4_nl,iq4_xs,plain_bf16,plain_f32,plain_i32,q2_0,q3_k,q4_0,q4_k,q5_k,q6_k,q8_0,stack', `inventory ${names}`);
+assert(join(',', names) == 'iq1_m,iq1_s,iq2_s,iq2_xs,iq2_xxs,iq3_s,iq3_xxs,iq4_nl,iq4_xs,plain_bf16,plain_f32,plain_i32,q2_0,q2_k,q3_k,q4_0,q4_k,q5_k,q6_k,q8_0,stack', `inventory ${names}`);
 
 // shape (row-major), logical dtype, byte count
 function check_info(n, dtype, shape, nbytes) {

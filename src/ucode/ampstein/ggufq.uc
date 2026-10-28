@@ -8,8 +8,8 @@
 const SCRATCH_ELEMS = +(getenv("AMP_GGUF_SLICE") ?? 8 * 1024 * 1024);     // dequantized slice of a prefill matmul, elements (fp16: 16 MiB)
 const PF_OFF = getenv('AMP_GGUF_NO_PF') != null;                    // the per-expert dequantize + cuBLAS prefill instead of the grouped kernel
 const PT_OFF = getenv('AMP_GGUF_NO_PT') != null;                    // the pointer-table prefill kernel off (per-expert loop for cold experts)
-const PF_TYPES = {IQ2_XXS: true, IQ2_XS: true, IQ1_M: true, IQ1_S: true};
-const I8_TYPES = {Q8_0: true, Q5_K: true, Q6_K: true, Q4_K: true, IQ4_XS: true, IQ4_NL: true, Q2_0: true, IQ2_S: true, IQ3_XXS: true, IQ3_S: true, IQ2_XXS: true, IQ2_XS: true, IQ1_M: true, IQ1_S: true};
+const PF_TYPES = {IQ2_XXS: true, IQ2_XS: true, IQ1_M: true, IQ1_S: true, Q2_K: true};
+const I8_TYPES = {Q8_0: true, Q5_K: true, Q6_K: true, Q4_K: true, IQ4_XS: true, IQ4_NL: true, Q2_0: true, IQ2_S: true, IQ3_XXS: true, IQ3_S: true, IQ2_XXS: true, IQ2_XS: true, IQ1_M: true, IQ1_S: true, Q2_K: true};
 const FUSED_OFF = getenv('AMP_GGUF_NO_FUSED') != null || getenv('AMP_GGUF_FP16') != null;           // separate gate / up launches
 const SHARED_PAR_OFF = getenv('AMP_GGUF_NO_SHARED_PAR') != null;                                       // the shared expert on the compute stream
 const GROUP_OFF = getenv('AMP_GGUF_GROUP') == null;                                                    // verify steps: one slot per pick (AMP_GGUF_GROUP=1: grouped by expert, slower on random picks)
@@ -41,7 +41,7 @@ const BLK = {
 	Q4_0: [ 32, 18 ], Q8_0: [ 32, 34 ], IQ4_NL: [ 32, 18 ], Q5_K: [ 256, 176 ],
 	IQ2_XXS: [ 256, 66 ], IQ2_XS: [ 256, 74 ], IQ1_M: [ 256, 56 ], IQ1_S: [ 256, 50 ],
 	Q2_0: [ 64, 18 ], Q4_K: [ 256, 144 ], Q3_K: [ 256, 110 ], Q6_K: [ 256, 210 ],
-	IQ2_S: [ 256, 82 ], IQ3_XXS: [ 256, 98 ], IQ3_S: [ 256, 110 ], IQ4_XS: [ 256, 136 ]
+	IQ2_S: [ 256, 82 ], IQ3_XXS: [ 256, 98 ], IQ3_S: [ 256, 110 ], IQ4_XS: [ 256, 136 ], Q2_K: [ 256, 84 ]
 };
 
 /* The linear over rows `raw` (N, row bytes) of type qt: forward(x) with x (M, K) fp16 -> (M, N) fp16 */

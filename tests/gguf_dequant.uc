@@ -24,7 +24,7 @@ function maxdiff(a, b) {
 }
 
 for (let name in [ 'q4_0', 'q8_0', 'iq4_nl', 'q5_k', 'iq2_xxs', 'iq2_xs', 'iq1_m', 'iq1_s',
-	'q2_0', 'q4_k', 'q3_k', 'q6_k', 'iq2_s', 'iq3_xxs', 'iq3_s', 'iq4_xs', 'stack' ]) {
+	'q2_0', 'q2_k', 'q4_k', 'q3_k', 'q6_k', 'iq2_s', 'iq3_xxs', 'iq3_s', 'iq4_xs', 'stack' ]) {
 	let ty = f.info(name).dtype;
 	let ref = r.tensor(name).cuda();
 	let raw = f.tensor(name).cuda();
@@ -51,7 +51,7 @@ function rel_err(a, b) {
 }
 
 for (let name in [ 'q4_0', 'q8_0', 'iq4_nl', 'q5_k', 'iq2_xxs', 'iq2_xs', 'iq1_m', 'iq1_s',
-	'q2_0', 'q4_k', 'q3_k', 'q6_k', 'iq2_s', 'iq3_xxs', 'iq3_s', 'iq4_xs' ]) {
+	'q2_0', 'q2_k', 'q4_k', 'q3_k', 'q6_k', 'iq2_s', 'iq3_xxs', 'iq3_s', 'iq4_xs' ]) {
 	let ty = f.info(name).dtype;
 	let raw = f.tensor(name).cuda();
 	let ref = r.tensor(name).cuda();                 // (24, 768) float32
@@ -164,7 +164,7 @@ for (let name in [ 'q5_k', 'iq2_xxs', 'iq1_m', 'iq1_s', 'iq3_s', 'q8_0' ]) {
 
 // embedding rows by id: the same values as the dequantized table, any id shape, an id outside the table gives row 0
 for (let name in [ 'q4_0', 'q5_k', 'q8_0', 'iq2_xxs', 'iq1_m', 'iq1_s', 'iq4_nl',
-	'q2_0', 'q4_k', 'q3_k', 'q6_k', 'iq2_s', 'iq3_xxs', 'iq3_s', 'iq4_xs' ]) {
+	'q2_0', 'q2_k', 'q4_k', 'q3_k', 'q6_k', 'iq2_s', 'iq3_xxs', 'iq3_s', 'iq4_xs' ]) {
 	let ty = f.info(name).dtype, raw = f.tensor(name).cuda();
 	let full = torch.gguf_dequant(raw, ty, 'float16');
 	let ids = torch.from_array([ [ 3, 0 ], [ 23, 99 ] ], 'int64', 'cuda');

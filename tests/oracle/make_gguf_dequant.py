@@ -37,6 +37,9 @@ def make_blocks(t, nblocks):
         raw[:, 2:4] = f16_bytes(nblocks)
     elif t == T.Q3_K:
         raw[:, 108:110] = f16_bytes(nblocks)
+    elif t == T.Q2_K:
+        raw[:, 80:82] = f16_bytes(nblocks)
+        raw[:, 82:84] = f16_bytes(nblocks)
     elif t == T.Q6_K:
         raw[:, 208:210] = f16_bytes(nblocks)
     elif t == T.IQ1_M:
@@ -65,7 +68,7 @@ w.add_array('test.arr_f', [0.5, 0.25])
 
 refs = {}
 for t in (T.Q4_0, T.Q8_0, T.IQ4_NL, T.Q5_K, T.IQ2_XXS, T.IQ2_XS, T.IQ1_M, T.IQ1_S,
-          T.Q2_0, T.Q4_K, T.Q3_K, T.Q6_K, T.IQ2_S, T.IQ3_XXS, T.IQ3_S, T.IQ4_XS):
+          T.Q2_0, T.Q2_K, T.Q4_K, T.Q3_K, T.Q6_K, T.IQ2_S, T.IQ3_XXS, T.IQ3_S, T.IQ4_XS):
     blk, size = GGML_QUANT_SIZES[t]
     cols = 768
     rows = 24
